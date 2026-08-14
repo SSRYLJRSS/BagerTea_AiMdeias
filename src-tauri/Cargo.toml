@@ -1,6 +1,6 @@
 [package]
 name = "bagertea_ai_media_v2"
-version = "0.1.0"
+version = "1.0.1"
 edition = "2021"
 description = "茶包素材 BagerTea AiMdeias V2 — 本地图片/视频素材数据库"
 
