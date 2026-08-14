@@ -1,0 +1,15 @@
+# 前端
+node_modules/
+dist/
+*.local
+
+# Rust / Tauri
+src-tauri/target/
+src-tauri/gen/
+
+# 系统
+.DS_Store
+Thumbs.db
+
+# 本地工作数据
+.workbuddy/

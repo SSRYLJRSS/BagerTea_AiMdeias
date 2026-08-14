@@ -1,0 +1,57 @@
+[package]
+name = "bagertea_ai_media_v2"
+version = "0.1.0"
+edition = "2021"
+description = "茶包素材 BagerTea AiMdeias V2 — 本地图片/视频素材数据库"
+
+[lib]
+name = "bagertea_ai_media_v2_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# ── 依赖分批：T01 核心集；T02 数据层（rusqlite/sha2/walkdir/dirs/chrono/uuid，本批）；
+#    T03 加 image（本批）；ffmpeg 改走 PATH 探测 + 优雅降级（sidecar 分发留到打包阶段）；
+#    kamadak-exif 曾弃用于缩略图；v2.5 重新引入做 EXIF 元信息提取（PRD 5.5）；T05 加 reqwest/ort
+tauri = { version = "2", features = ["protocol-asset"] }
+rusqlite = { version = "0.31", features = ["bundled", "modern_sqlite", "functions"] }
+sha2 = "0.10"
+walkdir = "2"
+dirs = "5"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4"] }
+tauri-plugin-dialog = "2"
+tauri-plugin-fs = "2"
+tauri-plugin-shell = "2"
+tauri-plugin-opener = "2"
+tauri-plugin-store = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# 异步运行时由 tauri::async_runtime 提供（内部自带 tokio），无需直接依赖 tokio
+thiserror = "1"
+kamadak-exif = "0.5"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+rayon = "1"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+# T05a 云端 AI 打标：blocking 与现有同步 command 风格一致（避免跨 await 持 DB 锁）
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+base64 = "0.22"
+
+[dev-dependencies]
+tempfile = "3"
+
+# 开发期性能：图像/解码相关 crate 在 dev 下也按 O3 编译
+# （debug 构建下 24MP JPEG 全解码 12.7s → O3 后亚秒级，老板走查体感关键）
+[profile.dev.package.image]
+opt-level = 3
+[profile.dev.package.zune-jpeg]
+opt-level = 3
+[profile.dev.package.png]
+opt-level = 3
+[profile.dev.package.kamadak-exif]
+opt-level = 3
+[profile.dev.package.rayon]
+opt-level = 3

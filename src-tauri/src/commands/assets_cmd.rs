@@ -1,0 +1,182 @@
+use std::path::{Path, PathBuf};
+
+use serde::Serialize;
+use tauri::{Manager, State};
+
+use crate::db::assets::{self, Asset, AssetFilter, AssetPage};
+use crate::error::{AppError, AppResult};
+use crate::services::thumbnail::ThumbnailService;
+use crate::state::AppState;
+
+// 参数取 &AppState（State<T> 经 Deref 自动转换），规避 State 生命周期标注
+fn lock_db(state: &AppState) -> AppResult<std::sync::MutexGuard<'_, rusqlite::Connection>> {
+    state.db.lock().map_err(|_| AppError::msg("数据库锁中毒"))
+}
+
+/// asset 协议逐路径放行（安全收敛）：仅列表/详情返回过的素材原文件可被 webview 读取
+fn allow_asset(app: &tauri::AppHandle, path: &str) {
+    let _ = app.asset_protocol_scope().allow_file(Path::new(path));
+}
+
+/// B02/B03：删除结果——deleted 为已从库删除数，failed_files 为磁盘删除失败的 asset id
+/// （delete_file 策略下磁盘删除失败的 id 不从库中删除，避免假删除）
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteResult {
+    pub deleted: u64,
+    pub failed_files: Vec<i64>,
+}
+
+#[tauri::command]
+pub fn list_assets(
+    app: tauri::AppHandle,
+    state: State<AppState>,
+    filter: AssetFilter,
+) -> AppResult<AssetPage> {
+    let conn = lock_db(&state)?;
+    let page = assets::list(&conn, &filter)?;
+    for a in &page.items {
+        allow_asset(&app, &a.file_path);
+    }
+    Ok(page)
+}
+
+/// 取当前筛选结果的全部 id（BUG-E：全选/反选/批量操作用）。
+/// 只 SELECT id，不返回完整 Asset、不调 allow_asset——避免拉全量对象浪费 IPC/内存，
+/// 且不暴露原文件路径、消除 asset 协议 scope 随全选无界增长。
+#[tauri::command]
+pub fn list_asset_ids(state: State<AppState>, filter: AssetFilter) -> AppResult<Vec<i64>> {
+    let conn = lock_db(&state)?;
+    assets::list_ids(&conn, &filter)
+}
+
+#[tauri::command]
+pub fn get_asset(app: tauri::AppHandle, state: State<AppState>, id: i64) -> AppResult<Asset> {
+    let conn = lock_db(&state)?;
+    let a = assets::get(&conn, id)?;
+    allow_asset(&app, &a.file_path);
+    Ok(a)
+}
+
+/// 删除双策略：remove_from_library（仅移出库）| delete_file（连同原文件删除）
+/// B02：改 async + spawn_blocking，文件 IO 下沉工作线程，避免主线程阻塞卡 UI
+/// B03：delete_file 策略下磁盘删除失败的 id 不从库删（消除假删除），收集失败列表返回前端
+#[tauri::command]
+pub async fn delete_assets(
+    state: State<'_, AppState>,
+    ids: Vec<i64>,
+    strategy: String,
+) -> AppResult<DeleteResult> {
+    // 参数校验仍在主线程（快）
+    if strategy != "remove_from_library" && strategy != "delete_file" {
+        return Err(AppError::msg("非法删除策略"));
+    }
+
+    let db = std::sync::Arc::clone(&state.db);
+    let data_dir = state.data_dir.clone();
+
+    tauri::async_runtime::spawn_blocking(move || -> AppResult<DeleteResult> {
+        let thumbs = ThumbnailService::new(&data_dir)?;
+
+        // 阶段一：短锁收集待删文件路径（仅 delete_file 策略需要原文件路径）
+        let paths: Vec<(i64, PathBuf)> = if strategy == "delete_file" {
+            let conn = db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
+            ids.iter()
+                .filter_map(|&id| {
+                    assets::get(&conn, id)
+                        .ok()
+                        .map(|a| (id, PathBuf::from(a.file_path)))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        // 阶段二：锁外删磁盘文件 + 收集失败（B03：不再吞错）
+        let failed_set: std::collections::HashSet<i64> = if strategy == "delete_file" {
+            paths
+                .iter()
+                .filter_map(|(id, p)| {
+                    if std::fs::remove_file(p).is_err() {
+                        Some(*id) // B03：记录磁盘删除失败的 id
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        } else {
+            std::collections::HashSet::new()
+        };
+
+        // 阶段三：短锁写库——delete_file 策略只删磁盘删除成功的（+ remove_from_library 全删）
+        let to_delete_db: Vec<i64> = if strategy == "delete_file" {
+            ids.iter()
+                .filter(|id| !failed_set.contains(id))
+                .copied()
+                .collect()
+        } else {
+            ids.clone()
+        };
+        let n = {
+            let conn = db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
+            assets::delete(&conn, &to_delete_db)?
+        };
+
+        // 阶段四：缩略图清理（仅清理已成功从库删除的，文件 IO 不持锁）
+        for &id in &to_delete_db {
+            thumbs.delete_for_asset(id);
+        }
+
+        let failed_files: Vec<i64> = failed_set.into_iter().collect();
+        Ok(DeleteResult {
+            deleted: n,
+            failed_files,
+        })
+    })
+    .await
+    .map_err(|e| AppError::msg(format!("删除线程异常: {e}")))?
+}
+
+/// 返回原始文件路径（前端 convertFileSrc 使用，禁止拼 file://）
+/// B09：改为部分成功——跳过不存在的 id 而非整体 Err（删除后选中含已删 id 时复制路径不再整体失败）
+#[tauri::command]
+pub fn get_asset_urls(
+    app: tauri::AppHandle,
+    state: State<AppState>,
+    ids: Vec<i64>,
+) -> AppResult<Vec<String>> {
+    let conn = lock_db(&state)?;
+    let mut out = Vec::with_capacity(ids.len());
+    for id in ids {
+        match assets::get(&conn, id) {
+            Ok(a) => {
+                allow_asset(&app, &a.file_path);
+                out.push(a.file_path);
+            }
+            Err(_) => continue, // B09：跳过不存在的 id，不整体失败
+        }
+    }
+    Ok(out)
+}
+
+/// 在系统文件管理器中定位文件（右键菜单「打开所在文件夹」）
+/// B24：校验路径属于已入库文件，拒绝任意路径（防越权打开系统目录）
+#[tauri::command]
+pub fn reveal_in_folder(
+    app: tauri::AppHandle,
+    state: State<AppState>,
+    path: String,
+) -> AppResult<()> {
+    // B24：校验路径属于已入库素材
+    let norm = crate::utils::path::normalize_path(&path);
+    {
+        let conn = lock_db(&state)?;
+        if assets::find_by_path(&conn, &norm)?.is_none() {
+            return Err(AppError::msg("路径不属于已入库素材"));
+        }
+    }
+    use tauri_plugin_opener::OpenerExt;
+    app.opener()
+        .reveal_item_in_dir(&path)
+        .map_err(|e| AppError::msg(format!("打开所在文件夹失败: {e}")))
+}

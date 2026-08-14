@@ -1,0 +1,8 @@
+{
+  "rust-analyzer.linkedProjects": ["${workspaceFolder}/src-tauri/Cargo.toml"],
+  "rust-analyzer.checkOnSave": true,
+  "editor.formatOnSave": true,
+  "files.exclude": {
+    "src-tauri/target": true
+  }
+}

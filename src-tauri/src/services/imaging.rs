@@ -1,0 +1,356 @@
+//! 全局统一图像引擎（PRD v2.6）：全应用唯一的图片解码/缩略图实现
+//! preview.rs（待入库）与 thumbnail.rs（已入库）都是它的瘦壳。
+//!
+//! 内嵌预览策略链（开源看图软件标准做法，对标 ExifTool/FastRawViewer）：
+//!   1. EXIF IFD1 ThumbnailImage（kamadak-exif；相机 JPEG/TIFF 微秒级）
+//!   2. 手写 TIFF 遍历：任意 IFD 的 0x0201/0x0202 + Panasonic JpgFromRaw(0x2E)（RW2/DNG/CR2…）
+//!   3. FFD8..FFD9 标记扫描（取最大 JPEG 块，一切 RAW 兜底）
+//!
+//! 解码路径：
+//!   内嵌图（尺寸达标直接用）→ jpeg-decoder DCT 缩放（1/8~1/1，比全解码快数倍）
+//!   → image::open 全解码兜底（PNG/GIF/WebP/BMP）
+//! 并发：全局 4 许可信号量（手写 Condvar），替代两处串行 Mutex，吞吐 ×4
+
+use std::io::{Read, Seek, SeekFrom};
+use std::path::Path;
+use std::sync::{Condvar, Mutex};
+
+use image::{DynamicImage, GenericImageView};
+
+// ---------------------------------------------------------------------------
+// 并发许可：最多 4 个解码并行（解码是 CPU 密集活，再多只会互相抢）
+// ---------------------------------------------------------------------------
+
+static DECODE_SEM: (Mutex<usize>, Condvar) = (Mutex::new(4), Condvar::new());
+const MAX_PERMITS: usize = 4;
+
+pub struct DecodePermit;
+
+impl Drop for DecodePermit {
+    fn drop(&mut self) {
+        let (m, c) = &DECODE_SEM;
+        if let Ok(mut n) = m.lock() {
+            *n += 1;
+            debug_assert!(*n <= MAX_PERMITS);
+        }
+        c.notify_one();
+    }
+}
+
+pub fn acquire() -> DecodePermit {
+    let (m, c) = &DECODE_SEM;
+    let mut n = m.lock().unwrap_or_else(|e| e.into_inner());
+    while *n == 0 {
+        n = c.wait(n).unwrap_or_else(|e| e.into_inner());
+    }
+    *n -= 1;
+    DecodePermit
+}
+
+// ---------------------------------------------------------------------------
+// 内嵌预览提取（策略链）
+// ---------------------------------------------------------------------------
+
+/// 从文件里按偏移+长度抠 JPEG：宽容裁剪（前 64 字节内找 SOI、末尾找 EOI）
+/// 某些相机内嵌图带填充字节，严格校验会误杀
+fn cut_jpeg(src: &Path, offset: u64, len: u64) -> Option<Vec<u8>> {
+    if len == 0 || len > 64 * 1024 * 1024 {
+        return None;
+    }
+    let mut f = std::fs::File::open(src).ok()?;
+    f.seek(SeekFrom::Start(offset)).ok()?;
+    let mut buf = vec![0u8; len as usize];
+    f.read_exact(&mut buf).ok()?;
+    // 头部 64 字节内定位 SOI
+    let soi = buf[..buf.len().min(64)]
+        .windows(2)
+        .position(|w| w[0] == 0xFF && w[1] == 0xD8)?;
+    // 末尾定位最后一个 EOI
+    let eoi = buf.windows(2).rposition(|w| w[0] == 0xFF && w[1] == 0xD9)?;
+    if eoi <= soi {
+        return None;
+    }
+    Some(buf[soi..eoi + 2].to_vec())
+}
+
+/// 定位 TIFF 头：(基准偏移, 是否大端)
+/// - TIFF/RAW 容器：base=0（RW2 magic 0x55，标准 0x2A）
+/// - JPEG 容器：扫 APP 段找 FFE1+"Exif\0\0"，TIFF 头在其后；IFD 里的偏移全部相对该基准
+fn locate_tiff_base(src: &Path) -> Option<(u64, bool)> {
+    let mut f = std::fs::File::open(src).ok()?;
+    let mut head = [0u8; 4];
+    f.read_exact(&mut head).ok()?;
+    match &head[0..2] {
+        b"II" => return Some((0, false)),
+        b"MM" => return Some((0, true)),
+        _ => {}
+    }
+    // JPEG：遍历 marker 段找 Exif APP1
+    if head[0] != 0xFF || head[1] != 0xD8 {
+        return None;
+    }
+    f.seek(SeekFrom::Start(2)).ok()?;
+    let mut buf = vec![0u8; 256 * 1024];
+    let n = f.read(&mut buf).ok()?;
+    buf.truncate(n);
+    let mut i = 0;
+    while i + 4 < buf.len() {
+        if buf[i] != 0xFF {
+            i += 1;
+            continue;
+        }
+        let marker = buf[i + 1];
+        if marker == 0xD8 || marker == 0x01 || (0xD0..=0xD7).contains(&marker) {
+            i += 2; // 无长度段
+            continue;
+        }
+        if marker == 0xDA {
+            break; // SOS：扫描开始，后面没有 APP 段了
+        }
+        let seg_len = u16::from_be_bytes([buf[i + 2], buf[i + 3]]) as usize;
+        if seg_len < 2 || i + 2 + seg_len > buf.len() {
+            break;
+        }
+        if marker == 0xE1 && seg_len >= 8 && &buf[i + 4..i + 10] == b"Exif\0\0" {
+            // buf 从文件偏移 2 开始读：TIFF 基准(文件绝对) = i + 2(marker) + 4(段头) + 6(Exif\0\0)
+            let base = (i + 12) as u64;
+            let be = match &buf[i + 10..i + 12] {
+                b"II" => false,
+                b"MM" => true,
+                _ => return None,
+            };
+            return Some((base, be));
+        }
+        i += 2 + seg_len;
+    }
+    None
+}
+
+/// 统一 TIFF 遍历（策略 1+2 合体）：沿 IFD 链找
+/// 标准 0x0201/0x0202（JPEGInterchangeFormat）与 Panasonic 0x2E（JpgFromRaw，count 即长度）
+fn tiff_embedded_jpeg(src: &Path) -> Option<Vec<u8>> {
+    let (base, be) = locate_tiff_base(src)?;
+    let mut f = std::fs::File::open(src).ok()?;
+    let u16 = |b: &[u8]| -> u16 {
+        if be {
+            u16::from_be_bytes([b[0], b[1]])
+        } else {
+            u16::from_le_bytes([b[0], b[1]])
+        }
+    };
+    let u32 = |b: &[u8]| -> u32 {
+        if be {
+            u32::from_be_bytes([b[0], b[1], b[2], b[3]])
+        } else {
+            u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+        }
+    };
+
+    let mut magic_buf = [0u8; 8];
+    f.seek(SeekFrom::Start(base)).ok()?;
+    f.read_exact(&mut magic_buf).ok()?;
+    let magic = u16(&magic_buf[2..4]);
+    if magic != 42 && magic != 85 {
+        return None;
+    }
+    let mut ifd_off = u32(&magic_buf[4..8]) as u64;
+
+    // 沿 IFD 链走（IFD0 → IFD1 → …），最多 8 层防坏文件死循环
+    for _ in 0..8 {
+        if ifd_off == 0 {
+            return None;
+        }
+        f.seek(SeekFrom::Start(base + ifd_off)).ok()?;
+        let mut cnt_buf = [0u8; 2];
+        f.read_exact(&mut cnt_buf).ok()?;
+        let n = u16(&cnt_buf) as usize;
+        if n > 512 {
+            return None;
+        }
+        let mut entries = vec![0u8; n * 12];
+        f.read_exact(&mut entries).ok()?;
+
+        let mut jpeg_off: Option<u64> = None;
+        let mut jpeg_len: Option<u64> = None;
+        let mut pana_off: Option<u64> = None;
+        let mut pana_len: Option<u64> = None;
+
+        for i in 0..n {
+            let e = &entries[i * 12..i * 12 + 12];
+            let tag = u16(&e[0..2]);
+            let typ = u16(&e[2..4]);
+            let count = u32(&e[4..8]) as u64;
+            let val = u32(&e[8..12]) as u64;
+            match tag {
+                0x0201 => jpeg_off = Some(val),
+                0x0202 => jpeg_len = Some(val),
+                // Panasonic JpgFromRaw：UNDEF(7)，count 即数据长度，value 为偏移
+                0x002E if typ == 7 && count > 1024 => {
+                    pana_off = Some(val);
+                    pana_len = Some(count);
+                }
+                _ => {}
+            }
+        }
+
+        // 优先标准 JPEGInterchangeFormat，其次 Panasonic（偏移相对 TIFF 基准）
+        if let (Some(o), Some(l)) = (jpeg_off, jpeg_len) {
+            if let Some(j) = cut_jpeg(src, base + o, l) {
+                return Some(j);
+            }
+        }
+        if let (Some(o), Some(l)) = (pana_off, pana_len) {
+            if let Some(j) = cut_jpeg(src, base + o, l) {
+                return Some(j);
+            }
+        }
+
+        // 下一个 IFD
+        let mut next = [0u8; 4];
+        f.read_exact(&mut next).ok()?;
+        ifd_off = u32(&next) as u64;
+    }
+    None
+}
+
+/// 策略 3：FFD8..FFD9 标记扫描（取最大 JPEG 块；一切格式的最后兜底）
+fn marker_scan_jpeg(src: &Path) -> Option<Vec<u8>> {
+    let data = std::fs::read(src).ok()?;
+    if data.len() < 4 {
+        return None;
+    }
+    let mut best: Option<(usize, usize)> = None; // (start, len)
+    let mut i = 0;
+    while i + 1 < data.len() {
+        if data[i] == 0xFF && data[i + 1] == 0xD8 {
+            // 找匹配的 EOI
+            let mut j = i + 2;
+            while j + 1 < data.len() {
+                if data[j] == 0xFF && data[j + 1] == 0xD9 {
+                    let len = j + 2 - i;
+                    if len > 4096 && best.map(|(_, bl)| len > bl).unwrap_or(true) {
+                        best = Some((i, len));
+                    }
+                    break;
+                }
+                j += 1;
+            }
+            i = j.max(i + 2);
+        } else {
+            i += 1;
+        }
+    }
+    let (start, len) = best?;
+    Some(data[start..start + len].to_vec())
+}
+
+/// 内嵌预览策略链：TIFF 遍历（含 JPEG 容器定位）→ 标记扫描
+/// 标记扫描对 .jpg 文件禁用（整个文件就是 JPEG，会误抓主图）
+pub fn embedded_preview(src: &Path) -> Option<Vec<u8>> {
+    tiff_embedded_jpeg(src).or_else(|| {
+        if is_jpeg_like(src) {
+            None
+        } else {
+            marker_scan_jpeg(src)
+        }
+    })
+}
+
+// ---------------------------------------------------------------------------
+// 解码
+// ---------------------------------------------------------------------------
+
+fn is_jpeg_like(src: &Path) -> bool {
+    src.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| matches!(e.to_ascii_lowercase().as_str(), "jpg" | "jpeg"))
+        .unwrap_or(false)
+}
+
+/// 统一解码入口：目标最长边 max_px
+/// 内嵌图达标（≥max_px）直接用；不达标再按格式选最快的解码路
+pub fn decode_thumb(src: &Path, max_px: u32) -> Option<DynamicImage> {
+    let _permit = acquire();
+
+    // 1. 内嵌预览（微秒~毫秒级）
+    if let Some(jpeg) = embedded_preview(src) {
+        if let Ok(img) = image::load_from_memory(&jpeg) {
+            if img.dimensions().0.max(img.dimensions().1) >= max_px {
+                return Some(img.thumbnail(max_px, max_px));
+            }
+            // 内嵌太小（如 160px 的 IFD1 缩略图）：小目标直接够用
+            if max_px <= 320 {
+                return Some(img);
+            }
+        }
+    }
+
+    // 2. 全解码 + 缩放（image 0.24 默认 zune-jpeg；dev 下已配 O3 override，
+    //    24MP 全解码 ~370ms——实测比 jpeg-decoder 的 DCT 缩放路径还快，故精简掉后者）
+    image::open(src)
+        .ok()
+        .map(|img| img.thumbnail(max_px, max_px))
+}
+
+/// 解码并写 webp 缩略图到 out
+pub fn write_thumb(src: &Path, out: &Path, max_px: u32) -> bool {
+    match decode_thumb(src, max_px) {
+        Some(img) => img.save_with_format(out, image::ImageFormat::WebP).is_ok(),
+        None => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn semaphore_allows_up_to_four() {
+        let p1 = acquire();
+        let p2 = acquire();
+        let p3 = acquire();
+        let p4 = acquire();
+        // 第 5 个会阻塞——另起线程验证释放后能拿到
+        let h = std::thread::spawn(|| {
+            acquire();
+        });
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(!h.is_finished());
+        drop(p1);
+        h.join().unwrap();
+        drop(p2);
+        drop(p3);
+        drop(p4);
+    }
+
+    #[test]
+    fn marker_scan_picks_largest_jpeg() {
+        let dir = std::env::temp_dir().join(format!("bagertea_marker_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("fake.raw");
+        let mut data = vec![0u8; 100];
+        // 小 JPEG
+        data.extend_from_slice(&[0xFF, 0xD8, 1, 2, 3, 0xFF, 0xD9]);
+        data.extend_from_slice(&[0u8; 50]);
+        // 大 JPEG
+        data.extend_from_slice(&[0xFF, 0xD8]);
+        data.extend_from_slice(&vec![7u8; 5000]);
+        data.extend_from_slice(&[0xFF, 0xD9]);
+        std::fs::write(&f, &data).unwrap();
+        let j = marker_scan_jpeg(&f).unwrap();
+        assert_eq!(j.len(), 5004);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn cut_jpeg_validates_markers() {
+        let dir = std::env::temp_dir().join(format!("bagertea_cut_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("x.bin");
+        std::fs::write(&f, [0xFF, 0xD8, 9, 9, 0xFF, 0xD9]).unwrap();
+        assert!(cut_jpeg(&f, 0, 6).is_some());
+        assert!(cut_jpeg(&f, 1, 4).is_none()); // 缺 SOI
+        assert!(cut_jpeg(&f, 0, 0).is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
