@@ -1,4 +1,4 @@
-//! QA 实测集成测试（2026-08-14 严过关）
+﻿//! QA 实测集成测试（2026-08-14 严过关）
 //! 覆盖：migrations 幂等 / assets CRUD+级联删除 / LIKE 转义(% _ \) / FTS 搜索(海边vs上海湖边、引号文件名、ASCII 子串)
 //!       批量删除 / tag 父子/循环校验 / 分页边界
 //! 运行：cargo test --test qa_edge_tests
@@ -25,10 +25,10 @@ fn count(conn: &rusqlite::Connection, sql: &str) -> i64 {
 #[test]
 fn migrate_twice_is_idempotent() -> AppResult<()> {
     let conn = setup();
-    // 再次执行 migrate（user_version 已=3，V3 重建幂等）
+    // 再次执行 migrate（user_version 已=7，幂等）
     migrations::migrate(&conn)?;
     let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    assert_eq!(v, 3);
+    assert_eq!(v, 7);
     // 表仍存在且可用
     add_asset(&conn, "d:/p/a.jpg", "a.jpg", "jpg", "image/jpeg");
     Ok(())
@@ -525,8 +525,7 @@ fn list_ids_matches_list_filter() -> AppResult<()> {
         untagged_only: untagged,
         tag_id,
         search: search.map(String::from),
-        offset: 0,
-        limit: 1000,
+        ..Default::default()
     };
 
     let cases: Vec<AssetFilter> = vec![
@@ -580,11 +579,11 @@ fn v3_rebuild_normalizes_fts_content() -> AppResult<()> {
     got.sort();
     assert_eq!(got, vec![id]);
 
-    // user_version 已升到 3
+    // user_version 已升到 7（V3 及后续迁移链全部执行）
     let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    assert_eq!(v, 3);
+    assert_eq!(v, 7);
 
-    // 幂等：再跑一次 migrate 无副作用（version 已=3，V3 不重跑）
+    // 幂等：再跑一次 migrate 无副作用（version 已=7，不重跑）
     migrations::migrate(&conn)?;
     let fname2: String = conn.query_row(
         "SELECT file_name FROM fts_content WHERE asset_id = ?1",
@@ -593,7 +592,7 @@ fn v3_rebuild_normalizes_fts_content() -> AppResult<()> {
     )?;
     assert_eq!(fname2, "进 度 100%.jpg");
     let v2: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    assert_eq!(v2, 3);
+    assert_eq!(v2, 7);
     Ok(())
 }
 
@@ -693,8 +692,7 @@ fn list_ids_matches_list_tag_subtree_and_combined() -> AppResult<()> {
         untagged_only: untagged,
         tag_id,
         search: search.map(String::from),
-        offset: 0,
-        limit: 1000,
+        ..Default::default()
     };
 
     let cases: Vec<AssetFilter> = vec![
@@ -828,9 +826,9 @@ fn b37_v2_crash_recovery_all_columns_present() -> AppResult<()> {
     conn.pragma_update(None, "user_version", 1)?;
     // 重新迁移
     migrations::migrate(&conn)?;
-    // version 应升到 3
+    // version 应升到 7（当前迁移链终版）
     let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    assert_eq!(v, 3);
+    assert_eq!(v, 7);
     // 所有 V2 列仍在
     let cols = asset_columns(&conn);
     for c in V2_COLS {
@@ -868,20 +866,20 @@ fn b37_v2_partial_columns_recovery() -> AppResult<()> {
         assert!(cols_after.contains(*c), "迁移后列 {c} 应存在");
     }
     let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    assert_eq!(v, 3);
+    assert_eq!(v, 7);
     Ok(())
 }
 
 #[test]
 fn b37_fresh_install_all_v2_columns() -> AppResult<()> {
-    // 场景：全新安装 → V1→V2（全部 ALTER）→ V3
+    // 场景：全新安装 → V1→V2（全部 ALTER）→ V3…V6
     let conn = db::init_memory()?;
     let cols = asset_columns(&conn);
     for c in V2_COLS {
         assert!(cols.contains(*c), "全新安装后列 {c} 应存在");
     }
     let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    assert_eq!(v, 3);
+    assert_eq!(v, 7);
     Ok(())
 }
 

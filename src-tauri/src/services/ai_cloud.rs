@@ -96,13 +96,68 @@ pub fn parse_categorized(content: &str) -> CategorizedTags {
     out
 }
 
-/// 解析模型回复并要求非空（v2.12）：空结果视为失败——通常意味着模型不支持图片输入或未遵循提示词
+/// 退化输出检测（Ollama 长驻状态损坏的已知症状，见 ollama/ollama#8235/#17587）：
+/// - 重复单一字符串（@@@@@… / !!!!!…）：采样/分词状态损坏后贪心退化的典型输出；
+/// - UTF-8 字节被按 Latin-1 误读的乱码（ä¸æ¯…）：分词器字节错切的典型输出；
+///
+/// 此类输出重试无意义，应卸载模型重载后重试（社区已验证的恢复手段，#8235 评论）。
+fn is_degenerate(content: &str) -> bool {
+    let t = content.trim();
+    let chars: Vec<char> = t.chars().collect();
+    if chars.len() < 6 {
+        return false;
+    }
+    // 全部同字符（@@@@@ / !!!!! …）
+    if chars.iter().all(|c| *c == chars[0]) {
+        return true;
+    }
+    // Latin-1 补充区字符占比 >1/3（UTF-8 字节误读为 Latin-1 的乱码特征）
+    let latin = chars
+        .iter()
+        .copied()
+        .filter(|c| ('\u{0080}'..='\u{00FF}').contains(c))
+        .count();
+    latin * 3 > chars.len()
+}
+
+/// 本地（Ollama）档案：触发一次模型卸载（keep_alive=0）。
+/// 长驻 runner 状态损坏后"卸载重载"即恢复（#8235 作者验证）；失败静默，由上层重试兜底。
+fn unload_ollama_model(cfg: &ApiProfile) {
+    // 本地档案 base_url 形如 http://localhost:11434/v1 → 原生端点剥掉 /v1
+    let base = cfg.base_url.trim_end_matches('/');
+    let native = base.strip_suffix("/v1").unwrap_or(base).to_string();
+    let body = serde_json::json!({
+        "model": cfg.model,
+        "prompt": "",
+        "keep_alive": "0",
+    });
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(8))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let _ = client
+        .post(format!("{native}/api/generate"))
+        .json(&body)
+        .send();
+}
+
+/// 解析模型回复并要求非空（v2.12）：空结果视为失败——通常意味着模型不支持图片输入或未遵循提示词。
+/// 失败时把模型原始返回内容（截断）带进错误信息，便于定位“模型没按 JSON 输出”类问题
 fn parse_tags_strict(content: &str) -> AppResult<CategorizedTags> {
     let tags = parse_categorized(content);
     if tags.is_empty() {
-        return Err(AppError::msg(
-            "模型未返回可解析的标签（模型可能不支持图片输入，或未按提示词返回 JSON）",
-        ));
+        let snippet: String = content.chars().take(300).collect();
+        let shown = if snippet.chars().count() < content.chars().count() {
+            format!("{snippet}…")
+        } else {
+            snippet
+        };
+        return Err(AppError::msg(format!(
+            "模型未返回可解析的标签（可能不支持图片输入或未按提示词输出 JSON）。模型原始返回：{shown}"
+        )));
     }
     Ok(tags)
 }
@@ -113,70 +168,122 @@ fn request_tags(
     categories: &[TagCategory],
     image_path: &std::path::Path,
 ) -> AppResult<CategorizedTags> {
+    // 连接失败引导（P3-01a）：本地档案连不上时明示安装/启动本地服务
+    let conn_err = |e: reqwest::Error| {
+        if cfg.is_local() {
+            AppError::msg(format!(
+                "无法连接本地服务 {base}：请确认 Ollama/LM Studio 已启动（Ollama 需先 ollama pull 视觉模型，如 llava），或在设置页切回云端档案: {e}",
+                base = cfg.base_url
+            ))
+        } else {
+            AppError::msg(format!("云端请求失败: {e}"))
+        }
+    };
     let bytes = std::fs::read(image_path)?;
     let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-    let mime = if image_path.extension().map(|e| e == "png").unwrap_or(false) {
-        "image/png"
-    } else {
-        "image/jpeg"
+    // MIME 按扩展名判定：高清/占位缩略图均为 .webp，误标 jpeg 会被严格的服务商拒绝
+    let mime = match image_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("png") => "image/png",
+        Some("webp") => "image/webp",
+        Some("gif") => "image/gif",
+        _ => "image/jpeg",
     };
 
     let prompt = build_prompt(categories);
     let base = cfg.base_url.trim_end_matches('/');
 
-    if cfg.api_mode == "anthropic" {
+    // 发起一次请求并取回模型文本回复（不同协议分支各自组包）
+    let fetch: Box<dyn Fn() -> AppResult<String>> = if cfg.api_mode == "anthropic" {
         // Anthropic Messages：x-api-key 鉴权 + base64 source 图片块
-        let body = serde_json::json!({
-            "model": cfg.model,
-            "max_tokens": 500,
-            "messages": [{
-                "role": "user",
-                "content": [
-                    { "type": "text", "text": prompt },
-                    { "type": "image", "source": { "type": "base64", "media_type": mime, "data": b64 } }
-                ]
-            }]
-        });
-        let resp: serde_json::Value = client
-            .post(format!("{base}/messages"))
-            .header("x-api-key", &cfg.api_key)
-            .header("anthropic-version", "2023-06-01")
-            .json(&body)
-            .send()
-            .map_err(|e| AppError::msg(format!("云端请求失败: {e}")))?
-            .json()
-            .map_err(|e| AppError::msg(format!("响应解析失败: {e}")))?;
-        let content = extract_anthropic_text(&resp)
-            .ok_or_else(|| AppError::msg("Anthropic 返回缺少 text 内容块"))?;
-        return parse_tags_strict(&content);
+        Box::new(move || {
+            let body = serde_json::json!({
+                "model": cfg.model,
+                "max_tokens": 500,
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        { "type": "text", "text": prompt },
+                        { "type": "image", "source": { "type": "base64", "media_type": mime, "data": b64 } }
+                    ]
+                }]
+            });
+            let resp: serde_json::Value = client
+                .post(format!("{base}/messages"))
+                .header("x-api-key", &cfg.api_key)
+                .header("anthropic-version", "2023-06-01")
+                .json(&body)
+                .send()
+                .map_err(conn_err)?
+                .json()
+                .map_err(|e| AppError::msg(format!("响应解析失败: {e}")))?;
+            extract_anthropic_text(&resp)
+                .ok_or_else(|| AppError::msg("Anthropic 返回缺少 text 内容块"))
+        })
+    } else {
+        // OpenAI 兼容（默认）：Bearer 鉴权 + data:image base64
+        Box::new(move || {
+            let body = serde_json::json!({
+                "model": cfg.model,
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        { "type": "text", "text": prompt },
+                        { "type": "image_url", "image_url": { "url": format!("data:{mime};base64,{b64}") } }
+                    ]
+                }],
+                "max_tokens": 500
+            });
+
+            let resp: serde_json::Value = client
+                .post(format!("{base}/chat/completions"))
+                .bearer_auth(&cfg.api_key)
+                .json(&body)
+                .send()
+                .map_err(conn_err)?
+                .json()
+                .map_err(|e| AppError::msg(format!("响应解析失败: {e}")))?;
+
+            resp["choices"][0]["message"]["content"]
+                .as_str()
+                .map(str::to_string)
+                .ok_or_else(|| {
+                    // 把原始响应（截断）带进错误，便于判断是错误页/限流/空 choices
+                    let raw = serde_json::to_string(&resp).unwrap_or_default();
+                    let snippet: String = raw.chars().take(300).collect();
+                    AppError::msg(format!("服务未返回可选内容（choices 为空）。原始响应：{snippet}"))
+                })
+        })
+    };
+
+    let mut content = fetch()?;
+    if let Ok(t) = parse_tags_strict(&content) {
+        return Ok(t);
     }
-
-    // OpenAI 兼容（默认）：Bearer 鉴权 + data:image base64
-    let body = serde_json::json!({
-        "model": cfg.model,
-        "messages": [{
-            "role": "user",
-            "content": [
-                { "type": "text", "text": prompt },
-                { "type": "image_url", "image_url": { "url": format!("data:{mime};base64,{b64}") } }
-            ]
-        }],
-        "max_tokens": 500
-    });
-
-    let resp: serde_json::Value = client
-        .post(format!("{base}/chat/completions"))
-        .bearer_auth(&cfg.api_key)
-        .json(&body)
-        .send()
-        .map_err(|e| AppError::msg(format!("云端请求失败: {e}")))?
-        .json()
-        .map_err(|e| AppError::msg(format!("响应解析失败: {e}")))?;
-
-    let content = resp["choices"][0]["message"]["content"]
-        .as_str()
-        .ok_or_else(|| AppError::msg("云端返回缺少 content"))?;
-    parse_tags_strict(content)
+    // 本地档案失败自愈：任何解析失败（@@@@ 退化 / 乱码 / 答非所问）都先卸载重载一次再重试。
+    // Ollama 长驻 runner 状态损坏会污染其后全部请求，卸载重载即恢复（ollama/ollama#8235/#17587 已验证）
+    if cfg.is_local() {
+        unload_ollama_model(cfg);
+        if let Ok(c) = fetch() {
+            if let Ok(t) = parse_tags_strict(&c) {
+                return Ok(t);
+            }
+            content = c;
+        }
+        if is_degenerate(&content) {
+            // 重载后仍退化：服务本身已不可用，给用户明确指引
+            let snippet: String = content.chars().take(120).collect();
+            return Err(AppError::msg(format!(
+                "Ollama 模型输出持续异常（原始返回：{snippet}…）：多因长驻服务状态损坏，请重启 Ollama 后重试，或改用云端档案（设置 → AI 打标）。"
+            )));
+        }
+    }
+    // 非退化（模型正常回复但没按提示词输出 JSON）：保留原始错误信息便于定位
+    parse_tags_strict(&content)
 }
 
 /// 从 Anthropic Messages 响应中取第一个 text 内容块
@@ -214,6 +321,9 @@ pub fn list_models(base_url: &str, api_key: &str, api_mode: &str) -> AppResult<V
     let req = if api_mode == "anthropic" {
         req.header("x-api-key", api_key)
             .header("anthropic-version", "2023-06-01")
+    } else if api_key.trim().is_empty() {
+        // 本地兼容端点（Ollama/LM Studio）通常无 Key，不带鉴权头（P3-01a）
+        req
     } else {
         req.bearer_auth(api_key)
     };
@@ -229,25 +339,6 @@ pub fn list_models(base_url: &str, api_key: &str, api_mode: &str) -> AppResult<V
     Ok(models)
 }
 
-/// 从模型回复中提取标签数组（宽容解析：先整串 JSON，再退化找 [...] 片段）
-pub fn extract_tags(content: &str) -> Vec<String> {
-    let trimmed = content.trim();
-    let parsed = serde_json::from_str::<Vec<String>>(trimmed)
-        .ok()
-        .or_else(|| {
-            let start = trimmed.find('[')?;
-            let end = trimmed.rfind(']')?;
-            serde_json::from_str::<Vec<String>>(&trimmed[start..=end]).ok()
-        });
-    parsed
-        .unwrap_or_default()
-        .into_iter()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty() && s.chars().count() <= 20)
-        .take(8)
-        .collect()
-}
-
 /// 取用于打标的图片路径：高清缩略图 > 占位图 > 原图
 fn pick_image(asset: &assets::Asset) -> PathBuf {
     if let Some(p) = &asset.hd_thumbnail_path {
@@ -257,6 +348,77 @@ fn pick_image(asset: &assets::Asset) -> PathBuf {
         return PathBuf::from(p);
     }
     PathBuf::from(&asset.file_path)
+}
+
+/// P3-02：多帧标签频次合并——同分类同标签命中 ≥2 帧才进建议（单帧时阈值降 1）；
+/// 每分类最多保留 5 个（与单帧解析上限一致，防标签体系污染）
+pub fn merge_frame_tags(frames: &[CategorizedTags]) -> CategorizedTags {
+    let ok = frames.len();
+    if ok == 0 {
+        return CategorizedTags::new();
+    }
+    let threshold = if ok >= 2 { 2 } else { 1 };
+    let mut counts: std::collections::BTreeMap<(String, String), usize> =
+        std::collections::BTreeMap::new();
+    for t in frames {
+        for (cat, tags) in t {
+            for tag in tags {
+                *counts.entry((cat.clone(), tag.clone())).or_default() += 1;
+            }
+        }
+    }
+    let mut out = CategorizedTags::new();
+    for ((cat, tag), c) in counts {
+        if c >= threshold {
+            let v = out.entry(cat).or_default();
+            if v.len() < 5 {
+                v.push(tag);
+            }
+        }
+    }
+    out
+}
+
+/// P3-02：视频打标——抽头/中/尾三帧逐帧请求后频次合并；抽帧/识别全失败返回 Err（单条置 rejected）
+fn tag_video(
+    client: &reqwest::blocking::Client,
+    cfg: &ApiProfile,
+    categories: &[TagCategory],
+    asset: &assets::Asset,
+) -> AppResult<CategorizedTags> {
+    let dir = std::env::temp_dir().join(format!(
+        "bagertea_kframes_{}_{}",
+        std::process::id(),
+        asset.id
+    ));
+    std::fs::create_dir_all(&dir)?;
+    let frames = super::video::extract_keyframes(
+        std::path::Path::new(&asset.file_path),
+        asset.duration_ms,
+        &dir,
+        3,
+    );
+    if frames.is_empty() {
+        let _ = std::fs::remove_dir_all(&dir);
+        return Err(AppError::msg(
+            "视频抽帧失败：未安装 ffmpeg 或编码不支持（可在设置关闭视频打标）",
+        ));
+    }
+    let mut results: Vec<CategorizedTags> = Vec::new();
+    for f in &frames {
+        if let Ok(t) = request_tags(client, cfg, categories, f) {
+            results.push(t);
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    if results.is_empty() {
+        return Err(AppError::msg("视频全部帧 AI 识别失败"));
+    }
+    let merged = merge_frame_tags(&results);
+    if merged.is_empty() {
+        return Err(AppError::msg("视频帧标签未达命中阈值（需 ≥2 帧共同命中）"));
+    }
+    Ok(merged)
 }
 
 /// 执行批次：逐条「读库 → 网络请求 → 写库」，进度回调 + 取消；
@@ -275,11 +437,18 @@ pub fn run_cloud_batch<F: Fn(AiProgress)>(
     let profile = cfg
         .active()
         .ok_or_else(|| AppError::msg("请先在设置页添加 API 配置（中转站）"))?;
-    if profile.base_url.trim().is_empty() || profile.api_key.trim().is_empty() {
-        return Err(AppError::msg("当前 API 配置缺少 base_url 或 API Key"));
+    if profile.base_url.trim().is_empty() {
+        return Err(AppError::msg("当前 API 配置缺少 base_url"));
+    }
+    // P3-01a：本地兼容端点（Ollama/LM Studio）通常无需 API Key；云端仍必填
+    if !profile.is_local() && profile.api_key.trim().is_empty() {
+        return Err(AppError::msg("当前 API 配置缺少 API Key"));
     }
     let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(60))
+        // 连接 15s：本地服务没起来能快速报错；总超时 300s：
+        // 本地大模型（7B+纯 CPU）单张响应可能远超 60s，60s 会误杀慢速打标
+        .connect_timeout(Duration::from_secs(15))
+        .timeout(Duration::from_secs(300))
         .build()
         .map_err(|e| AppError::msg(format!("HTTP 客户端初始化失败: {e}")))?;
 
@@ -296,15 +465,27 @@ pub fn run_cloud_batch<F: Fn(AiProgress)>(
         ai::list_suggestions(&conn, batch_id)?
     };
     // v2.11：可选只处理前 N 张（其余保持 pending，可再次启动）
+    // F15a（2026-08-22）：筛选仅看 status=="pending" 会把「已生成候选但未确认」的条目重复送 AI
+    // （set_suggestion_tags 不改 status）→ 续跑重复请求 + processed 虚增。修复：待处理 = pending 且尚无候选。
     let pending: Vec<_> = suggestions
         .into_iter()
-        .filter(|s| s.status == "pending")
+        .filter(|s| s.status == "pending" && s.suggested_tags.is_empty())
         .collect();
     let todo: Vec<_> = match limit {
         Some(n) => pending.into_iter().take(n.max(0) as usize).collect(),
         None => pending,
     };
     let total = todo.len() as i64;
+    // F15b（2026-08-22）：无待打标项（全部已处理/已确认/已拒绝）不再空转 done——
+    // 明确报错；并先把批次状态复位，避免留下 processing 僵尸态
+    // （命令层 ai_start_batch 已在预检拦截同场景，此处为直接服务层调用的兜底）
+    if todo.is_empty() {
+        let conn = lock()?;
+        ai::set_batch_status(&conn, batch_id, "done")?;
+        return Err(AppError::msg(
+            "当前没有待打标的建议（已全部处理或确认）",
+        ));
+    }
 
     for (i, s) in todo.iter().enumerate() {
         if cancel.load(Ordering::Relaxed) {
@@ -316,15 +497,27 @@ pub fn run_cloud_batch<F: Fn(AiProgress)>(
             let conn = lock()?;
             assets::get(&conn, s.asset_id)?
         };
-        // 网络请求（可能耗时数十秒）：不持 DB 锁
-        let tags = request_tags(&client, profile, categories, &pick_image(&asset));
+        // 按资产类型分发（P3-02）：视频抽帧打标（受 video_tagging 开关控制），图片走原路径
+        let is_video = asset.mime_type.starts_with("video/");
+        let tags = if is_video && !cfg.video_tagging {
+            Err(AppError::msg(
+                "视频 AI 打标未开启（设置 → AI 打标 → 视频 AI 打标）",
+            ))
+        } else if is_video {
+            tag_video(&client, profile, categories, &asset)
+        } else {
+            // 网络请求（可能耗时数十秒）：不持 DB 锁
+            request_tags(&client, profile, categories, &pick_image(&asset))
+        };
         {
             let conn = lock()?;
             match tags {
                 Ok(t) => ai::set_suggestion_tags(&conn, s.id, &t)?,
                 Err(e) => {
-                    // 单条失败不阻塞批次：建议置 rejected 并记录空标签
-                    tracing::warn!("asset {} 打标失败: {e}", s.asset_id);
+                    // 单条失败不阻塞批次：建议置 rejected 并记录空标签与失败原因（v6 详情落库）
+                    let err = e.to_string();
+                    tracing::warn!("asset {} 打标失败: {err}", s.asset_id);
+                    let _ = ai::set_suggestion_error(&conn, s.id, &err);
                     ai::reject_suggestion(&conn, s.id)?;
                 }
             }
@@ -348,7 +541,7 @@ pub fn run_cloud_batch<F: Fn(AiProgress)>(
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_anthropic_text, extract_tags, parse_categorized, parse_model_ids};
+    use super::{extract_anthropic_text, parse_categorized, parse_model_ids};
 
     #[test]
     fn categorized_clean_object() {
@@ -419,25 +612,60 @@ mod tests {
     }
 
     #[test]
-    fn extract_clean_json() {
-        assert_eq!(extract_tags("[\"人像\", \"宠物\"]"), vec!["人像", "宠物"]);
+    fn merge_frames_keeps_majority_tags() {
+        use std::collections::BTreeMap;
+        let f = |pairs: &[(&str, &[&str])]| -> super::CategorizedTags {
+            let mut m = BTreeMap::new();
+            for (k, v) in pairs {
+                m.insert(k.to_string(), v.iter().map(|s| s.to_string()).collect());
+            }
+            m
+        };
+        let frames = vec![
+            f(&[("场景", &["公园", "街道"])]),
+            f(&[("场景", &["公园"]), ("光线", &["逆光"])]),
+            f(&[("场景", &["公园", "海边"])]),
+        ];
+        let r = super::merge_frame_tags(&frames);
+        assert_eq!(r.get("场景").unwrap(), &vec!["公园".to_string()]); // 3 帧命中
+        assert!(!r.contains_key("光线")); // 仅 1 帧，不达阈值
     }
 
     #[test]
-    fn extract_from_noisy_reply() {
-        let r = extract_tags("好的，标签如下：\n[\"风景\", \"海边\"]\n希望对你有帮助");
-        assert_eq!(r, vec!["风景", "海边"]);
+    fn merge_single_frame_keeps_all() {
+        use std::collections::BTreeMap;
+        let mut m = BTreeMap::new();
+        m.insert("场景".to_string(), vec!["室内".to_string()]);
+        let r = super::merge_frame_tags(&[m]);
+        assert_eq!(r.get("场景").unwrap(), &vec!["室内".to_string()]);
+        assert!(super::merge_frame_tags(&[]).is_empty());
     }
 
     #[test]
-    fn extract_garbage_gives_empty() {
-        assert!(extract_tags("无法识别").is_empty());
+    fn degenerate_repeated_char_detected() {
+        assert!(super::is_degenerate("@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@"));
+        assert!(super::is_degenerate("!!!!!!!!!!!!!!!!!!!!!!!!!!!!"));
+        assert!(!super::is_degenerate("@@"));
+        assert!(!super::is_degenerate(""));
     }
 
     #[test]
-    fn overlong_and_blank_filtered() {
-        let r =
-            extract_tags("[\"\", \"  \", \"这是一个非常非常非常长的标签超过二十个字符限制了吧\"] ");
-        assert!(r.is_empty());
+    fn degenerate_mojibake_detected() {
+        // UTF-8 中文被按 Latin-1 误读的典型乱码（ollama 分词器字节错切症状，实测样本）
+        assert!(super::is_degenerate(
+            "å¯¹ä¸èµ·ï¼ææ æ³å¸®å©æ¨è§£è¯»å¾åå®¹ã"
+        ));
+        assert!(super::is_degenerate(
+            "ä»¥ä¸æ¯æ´çå¥½å¹¶è§æ ¼åçJSONæ ¼å¼ï¼"
+        ));
+    }
+
+    #[test]
+    fn normal_replies_not_degenerate() {
+        assert!(!super::is_degenerate("这张图片是一张纯红色的图片。"));
+        assert!(!super::is_degenerate("{\"场景\": [\"公园\"]}"));
+        assert!(!super::is_degenerate("This image shows a bridge in a city."));
+        // 中文标点+ASCII 混排不误报
+        assert!(!super::is_degenerate("1 + 1 = 2"));
     }
 }

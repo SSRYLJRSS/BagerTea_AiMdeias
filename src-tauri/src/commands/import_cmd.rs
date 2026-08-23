@@ -59,3 +59,15 @@ pub async fn inspect_import(paths: Vec<String>) -> AppResult<importer::ImportPla
 pub fn cancel_import(state: State<AppState>) {
     state.import_cancel.store(true, Ordering::Relaxed);
 }
+
+/// 改名模板预览（前端 RenameBuilder 实时预览用）：直调后端 render_name，
+/// 消除前后端双实现的规则 drift（单一事实源）
+#[tauri::command]
+pub fn preview_rename(
+    template: String,
+    collection: String,
+    orig_stem: String,
+    seq: Option<usize>,
+) -> String {
+    importer::preview_rename(&template, &collection, &orig_stem, seq.unwrap_or(1))
+}

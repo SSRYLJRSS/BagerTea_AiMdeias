@@ -1,5 +1,5 @@
 /** 模型选择器：自动从 {base_url}/models 拉取可选模型下拉选择（PRD 5.3 设置页①，R-06）
- *  - 进入时若已配置 base_url + API Key 自动拉取一次，失败/为空可手动重试或手输
+ *  - 进入时若已配置 base_url 自动拉取一次（本地服务无需 API Key，P3-01a），失败/为空可手动重试或手输
  *  - 设置页与 AI 打标页共用
  */
 import { useCallback, useEffect, useState } from "react";
@@ -19,8 +19,8 @@ export default function ModelSelect({ apiMode, baseUrl, apiKey, value, onChange 
   const [error, setError] = useState<string | null>(null);
 
   const fetchModels = useCallback(async () => {
-    if (!baseUrl.trim() || !apiKey.trim()) {
-      setError("请先填写 Base URL 与 API Key");
+    if (!baseUrl.trim()) {
+      setError("请先填写 Base URL");
       return;
     }
     setLoading(true);
@@ -35,9 +35,9 @@ export default function ModelSelect({ apiMode, baseUrl, apiKey, value, onChange 
     }
   }, [apiMode, baseUrl, apiKey]);
 
-  // 进入时自动拉取一次（仅在配置齐全时）
+  // 进入时自动拉取一次（仅在 base_url 已配置时；本地服务无 Key 也可拉）
   useEffect(() => {
-    if (baseUrl.trim() && apiKey.trim()) void fetchModels();
+    if (baseUrl.trim()) void fetchModels();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 

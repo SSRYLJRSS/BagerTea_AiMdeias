@@ -10,9 +10,11 @@ import { useSelectionStore } from "@/stores/selectionStore";
 interface DeleteDialogProps {
   open: boolean;
   onClose: () => void;
+  /** R-22 回收站「彻底删除」模式：锁定 delete_file 策略，不提供软删选项 */
+  purgeOnly?: boolean;
 }
 
-export default function DeleteDialog({ open, onClose }: DeleteDialogProps) {
+export default function DeleteDialog({ open, onClose, purgeOnly = false }: DeleteDialogProps) {
   const { selected, clear } = useSelectionStore(useShallow((s) => ({ selected: s.selected, clear: s.clear })));
   const removeLocal = useLibraryStore((s) => s.removeLocal);
   const [strategy, setStrategy] = useState<DeleteStrategy>("remove_from_library");
@@ -21,6 +23,7 @@ export default function DeleteDialog({ open, onClose }: DeleteDialogProps) {
   const [error, setError] = useState<string | null>(null);
 
   const ids = Array.from(selected);
+  const effectiveStrategy: DeleteStrategy = purgeOnly ? "delete_file" : strategy;
 
   const close = () => {
     setStrategy("remove_from_library");
@@ -33,7 +36,7 @@ export default function DeleteDialog({ open, onClose }: DeleteDialogProps) {
     setBusy(true);
     setError(null);
     try {
-      const result = await deleteAssets(ids, strategy);
+      const result = await deleteAssets(ids, effectiveStrategy);
       // B03：磁盘删除失败的不从库删——只移除成功的，提示失败数
       const successIds = ids.filter((id) => !result.failedFiles.includes(id));
       if (successIds.length > 0) removeLocal(successIds);
@@ -54,7 +57,7 @@ export default function DeleteDialog({ open, onClose }: DeleteDialogProps) {
   };
 
   const onConfirm = () => {
-    if (strategy === "delete_file" && !confirmingFile) {
+    if (effectiveStrategy === "delete_file" && !confirmingFile) {
       setConfirmingFile(true);
       return;
     }
@@ -62,7 +65,7 @@ export default function DeleteDialog({ open, onClose }: DeleteDialogProps) {
   };
 
   return (
-    <Modal open={open} title={`删除 ${ids.length} 项素材`} onClose={close}
+    <Modal open={open} title={purgeOnly ? `彻底删除 ${ids.length} 项素材` : `删除 ${ids.length} 项素材`} onClose={close}
       footer={
         <>
           <Button onClick={close}>取消</Button>
@@ -73,35 +76,43 @@ export default function DeleteDialog({ open, onClose }: DeleteDialogProps) {
       }
     >
       <div className="flex flex-col gap-3">
-        <label className="flex cursor-pointer items-start gap-2">
-          <input
-            type="radio"
-            name="del-strategy"
-            checked={strategy === "remove_from_library"}
-            onChange={() => {
-              setStrategy("remove_from_library");
-              setConfirmingFile(false);
-            }}
-            className="mt-1"
-          />
-          <span>
-            <span className="block text-[var(--color-text)]">仅移出库（保留原文件）</span>
-            <span className="block text-xs text-[var(--color-text-secondary)]">从素材库移除记录与缩略图，磁盘文件不动</span>
-          </span>
-        </label>
-        <label className="flex cursor-pointer items-start gap-2">
-          <input
-            type="radio"
-            name="del-strategy"
-            checked={strategy === "delete_file"}
-            onChange={() => setStrategy("delete_file")}
-            className="mt-1"
-          />
-          <span>
-            <span className="block text-[var(--color-danger)]">删除文件（不可恢复）</span>
-            <span className="block text-xs text-[var(--color-text-secondary)]">连同磁盘上的原始文件一起删除</span>
-          </span>
-        </label>
+        {purgeOnly ? (
+          <p className="text-[var(--color-text)]">
+            将从回收站彻底删除所选素材，<span className="text-[var(--color-danger)]">连同原始文件，不可恢复</span>。
+          </p>
+        ) : (
+          <>
+            <label className="flex cursor-pointer items-start gap-2">
+              <input
+                type="radio"
+                name="del-strategy"
+                checked={strategy === "remove_from_library"}
+                onChange={() => {
+                  setStrategy("remove_from_library");
+                  setConfirmingFile(false);
+                }}
+                className="mt-1"
+              />
+              <span>
+                <span className="block text-[var(--color-text)]">移入回收站（保留原文件）</span>
+                <span className="block text-xs text-[var(--color-text-secondary)]">可在回收站恢复；超期后自动清理（见设置）</span>
+              </span>
+            </label>
+            <label className="flex cursor-pointer items-start gap-2">
+              <input
+                type="radio"
+                name="del-strategy"
+                checked={strategy === "delete_file"}
+                onChange={() => setStrategy("delete_file")}
+                className="mt-1"
+              />
+              <span>
+                <span className="block text-[var(--color-danger)]">删除文件（不可恢复）</span>
+                <span className="block text-xs text-[var(--color-text-secondary)]">连同磁盘上的原始文件一起删除</span>
+              </span>
+            </label>
+          </>
+        )}
         {confirmingFile && (
           <p className="rounded bg-[var(--color-surface)] px-3 py-2 text-xs text-[var(--color-danger)]">
             二次确认：即将永久删除 {ids.length} 个原始文件，此操作不可恢复！

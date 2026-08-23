@@ -108,7 +108,7 @@ impl ThumbnailService {
                 assets::set_hd_thumbnail_path(&conn, asset_id, &out.to_string_lossy())?;
                 // B05：每生成 100 张触发一次 LRU 清理
                 let n = HD_GEN_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-                if n % LRU_CHECK_INTERVAL == 0 {
+                if n.is_multiple_of(LRU_CHECK_INTERVAL) {
                     crate::db::settings::get_settings(&conn)
                         .ok()
                         .map(|s| s.thumbnail_cache_mb)

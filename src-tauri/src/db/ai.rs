@@ -13,7 +13,10 @@ pub type CategorizedTags = std::collections::BTreeMap<String, Vec<String>>;
 pub fn parse_tags_json(raw: &str) -> CategorizedTags {
     let v: serde_json::Value = serde_json::from_str(raw).unwrap_or_default();
     if let Some(arr) = v.as_array() {
-        let tags: Vec<String> = arr.iter().filter_map(|t| t.as_str().map(String::from)).collect();
+        let tags: Vec<String> = arr
+            .iter()
+            .filter_map(|t| t.as_str().map(String::from))
+            .collect();
         return if tags.is_empty() {
             CategorizedTags::new()
         } else {
@@ -64,6 +67,8 @@ pub struct AiSuggestion {
     pub suggested_tags: CategorizedTags,
     pub status: String, // pending|confirmed|rejected|modified
     pub confirmed_tags: CategorizedTags,
+    /// 单条打标失败原因（v6：失败详情落库，前端可展示，不再只看到 rejected）
+    pub last_error: Option<String>,
     pub created_at: i64,
 }
 
@@ -112,7 +117,9 @@ pub fn list_batches(conn: &Connection) -> AppResult<Vec<AiBatch>> {
     let mut stmt = conn.prepare(&format!(
         "SELECT {BATCH_COLS} FROM ai_batches ORDER BY id DESC"
     ))?;
-    let rows = stmt.query_map([], batch_from_row)?.collect::<Result<Vec<_>, _>>()?;
+    let rows = stmt
+        .query_map([], batch_from_row)?
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(rows)
 }
 
@@ -144,6 +151,7 @@ pub fn set_suggestion_tags(conn: &Connection, id: i64, tags: &CategorizedTags) -
 fn suggestion_from_row(r: &rusqlite::Row) -> rusqlite::Result<AiSuggestion> {
     let suggested: String = r.get(4)?;
     let confirmed: Option<String> = r.get(6)?;
+    let last_error: Option<String> = r.get(8)?;
     Ok(AiSuggestion {
         id: r.get(0)?,
         batch_id: r.get(1)?,
@@ -152,11 +160,12 @@ fn suggestion_from_row(r: &rusqlite::Row) -> rusqlite::Result<AiSuggestion> {
         suggested_tags: parse_tags_json(&suggested),
         status: r.get(5)?,
         confirmed_tags: confirmed.map(|s| parse_tags_json(&s)).unwrap_or_default(),
+        last_error,
         created_at: r.get(7)?,
     })
 }
 
-const SUGG_COLS: &str = "s.id, s.batch_id, s.asset_id, a.file_path, s.suggested_tags, s.status, s.confirmed_tags, s.created_at";
+const SUGG_COLS: &str = "s.id, s.batch_id, s.asset_id, a.file_path, s.suggested_tags, s.status, s.confirmed_tags, s.created_at, s.last_error";
 
 pub fn list_suggestions(conn: &Connection, batch_id: i64) -> AppResult<Vec<AiSuggestion>> {
     let mut stmt = conn.prepare(&format!(
@@ -172,16 +181,24 @@ pub fn list_suggestions(conn: &Connection, batch_id: i64) -> AppResult<Vec<AiSug
 /// 确认建议（内部版，不开事务）：供外层已开事务的调用方使用（confirm_all_pending）
 /// B20：拆出 inner 版，与 asset_tags::assign / assign_inner 模式一致
 fn confirm_suggestion_inner(conn: &Connection, id: i64, tags: &CategorizedTags) -> AppResult<()> {
-    let (asset_id, batch_id, mode): (i64, i64, String) = conn.query_row(
-        "SELECT s.asset_id, s.batch_id, b.mode FROM ai_suggestions s
+    let (asset_id, batch_id, mode, status): (i64, i64, String, String) = conn.query_row(
+        "SELECT s.asset_id, s.batch_id, b.mode, s.status FROM ai_suggestions s
          JOIN ai_batches b ON b.id = s.batch_id WHERE s.id = ?1",
         [id],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
     )?;
-    let source = if mode == "cloud" { "ai_cloud" } else { "ai_local" };
+    // 幂等守卫：已确认的建议重复调用直接返回，防止 ai_batches.confirmed 计数虚增
+    if status == "confirmed" {
+        return Ok(());
+    }
+    let source = if mode == "cloud" {
+        "ai_cloud"
+    } else {
+        "ai_local"
+    };
 
     let tag_ids = categorized_tag_ids(conn, tags)?;
-    asset_tags::assign_inner(conn, &[asset_id], &tag_ids, source)?;
+    asset_tags::assign_inner(conn, &[asset_id], &tag_ids, source, Some(batch_id))?;
     let status = "confirmed";
     conn.execute(
         "UPDATE ai_suggestions SET status = ?1, confirmed_tags = ?2 WHERE id = ?3",
@@ -210,7 +227,7 @@ pub fn apply_tags(conn: &Connection, asset_ids: &[i64], tags: &CategorizedTags) 
     }
     let tx = conn.unchecked_transaction()?;
     let tag_ids = categorized_tag_ids(&tx, tags)?;
-    asset_tags::assign_inner(&tx, asset_ids, &tag_ids, "manual")?;
+    asset_tags::assign_inner(&tx, asset_ids, &tag_ids, "manual", None)?;
     tx.commit()?;
     Ok(())
 }
@@ -220,6 +237,15 @@ pub fn restore_suggestion(conn: &Connection, id: i64) -> AppResult<()> {
     conn.execute(
         "UPDATE ai_suggestions SET status = 'pending' WHERE id = ?1 AND status = 'rejected'",
         rusqlite::params![id],
+    )?;
+    Ok(())
+}
+
+/// 记录单条建议打标失败原因（v6）：失败详情落库，前端可展示
+pub fn set_suggestion_error(conn: &Connection, id: i64, error: &str) -> AppResult<()> {
+    conn.execute(
+        "UPDATE ai_suggestions SET last_error = ?1 WHERE id = ?2",
+        rusqlite::params![error, id],
     )?;
     Ok(())
 }
@@ -239,11 +265,12 @@ pub fn confirm_all_pending(conn: &Connection, batch_id: i64) -> AppResult<()> {
         let mut stmt = conn.prepare(
             "SELECT id, suggested_tags FROM ai_suggestions WHERE batch_id = ?1 AND status = 'pending'",
         )?;
-        let rows = stmt.query_map([batch_id], |r| {
-            let raw: String = r.get(1)?;
-            Ok((r.get::<_, i64>(0)?, parse_tags_json(&raw)))
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
+        let rows = stmt
+            .query_map([batch_id], |r| {
+                let raw: String = r.get(1)?;
+                Ok((r.get::<_, i64>(0)?, parse_tags_json(&raw)))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
         rows
     };
     // B20：外层单事务，部分失败整批回滚

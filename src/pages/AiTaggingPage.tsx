@@ -8,22 +8,25 @@ import ProgressBar from "@/components/common/ProgressBar";
 import Filmstrip from "@/components/ai/Filmstrip";
 import Workbench from "@/components/ai/Workbench";
 import { aiApplyTags, onAiProgress } from "@/api/ai";
+import { recentTagOps, undoTagBatch } from "@/api/tags";
 import { useTauriEvent } from "@/hooks/hooks";
 import { useAiStore } from "@/stores/aiStore";
 import { useLibraryStore } from "@/stores/libraryStore";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { useTagStore } from "@/stores/tagStore";
 import type { AiSuggestion, CategorizedTags } from "@/types/ai";
+import type { TagOp } from "@/types/asset";
 
 export default function AiTaggingPage() {
   const {
-    batches, currentBatchId, suggestions, running, error, pendingAssetIds, pendingMode,
+    batches, currentBatchId, suggestions, running, cancelling, error, pendingAssetIds, pendingMode,
   } = useAiStore(
     useShallow((s) => ({
       batches: s.batches,
       currentBatchId: s.currentBatchId,
       suggestions: s.suggestions,
       running: s.running,
+      cancelling: s.cancelling,
       error: s.error,
       pendingAssetIds: s.pendingAssetIds,
       pendingMode: s.pendingMode,
@@ -51,8 +54,8 @@ export default function AiTaggingPage() {
     useShallow((s) => ({ settings: s.settings, loaded: s.loaded, load: s.load, save: s.save })),
   );
 
-  // 打标模式（v2.10）：云端 API / 手动；本地模型 M2 禁用
-  const [mode, setMode] = useState<"cloud" | "manual">("cloud");
+  // 打标模式（v2.10 / P3-01a）：AI 打标（云端/本地按激活档案自动解析）/ 手动
+  const [mode, setMode] = useState<"auto" | "manual">("auto");
   // 打标范围（v2.11）：全部 / 仅前 N 张
   const [scopeAll, setScopeAll] = useState(true);
   const [scopeN, setScopeN] = useState("10");
@@ -70,19 +73,32 @@ export default function AiTaggingPage() {
     settings?.ai.profiles.find((p) => p.id === settings.ai.activeProfile) ?? settings?.ai.profiles[0] ?? null;
 
   // 打标页切换档案/模型即保存生效（PRD 5.3：中转站快速切换）
+  // P2-10：保存失败不再被 void 吞掉——显示错误，避免 UI 已切换而后端仍用旧配置
+  const [saveError, setSaveError] = useState<string | null>(null);
   const switchProfile = useCallback(
-    (id: string) => {
-      if (settings) void save({ ...settings, ai: { ...settings.ai, activeProfile: id } });
+    async (id: string) => {
+      if (!settings) return;
+      try {
+        await save({ ...settings, ai: { ...settings.ai, activeProfile: id } });
+        setSaveError(null);
+      } catch (e) {
+        setSaveError(e instanceof Error ? e.message : String(e));
+      }
     },
     [settings, save],
   );
   const changeModel = useCallback(
-    (v: string) => {
+    async (v: string) => {
       if (settings && activeProfile) {
-        void save({
-          ...settings,
-          ai: { ...settings.ai, profiles: settings.ai.profiles.map((p) => (p.id === activeProfile.id ? { ...p, model: v } : p)) },
-        });
+        try {
+          await save({
+            ...settings,
+            ai: { ...settings.ai, profiles: settings.ai.profiles.map((p) => (p.id === activeProfile.id ? { ...p, model: v } : p)) },
+          });
+          setSaveError(null);
+        } catch (e) {
+          setSaveError(e instanceof Error ? e.message : String(e));
+        }
       }
     },
     [settings, activeProfile, save],
@@ -97,6 +113,9 @@ export default function AiTaggingPage() {
   useTauriEvent(() => onAiProgress((p) => patchProgress(p.processed)), []);
 
   const current = batches.find((b) => b.id === currentBatchId) ?? null;
+  /** 当前批次是否走 AI 管线（云端或本地，P3-01a：开始打标按钮对两者常显） */
+  const isAiBatch = current?.mode === "cloud" || current?.mode === "local";
+  const aiLabel = current?.mode === "local" ? "本地" : "云端";
   const pending = useMemo(() => suggestions.filter((s) => s.status === "pending"), [suggestions]);
   const stats = useMemo(
     () => ({
@@ -125,8 +144,10 @@ export default function AiTaggingPage() {
         ? currentSuggestion.confirmedTags
         : currentSuggestion.suggestedTags;
     setDraftTags(structuredClone(src));
+    // 依赖含 suggestedTags 内容：批次跑完回载后 id/status 不变但标签已写入，
+    // 若只依赖 [id, status] 当前张会停在旧的空 draft，此时点确认会写入空标签
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [currentSuggestion?.id, currentSuggestion?.status]);
+  }, [currentSuggestion?.id, currentSuggestion?.status, JSON.stringify(currentSuggestion?.suggestedTags)]);
 
   // 胶片条多选（批量套用用，按 assetId）
   const [selectedAssets, setSelectedAssets] = useState<Set<number>>(new Set());
@@ -154,6 +175,31 @@ export default function AiTaggingPage() {
 
   const afterWrite = async () => {
     await Promise.all([refreshLibrary(), refreshTags()]);
+    void loadRecent(); // R-25：确认后刷新最近打标流水
+  };
+
+  // R-25 最近打标流水 + 批次撤销（两击确认防误触）
+  const [recentOps, setRecentOps] = useState<TagOp[]>([]);
+  const [undoArmed, setUndoArmed] = useState<number | null>(null);
+  const loadRecent = useCallback(async () => {
+    try {
+      setRecentOps(await recentTagOps(50));
+    } catch {
+      /* 流水拉取失败不阻塞主流程 */
+    }
+  }, []);
+  useEffect(() => {
+    void loadRecent();
+  }, [loadRecent]);
+  const undoBatch = async (batchId: number) => {
+    if (undoArmed !== batchId) {
+      setUndoArmed(batchId);
+      return;
+    }
+    setUndoArmed(null);
+    await undoTagBatch(batchId);
+    await Promise.all([refreshLibrary(), refreshTags()]);
+    await loadRecent();
   };
 
   // 批量套用：把当前张标签写到胶片条选中素材（连拍/同场景提速）
@@ -181,7 +227,7 @@ export default function AiTaggingPage() {
           <div className="flex flex-col gap-1 text-sm">
             {(
               [
-                ["cloud", "云端 API"],
+                ["auto", "AI 打标"],
                 ["manual", "手动模式"],
               ] as const
             ).map(([m, label]) => (
@@ -198,15 +244,16 @@ export default function AiTaggingPage() {
                 {label}
               </button>
             ))}
-            <span
-              title="本地小模型将于二期（M2）交付"
-              className="cursor-not-allowed rounded px-2 py-1 text-[var(--color-text-secondary)] opacity-40"
-            >
-              本地模型（M2）
-            </span>
+            {mode === "auto" && (
+              <span className="rounded px-2 text-[10px] leading-4 text-[var(--color-text-secondary)]">
+                {activeProfile?.kind === "local"
+                  ? `当前走本地服务（${activeProfile.name || "未命名"}）`
+                  : "当前走云端 API；本地打标请到「设置 → 本地打标」配置本地模型并选中使用"}
+              </span>
+            )}
           </div>
-          {/* 云端批次启动区：不在运行中就常显「开始打标」（打完也保留，可续跑剩余 pending；v2.12） */}
-          {current?.mode === "cloud" && !running && (
+          {/* AI 批次启动区：不在运行中就常显「开始打标」（打完也保留，可续跑剩余 pending；v2.12） */}
+          {isAiBatch && !running && (
             <div className="mt-3 flex flex-col gap-1.5">
               <label className="flex items-center gap-1.5 text-xs text-[var(--color-text-secondary)]">
                 <input type="radio" checked={scopeAll} onChange={() => setScopeAll(true)} />
@@ -238,29 +285,35 @@ export default function AiTaggingPage() {
             </div>
           )}
           {running && (
-            <Button className="mt-3 w-full" onClick={() => void cancel()}>
-              取消
+            <Button
+              className="mt-3 w-full"
+              disabled={cancelling}
+              onClick={() => void cancel()}
+            >
+              {cancelling ? "已请求取消…" : "取消"}
             </Button>
           )}
           <p className="mt-2 text-[10px] leading-4 text-[var(--color-text-secondary)]">
             {running
-              ? "云端打标中…"
-              : current?.mode === "cloud"
+              ? cancelling
+                ? "取消已受理，当前图片完成后停止" // P2-01：300s 单请求超时不可打断，诚实告知
+                : `${aiLabel}打标中…`
+              : isAiBatch
                 ? current?.status === "pending"
-                  ? "批次已就绪，图片已载入——点「开始打标」启动云端打标"
+                  ? `批次已就绪，图片已载入——点「开始打标」启动${aiLabel}打标`
                   : "点「开始打标」可继续处理剩余未打标项"
                 : "在素材库选中素材后，顶栏「打标 → AI/手动」直达本页"}
           </p>
         </div>
 
-        {settings && mode === "cloud" && (
+        {settings && mode === "auto" && (
           <div className="border-b border-[var(--color-border)] p-3">
             <h3 className="mb-2 text-xs font-medium tracking-wide text-[var(--color-text-secondary)] uppercase">
               API 配置 / 模型
             </h3>
             {settings.ai.profiles.length === 0 ? (
               <p className="text-xs leading-5 text-[var(--color-text-secondary)]">
-                还没有 API 配置，去「设置 → AI 打标」添加中转站
+                还没有 API 配置，去「设置 → AI 打标」添加中转站或本地服务
               </p>
             ) : (
               <div className="flex flex-col gap-2">
@@ -304,7 +357,7 @@ export default function AiTaggingPage() {
               <div className="mt-2">
                 <ProgressBar value={current.total ? current.processed / current.total : 0} />
                 <p className="mt-1 text-[10px] text-[var(--color-text-secondary)]">
-                  {current.mode === "manual" ? "手动模式：请逐张编辑标签" : `云端生成建议 ${current.processed}/${current.total}`}
+                  {current.mode === "manual" ? "手动模式：请逐张编辑标签" : `${aiLabel}生成建议 ${current.processed}/${current.total}`}
                 </p>
               </div>
             )}
@@ -316,29 +369,70 @@ export default function AiTaggingPage() {
           </div>
         )}
 
-        {batches.length > 0 && (
+        {(batches.length > 0 || recentOps.length > 0) && (
           <div className="min-h-0 flex-1 overflow-y-auto p-2">
-            <h3 className="mb-1 px-1 text-xs font-medium tracking-wide text-[var(--color-text-secondary)] uppercase">
-              历史批次
-            </h3>
-            {batches.map((b) => (
-              <button
-                key={b.id}
-                onClick={() => {
-                  setReviewIdx(0);
-                  void openBatch(b.id);
-                }}
-                className={clsx(
-                  "block w-full rounded px-2 py-1.5 text-left text-xs transition-colors hover:bg-[var(--color-surface)]",
-                  b.id === currentBatchId
-                    ? "bg-[var(--color-surface)] text-[var(--color-text)]"
-                    : "text-[var(--color-text-secondary)]",
-                )}
-              >
-                #{b.id} · {b.mode === "cloud" ? "云端" : b.mode === "manual" ? "手动" : "本地"} · {b.confirmed}/{b.total}
-                <span className="block opacity-60">{new Date(b.createdAt).toLocaleDateString()}</span>
-              </button>
-            ))}
+            {batches.length > 0 && (
+              <>
+                <h3 className="mb-1 px-1 text-xs font-medium tracking-wide text-[var(--color-text-secondary)] uppercase">
+                  历史批次
+                </h3>
+                {batches.map((b) => (
+                  <div key={b.id} className="flex items-center gap-1">
+                    <button
+                      onClick={() => {
+                        setReviewIdx(0);
+                        void openBatch(b.id);
+                      }}
+                      className={clsx(
+                        "min-w-0 flex-1 rounded px-2 py-1.5 text-left text-xs transition-colors hover:bg-[var(--color-surface)]",
+                        b.id === currentBatchId
+                          ? "bg-[var(--color-surface)] text-[var(--color-text)]"
+                          : "text-[var(--color-text-secondary)]",
+                      )}
+                    >
+                      #{b.id} · {b.mode === "cloud" ? "云端" : b.mode === "manual" ? "手动" : "本地"} · {b.confirmed}/{b.total}
+                      <span className="block opacity-60">{new Date(b.createdAt).toLocaleDateString()}</span>
+                    </button>
+                    {/* R-25：AI 批次撤销（两击确认） */}
+                    {b.mode !== "manual" && b.confirmed > 0 && (
+                      <button
+                        onClick={() => void undoBatch(b.id)}
+                        title="撤销本批次已确认的标签（再点一次确认）"
+                        className={clsx(
+                          "shrink-0 rounded px-1.5 py-1 text-[10px] transition-colors",
+                          undoArmed === b.id
+                            ? "bg-[var(--color-danger)] text-white"
+                            : "text-[var(--color-text-secondary)] hover:bg-[var(--color-surface)] hover:text-[var(--color-danger)]",
+                        )}
+                      >
+                        {undoArmed === b.id ? "确认?" : "撤销"}
+                      </button>
+                    )}
+                  </div>
+                ))}
+              </>
+            )}
+
+            {/* R-25 最近打标：挂/摘流水，AI 来源带角标 */}
+            {recentOps.length > 0 && (
+              <>
+                <h3 className="mt-3 mb-1 px-1 text-xs font-medium tracking-wide text-[var(--color-text-secondary)] uppercase">
+                  最近打标
+                </h3>
+                {recentOps.map((o) => (
+                  <div key={o.id} className="flex items-center gap-1 rounded px-2 py-1 text-[11px] text-[var(--color-text-secondary)]">
+                    <span className={o.op === "add" ? "text-[var(--color-text)]" : "text-[var(--color-danger)]"}>
+                      {o.op === "add" ? "＋" : "－"}
+                    </span>
+                    <span className="shrink-0 text-[var(--color-text)]">{o.tagName}</span>
+                    <span className="min-w-0 flex-1 truncate opacity-70" title={o.assetName}>{o.assetName}</span>
+                    {o.actor !== "manual" && (
+                      <span className="shrink-0 rounded bg-[var(--color-surface)] px-1 text-[9px]">AI</span>
+                    )}
+                  </div>
+                ))}
+              </>
+            )}
           </div>
         )}
       </aside>
@@ -346,6 +440,7 @@ export default function AiTaggingPage() {
       {/* 右侧四段式：大图 → EXIF 行（在 Workbench 内）→ 胶片条 → 分类标签面板 */}
       <div className="flex min-w-0 flex-1 flex-col">
         {error && <p className="px-4 pt-2 text-xs text-[var(--color-danger)]">{error}</p>}
+        {saveError && <p className="px-4 pt-2 text-xs text-[var(--color-danger)]">配置保存失败：{saveError}</p>}
 
         {currentSuggestion ? (
           <>
@@ -400,7 +495,7 @@ export default function AiTaggingPage() {
         ) : (
           <div className="flex flex-1 items-center justify-center text-sm text-[var(--color-text-secondary)]">
             {running
-              ? "云端正在生成标签建议…"
+              ? `${aiLabel}正在生成标签建议…`
               : suggestions.length > 0
                 ? "本批次已全部处理完毕"
                 : "还没有打标批次——去素材库选中素材，点顶部「AI 打标」"}

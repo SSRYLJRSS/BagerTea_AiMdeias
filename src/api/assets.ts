@@ -1,6 +1,6 @@
 /** 素材相关命令封装（对应 commands/assets_cmd.rs） */
 import { invoke } from "./client";
-import type { Asset, AssetFilter, AssetPage } from "@/types/asset";
+import type { Asset, AssetFilter, AssetPage, DupGroup } from "@/types/asset";
 
 export type DeleteStrategy = "remove_from_library" | "delete_file";
 
@@ -30,7 +30,22 @@ export function deleteAssets(ids: number[], strategy: DeleteStrategy): Promise<D
   return invoke<DeleteResult>("delete_assets", { ids, strategy });
 }
 
+/** 重复素材扫描（M3-02 R-20）：hash 精确分组 */
+export function scanDuplicates(): Promise<DupGroup[]> {
+  return invoke<DupGroup[]>("dedup_scan");
+}
+
+/** R-22 回收站恢复：返回实际恢复条数 */
+export function trashRestore(ids: number[]): Promise<number> {
+  return invoke<number>("trash_restore", { ids });
+}
+
 /** 取原文件路径（用于系统打开/复制链接等） */
 export function getAssetUrls(ids: number[]): Promise<string[]> {
   return invoke<string[]>("get_asset_urls", { ids });
+}
+
+/** 在资源管理器中打开素材所在文件夹（右键菜单，B24 后端校验路径归属） */
+export function revealInFolder(path: string): Promise<void> {
+  return invoke<void>("reveal_in_folder", { path });
 }

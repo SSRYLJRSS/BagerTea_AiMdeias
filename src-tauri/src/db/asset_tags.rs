@@ -1,40 +1,67 @@
-//! 素材-标签关联：分配 / 移除 / 批量（FTS tag_names 由触发器聚合刷新）
+//! 素材-标签关联：分配 / 移除 / 批量（FTS tag_names 由触发器聚合刷新；R-25 同步写 tag_ops 流水）
 
 use rusqlite::Connection;
 
-use super::tags::Tag;
+use super::{tag_ops, tags::Tag};
 use crate::error::AppResult;
 
 /// 不带事务的内部版：供外层已开事务的调用方使用（如 ai::confirm_suggestion）
-pub(crate) fn assign_inner(conn: &Connection, asset_ids: &[i64], tag_ids: &[i64], source: &str) -> AppResult<()> {
+/// R-25：真实新增的关联写 add 流水（batch_id 由 AI 确认流传入，手工为 None）
+pub(crate) fn assign_inner(
+    conn: &Connection,
+    asset_ids: &[i64],
+    tag_ids: &[i64],
+    source: &str,
+    batch_id: Option<i64>,
+) -> AppResult<()> {
     let now = chrono::Utc::now().timestamp_millis();
     for &aid in asset_ids {
         for &tid in tag_ids {
-            conn.execute(
+            let n = conn.execute(
                 "INSERT OR IGNORE INTO asset_tags (asset_id, tag_id, source, created_at)
                  VALUES (?1, ?2, ?3, ?4)",
                 rusqlite::params![aid, tid, source, now],
             )?;
+            if n > 0 {
+                tag_ops::record(conn, aid, tid, "add", source, batch_id)?;
+            }
         }
     }
     Ok(())
 }
 
-pub fn assign(conn: &Connection, asset_ids: &[i64], tag_ids: &[i64], source: &str) -> AppResult<()> {
+pub fn assign(
+    conn: &Connection,
+    asset_ids: &[i64],
+    tag_ids: &[i64],
+    source: &str,
+) -> AppResult<()> {
     let tx = conn.unchecked_transaction()?;
-    assign_inner(&tx, asset_ids, tag_ids, source)?;
+    assign_inner(&tx, asset_ids, tag_ids, source, None)?;
     tx.commit()?;
     Ok(())
 }
 
+/// R-25：真实移除的关联写 remove 流水（actor 读原关联 source，保证 AI 标签可溯源）
 pub fn remove(conn: &Connection, asset_ids: &[i64], tag_ids: &[i64]) -> AppResult<()> {
     let tx = conn.unchecked_transaction()?;
     for &aid in asset_ids {
         for &tid in tag_ids {
-            tx.execute(
+            let src: Option<String> = tx
+                .query_row(
+                    "SELECT source FROM asset_tags WHERE asset_id = ?1 AND tag_id = ?2",
+                    rusqlite::params![aid, tid],
+                    |r| r.get(0),
+                )
+                .ok();
+            let n = tx.execute(
                 "DELETE FROM asset_tags WHERE asset_id = ?1 AND tag_id = ?2",
                 rusqlite::params![aid, tid],
             )?;
+            if n > 0 {
+                let actor = src.unwrap_or_else(|| "manual".to_string());
+                tag_ops::record(&tx, aid, tid, "remove", &actor, None)?;
+            }
         }
     }
     tx.commit()?;

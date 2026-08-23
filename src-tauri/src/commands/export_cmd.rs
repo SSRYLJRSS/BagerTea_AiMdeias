@@ -9,6 +9,7 @@ use crate::services::export_local::{self, ExportProgress};
 use crate::state::AppState;
 
 /// 本地导出：同步等待 + 事件进度（与入库同模式；任务化优化留后期）
+/// R-26：layout 控制子目录组织（flat|by_tag|by_date，缺省 flat）
 #[tauri::command]
 pub async fn export_local_files(
     app: AppHandle,
@@ -16,9 +17,14 @@ pub async fn export_local_files(
     asset_ids: Vec<i64>,
     dest_dir: String,
     mode: String,
+    layout: Option<String>,
 ) -> AppResult<ExportTask> {
     if mode != "copy" && mode != "move" {
         return Err(AppError::msg("非法导出模式"));
+    }
+    let layout = layout.unwrap_or_else(|| "flat".to_string());
+    if layout != "flat" && layout != "by_tag" && layout != "by_date" {
+        return Err(AppError::msg("非法目录组织"));
     }
     if asset_ids.is_empty() {
         return Err(AppError::msg("未选择任何素材"));
@@ -49,6 +55,7 @@ pub async fn export_local_files(
             &asset_ids,
             &dest_dir,
             &mode,
+            &layout,
             &cancel,
             |p: ExportProgress| {
                 let _ = app.emit("export://progress", p);
@@ -73,6 +80,21 @@ pub async fn export_local_files(
 pub fn list_export_tasks(state: State<AppState>) -> AppResult<Vec<ExportTask>> {
     let conn = state.db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
     export::list_tasks(&conn)
+}
+
+/// R-26 CSV 清单导出：短锁内完成（纯读库 + 单文件写入，毫秒级），返回清单路径
+#[tauri::command]
+pub fn export_csv_manifest(
+    state: State<AppState>,
+    asset_ids: Vec<i64>,
+    dest_dir: String,
+) -> AppResult<String> {
+    if asset_ids.is_empty() {
+        return Err(AppError::msg("未选择任何素材"));
+    }
+    let conn = state.db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
+    let out = export_local::write_csv_manifest(&conn, &asset_ids, &dest_dir)?;
+    Ok(out.to_string_lossy().into_owned())
 }
 
 #[tauri::command]

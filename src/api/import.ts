@@ -24,18 +24,9 @@ export function importFiles(paths: string[], opts: ImportOptions = {}): Promise<
   });
 }
 
-/** 前端预览用：与后端 render_name 同规则（日期以今天示意） */
-export function renderNamePreview(template: string, collection: string, origStem: string, seq = 1): string {
-  const date = new Date();
-  const ymd = `${date.getFullYear()}${String(date.getMonth() + 1).padStart(2, "0")}${String(date.getDate()).padStart(2, "0")}`;
-  let out = template.replace(/\{序号:(\d+)\}/, (_, w) => String(seq).padStart(Number(w), "0"));
-  out = out
-    .replaceAll("{分库}", collection)
-    .replaceAll("{原名}", origStem)
-    .replaceAll("{日期}", ymd)
-    .replaceAll("{序号}", String(seq));
-  out = out.replace(/[<>:"/\\|?*]/g, "_").replace("..", "_").trim().replace(/^\.+|\.+$/g, "");
-  return out || origStem;
+/** 改名预览：直调后端 render_name（单一事实源，防前后端规则 drift；日期以今天示意） */
+export function renderNamePreview(template: string, collection: string, origStem: string, seq = 1): Promise<string> {
+  return invoke<string>("preview_rename", { template, collection, origStem, seq });
 }
 
 export function cancelImport(): Promise<void> {

@@ -54,8 +54,23 @@ pub struct AssetFilter {
     pub untagged_only: bool,
     /// 父标签连带子标签（递归 CTE 处理）
     pub tag_id: Option<i64>,
+    /// 多标签筛选（R-21，与 tag_id 二选一，优先 tag_ids）
+    #[serde(default)]
+    pub tag_ids: Vec<i64>,
+    /// 多标签组合模式：any（默认）| all（EXISTS 逐标签，防 JOIN 行数爆炸）
+    #[serde(default)]
+    pub tags_mode: Option<String>,
     /// 搜索关键词（FTS5 / ≤2 字 LIKE 兜底，见 db/search.rs）
     pub search: Option<String>,
+    /// 排序字段（R-21）：created_at（默认）| taken_at | size | resolution；缺值排最后
+    #[serde(default)]
+    pub sort_by: Option<String>,
+    /// 排序方向：desc（默认）| asc
+    #[serde(default)]
+    pub sort_dir: Option<String>,
+    /// true = 查回收站（deleted_at 非空）；默认查在库（R-22）
+    #[serde(default)]
+    pub trash_only: bool,
     #[serde(default)]
     pub offset: i64,
     #[serde(default = "default_limit")]
@@ -73,7 +88,12 @@ impl Default for AssetFilter {
             asset_type: None,
             untagged_only: false,
             tag_id: None,
+            tag_ids: Vec::new(),
+            tags_mode: None,
             search: None,
+            sort_by: None,
+            sort_dir: None,
+            trash_only: false,
             offset: 0,
             limit: default_limit(),
         }
@@ -88,12 +108,13 @@ pub struct AssetPage {
     pub has_more: bool,
 }
 
-const COLUMNS: &str = "id, file_path, file_name, file_ext, file_size, mime_type, width, height, \
+pub(crate) const COLUMNS: &str =
+    "id, file_path, file_name, file_ext, file_size, mime_type, width, height, \
                        duration_ms, video_codec, audio_codec, taken_at, created_at, modified_at, \
                        hash, placeholder_path, hd_thumbnail_path, \
                        camera, lens, iso, aperture, shutter, focal";
 
-fn from_row(row: &Row) -> rusqlite::Result<Asset> {
+pub(crate) fn from_row(row: &Row) -> rusqlite::Result<Asset> {
     Ok(Asset {
         id: row.get(0)?,
         file_path: row.get(1)?,
@@ -126,6 +147,12 @@ fn from_row(row: &Row) -> rusqlite::Result<Asset> {
 fn build_where(filter: &AssetFilter, search_ids: Option<&[i64]>) -> (String, Vec<i64>) {
     let mut cond = String::from("1=1");
     let mut params: Vec<i64> = Vec::new();
+    // 回收站隔离（R-22）：默认只看不在回收站的
+    if filter.trash_only {
+        cond.push_str(" AND a.deleted_at IS NOT NULL");
+    } else {
+        cond.push_str(" AND a.deleted_at IS NULL");
+    }
     match filter.asset_type.as_deref() {
         Some("image") => cond.push_str(" AND a.mime_type LIKE 'image/%'"),
         Some("video") => cond.push_str(" AND a.mime_type LIKE 'video/%'"),
@@ -145,6 +172,39 @@ fn build_where(filter: &AssetFilter, search_ids: Option<&[i64]>) -> (String, Vec
             params.len()
         ));
     }
+    // 多标签筛选（R-21）：any = 单 CTE 多 seed；all = 逐标签 EXISTS（防 JOIN 行数爆炸）
+    if !filter.tag_ids.is_empty() {
+        let all_mode = filter.tags_mode.as_deref() == Some("all");
+        if all_mode {
+            for &tid in &filter.tag_ids {
+                params.push(tid);
+                cond.push_str(&format!(
+                    " AND EXISTS (SELECT 1 FROM asset_tags at2 WHERE at2.asset_id = a.id AND at2.tag_id IN (
+                        WITH RECURSIVE sub(id) AS (
+                          SELECT ?{} UNION ALL
+                          SELECT t.id FROM tags t JOIN sub s ON t.parent_id = s.id
+                        ) SELECT id FROM sub))",
+                    params.len()
+                ));
+            }
+        } else {
+            let mut seeds = String::new();
+            for &tid in &filter.tag_ids {
+                params.push(tid);
+                if !seeds.is_empty() {
+                    seeds.push_str(" UNION ALL");
+                }
+                seeds.push_str(&format!(" SELECT ?{}", params.len()));
+            }
+            cond.push_str(&format!(
+                " AND a.id IN (SELECT asset_id FROM asset_tags WHERE tag_id IN (
+                    WITH RECURSIVE sub(id) AS (
+                      {seeds} UNION ALL
+                      SELECT t.id FROM tags t JOIN sub s ON t.parent_id = s.id
+                    ) SELECT id FROM sub))"
+            ));
+        }
+    }
     if let Some(ids) = search_ids {
         if ids.is_empty() {
             cond.push_str(" AND 1=0"); // 搜索无命中
@@ -154,6 +214,24 @@ fn build_where(filter: &AssetFilter, search_ids: Option<&[i64]>) -> (String, Vec
         }
     }
     (cond, params)
+}
+
+/// 排序子句（R-21）：taken_at/resolution 缺值排最后；尾缀 a.id DESC 稳定分页
+fn order_by(filter: &AssetFilter) -> String {
+    let dir = if filter.sort_dir.as_deref() == Some("asc") {
+        "ASC"
+    } else {
+        "DESC"
+    };
+    let expr = match filter.sort_by.as_deref() {
+        Some("taken_at") => format!("CASE WHEN a.taken_at IS NULL THEN 1 ELSE 0 END ASC, a.taken_at {dir}"),
+        Some("size") => format!("a.file_size {dir}"),
+        Some("resolution") => format!(
+            "CASE WHEN a.width IS NULL OR a.height IS NULL THEN 1 ELSE 0 END ASC, (a.width * a.height) {dir}"
+        ),
+        _ => format!("a.created_at {dir}"),
+    };
+    format!("{expr}, a.id DESC")
 }
 
 /// 只返回当前筛选结果的 id 数组（BUG-E：全选/反选/批量操作无需完整 Asset 对象）。
@@ -170,7 +248,8 @@ pub fn list_ids(conn: &Connection, filter: &AssetFilter) -> AppResult<Vec<i64>> 
         .collect();
     let refs: Vec<&dyn rusqlite::ToSql> = owned.iter().map(|b| b.as_ref()).collect();
     let mut stmt = conn.prepare(&format!(
-        "SELECT a.id FROM assets a WHERE {cond} ORDER BY a.created_at DESC, a.id DESC LIMIT 100000" // B19：上限 100000（全选用，放宽但防滥用）
+        "SELECT a.id FROM assets a WHERE {cond} ORDER BY {} LIMIT 100000", // B19：上限 100000（全选用，放宽但防滥用）
+        order_by(filter)
     ))?;
     let ids = stmt
         .query_map(refs.as_slice(), |r| r.get::<_, i64>(0))?
@@ -197,12 +276,13 @@ pub fn list(conn: &Connection, filter: &AssetFilter) -> AppResult<AssetPage> {
     )?;
 
     let mut page_params = refs.clone();
-    let limit = filter.limit.max(1).min(1000); // B19：上限 1000，防一次拉全库
+    let limit = filter.limit.clamp(1, 1000); // B19：上限 1000，防一次拉全库
     let offset = filter.offset.max(0);
     page_params.push(&limit);
     page_params.push(&offset);
     let mut stmt = conn.prepare(&format!(
-        "SELECT {COLUMNS} FROM assets a WHERE {cond} ORDER BY a.created_at DESC, a.id DESC LIMIT ?{} OFFSET ?{}",
+        "SELECT {COLUMNS} FROM assets a WHERE {cond} ORDER BY {} LIMIT ?{} OFFSET ?{}",
+        order_by(filter),
         refs.len() + 1,
         refs.len() + 2
     ))?;
@@ -295,6 +375,46 @@ pub fn delete(conn: &Connection, ids: &[i64]) -> AppResult<u64> {
     let list = ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
     let n = conn.execute(&format!("DELETE FROM assets WHERE id IN ({list})"), [])?;
     Ok(n as u64)
+}
+
+/// R-22 软删入回收站：deleted_at 置当前时间（重复软删不覆盖首次时间）
+pub fn soft_delete(conn: &Connection, ids: &[i64]) -> AppResult<u64> {
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    let list = ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
+    let now = chrono::Utc::now().timestamp_millis();
+    let n = conn.execute(
+        &format!("UPDATE assets SET deleted_at = ?1 WHERE id IN ({list}) AND deleted_at IS NULL"),
+        [now],
+    )?;
+    Ok(n as u64)
+}
+
+/// R-22 从回收站恢复：deleted_at 置空
+pub fn restore(conn: &Connection, ids: &[i64]) -> AppResult<u64> {
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    let list = ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
+    let n = conn.execute(
+        &format!(
+            "UPDATE assets SET deleted_at = NULL WHERE id IN ({list}) AND deleted_at IS NOT NULL"
+        ),
+        [],
+    )?;
+    Ok(n as u64)
+}
+
+/// R-22 查超期回收站项（deleted_at < cutoff），返回 (id, file_path) 供锁外删文件
+pub fn list_expired_trash(conn: &Connection, cutoff_ms: i64) -> AppResult<Vec<(i64, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, file_path FROM assets WHERE deleted_at IS NOT NULL AND deleted_at < ?1",
+    )?;
+    let rows = stmt.query_map([cutoff_ms], |r| {
+        Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+    })?;
+    Ok(rows.collect::<Result<Vec<_>, _>>()?)
 }
 
 /// EXIF 回写补丁（均为可空，提取不到就存 NULL）

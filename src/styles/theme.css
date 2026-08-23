@@ -1,9 +1,7 @@
 /* Notion 风格主题变量 —— Tailwind v4 @theme
  * 主题机制：全部组件只引用 var(--color-*)，不硬编码任何颜色；
  * 切主题 = 换变量值，组件零改动。
- * 当前：默认跟随系统（prefers-color-scheme）；
- * P2（R-24）手动切换：把暗色块从 media query 迁到 [data-theme="dark"]，
- * 在 <html> 上切换 data-theme 属性即可（settingsStore 已预留 theme: system|light|dark）。
+ * R-24：<html> 的 data-theme 属性控制 light|dark；system（或属性缺失）时跟随 prefers-color-scheme。
  */
 @theme {
   --color-bg: #ffffff;
@@ -19,9 +17,23 @@
   --font-sans: ui-sans-serif, system-ui, "Segoe UI", "Microsoft YaHei", sans-serif;
 }
 
-/* 暗色：跟随系统（Notion 暗色系配色） */
+/* 暗色：显式指定 dark（Notion 暗色系配色） */
+:root[data-theme="dark"] {
+  --color-bg: #191919;
+  --color-surface: #202020;
+  --color-border: #2f2f2f;
+  --color-text: #d4d4d2;
+  --color-text-secondary: #9b9b9b;
+  --color-accent: #e8e8e6;
+  --color-accent-hover: #ffffff;
+  --color-accent-text: #191919;
+  --color-danger: #eb5757;
+}
+
+/* system（或属性缺失，启动初始态）：跟随系统 */
 @media (prefers-color-scheme: dark) {
-  :root {
+  :root:not([data-theme]),
+  :root[data-theme="system"] {
     --color-bg: #191919;
     --color-surface: #202020;
     --color-border: #2f2f2f;

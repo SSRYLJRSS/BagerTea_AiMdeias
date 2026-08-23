@@ -216,6 +216,14 @@ export default function Workbench({
         </div>
       )}
 
+      {/* ②b 打标失败原因（v6：rejected 且带 lastError 时展示，替代“只看得到灰块”混淆） */}
+      {isRejected && s.lastError && (
+        <div className="shrink-0 border-t border-[var(--color-danger)] px-3 py-2 text-[11px] text-[var(--color-danger)]">
+          <p className="font-medium">本张打标失败：</p>
+          <p className="mt-0.5 leading-4 break-all">{s.lastError}</p>
+        </div>
+      )}
+
       {/* ③ 分类标签面板：一排两个分类（v2.11） */}
       <div className="max-h-52 shrink-0 overflow-y-auto border-t border-[var(--color-border)] p-3">
         <div className="grid grid-cols-2 gap-x-4 gap-y-2">

@@ -17,10 +17,16 @@ export function useTauriEvent(subscribe: () => Promise<UnlistenFn>, deps: unknow
   useEffect(() => {
     let unlisten: UnlistenFn | undefined;
     let cancelled = false;
-    subscribe().then((fn) => {
-      if (cancelled) fn();
-      else unlisten = fn;
-    });
+    subscribe()
+      .then((fn) => {
+        if (cancelled) fn();
+        else unlisten = fn;
+      })
+      // P2-02：订阅失败（如 Tauri API 暂不可用/测试环境）不能被 Promise.all 之外的空
+      // then 链吞成 unhandled rejection；cleanup 由 cancelled 标志兜底，失败不阻断渲染
+      .catch((e) => {
+        console.error("Tauri 事件订阅失败", e);
+      });
     return () => {
       cancelled = true;
       unlisten?.();

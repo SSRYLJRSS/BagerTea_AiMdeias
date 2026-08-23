@@ -4,10 +4,12 @@ pub mod ai;
 pub mod asset_tags;
 pub mod assets;
 pub mod cloud;
+pub mod dedup;
 pub mod export;
 pub mod migrations;
 pub mod search;
 pub mod settings;
+pub mod tag_ops;
 pub mod tags;
 
 use std::path::Path;

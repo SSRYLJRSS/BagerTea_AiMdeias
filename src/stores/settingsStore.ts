@@ -3,6 +3,11 @@ import { create } from "zustand";
 import { getSettings, saveSettings } from "@/api/settings";
 import type { Settings } from "@/types/settings";
 
+/** R-24：主题写入 <html> 的 data-theme（system 时 media query 接管，light/dark 显式生效） */
+export function applyTheme(theme: Settings["theme"]) {
+  document.documentElement.dataset.theme = theme;
+}
+
 interface SettingsState {
   settings: Settings | null;
   loaded: boolean;
@@ -22,6 +27,7 @@ export const useSettingsStore = create<SettingsState>((set) => ({
     try {
       const settings = await getSettings();
       set({ settings, loaded: true, loadError: null });
+      applyTheme(settings.theme); // R-24：启动即应用已保存主题
     } catch (e) {
       // B28：暴露错误状态而非静默吞错（后端异常时用户看到默认设置页，保存后可能覆盖真实配置）
       set({ loaded: true, loadError: e instanceof Error ? e.message : String(e) });
@@ -33,6 +39,7 @@ export const useSettingsStore = create<SettingsState>((set) => ({
     try {
       await saveSettings(s);
       set({ settings: s, saving: false });
+      applyTheme(s.theme);
     } catch (e) {
       set({ saving: false });
       throw e;

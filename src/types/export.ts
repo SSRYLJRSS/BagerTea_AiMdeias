@@ -12,4 +12,6 @@ export interface ExportTask {
   shareUrl: string | null;
   error: string | null;
   createdAt: number;
+  /** P1-04：status=done 时的软提示（如「N 个源文件未能清理」），成功但不完全干净 */
+  warning: string | null;
 }

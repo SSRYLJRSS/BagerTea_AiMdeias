@@ -44,10 +44,16 @@ pub fn run() {
         .setup(move |app| {
             let thumbs_dir = scope_dir.join("thumbnails");
             let previews_dir = scope_dir.join("previews");
-            if let Err(e) = app.asset_protocol_scope().allow_directory(&thumbs_dir, true) {
+            if let Err(e) = app
+                .asset_protocol_scope()
+                .allow_directory(&thumbs_dir, true)
+            {
                 tracing::warn!("asset 协议放行缩略图目录失败: {e}");
             }
-            if let Err(e) = app.asset_protocol_scope().allow_directory(&previews_dir, true) {
+            if let Err(e) = app
+                .asset_protocol_scope()
+                .allow_directory(&previews_dir, true)
+            {
                 tracing::warn!("asset 协议放行预览目录失败: {e}");
             }
             // B05：启动时执行一次 LRU 清理（读 settings 短锁 → 锁外清理）
@@ -55,13 +61,36 @@ pub fn run() {
             let cache_mb = {
                 let conn = state.db.lock().map_err(|_| AppError::msg("数据库锁中毒"));
                 match conn {
-                    Ok(c) => settings::get_settings(&c).ok().map(|s| s.thumbnail_cache_mb),
+                    Ok(c) => settings::get_settings(&c)
+                        .ok()
+                        .map(|s| s.thumbnail_cache_mb),
                     Err(_) => None,
                 }
             };
             if let Some(max_mb) = cache_mb {
                 if let Ok(thumbs) = ThumbnailService::new(&scope_dir) {
                     let _ = thumbs.cleanup_lru(max_mb);
+                }
+            }
+            // R-22：启动时清理超期回收站（不常驻定时器；文件 IO 后台线程不堵启动）
+            let trash_days = {
+                let conn = state.db.lock().map_err(|_| AppError::msg("数据库锁中毒"));
+                match conn {
+                    Ok(c) => settings::get_settings(&c)
+                        .ok()
+                        .map(|s| s.trash_retention_days),
+                    Err(_) => None,
+                }
+            };
+            if let Some(days) = trash_days {
+                if days > 0 {
+                    let db = std::sync::Arc::clone(&state.db);
+                    let dir = scope_dir.clone();
+                    std::thread::spawn(move || {
+                        if let Err(e) = commands::purge_expired_trash(&db, &dir, days) {
+                            tracing::warn!("回收站自动清理失败: {e}");
+                        }
+                    });
                 }
             }
             Ok(())
@@ -77,26 +106,33 @@ pub fn run() {
             commands::list_asset_ids,
             commands::get_asset,
             commands::delete_assets,
+            commands::trash_restore,
+            commands::dedup_scan,
             commands::get_asset_urls,
             commands::reveal_in_folder,
             // 入库
             commands::import_files,
             commands::inspect_import,
             commands::cancel_import,
+            commands::preview_rename,
             // 标签
             commands::list_tags,
             commands::create_tag,
             commands::update_tag,
             commands::delete_tag,
+            commands::tag_merge,
             commands::assign_tags,
             commands::remove_tags,
             commands::get_asset_tags,
+            commands::tag_recent_ops,
+            commands::tag_undo_batch,
             // 缩略图
             commands::get_thumbnail,
             commands::clear_thumbnail_cache,
             commands::get_preview,
             // 导出
             commands::export_local_files,
+            commands::export_csv_manifest,
             commands::list_export_tasks,
             commands::cancel_export,
             // AI 打标
@@ -111,6 +147,25 @@ pub fn run() {
             commands::ai_confirm_all,
             commands::ai_list_models,
             commands::ai_apply_tags,
+            // Ollama 一键配置（方案 A2）+ 一键安装（方案 A3）
+            commands::ollama_ping,
+            commands::ollama_probe_hardware,
+            commands::ollama_pull,
+            commands::ollama_open_download_page,
+            commands::ollama_install_status,
+            commands::ollama_download_install,
+            commands::ollama_start_service,
+            commands::ollama_remove_installer,
+            // 下载源自选/测速（改造方案）
+            commands::ollama_list_sources,
+            commands::ollama_probe_sources,
+            commands::ollama_add_custom_source,
+            commands::ollama_remove_custom_source,
+            // 本地打标：模型管理（列表/删除/目录）
+            commands::ollama_list_local_models,
+            commands::ollama_delete_model,
+            commands::ollama_model_dir,
+            commands::ollama_open_model_dir,
             // 设置
             commands::get_settings,
             commands::save_settings,

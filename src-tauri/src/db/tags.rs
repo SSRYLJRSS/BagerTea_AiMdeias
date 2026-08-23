@@ -115,7 +115,10 @@ pub fn update(
     parent_id: Option<Option<i64>>,
 ) -> AppResult<()> {
     if let Some(n) = name {
-        conn.execute("UPDATE tags SET name = ?1 WHERE id = ?2", rusqlite::params![n, id])?;
+        conn.execute(
+            "UPDATE tags SET name = ?1 WHERE id = ?2",
+            rusqlite::params![n, id],
+        )?;
     }
     if let Some(pid) = parent_id {
         // 防环：新父级不能是自身或自身后代
@@ -135,6 +138,53 @@ pub fn update(
 /// 删除标签：CASCADE 删除子标签与 asset_tags 关联（FTS 由触发器联动）
 pub fn delete(conn: &Connection, id: i64) -> AppResult<()> {
     conn.execute("DELETE FROM tags WHERE id = ?1", [id])?;
+    Ok(())
+}
+
+/// 合并标签（M3-01 R-19）：src 的素材关联与子标签全部并入 dst，随后删除 src。
+/// 单事务；走 DELETE+INSERT 而非 UPDATE 改挂，保证 FTS 触发器（trg_at_ai/ad）联动。
+pub fn merge(conn: &Connection, src_id: i64, dst_id: i64) -> AppResult<()> {
+    if src_id == dst_id {
+        return Err(crate::error::AppError::msg("不能把标签合并到它自己"));
+    }
+    // 防环：目标不能是源标签的后代（否则子标签回挂后树结构错乱）
+    if descendant_ids(conn, src_id)?.contains(&dst_id) {
+        return Err(crate::error::AppError::msg(
+            "不能把标签合并到它自己的子标签下",
+        ));
+    }
+    // 预检子标签同名冲突（tags 表 UNIQUE(parent_id, name)）
+    let clash: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM tags a JOIN tags b
+           ON a.parent_id = ?1 AND b.parent_id = ?2 AND a.name = b.name",
+        rusqlite::params![src_id, dst_id],
+        |r| r.get(0),
+    )?;
+    if clash > 0 {
+        return Err(crate::error::AppError::msg(
+            "目标标签下已有同名子标签，请先重命名后再合并",
+        ));
+    }
+
+    let tx = conn.unchecked_transaction()?;
+    // ① src 独有素材 → 挂到 dst（INSERT 触发 FTS 更新）
+    tx.execute(
+        "INSERT INTO asset_tags (asset_id, tag_id, source, created_at)
+         SELECT at.asset_id, ?2, at.source, at.created_at FROM asset_tags at
+          WHERE at.tag_id = ?1
+            AND NOT EXISTS (SELECT 1 FROM asset_tags x WHERE x.asset_id = at.asset_id AND x.tag_id = ?2)",
+        rusqlite::params![src_id, dst_id],
+    )?;
+    // ② 删除 src 全部关联（DELETE 触发 FTS 更新；已挂 dst 的素材去重生效）
+    tx.execute("DELETE FROM asset_tags WHERE tag_id = ?1", [src_id])?;
+    // ③ src 的子标签回挂 dst（保留层级）
+    tx.execute(
+        "UPDATE tags SET parent_id = ?2 WHERE parent_id = ?1",
+        rusqlite::params![src_id, dst_id],
+    )?;
+    // ④ 删除 src 标签本体（关联已清空，CASCADE 无副作用）
+    tx.execute("DELETE FROM tags WHERE id = ?1", [src_id])?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -168,7 +218,9 @@ pub fn seed_presets(conn: &Connection) -> AppResult<()> {
     if count > 0 {
         return Ok(());
     }
-    const PRESETS: &[&str] = &["人像", "风景", "美食", "街拍", "宠物", "建筑", "夜景", "自拍", "旅行"];
+    const PRESETS: &[&str] = &[
+        "人像", "风景", "美食", "街拍", "宠物", "建筑", "夜景", "自拍", "旅行",
+    ];
     for (i, name) in PRESETS.iter().enumerate() {
         conn.execute(
             "INSERT INTO tags (name, is_preset, sort_order) VALUES (?1, 1, ?2)",

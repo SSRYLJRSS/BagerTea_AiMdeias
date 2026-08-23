@@ -30,39 +30,45 @@
 |---|---|---|
 | `imaging.rs` | **全局唯一图像解码引擎**（老板点名"全局公用一个"） | 内嵌策略链 + 4 许可信号量 + 宽容裁剪，详见第四节 |
 | `preview.rs` | 待入库预览（瘦壳） | 缓存键 + 委托 imaging |
-| `thumbnail.rs` | 已入库双层缩略图（瘦壳） | 占位图/高清图；`get_or_create_hd` 用 `Arc<Mutex>` 短暂持锁（解码放锁外） |
+| `thumbnail.rs` | 已入库双层缩略图（瘦壳） | 占位图/高清图 + LRU 清理（B05）；`get_or_create_hd` 短持锁（解码放锁外） |
 | `importer.rs` | 入库管线 | 复制入分库 → 改名模板 → EXIF 提取 → 占位图 → 落库 |
 | `exif_meta.rs` | EXIF 提取 | kamadak-exif：camera/lens/iso/aperture/shutter/focal/taken_at；`parse_exif_datetime` 本地时区 |
-| `ai_cloud.rs` | 云端打标 | 双模式请求（OpenAI 兼容 / Anthropic Messages）+ `parse_tags_strict`（空解析即失败，v2.12）+ 逐条写回 + 进度回调 + 取消 |
-| `export_local.rs` | 本地导出 | 复制 + 完整性校验 |
-| `video.rs` | 视频封面帧提取 | 内嵌封面优先 |
-| `dedup.rs` | 哈希去重（预留） | — |
+| `ai_cloud.rs` | 云端/本地统一打标管线 | OpenAI 兼容 + Anthropic 双协议 + `parse_tags_strict`（v2.12）+ Ollama 退化输出自愈（卸载重载）+ 进度回调 + 取消 |
+| `export_local.rs` | 本地导出 | copy/move + 同名唯一化（B06b）+ R-26 子目录（by_tag/by_date）+ CSV 清单（公式注入转义）+ 任务持久化 + 完成软提示 |
+| `video.rs` | 视频封面帧/关键帧提取 | 内嵌封面优先 + 抽帧打标（P3-02） |
+| `dedup.rs` | 哈希去重（v4 索引 + 入库去重 + 去重扫描） | M3-02 去重对话框 |
+| `heic_decode.rs` / `raw_decode.rs` | HEIC/RAW 解码兜底层 | libheif 静态链 + darktable rawler |
+| `ollama_setup.rs` / `ollama_installer.rs` | 本地模型一键配置/安装（A2/A3） | ping/probe/pull + 多源降级 + 断点续传 + 自动安装 |
 
 ### 2.2 db/（数据层）
 
 | 模块 | 职责 |
 |---|---|
-| `migrations.rs` | 版本化迁移（v2 = assets 加 6 个 EXIF 列） |
+| `migrations.rs` | 版本化迁移（v2 EXIF 列 / v3 FTS 重建 / v4 去重索引 / v5 排序+回收站+tag_ops / v6 last_error / v7 导出任务 warning） |
 | `assets.rs` | 素材 CRUD + `set_exif`；Asset 含 EXIF 字段 |
 | `tags.rs` | 父子层级标签树；`find_or_create_root/child` |
 | `asset_tags.rs` | 素材-标签关联 |
+| `tag_ops.rs` | 打标流水（R-25）：add/remove + 批次撤销 |
 | `search.rs` | FTS5 查询：fts_content 表 + 9 触发器 + cjk_bigram 逐字切分 + 短语查询 + ≤2 字 LIKE 兜底 |
 | `ai.rs` | 批次/建议表；`CategorizedTags = BTreeMap<String, Vec<String>>`；`parse_tags_json` 兼容旧扁平数组→「未分类」 |
-| `settings.rs` | `ApiProfile{id,name,api_mode,base_url,api_key,model}` + `profiles[]/active_profile` + `TagCategory{name,hint,single,max}`；`normalize()` 旧扁平字段迁移（skip_serializing 只读，拒绝双数据源） |
-| `cloud.rs` / `export.rs` | 网盘/导出记录（M2 预留） |
+| `settings.rs` | `ApiProfile{id,name,api_mode,kind,base_url,api_key,model}` + `profiles[]/active_profile` + `TagCategory{name,hint,single,max}`；`normalize()` 旧扁平字段迁移（skip_serializing 只读，拒绝双数据源） |
+| `export.rs` | 导出任务持久化（copy/move/CSV 统一任务模型，含 warning 软提示列） |
+| `cloud.rs` | 网盘账号（M2 预留，前端置灰） |
 
 **settings 表只有一个 key：`app_settings`**（JSON 整体存取）。排查配置问题时别查 `key='settings'`。
 
 ### 2.3 commands/（Tauri 命令薄壳）
 
-ai_cmd / assets_cmd / import_cmd / thumbnail_cmd / tags_cmd / settings_cmd / export_cmd。网络请求一律 `spawn_blocking` 不堵主线程；进度走 `app.emit("ai://progress", …)`。
+ai_cmd / assets_cmd / import_cmd / thumbnail_cmd / tags_cmd / settings_cmd / export_cmd / ollama_cmd。
+网络请求一律 `spawn_blocking` 不堵主线程；进度走 `app.emit("ai://progress" / "export://progress" /
+"import://progress" / "ollama://pull-progress", …)`。
 
 ## 三、前端结构（src/）
 
 | 层 | 内容 |
 |---|---|
 | `pages/` | ImportPage（编排层瘦身）/ LibraryPage / AiTaggingPage / SettingsPage |
-| `stores/` | libraryStore / selectionStore / tagStore / aiStore / settingsStore（Zustand） |
+| `stores/` | libraryStore / selectionStore / tagStore / aiStore / settingsStore / taskStore（全局任务条，M3-04） |
 | `api/` | invoke 封装 + 模块级缓存（preview.ts）；`client.ts` 统一错误 |
 | `types/` | 与 Rust 结构体 serde 对齐（改 Rust 字段必须同步改这里） |
 
@@ -123,9 +129,10 @@ FTS5 `fts_content` 独立表 + 9 个触发器同步 + 自注册 `cjk_bigram` 分
 
 | 链路 | 路径 |
 |---|---|
-| 入库 | ImportPage → importStore → import_cmd → importer（复制/改名/EXIF/占位图）→ assets 落库 |
+| 入库 | ImportPage（本地 state）→ import_cmd → importer（复制/改名/EXIF/占位图）→ assets 落库 |
 | 缩略图 | Thumbnail.tsx → thumbnail_cmd → thumbnail.rs → imaging.rs → 缓存目录 |
 | AI 打标 | LibraryPage 选图 → aiStore.createBatch → ai_cmd → ai.create_batch（pending 占位）→ AiTaggingPage → startBatch → run_cloud_batch（逐条 request_tags→set_suggestion_tags，失败置 rejected）→ emit 进度 → Workbench 确认 → ai_apply_tags 写标签树 |
+| 本地模型 | LocalModelGroup → ollama_cmd → ollama_setup/ollama_installer（检测/推荐/拉取/一键安装） |
 | 搜索 | SearchInput（防抖）→ assets_cmd.list_assets → search.rs（FTS5 三策略） |
 | 配置 | SettingsPage → settingsStore → settings_cmd → settings.rs（normalize 迁移） |
 

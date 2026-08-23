@@ -1,7 +1,8 @@
 use tauri::State;
 
-use crate::db::{asset_tags, tags};
+use crate::db::tag_ops::TagOp;
 use crate::db::tags::{Tag, TagNode};
+use crate::db::{asset_tags, tag_ops, tags};
 use crate::error::{AppError, AppResult};
 use crate::state::AppState;
 
@@ -63,13 +64,27 @@ pub fn delete_tag(state: State<AppState>, id: i64) -> AppResult<()> {
 }
 
 #[tauri::command]
-pub fn assign_tags(state: State<AppState>, asset_ids: Vec<i64>, tag_ids: Vec<i64>) -> AppResult<()> {
+pub fn tag_merge(state: State<AppState>, src_id: i64, dst_id: i64) -> AppResult<()> {
+    let conn = lock_db(&state)?;
+    tags::merge(&conn, src_id, dst_id)
+}
+
+#[tauri::command]
+pub fn assign_tags(
+    state: State<AppState>,
+    asset_ids: Vec<i64>,
+    tag_ids: Vec<i64>,
+) -> AppResult<()> {
     let conn = lock_db(&state)?;
     asset_tags::assign(&conn, &asset_ids, &tag_ids, "manual")
 }
 
 #[tauri::command]
-pub fn remove_tags(state: State<AppState>, asset_ids: Vec<i64>, tag_ids: Vec<i64>) -> AppResult<()> {
+pub fn remove_tags(
+    state: State<AppState>,
+    asset_ids: Vec<i64>,
+    tag_ids: Vec<i64>,
+) -> AppResult<()> {
     let conn = lock_db(&state)?;
     asset_tags::remove(&conn, &asset_ids, &tag_ids)
 }
@@ -78,4 +93,18 @@ pub fn remove_tags(state: State<AppState>, asset_ids: Vec<i64>, tag_ids: Vec<i64
 pub fn get_asset_tags(state: State<AppState>, asset_id: i64) -> AppResult<Vec<Tag>> {
     let conn = lock_db(&state)?;
     asset_tags::get_asset_tags(&conn, asset_id)
+}
+
+/// R-25 最近打标流水（打标页「最近打标」列表）
+#[tauri::command]
+pub fn tag_recent_ops(state: State<AppState>, limit: Option<i64>) -> AppResult<Vec<TagOp>> {
+    let conn = lock_db(&state)?;
+    tag_ops::recent(&conn, limit.unwrap_or(100))
+}
+
+/// R-25 批次撤销：按流水反向操作，返回实际生效条数（幂等）
+#[tauri::command]
+pub fn tag_undo_batch(state: State<AppState>, batch_id: i64) -> AppResult<u64> {
+    let conn = lock_db(&state)?;
+    tag_ops::undo_batch(&conn, batch_id)
 }

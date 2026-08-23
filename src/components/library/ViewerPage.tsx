@@ -7,8 +7,11 @@ import clsx from "clsx";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { useShallow } from "zustand/react/shallow";
 import TagChip from "@/components/library/TagChip";
+import TagAssignDialog from "@/components/dialogs/TagAssignDialog";
 import { getThumbnailUrl, toFileUrl } from "@/api/thumbnail";
+import { removeTags } from "@/api/tags";
 import { useLibraryStore } from "@/stores/libraryStore";
+import { useSelectionStore } from "@/stores/selectionStore";
 import type { Asset } from "@/types/asset";
 
 const ZOOM_MIN = 0.2;
@@ -19,6 +22,20 @@ function formatSize(bytes: number): string {
   if (bytes >= 1 << 30) return `${(bytes / (1 << 30)).toFixed(1)} GB`;
   if (bytes >= 1 << 20) return `${(bytes / (1 << 20)).toFixed(1)} MB`;
   return `${Math.round(bytes / 1024)} KB`;
+}
+
+function formatDuration(ms: number): string {
+  const s = Math.round(ms / 1000);
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  return h > 0
+    ? `${h}:${String(m).padStart(2, "0")}:${String(sec).padStart(2, "0")}`
+    : `${m}:${String(sec).padStart(2, "0")}`;
+}
+
+function formatTime(ms: number): string {
+  return new Date(ms).toLocaleString();
 }
 
 function exifLine(a: Asset): string {
@@ -38,8 +55,8 @@ interface ViewerPageProps {
 }
 
 export default function ViewerPage({ asset: initial, onClose }: ViewerPageProps) {
-  const { items, total, loadMore } = useLibraryStore(
-    useShallow((s) => ({ items: s.items, total: s.total, loadMore: s.loadMore })),
+  const { items, total, loadMore, patchLocal } = useLibraryStore(
+    useShallow((s) => ({ items: s.items, total: s.total, loadMore: s.loadMore, patchLocal: s.patchLocal })),
   );
   const [currentId, setCurrentId] = useState(initial.id);
   const current: Asset = useMemo(
@@ -60,6 +77,33 @@ export default function ViewerPage({ asset: initial, onClose }: ViewerPageProps)
 
   const [src, setSrc] = useState<string | null>(null);
   const [entered, setEntered] = useState(false);
+
+  // 详情抽屉（M3-03 R-18）：标签增删 + 元数据面板，ViewerPage 内部状态切换不新建路由
+  const [drawerOpen, setDrawerOpen] = useState(false);
+  const [assignOpen, setAssignOpen] = useState(false);
+  const prevSelected = useRef<ReadonlySet<number> | null>(null);
+
+  const openAssign = () => {
+    // TagAssignDialog 基于选中集工作：暂存原选中，换为当前单张，关闭时恢复
+    prevSelected.current = useSelectionStore.getState().selected;
+    useSelectionStore.setState({ selected: new Set([current.id]) });
+    setAssignOpen(true);
+  };
+
+  const closeAssign = () => {
+    setAssignOpen(false);
+    if (prevSelected.current) useSelectionStore.setState({ selected: prevSelected.current });
+    prevSelected.current = null;
+  };
+
+  const removeTag = async (tagId: number) => {
+    try {
+      await removeTags([current.id], [tagId]);
+      patchLocal([current.id], { tags: current.tags.filter((t) => t.id !== tagId) });
+    } catch {
+      /* 失败保持现状，下次打开抽屉仍可重试 */
+    }
+  };
 
   // 进场动画
   useEffect(() => {
@@ -201,6 +245,17 @@ export default function ViewerPage({ asset: initial, onClose }: ViewerPageProps)
           {index >= 0 ? `${index + 1} / ${total}` : ""}
         </span>
         <button
+          onClick={() => setDrawerOpen((v) => !v)}
+          className={clsx(
+            "shrink-0 rounded-md px-2 py-1 text-sm transition-colors hover:bg-[var(--color-surface)]",
+            drawerOpen
+              ? "text-[var(--color-text)]"
+              : "text-[var(--color-text-secondary)] hover:text-[var(--color-text)]",
+          )}
+        >
+          详情
+        </button>
+        <button
           onClick={onClose}
           className="shrink-0 rounded-md px-2 py-1 text-sm text-[var(--color-text-secondary)] transition-colors hover:bg-[var(--color-surface)] hover:text-[var(--color-text)]"
         >
@@ -286,6 +341,80 @@ export default function ViewerPage({ asset: initial, onClose }: ViewerPageProps)
           </button>
         ))}
       </div>
+
+      {/* 详情抽屉（M3-03）：标签增删 + 元数据面板（信息分组借鉴 Lightroom 检查器：文件/EXIF/标签三段） */}
+      {drawerOpen && (
+        <div className="absolute top-10 right-0 bottom-0 z-10 w-[300px] overflow-y-auto border-l border-[var(--color-border)] bg-[var(--color-bg)] p-3">
+          {/* 标签 */}
+          <section className="mb-4">
+            <h4 className="mb-1.5 text-[10px] font-medium tracking-wide text-[var(--color-text-secondary)] uppercase">标签</h4>
+            <div className="flex flex-wrap items-center gap-1.5">
+              {current.tags.map((t) => (
+                <TagChip key={t.id} label={t.name} onRemove={() => void removeTag(t.id)} />
+              ))}
+              {current.tags.length === 0 && (
+                <span className="text-xs text-[var(--color-text-secondary)]">未打标</span>
+              )}
+            </div>
+            <button
+              onClick={openAssign}
+              className="mt-2 rounded-md border border-dashed border-[var(--color-border)] px-2 py-1 text-xs text-[var(--color-text-secondary)] transition-colors hover:border-[var(--color-accent)] hover:text-[var(--color-text)]"
+            >
+              + 添加标签
+            </button>
+          </section>
+
+          {/* 文件 */}
+          <section className="mb-4">
+            <h4 className="mb-1.5 text-[10px] font-medium tracking-wide text-[var(--color-text-secondary)] uppercase">文件</h4>
+            <dl className="flex flex-col gap-1 text-xs">
+              <MetaRow label="名称" value={current.fileName} />
+              <MetaRow label="路径" value={current.filePath} />
+              <MetaRow label="大小" value={formatSize(current.fileSize)} />
+              <MetaRow label="类型" value={current.mimeType} />
+              {current.width != null && current.height != null && (
+                <MetaRow label="分辨率" value={`${current.width}×${current.height}`} />
+              )}
+              <MetaRow label="入库时间" value={formatTime(current.createdAt)} />
+              {current.durationMs != null && (
+                <>
+                  <MetaRow label="时长" value={formatDuration(current.durationMs)} />
+                  {current.videoCodec && <MetaRow label="视频编码" value={current.videoCodec} />}
+                  {current.audioCodec && <MetaRow label="音频编码" value={current.audioCodec} />}
+                </>
+              )}
+            </dl>
+          </section>
+
+          {/* EXIF（入库时已提取进 assets 表，直读） */}
+          {(current.camera || current.lens || current.aperture != null || current.shutter ||
+            current.iso != null || current.focal != null || current.takenAt != null) && (
+              <section>
+                <h4 className="mb-1.5 text-[10px] font-medium tracking-wide text-[var(--color-text-secondary)] uppercase">EXIF</h4>
+                <dl className="flex flex-col gap-1 text-xs">
+                  {current.takenAt != null && <MetaRow label="拍摄时间" value={formatTime(current.takenAt)} />}
+                  {current.camera && <MetaRow label="机身" value={current.camera} />}
+                  {current.lens && <MetaRow label="镜头" value={current.lens} />}
+                  {current.aperture != null && <MetaRow label="光圈" value={`f/${current.aperture}`} />}
+                  {current.shutter && <MetaRow label="快门" value={`${current.shutter}s`} />}
+                  {current.iso != null && <MetaRow label="ISO" value={String(current.iso)} />}
+                  {current.focal != null && <MetaRow label="焦距" value={`${current.focal}mm`} />}
+                </dl>
+              </section>
+            )}
+        </div>
+      )}
+
+      <TagAssignDialog open={assignOpen} onClose={closeAssign} />
+    </div>
+  );
+}
+
+function MetaRow({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="flex gap-2">
+      <dt className="w-14 shrink-0 text-[var(--color-text-secondary)]">{label}</dt>
+      <dd className="min-w-0 flex-1 break-all text-[var(--color-text)]">{value}</dd>
     </div>
   );
 }

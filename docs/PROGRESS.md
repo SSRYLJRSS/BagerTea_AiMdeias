@@ -8,9 +8,10 @@
 
 ## 一、当前焦点
 
-- **正在做**：T01~T05a 全部完成（2026-08-08），M1 进入 P0 需求逐条走查
-- **下一步**：M1 出口走查（R-01~R-06、R-08~R-10、R-12~R-14、R-31）→ T05b（M2）
-- **阻塞项**：无
+- **正在做**：Phase 3 AI 与体验增强（老板 2026-08-18 拍板：网盘暂缓，其余按计划开工），总纲见 [PHASE3_AI_EXPORT.md](PHASE3_AI_EXPORT.md)
+- **已完成**：Phase 2 代码层全部完成（F01~F06，三关全绿）
+- **下一步**：P3-01a（本地 Ollama 兼容端点打标）→ P3-02（视频抽帧打标）→ v2.15 M3 体验完善 → v2.16 P2 打包
+- **阻塞项**：Phase 2 真实样本验收需老板提供样本；云端端到端需视觉模型 Key
 
 ---
 
@@ -26,11 +27,36 @@
 | **T04** | 前端核心 UI | 符合 PRD 5.2 信息架构；3 万素材滚动流畅；搜索防抖；删除/导出弹窗交互完整；双层缩略图淡入替换 | ☑ 已完成 | 2026-08-08（tsc+build+冒烟通过；3 万条性能验收待真实数据集回归） |
 | **T05a** | 云端 AI 打标 + 确认流（R-06 提前） | 云端跑通「建批次→建议→确认→可检索」；确认后新标签可被 FTS 搜到 | ☑ 已完成 | 2026-08-08（链路+测试 24/24 通过；真实 API 端到端待老板配置 Key 后走查） |
 
-### M2 AI 与导出增强（P1）
+### M2 AI 与导出增强（P1，顺延 Phase 3）
 
 | 任务 | 内容 | 验收关键项 | 状态 | 完成日期 |
 |---|---|---|---|---|
 | **T05b** | 本地小模型 + 网盘导出 + 端到端 | 模型下载断点续传 + sha256 校验（HF 镜像/国内 CDN）；本地模式全链路；百度 OAuth（如资质允许）；端到端回归 | ☐ 未开始 | |
+
+### Phase 2 多格式支持（老板拍板提前，依赖：F01 → F02∥F03 → F04 → F05 → F06）
+
+| 任务 | 内容 | 验收关键项 | 状态 | 完成日期 |
+|---|---|---|---|---|
+| **F01** | TIFF 解码 + 格式白名单补齐 | image 加 tiff/bmp/tga feature（avif 因 dav1d/NASM 风险缓议）；mime.rs 补 25 个 RAW 扩展名；LZW/Deflate TIFF 出图 | ☑ 代码完成（样本待验） | 2026-08-17 |
+| **F02** | HEIC/AVIF 解码接入 | 方案改 heif-rs（预编译静态库，免 vcpkg）；纯 HEIC 出图；AVIF 随 image avif feature 后续 | ☑ 代码完成（样本待验） | 2026-08-17 |
+| **F03** | RAW 内嵌预览链加固 | CR3（ISOBMFF）分支落地 + 单测；ARW/NEF/RAF/ORF 真实样本占位图 ≤100ms | ☑ 代码完成（样本待验） | 2026-08-17 |
+| **F04** | RAW 真解码兜底层 | rawler 0.7.2 PoC 过（MSVC 直编）；raw_decode.rs（2×2 Bayer binning+色彩管线）；只进高清层；45MP ≤3s；色彩不偏灰 | ☑ 代码完成（样本待验） | 2026-08-17 |
+| **F05** | 元数据与 UI 配套 | RAW EXIF 验证；卡片格式角标；排查文档 | ☑ 代码完成（样本待验） | 2026-08-17 |
+| **F06** | 格式矩阵测试 + 性能回归 | format_matrix.rs 全绿；老板真实素材库零黑图；三关通过 | ☑ 代码完成（矩阵全绿+三关过，真实数据走查待样本） | 2026-08-17 |
+
+### Phase 3 AI 与体验增强（老板 2026-08-18 拍板，网盘暂缓，依赖：P3-01a → P3-02 → M3 系 → P2 系）
+
+| 任务 | 内容 | 验收关键项 | 状态 | 完成日期 |
+|---|---|---|---|---|
+| **P3-01a** | 本地 Ollama 兼容端点打标 | profiles 加 kind（cloud/local）；前端档案编辑支持本地端点；ai_start_batch 放开 local；无服务报错含引导 | ☑ 代码完成 | 2026-08-18 |
+| **P3-02** | 视频 AI 打标（R-15） | 开关默认关；抽头/中/尾三帧；≥2 帧命中才进建议；抽帧失败置 rejected | ☑ 代码完成 | 2026-08-18 |
+| **M3-01** | 标签管理（R-19） | merge/reparent 防环；前端管理视图；计数/FTS 一致 | ☑ 代码完成 | 2026-08-18 |
+| **M3-02** | 重复素材检测（R-20） | hash 分组扫描 + 前端去重面板 | ☑ 代码完成 | 2026-08-18 |
+| **M3-03** | 详情页增强（R-18） | ViewerPage 抽屉：标签 + EXIF/元数据 | ☑ 代码完成 | 2026-08-18 |
+| **M3-04** | 批量操作增强（R-17） | 移动入口 + BottomBar 任务条 | ☑ 代码完成 | 2026-08-18 |
+| **S3** | P2 打包（R-21/22/24/25/26） | 排序筛选/回收站/主题/打标历史/导出增强，见 PHASE3 拆解 | ☑ 代码完成（三关全绿：cargo test 128 过/tsc/vite 1.6s） | 2026-08-18 |
+| **A2** | Ollama 一键配置（P3-01a 体验增强） | 检测 + 显存推荐 + 一键 pull + 自动写回 model，见 LOCAL_MODEL_AUTOCONFIG_A2.md | ☑ 代码完成（三关全绿：cargo test 131 过/tsc/vite） | 2026-08-19 |
+| **A3** | 本地模型应用内全自动一键部署（A2 增强版） | 设置页独立入口 + 应用内下载 Ollama（多源降级/断点续传）→ 静默安装 → 就绪复检 → 一键拉取配置，见 LOCAL_MODEL_SETUP_A3.md | ☑ 代码完成（三关全绿：cargo test 136 过/tsc/vite） | 2026-08-20 |
 
 **M1 出口标准**（全部满足才算 M1 交付）：T01~T05a 全勾 + PRD P0 需求（R-01~R-06、R-08~R-10、R-12~R-14、R-31）逐条走查通过。
 
@@ -40,6 +66,22 @@
 
 | 日期 | 决策 | 原因/依据 |
 |---|---|---|
+| 2026-08-20 | **A3 本地模型应用内一键部署交付**：设置页左侧新增「本地模型」独立分组（GROUPS 第二项，向导卡片三态：未安装→一键安装 Ollama；已装未运行→启动并复检；就绪→显存推荐一键拉取并配置、自动建本地档案并置激活）；后端 services/ollama_installer.rs（detect_installed 查默认目录+PATH、resolve_sources 官方→gh-proxy→GitHub 三源降级、download 带 Range 断点续传+500ms 节流进度+体积校验（无稳定 sha256）、install_silent 静默参数集中常量、wait_ready 轮询 /api/version 最长 30s、start_service 无窗口拉起 serve）+ 四命令 ollama_install_status/download_install/start_service/remove_installer（事件 `ollama://install-progress`）；拉取状态机抽 useOllamaPull 供档案编辑区与向导卡片共用同一套事件；安装包落 $APP_DATA_DIR/bagertea_ai_media_v2/ollama/ 保留供离线重装，「数据与缓存」分组显示占用可清理 | 老板 2026-08-20 两点反馈：入口太深（藏在档案编辑表单）要独立入口；不要用户官网下载要应用内全自动。取舍：选 Setup.exe 路线（免管理员+装完自启+官方自升级）而非便携 zip（生命周期/自启/托盘全自管成本高）；安装退出码 0/1 均视为可接受（1=重启挂起），最终以 wait_ready 复检为准；复用 A2 的 ollama_setup 全部能力零重复开发 |
+| 2026-08-19 | A2 Ollama 一键配置交付：services/ollama_setup.rs（api_root 剥离 /v1 + ping/probe_gpu/recommend/pull 纯函数）+ ollama_cmd 四命令（事件 `ollama://pull-progress`）；推荐档 qwen2.5vl:3b/7b；拉取成功由前端写回 draft（后端不碰 settings 表单数据源）；设置页删 switchKind 硬编码 llava 预填；评审否决方案 A 并留档 LOCAL_MODEL_AUTOCONFIG_A2.md §9（修正三硬伤：模型名 qwen2.5-vl→qwen2.5vl、/api/* 在根路径非 /v1 下、Win32 AdapterRAM 32 位上限 4GB 改 nvidia-smi 优先探不到不猜） | 老板要求小白一键部署本地模型；方案 A 评审实测硬伤；tauri-plugin-opener 走 OpenerExt trait 方法（非自由函数），Rust 直调免 capabilities |
+| 2026-08-18 | S3 P2 打包五项交付：R-21 AssetFilter 加 sort_by/sort_dir/tags_mode（any\|all，EXISTS 子查询防 JOIN 爆炸），taken_at/resolution 缺值排最后；R-22 回收站改软删（assets.deleted_at，「仅移出库」走软删保留缩略图，启动时后台线程按 trashRetentionDays 清超期，彻底删除文件失败保留 DB 记录沿用 B03）；R-24 主题落 data-theme（light/dark/system，media query 只管 system/缺失，组件零改动兑现 T01 架构承诺）；R-25 新表 tag_ops 流水（挂/摘都记，actor 溯源 AI/manual，撤销=按 batch_id 倒序反向且幂等、反向操作不再写流水）；R-26 导出 layout（flat/by_tag/by_date 子目录）+ CSV 清单（UTF-8 BOM 保 Excel）；收尾同步旧测试（export_local 补 layout 参、AssetFilter 字面量补 default、user_version 断言 3→5），全套 128 项全绿 | 计划 S3 拆解；关键取舍：回收站复用 trashOnly 筛选不建独立页、彻底删除复用 DeleteDialog purgeOnly 模式、撤销不写新流水保持幂等 |
+| 2026-08-18 | M3 体验完善四项交付：M3-01 标签管理（merge 单事务改挂+删除、reparent 递归 CTE 防环）；M3-02 重复检测（hash GROUP BY HAVING>1 扫描 + 分组去重面板，保留最早高亮）；M3-03 ViewerPage 详情抽屉（标签增删 + EXIF/元数据三段式）；M3-04 批量移动入口 + BottomBar 全局任务条聚合既有事件 | 计划 M3 拆解；均无新后端依赖面，复用现有事件/确认流 |
+| 2026-08-18 | P3-01a/P3-02 交付：本地打标走档案 kind 字段（迁移默认 cloud 旧数据零感知），ai_cloud.rs 零改动靠 OpenAI 兼容协议直通 Ollama；视频打标设置开关默认关，抽头/中/尾三帧、≥2 帧命中标签才进建议，抽帧失败置 rejected 不阻塞批次 | P3-01a 速赢路线调研结论；P3-02 频次合并防单帧噪声 |
+| 2026-08-18 | Phase 3 开工：本地打标走「Ollama 兼容端点速赢（P3-01a）+ ort 内嵌机动（P3-01b）」两步；网盘导出（R-11/R-16）整体暂缓入机动项；v2.15 M3 体验完善、v2.16 P2 打包排入承诺 | 老板拍板「先不做网盘的东西，其他的按计划开始」；调研：ai_cloud.rs 已是 OpenAI 兼容客户端，Ollama/LM Studio 零改动接入；百度分享接口仅企业开发者可用，详见 PHASE3_AI_EXPORT.md |
+| 2026-08-17 | F05/F06 代码层完成：EXIF 兜底用 rawler 轻量识别（get_decoder+raw_metadata，只解元数据不解像素，只填 None 字段）；AssetCard 右上角格式角标（RAW/TIFF/HEIC，与 mime.rs 同源）；format_matrix 6 用例（白名单/格式×层级/占位层红线/降级护栏/截断宽容）+ perf_probe 新增混合吞吐与真实库走查探针；三关全绿（cargo test 123 通过/tsc/vite 2.03s） | Phase 2 仅剩真实样本验收；测试并行踩坑（共享临时目录）已改用例隔离并记 TROUBLESHOOTING |
+| 2026-08-17 | F02 选型改道：放弃 libheif-rs（vcpkg，作者自述 Windows 测试失败），改用 **heif-rs**（Apache-2.0 封装 + 预编译静态 libheif/x265/libde265，免 vcpkg）；纯 Rust `heic` crate 技术最优但 **AGPL-3.0 一票否决**（与 zenraw 同红线）；heif-oxide（MIT/Apache）12MP 需 ~1s 且 44/63 合规率，备选 | 调研实测：heif-rs 提供 static_windows_x64.zip；AGPL 传染闭源桌面软件不可接受 |
+| 2026-08-17 | heif-rs 环境三件套：① 二进制手动下载（本机 GitHub 不通，gh-proxy 分段续传）解压到 `heif-bin/`，`.cargo/config.toml` 设 HEIF_BINARIES_DIR；② winget 装 LLVM 22.1.8 供 bindgen（libclang）；③ **msvc_stl_shim.cpp** 补齐 heif.lib（MSVC 14.45+ 构建）引用的 `__std_rotate`/`__std_max_element_4i`/`__std_unique_4`（本机 Build Tools 14.44 STL 缺失），Build Tools 升 14.45+ 后可删 | 链接实测 LNK2019；shim 按 MSVC STL ABI 语义实现，见文件头注 |
+| 2026-08-17 | F04 缩略图解码用 **2×2 Bayer binning**（块内按 CFA 通道归组均值）替代完整 demosaic：半分辨率零插值伪影、1/4 内存，512/1920px 目标绰绰有余；X-Trans 降级灰度预览；色彩管线简化显影（黑白电平→wb_coeffs→cam2xyz→sRGB→gamma 2.2）非专业级 | 缩略图场景不需 AHD/Malvar 全插值；binning 天然抗锯齿 |
+| 2026-08-17 | F01 AVIF 缓议：image 0.25 的 avif feature 依赖 dav1d（C 库，Windows 需 NASM），与 HEIC 同类编译风险，待 F02 稳定后再开；白名单不放行 avif（防黑图入库） | D5 降级处理，风险登记见 PHASE2_FORMATS.md |
+| 2026-08-17 | LGPL-3 静态链接合规登记：heif.lib/libde265/x265 静态链入闭源应用，合规需「提供目标文件/允许用户替换库」；内部自用工具风险可接受，**对外分发前须法务确认**（或改动态链接分发） | LGPL-3 静态链接条款；rawler 为 GPL-3/LGPL-3 同样登记 |
+| 2026-08-17 | Phase 2 改为多格式支持优先（RAW/TIFF/HEIC/AVIF），原 M2（本地模型/网盘）顺延 Phase 3 | 老板拍板"最重要的还是多格式支持"；调研结论与任务拆解见 PHASE2_FORMATS.md |
+| 2026-08-17 | 多格式两级架构定案：内嵌预览链（快，已有）+ 真解码兜底层（全，新建 raw_decode.rs），对齐 FastRawViewer/Eagle/nomacs 业界共识 | 调研：业界清一色"内嵌预览秒开 + 后台真解码"；RawLib 实测内嵌提取比全解码快 10~100 倍 |
+| 2026-08-17 | RAW 真解码选型：rawler（darktable 系，纯 Rust）首选，LibRaw 备选，zenraw 因 AGPL 排除；需 PoC 验证 MSVC 编译 + LGPL 静态链接合规 | 调研对比：格式覆盖（含 CR3/X-Trans）、零 C 依赖、RapidRAW/dnglab 生产验证 |
+| 2026-08-17 | 发现并登记 D1：image crate tiff feature 未启用，TIFF/HEIC 白名单形同虚设（只能靠内嵌 JPEG 兜底） | Phase 2 现状核查实测；F01 修复 |
 | 2026-08-12 | PRD v2.12 打标执行修复：ai_start_batch 仅 processing 拒绝，done/cancelled 可续跑 pending（现场：批次8 done/processed=1/16条永pending，再点开始打标被 Err 吞掉）；request_tags 空解析改 Err 走单条失败路径（现场：mimo-v2.5 经中转站返回不可解析文本被写成 {} 冒充成功） | 老板报 bug：按了打标没结果；DB 现场取证定位 |
 | 2026-08-12 | PRD v2.11 打标页细节：ai_start_batch 加 limit（仅前 N 张）；ai_restore_suggestion 撤销拒绝；TagCategory.max 自定义数量上限入提示词；标签面板两列；大图区底部居中悬浮导航条（含跳页） | 老板反馈：按钮 UI 突兀、一排一个分类太空、误拒绝无法恢复 |
 | 2026-08-10 | PRD v2.10 打标流程：底栏更名「打标」；跳转即自动创建批次（pendingAssetIds>0 且非运行中触发，running 同步置真防重入）；新增手动模式——后端 mode=manual 建批后直接置 done 不调 AI，工作台从空标签起步纯人工 | 老板要求：去掉创建按钮一步到位；手动模式服务不入 API 的场景 |

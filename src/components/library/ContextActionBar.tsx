@@ -9,10 +9,11 @@ interface Props {
   onAiTag: () => void;
   onAssignTags: () => void;
   onExport: () => void;
+  onMove: () => void;
   onDelete: () => void;
 }
 
-export default function ContextActionBar({ onAiTag, onAssignTags, onExport, onDelete }: Props) {
+export default function ContextActionBar({ onAiTag, onAssignTags, onExport, onMove, onDelete }: Props) {
   const { selected, clear } = useSelectionStore(useShallow((s) => ({ selected: s.selected, clear: s.clear })));
   if (selected.size === 0) return null;
 
@@ -41,6 +42,7 @@ export default function ContextActionBar({ onAiTag, onAssignTags, onExport, onDe
       </div>
 
       <Button onClick={onExport}>导出</Button>
+      <Button onClick={onMove}>移动到…</Button>
       <Button onClick={onDelete}>删除</Button>
       <Button onClick={clear}>取消</Button>
     </div>

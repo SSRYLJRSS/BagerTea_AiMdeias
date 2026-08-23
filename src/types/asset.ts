@@ -34,7 +34,17 @@ export interface AssetFilter {
   assetType?: AssetType;
   untaggedOnly?: boolean;
   tagId?: number;
+  /** 多标签筛选（R-21，与 tagId 二选一） */
+  tagIds?: number[];
+  /** any（默认）| all（同时含全部标签） */
+  tagsMode?: "any" | "all";
   search?: string;
+  /** 排序字段（R-21）：createdAt（默认）| takenAt | size | resolution */
+  sortBy?: "created_at" | "taken_at" | "size" | "resolution";
+  /** desc（默认）| asc */
+  sortDir?: "desc" | "asc";
+  /** true = 查回收站（R-22） */
+  trashOnly?: boolean;
   offset?: number;
   limit?: number;
 }
@@ -50,4 +60,23 @@ export interface ImportResult {
   failed: number;
   duplicates: number;
   errors: string[];
+}
+
+/** 重复素材分组（M3-02）：assets 按 created_at 升序，首项最早（保留候选） */
+export interface DupGroup {
+  hash: string;
+  assets: Asset[];
+}
+
+/** 打标操作流水（R-25，对应 db/tag_ops.rs TagOp） */
+export interface TagOp {
+  id: number;
+  assetId: number;
+  tagId: number;
+  op: "add" | "remove";
+  actor: "manual" | "ai_cloud" | "ai_local";
+  batchId: number | null;
+  createdAt: number;
+  tagName: string;
+  assetName: string;
 }

@@ -1,5 +1,5 @@
 /** 待入库文件预览缩略图（PRD v2.6）；失败返回 null 由 UI 显示占位图标 */
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "./client";
 import { convertFileSrc } from "@tauri-apps/api/core";
 
 // 模块级缓存：同一路径只请求一次（含失败），滚动/切换视图不重复解码

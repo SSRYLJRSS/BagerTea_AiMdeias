@@ -1,0 +1,69 @@
+# ============================================================
+# 茶包素材 BagerTea AiMedias — P0 冒烟集 CI（目标 ≤15 分钟）
+# 对应 docs/TEST_STRATEGY.md §6.1 与附录 D.4；编排与 scripts/smoke.ps1 等价
+# 触发：push / PR 到 main；可手动 workflow_dispatch 重跑
+# 已知 flaky 处理：网络类集成测试（本地 TCP mock，Windows）偶发一次
+# "error sending request"（环境级，docs/TEST_EXECUTION_REPORT F15）——
+# 单独 --test-threads=1 串行跑 + 失败重试 1 次。
+# ============================================================
+name: smoke
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      # 稳定组（并行）：lib + 既有集成目标；网络目标不在此列
+      - name: Cargo test (stable group)
+        shell: pwsh
+        run: |
+          cargo test --manifest-path src-tauri/Cargo.toml `
+            --lib `
+            --test db_integration `
+            --test qa_edge_tests `
+            --test format_matrix `
+            --test services_integration
+          exit $LASTEXITCODE
+
+      # 网络组：AI / Ollama 服务层集成（串行 + 失败重试 1 次）
+      - name: Network integration tests (serial + retry)
+        shell: pwsh
+        run: |
+          foreach ($target in @("ai_service_integration", "ollama_service_integration")) {
+            cargo test --manifest-path src-tauri/Cargo.toml --test $target -- --test-threads=1
+            if ($LASTEXITCODE -ne 0) {
+              Write-Host ">>> $target 首次失败（本地 TCP flaky），重试 1 次" -ForegroundColor Yellow
+              cargo test --manifest-path src-tauri/Cargo.toml --test $target -- --test-threads=1
+            }
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+
+      - name: Frontend typecheck
+        run: npm run typecheck
+
+      - name: Frontend build
+        run: npm run build
+
+      - name: Frontend unit tests (vitest)
+        run: npm run test:unit

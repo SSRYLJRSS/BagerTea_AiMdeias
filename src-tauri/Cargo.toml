@@ -10,6 +10,8 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+# Phase 2 F02：编译 msvc_stl_shim.cpp（补 heif.lib 缺失的 STL 符号）
+cc = "1"
 
 [dependencies]
 # ── 依赖分批：T01 核心集；T02 数据层（rusqlite/sha2/walkdir/dirs/chrono/uuid，本批）；
@@ -35,10 +37,15 @@ kamadak-exif = "0.5"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 rayon = "1"
-image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "tiff", "bmp", "tga"] }
 # T05a 云端 AI 打标：blocking 与现有同步 command 风格一致（避免跨 await 持 DB 锁）
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 base64 = "0.22"
+# Phase 2 F04：RAW 真解码（darktable 系纯 Rust 解析器；API 不守 SemVer，锁精确版本）
+rawler = "=0.7.2"
+# Phase 2 F02：HEIC/HEIF 解码（预编译静态链接 libheif+libde265，免 vcpkg；
+# Apache-2.0 封装；libheif 本体 LGPL-3 静态链接——闭源分发合规见 PROGRESS 决策日志）
+heif-rs = "26.7"
 
 [dev-dependencies]
 tempfile = "3"
@@ -54,4 +61,6 @@ opt-level = 3
 [profile.dev.package.kamadak-exif]
 opt-level = 3
 [profile.dev.package.rayon]
+opt-level = 3
+[profile.dev.package.rawler]
 opt-level = 3

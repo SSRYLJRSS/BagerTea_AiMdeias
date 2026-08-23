@@ -151,6 +151,7 @@ fn export_copy_integrity() -> AppResult<()> {
         &ids,
         &dest.to_string_lossy(),
         "copy",
+        "flat",
         &Arc::new(AtomicBool::new(false)),
         |_| {},
     )?;
@@ -293,6 +294,7 @@ fn b04_export_move_updates_db_file_path() -> AppResult<()> {
         &[id],
         &dest.to_string_lossy(),
         "move",
+        "flat",
         &Arc::new(AtomicBool::new(false)),
         |_| {},
     )?;
@@ -314,10 +316,7 @@ fn b04_export_move_updates_db_file_path() -> AppResult<()> {
         "file_path 应指向导出目录: {}",
         asset.file_path
     );
-    assert_eq!(
-        asset.file_name, old_name,
-        "无同名冲突时 file_name 应不变"
-    );
+    assert_eq!(asset.file_name, old_name, "无同名冲突时 file_name 应不变");
     // 目标文件存在
     assert!(
         std::path::Path::new(&asset.file_path).exists(),
@@ -374,6 +373,7 @@ fn b04_export_move_same_name_suffix_updates_db() -> AppResult<()> {
         &[id],
         &dest.to_string_lossy(),
         "move",
+        "flat",
         &Arc::new(AtomicBool::new(false)),
         |_| {},
     )?;
@@ -510,6 +510,7 @@ fn b06b_export_same_name_exhaustion_errors() -> AppResult<()> {
         &[id],
         &dest.to_string_lossy(),
         "copy",
+        "flat",
         &Arc::new(AtomicBool::new(false)),
         |_| {},
     );

@@ -5,20 +5,25 @@ import { open as pickDir } from "@tauri-apps/plugin-dialog";
 import Modal from "@/components/common/Modal";
 import Button from "@/components/common/Button";
 import ProgressBar from "@/components/common/ProgressBar";
-import { exportLocalFiles, onExportProgress } from "@/api/export";
+import { exportLocalFiles, exportCsvManifest, onExportProgress, type ExportLayout } from "@/api/export";
 import { useTauriEvent } from "@/hooks/hooks";
 import { useSelectionStore } from "@/stores/selectionStore";
 
 interface ExportDialogProps {
   open: boolean;
   onClose: () => void;
+  /** 初始模式（M3-04：「移动到目录」入口传 move，默认 copy） */
+  initialMode?: "copy" | "move";
 }
 
-export default function ExportDialog({ open, onClose }: ExportDialogProps) {
+export default function ExportDialog({ open, onClose, initialMode = "copy" }: ExportDialogProps) {
   const selected = useSelectionStore((s) => s.selected);
   const [tab, setTab] = useState<"local" | "cloud">("local");
   const [destDir, setDestDir] = useState("");
   const [mode, setMode] = useState<"copy" | "move">("copy");
+  /** R-26：子目录组织 + CSV 清单 */
+  const [layout, setLayout] = useState<ExportLayout>("flat");
+  const [withCsv, setWithCsv] = useState(false);
   const [progress, setProgress] = useState<{ done: number; total: number } | null>(null);
   const [result, setResult] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -34,11 +39,14 @@ export default function ExportDialog({ open, onClose }: ExportDialogProps) {
 
   useEffect(() => {
     if (open) {
+      setMode(initialMode);
+      setLayout("flat");
+      setWithCsv(false);
       setProgress(null);
       setResult(null);
       setError(null);
     }
-  }, [open]);
+  }, [open, initialMode]);
 
   const chooseDir = async () => {
     const dir = await pickDir({ directory: true });
@@ -51,12 +59,22 @@ export default function ExportDialog({ open, onClose }: ExportDialogProps) {
     setError(null);
     setResult(null);
     try {
-      const task = await exportLocalFiles(Array.from(selected), destDir, mode);
-      setResult(
+      const task = await exportLocalFiles(Array.from(selected), destDir, mode, layout);
+      const verb = mode === "move" ? "移动" : "导出";
+      let msg =
         task.status === "done"
-          ? `导出完成：${task.done}/${task.total} 个文件 → ${destDir}`
-          : `导出${task.status === "cancelled" ? "已取消" : "失败"}${task.error ? `：${task.error}` : ""}`,
-      );
+          ? `${verb}完成：${task.done}/${task.total} 个文件 → ${destDir}${task.warning ? `（${task.warning}）` : ""}`
+          : `${verb}${task.status === "cancelled" ? "已取消" : "失败"}${task.error ? `：${task.error}` : ""}`;
+      // R-26：CSV 清单（仅在文件导出成功时生成）
+      if (withCsv && task.status === "done") {
+        try {
+          const csvPath = await exportCsvManifest(Array.from(selected), destDir);
+          msg += `；清单：${csvPath}`;
+        } catch (ce) {
+          msg += `；清单生成失败：${ce instanceof Error ? ce.message : String(ce)}`;
+        }
+      }
+      setResult(msg);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -65,13 +83,13 @@ export default function ExportDialog({ open, onClose }: ExportDialogProps) {
   };
 
   return (
-    <Modal open={open} title={`导出 ${selected.size} 项素材`} onClose={busy ? () => undefined : onClose}
+    <Modal open={open} title={`${mode === "move" ? "移动" : "导出"} ${selected.size} 项素材`} onClose={busy ? () => undefined : onClose}
       footer={
         tab === "local" ? (
           <>
             <Button onClick={onClose} disabled={busy}>关闭</Button>
             <Button variant="primary" disabled={!destDir || busy || selected.size === 0} onClick={run}>
-              {busy ? "导出中…" : "开始导出"}
+              {busy ? (mode === "move" ? "移动中…" : "导出中…") : mode === "move" ? "开始移动" : "开始导出"}
             </Button>
           </>
         ) : undefined
@@ -123,6 +141,23 @@ export default function ExportDialog({ open, onClose }: ExportDialogProps) {
                 {m.label}
               </label>
             ))}
+          </div>
+          {/* R-26：目录组织 + CSV 清单 */}
+          <div className="flex items-center gap-3 text-sm">
+            <span className="shrink-0 text-xs text-[var(--color-text-secondary)]">目录组织</span>
+            <select
+              value={layout}
+              onChange={(e) => setLayout(e.target.value as ExportLayout)}
+              className="rounded-md border border-[var(--color-border)] bg-[var(--color-surface)] px-2 py-1 text-sm outline-none"
+            >
+              <option value="flat">平铺（不分目录）</option>
+              <option value="by_tag">按标签分目录</option>
+              <option value="by_date">按拍摄月份分目录</option>
+            </select>
+            <label className="ml-auto flex cursor-pointer items-center gap-1.5 text-xs text-[var(--color-text-secondary)]">
+              <input type="checkbox" checked={withCsv} onChange={(e) => setWithCsv(e.target.checked)} />
+              附 CSV 清单（文件名/标签/EXIF）
+            </label>
           </div>
           {progress && (
             <div className="flex flex-col gap-1">

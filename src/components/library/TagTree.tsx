@@ -23,7 +23,7 @@ export default function TagTree() {
       <TreeRow
         label="未打标"
         active={filter.untaggedOnly}
-        onClick={() => setFilter({ tagId: null, untaggedOnly: true })}
+        onClick={() => setFilter({ tagId: null, untaggedOnly: true, trashOnly: false })}
       />
 
       {rows.map(({ node, depth }) => {
@@ -46,7 +46,7 @@ export default function TagTree() {
               label={node.tag.name}
               count={node.tag.totalCount}
               active={active}
-              onClick={() => setFilter({ tagId: active ? null : node.tag.id, untaggedOnly: false })}
+              onClick={() => setFilter({ tagId: active ? null : node.tag.id, untaggedOnly: false, trashOnly: false })}
             />
           </div>
         );

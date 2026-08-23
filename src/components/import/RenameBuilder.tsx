@@ -46,6 +46,7 @@ interface RenameBuilderProps {
 export default function RenameBuilder({ value, onChange, disabled, collection, sampleStem, sampleExt }: RenameBuilderProps) {
   const [selected, setSelected] = useState<string[]>(() => parsePattern(value)[0]);
   const [seqDigits, setSeqDigits] = useState<string>(() => parsePattern(value)[1]);
+  const [preview, setPreview] = useState("");
 
   /** SEQ 占位符按位数展开为真实 token */
   const expand = (sel: string[], digits: string) =>
@@ -58,6 +59,22 @@ export default function RenameBuilder({ value, onChange, disabled, collection, s
     if (!value.trim() && selected.length > 0) setSelected([]);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [value]);
+
+  // 实时预览：后端 preview_rename 单一事实源（异步，cancelled 防竞态）
+  useEffect(() => {
+    if (selected.length === 0 || !sampleStem) {
+      setPreview("");
+      return;
+    }
+    let cancelled = false;
+    renderNamePreview(expand(selected, seqDigits).join("_"), collection, sampleStem)
+      .then((p) => !cancelled && setPreview(p))
+      .catch(() => !cancelled && setPreview(""));
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selected, seqDigits, collection, sampleStem]);
 
   const toggle = (id: string) => {
     const next = selected.includes(id) ? selected.filter((t) => t !== id) : [...selected, id];
@@ -132,9 +149,9 @@ export default function RenameBuilder({ value, onChange, disabled, collection, s
       {selected.length > 0 && (
         <div className="flex flex-col gap-0.5 rounded-md bg-[var(--color-surface)] px-2 py-1.5 transition-all duration-200">
           <span className="font-mono text-[10px] text-[var(--color-text-secondary)]">{expand(selected, seqDigits).join("_")}</span>
-          {sampleStem && (
+          {sampleStem && preview && (
             <span className="text-[10px] text-[var(--color-text)]">
-              预览：{renderNamePreview(expand(selected, seqDigits).join("_"), collection, sampleStem)}.{sampleExt}
+              预览：{preview}.{sampleExt}
             </span>
           )}
         </div>

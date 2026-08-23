@@ -4,6 +4,8 @@ import ImportPage from "@/pages/ImportPage";
 import LibraryPage from "@/pages/LibraryPage";
 import AiTaggingPage from "@/pages/AiTaggingPage";
 import SettingsPage from "@/pages/SettingsPage";
+import { startGlobalTaskWatch } from "@/stores/taskStore";
+import { useSettingsStore } from "@/stores/settingsStore";
 
 type PageKey = TabKey | "settings";
 
@@ -19,6 +21,18 @@ export default function App() {
     window.addEventListener("app:navigate", onNav);
     return () => window.removeEventListener("app:navigate", onNav);
   }, []);
+
+  // 全局任务条：订阅入库/导出/AI 进度事件（幂等，M3-04）
+  useEffect(() => {
+    void startGlobalTaskWatch();
+  }, []);
+
+  // R-24：启动即加载设置并应用主题（load 内部调 applyTheme）
+  const settingsLoaded = useSettingsStore((s) => s.loaded);
+  const loadSettings = useSettingsStore((s) => s.load);
+  useEffect(() => {
+    if (!settingsLoaded) void loadSettings();
+  }, [settingsLoaded, loadSettings]);
 
   return (
     <div className="h-full flex flex-col">

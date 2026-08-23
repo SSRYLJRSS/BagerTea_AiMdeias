@@ -1,4 +1,4 @@
-/** 网格卡片：缩略图 + 选中态 + 视频时长角标 + 文件名 */
+/** 网格卡片：缩略图 + 选中态 + 视频时长角标 + 格式角标 + 文件名 */
 import { memo, useCallback } from "react";
 import clsx from "clsx";
 import Thumbnail from "./Thumbnail";
@@ -19,6 +19,22 @@ function formatDuration(ms: number): string {
   return `${m}:${String(s % 60).padStart(2, "0")}`;
 }
 
+/** RAW 系扩展名（与后端 mime.rs is_raw_ext 同源） */
+const RAW_EXTS = new Set([
+  "raw", "cr2", "cr3", "crw", "nef", "nrw", "arw", "srf", "sr2", "dng",
+  "raf", "orf", "rw2", "pef", "srw", "x3f", "mrw", "iiq", "3fr", "fff",
+  "kdc", "dcr", "mos", "mef", "erf",
+]);
+
+/** 格式角标（Phase 2 F05）：RAW/TIFF/HEIC 特殊格式标注，常见格式不打扰 */
+function formatBadge(ext: string): string | null {
+  const e = ext.toLowerCase();
+  if (e === "tif" || e === "tiff") return "TIFF";
+  if (e === "heic" || e === "heif") return "HEIC";
+  if (RAW_EXTS.has(e)) return "RAW";
+  return null;
+}
+
 export default memo(function AssetCard({ asset, index, selected, onSelect, onPreview, onContextMenu }: AssetCardProps) {
   const handleClick = useCallback(
     (e: React.MouseEvent) => onSelect(asset, index, e),
@@ -31,6 +47,7 @@ export default memo(function AssetCard({ asset, index, selected, onSelect, onPre
   );
 
   const isVideo = asset.durationMs != null;
+  const badge = formatBadge(asset.fileExt);
 
   return (
     <div
@@ -52,6 +69,13 @@ export default memo(function AssetCard({ asset, index, selected, onSelect, onPre
       {isVideo && (
         <span className="absolute right-1 bottom-1 rounded bg-black/60 px-1 text-[10px] leading-4 text-white">
           {formatDuration(asset.durationMs!)}
+        </span>
+      )}
+
+      {/* 格式角标（RAW/TIFF/HEIC） */}
+      {badge && (
+        <span className="absolute right-1 top-1 rounded bg-black/60 px-1 text-[10px] leading-4 text-white">
+          {badge}
         </span>
       )}
 

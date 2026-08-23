@@ -14,12 +14,22 @@ pub struct ApiProfile {
     /// 接口协议模式：openai（/chat/completions）| anthropic（/messages）
     #[serde(default = "default_api_mode")]
     pub api_mode: String,
+    /// 部署类型（P3-01a）：cloud（云端服务商）| local（本机 OpenAI 兼容服务，如 Ollama/LM Studio）；
+    /// serde 默认 cloud，旧数据零感知
+    #[serde(default = "default_profile_kind")]
+    pub kind: String,
     #[serde(default)]
     pub base_url: String,
     #[serde(default)]
     pub api_key: String,
     #[serde(default = "default_model")]
     pub model: String,
+}
+
+impl ApiProfile {
+    pub fn is_local(&self) -> bool {
+        self.kind == "local"
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -48,6 +58,9 @@ pub struct AiSettings {
     pub local_model_tier: String,
     #[serde(default = "default_batch_limit")]
     pub batch_limit: i64,
+    /// 一键安装的下载源偏好（"auto" = 测速选最快；旧数据缺省视为 auto）
+    #[serde(default = "default_ollama_source_id")]
+    pub ollama_source_id: String,
 }
 
 impl AiSettings {
@@ -62,6 +75,7 @@ impl AiSettings {
                 } else {
                     self.api_mode.clone()
                 },
+                kind: default_profile_kind(),
                 base_url: self.base_url.clone(),
                 api_key: self.api_key.clone(),
                 model: self.model.clone(),
@@ -81,6 +95,15 @@ impl AiSettings {
 
 fn default_api_mode() -> String {
     "openai".into()
+}
+fn default_ollama_source_id() -> String {
+    "auto".into()
+}
+fn default_custom_sources() -> Vec<CustomSource> {
+    Vec::new()
+}
+fn default_profile_kind() -> String {
+    "cloud".into()
 }
 fn default_model() -> String {
     "qwen-vl-plus".into()
@@ -143,8 +166,18 @@ impl Default for AiSettings {
             video_tagging: false,
             local_model_tier: default_tier(),
             batch_limit: default_batch_limit(),
+            ollama_source_id: default_ollama_source_id(),
         }
     }
+}
+
+/// 用户自定义下载源（改造方案：即时落库资产，独立于 draft）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomSource {
+    pub id: String,
+    pub label: String,
+    pub url: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -162,6 +195,15 @@ pub struct Settings {
     /// 总库位置（R-32）；空 = 原位索引模式
     #[serde(default)]
     pub library_root: String,
+    /// 回收站保留天数（R-22）；启动时清理超期项，0 = 不自动清理
+    #[serde(default = "default_trash_retention_days")]
+    pub trash_retention_days: i64,
+    /// Ollama 一键下载的自定义源（即时落库；旧数据缺省空）
+    #[serde(default = "default_custom_sources")]
+    pub custom_download_sources: Vec<CustomSource>,
+    /// Ollama 模型下载代理（改造方案·加速项 A：拉起 serve 时注入 HTTPS_PROXY；空 = 不用代理）
+    #[serde(default)]
+    pub model_download_proxy: String,
 }
 
 fn default_theme() -> String {
@@ -169,6 +211,9 @@ fn default_theme() -> String {
 }
 fn default_cache_mb() -> i64 {
     2048
+}
+fn default_trash_retention_days() -> i64 {
+    30
 }
 
 impl Default for Settings {
@@ -179,8 +224,23 @@ impl Default for Settings {
             thumbnail_cache_mb: default_cache_mb(),
             tag_categories: default_tag_categories(),
             library_root: String::new(),
+            trash_retention_days: default_trash_retention_days(),
+            custom_download_sources: default_custom_sources(),
+            model_download_proxy: String::new(),
         }
     }
+}
+
+/// 读取侧：对一份已解析的 Settings 就地新增自定义源（纯逻辑，便于单测/命令复用）
+pub fn add_custom_source(s: &mut Settings, src: CustomSource) {
+    s.custom_download_sources.push(src);
+}
+
+/// 读取侧：按 id 移除自定义源；返回是否移除成功
+pub fn remove_custom_source(s: &mut Settings, id: &str) -> bool {
+    let before = s.custom_download_sources.len();
+    s.custom_download_sources.retain(|c| c.id != id);
+    s.custom_download_sources.len() != before
 }
 
 const KEY: &str = "app_settings";
@@ -226,6 +286,16 @@ mod tests {
     }
 
     #[test]
+    fn legacy_profile_defaults_to_cloud_kind() {
+        let p: ApiProfile = serde_json::from_str(
+            r#"{"id":"x","name":"旧档案","baseUrl":"http://a/v1","apiKey":"k","model":"m"}"#,
+        )
+        .unwrap();
+        assert_eq!(p.kind, "cloud");
+        assert!(!p.is_local());
+    }
+
+    #[test]
     fn empty_config_stays_empty() {
         let mut ai = AiSettings::default();
         ai.normalize();
@@ -239,11 +309,39 @@ mod tests {
             id: "p1".into(),
             name: "A".into(),
             api_mode: "openai".into(),
+            kind: "cloud".into(),
             base_url: "u".into(),
             api_key: "k".into(),
             model: "m".into(),
         });
         ai.active_profile = "not-exist".into();
         assert_eq!(ai.active().unwrap().id, "p1");
+    }
+
+    #[test]
+    fn legacy_settings_default_new_fields() {
+        // 旧数据无新字段 → serde default 兜底
+        let s: Settings =
+            serde_json::from_str(r#"{"ai":{"profiles":[]},"theme":"system"}"#).unwrap();
+        assert_eq!(s.ai.ollama_source_id, "auto");
+        assert!(s.custom_download_sources.is_empty());
+        assert_eq!(s.model_download_proxy, "");
+    }
+
+    #[test]
+    fn custom_source_add_remove_roundtrip() {
+        let mut s = Settings::default();
+        add_custom_source(
+            &mut s,
+            CustomSource {
+                id: "custom-1".into(),
+                label: "NAS".into(),
+                url: "https://nas/x".into(),
+            },
+        );
+        assert_eq!(s.custom_download_sources.len(), 1);
+        assert!(remove_custom_source(&mut s, "custom-1"));
+        assert_eq!(s.custom_download_sources.len(), 0);
+        assert!(!remove_custom_source(&mut s, "custom-1"));
     }
 }

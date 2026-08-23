@@ -4,6 +4,7 @@ use serde::Serialize;
 use tauri::{Manager, State};
 
 use crate::db::assets::{self, Asset, AssetFilter, AssetPage};
+use crate::db::dedup::{self, DupGroup};
 use crate::error::{AppError, AppResult};
 use crate::services::thumbnail::ThumbnailService;
 use crate::state::AppState;
@@ -41,6 +42,19 @@ pub fn list_assets(
     Ok(page)
 }
 
+/// 重复素材扫描（M3-02 R-20）：hash 精确分组，单次 GROUP BY 毫秒级，无需异步进度
+#[tauri::command]
+pub fn dedup_scan(app: tauri::AppHandle, state: State<AppState>) -> AppResult<Vec<DupGroup>> {
+    let conn = lock_db(&state)?;
+    let groups = dedup::scan_groups(&conn)?;
+    for g in &groups {
+        for a in &g.assets {
+            allow_asset(&app, &a.file_path);
+        }
+    }
+    Ok(groups)
+}
+
 /// 取当前筛选结果的全部 id（BUG-E：全选/反选/批量操作用）。
 /// 只 SELECT id，不返回完整 Asset、不调 allow_asset——避免拉全量对象浪费 IPC/内存，
 /// 且不暴露原文件路径、消除 asset 协议 scope 随全选无界增长。
@@ -58,7 +72,7 @@ pub fn get_asset(app: tauri::AppHandle, state: State<AppState>, id: i64) -> AppR
     Ok(a)
 }
 
-/// 删除双策略：remove_from_library（仅移出库）| delete_file（连同原文件删除）
+/// 删除双策略：remove_from_library（软删入回收站，R-22）| delete_file（连同原文件硬删）
 /// B02：改 async + spawn_blocking，文件 IO 下沉工作线程，避免主线程阻塞卡 UI
 /// B03：delete_file 策略下磁盘删除失败的 id 不从库删（消除假删除），收集失败列表返回前端
 #[tauri::command]
@@ -108,7 +122,7 @@ pub async fn delete_assets(
             std::collections::HashSet::new()
         };
 
-        // 阶段三：短锁写库——delete_file 策略只删磁盘删除成功的（+ remove_from_library 全删）
+        // 阶段三：短锁写库——delete_file 只删磁盘删除成功的；remove_from_library 软删入回收站（R-22）
         let to_delete_db: Vec<i64> = if strategy == "delete_file" {
             ids.iter()
                 .filter(|id| !failed_set.contains(id))
@@ -119,12 +133,18 @@ pub async fn delete_assets(
         };
         let n = {
             let conn = db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
-            assets::delete(&conn, &to_delete_db)?
+            if strategy == "delete_file" {
+                assets::delete(&conn, &to_delete_db)?
+            } else {
+                assets::soft_delete(&conn, &to_delete_db)?
+            }
         };
 
-        // 阶段四：缩略图清理（仅清理已成功从库删除的，文件 IO 不持锁）
-        for &id in &to_delete_db {
-            thumbs.delete_for_asset(id);
+        // 阶段四：缩略图清理——仅硬删清理；软删保留缩略图供回收站预览/恢复（R-22）
+        if strategy == "delete_file" {
+            for &id in &to_delete_db {
+                thumbs.delete_for_asset(id);
+            }
         }
 
         let failed_files: Vec<i64> = failed_set.into_iter().collect();
@@ -135,6 +155,51 @@ pub async fn delete_assets(
     })
     .await
     .map_err(|e| AppError::msg(format!("删除线程异常: {e}")))?
+}
+
+/// R-22 回收站恢复：deleted_at 置空，素材回到在库状态（缩略图未删，无需重建）
+#[tauri::command]
+pub fn trash_restore(state: State<AppState>, ids: Vec<i64>) -> AppResult<u64> {
+    let conn = lock_db(&state)?;
+    assets::restore(&conn, &ids)
+}
+
+/// R-22 超期回收站自动清理（启动时调用，不常驻定时器）：
+/// 短锁取清单 → 锁外删文件（失败保留记录，沿用 B03 语义）→ 短锁硬删 DB + 清缩略图
+pub fn purge_expired_trash(
+    db: &std::sync::Arc<std::sync::Mutex<rusqlite::Connection>>,
+    data_dir: &std::path::Path,
+    retention_days: i64,
+) -> AppResult<()> {
+    let cutoff = chrono::Utc::now().timestamp_millis() - retention_days * 86_400_000;
+    let expired = {
+        let conn = db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
+        assets::list_expired_trash(&conn, cutoff)?
+    };
+    if expired.is_empty() {
+        return Ok(());
+    }
+    let mut ok_ids: Vec<i64> = Vec::new();
+    for (id, path) in &expired {
+        if std::fs::remove_file(path).is_ok() {
+            ok_ids.push(*id);
+        } else {
+            tracing::warn!("回收站清理：文件删除失败保留记录 id={id} path={path}");
+        }
+    }
+    if ok_ids.is_empty() {
+        return Ok(());
+    }
+    {
+        let conn = db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
+        assets::delete(&conn, &ok_ids)?;
+    }
+    let thumbs = ThumbnailService::new(data_dir)?;
+    for &id in &ok_ids {
+        thumbs.delete_for_asset(id);
+    }
+    tracing::info!("回收站自动清理完成：{} 项", ok_ids.len());
+    Ok(())
 }
 
 /// 返回原始文件路径（前端 convertFileSrc 使用，禁止拼 file://）

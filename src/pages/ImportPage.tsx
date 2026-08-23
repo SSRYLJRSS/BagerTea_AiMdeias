@@ -20,13 +20,16 @@ import { useLibraryStore } from "@/stores/libraryStore";
 import { useSettingsStore } from "@/stores/settingsStore";
 import type { ImportResult } from "@/types/asset";
 
+// 与后端 utils/mime.rs asset_type_from_ext 白名单同步（选择器过滤，拖拽入口由后端扫描过滤）
 const FILE_FILTERS = [
   {
     name: "图片与视频",
     extensions: [
-      "jpg", "jpeg", "png", "gif", "webp", "heic", "heif", "bmp", "tif", "tiff",
-      "cr2", "cr3", "nef", "arw", "dng", "orf", "rw2", "raf",
-      "mp4", "mov", "avi", "mkv", "webm",
+      "jpg", "jpeg", "png", "gif", "webp", "bmp", "tga", "tif", "tiff", "heic", "heif",
+      "raw", "cr2", "cr3", "crw", "nef", "nrw", "arw", "srf", "sr2", "dng",
+      "raf", "orf", "rw2", "pef", "srw", "x3f", "mrw", "iiq", "3fr", "fff",
+      "kdc", "dcr", "mos", "mef", "erf",
+      "mp4", "mov", "avi", "mkv", "webm", "m4v", "mts", "m2ts",
     ],
   },
 ];

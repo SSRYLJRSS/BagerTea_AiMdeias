@@ -17,6 +17,9 @@ pub struct ExportTask {
     pub share_url: Option<String>,
     pub error: Option<String>,
     pub created_at: i64,
+    /// P1-04：status=done 时携带的软提示（如「N 个源文件未能清理」）；成功但有注意事项
+    #[serde(default)]
+    pub warning: Option<String>,
 }
 
 fn from_row(r: &rusqlite::Row) -> rusqlite::Result<ExportTask> {
@@ -30,10 +33,11 @@ fn from_row(r: &rusqlite::Row) -> rusqlite::Result<ExportTask> {
         share_url: r.get(6)?,
         error: r.get(7)?,
         created_at: r.get(8)?,
+        warning: r.get(9).unwrap_or(None),
     })
 }
 
-const COLS: &str = "id, target, status, total, done, dest_dir, share_url, error, created_at";
+const COLS: &str = "id, target, status, total, done, dest_dir, share_url, error, created_at, warning";
 
 pub fn create_task(conn: &Connection, target: &str, total: i64, dest_dir: Option<&str>, account_id: Option<i64>) -> AppResult<ExportTask> {
     let now = chrono::Utc::now().timestamp_millis();
@@ -69,8 +73,18 @@ pub fn update_progress(conn: &Connection, id: i64, done: i64, status: &str) -> A
 
 pub fn finish_task(conn: &Connection, id: i64, status: &str, share_url: Option<&str>, error: Option<&str>) -> AppResult<()> {
     conn.execute(
-        "UPDATE export_tasks SET status = ?1, share_url = ?2, error = ?3 WHERE id = ?4",
+        "UPDATE export_tasks SET status = ?1, share_url = ?2, error = ?3, warning = NULL WHERE id = ?4",
         rusqlite::params![status, share_url, error, id],
+    )?;
+    Ok(())
+}
+
+/// P1-04：任务「成功但带注意事项」——status 置 done，warning 列写入软提示，
+/// error 列保持 NULL（区别于失败），前端可据此展示「完成但请留意」消息
+pub fn finish_task_with_warning(conn: &Connection, id: i64, warning: &str) -> AppResult<()> {
+    conn.execute(
+        "UPDATE export_tasks SET status = 'done', share_url = NULL, error = NULL, warning = ?1 WHERE id = ?2",
+        rusqlite::params![warning, id],
     )?;
     Ok(())
 }

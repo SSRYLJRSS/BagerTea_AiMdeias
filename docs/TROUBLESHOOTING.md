@@ -1,6 +1,6 @@
 # 茶包素材 V2 — 踩坑与疑难手册
 
-> 版本 v1.0 ｜ 2026-08-12
+> 版本 v1.1 ｜ 2026-08-17
 > 定位：**真实踩过的坑全记录**——症状、根因、修法。遇到"看不懂的防御性代码"先来这查；新踩的坑修完必须追加。
 
 ---
@@ -54,52 +54,79 @@
 - **根因**：AI 配置改多档案结构（profiles[]）后测试还断言旧扁平字段
 - **修法**：迁移 `normalize()` 只读旧字段（skip_serializing），测试改档案结构断言。**教训：结构迁移必同步测试**
 
+### 9. 某格式黑图排查路径（Phase 2 多格式）
+
+黑图 = `decode_thumb` 全链路返回 None。按策略链逐级定位（`imaging.rs` 四级链）：
+
+1. **确认扩展名在白名单**（`utils/mime.rs`）：不在则入库就被拒，不是黑图而是漏收；avif 故意不放行（无解码器）
+2. **占位层（≤320px）只有内嵌链**：TIFF 遍历 → CR3 ISOBMFF → 标记扫描（jpg 禁用）。内嵌图缺失的 RAW 占位层黑图是**设计如此**（红线：真解码不进占位路径），高清图层会兜底
+3. **高清层黑图**：`image::open` 失败后走 `special_decode`——heic/heif 查 `heic_decode`（128MB 上限/libheif 报错），其余查 `raw_decode`（rawler 不支持的机型/Float RAW/>150MP 上限会拒绝）
+4. **取证**：`cargo test --test perf_probe -- --ignored --nocapture` 跑 `probe_real_files`/`probe_raw_library_walk`，直接看每级耗时与成败
+5. **常见归因**：X-Trans 机型只出灰度预览（binning 不适用）；CR3 占位层未命中时靠高清层 rawler 兜底；HEIC 超 128MB 直接放弃
+
+### 10. RAW EXIF 读不到相机型号（F05）
+
+- **根因**：CR3 是 ISOBMFF 容器、RW2 用非标 TIFF 魔数（0x55），kamadak-exif 读不了
+- **修法**：`exif_meta::raw_fallback` 用 rawler 轻量识别（`get_decoder` + `raw_metadata`，只解元数据不解像素）补缺，只填 None 字段不覆盖
+
 ## 二、前端 / React
 
-### 9. 右键菜单项全部失效（"你不会只做了 ui 吧"）
+### 11. 右键菜单项全部失效（"你不会只做了 ui 吧"）
 
 - **根因**：ContextMenu 点外关闭用**捕获阶段**监听，把菜单项自己的点击也拦了
 - **修法**：捕获回调里 `if (ref.current?.contains(e.target)) return` 排除菜单内部
 
-### 10. Alt+滚轮缩放拦不住页面滚动
+### 12. Alt+滚轮缩放拦不住页面滚动
 
 - **根因**：React `onWheel` 是 passive 监听，preventDefault 无效
 - **修法**：原生 `addEventListener('wheel', fn, { passive: false })`
 
-### 11. aiCreateBatch 参数顺序传反
+### 13. aiCreateBatch 参数顺序传反
 
 - **症状**：建批失败/模式错乱
 - **修法**：`(ids, mode)` 顺序，tsc 抓获。**教训：invoke 封装函数签名改参数顺序后全仓搜索调用点**
 
-### 12. 缩放锚点漂移
+### 14. 缩放锚点漂移
 
 - **公式**：`imgP = (cursor - center - pan) / scale; pan' = cursor - center - imgP * nextScale`
 - 查看器缩放/平移必须以光标为锚，改这块先用大图验证手感
 
 ## 三、工具链 / 环境
 
-### 13. `npm : 无法将"npm"项识别为…`
+### 15. `npm : 无法将"npm"项识别为…`
 
 - **根因**：便携 Node 不在系统 PATH
 - **修法**：见 DEVELOPMENT.md 第一节；VSCode 终端需重启或配置 profile
 
-### 14. bash 里 cargo 找不到
+### 16. bash 里 cargo 找不到
 
 - **修法**：`export PATH="/c/Users/33887/.cargo/bin:$PATH"`（每个新 shell 都要）
 
-### 15. python sqlite3 清数据报 `no such function: cjk_bigram`
+### 17. python sqlite3 清数据报 `no such function: cjk_bigram`
 
 - **根因**：FTS 触发器依赖应用启动时注册的自定义分词函数，外部连接没有
 - **修法**：**外部连接只能 SELECT**；清数据用应用内删除功能
 
-### 16. CRLF 行尾导致补丁工具匹配失败 / bash heredoc 断裂
+### 18. CRLF 行尾导致补丁工具匹配失败 / bash heredoc 断裂
 
 - **修法**：复杂补丁写 python .py 文件执行（读文件归一 `\r\n`→`\n` 处理，写回恢复）；禁止 heredoc 传含特殊字符的长文本
 
-### 17. tauri dev 日志丢失 / 后端没重编译
+### 19. tauri dev 日志丢失 / 后端没重编译
 
 - **现象**：/tmp 日志电脑重启后丢失；vite 1420 活着但 exe 是旧的
 - **修法**：确认 cargo watcher 进程在跑；拿不准就重启 `npm run tauri dev`
+
+### 20. heif-rs 环境三件套（F02，新机器必做）
+
+- **症状**：heif-rs 构建失败（下载拒绝/缺 libclang/LNK2019）
+- **修法**：① `heif-bin/` 预编译库 + `.cargo/config.toml` HEIF_BINARIES_DIR；② winget 装 LLVM（bindgen）；③ `msvc_stl_shim.cpp` 补 STL ABI 符号（Build Tools 升 14.45+ 后删）
+- **教训**：GitHub 直连不通时 gh-proxy.com + curl -C - 分段续传可救
+
+### 21. 编辑工具报"save failed"但实际已部分写入
+
+- **症状**：SearchReplace 报保存失败，重试后文件出现重复段落，编译报 `unexpected closing delimiter`
+- **修法**：写入报错后先 `Read`/`grep` 核实文件真实状态再动手；小文件直接用 Write 整体重写
+- **教训**：工具报错≠没写入，盲目重试是重复内容的根源
 
 ## 四、排查方法论（新 bug 来了怎么做）
 

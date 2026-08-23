@@ -4,7 +4,8 @@
 //! 内嵌预览策略链（开源看图软件标准做法，对标 ExifTool/FastRawViewer）：
 //!   1. EXIF IFD1 ThumbnailImage（kamadak-exif；相机 JPEG/TIFF 微秒级）
 //!   2. 手写 TIFF 遍历：任意 IFD 的 0x0201/0x0202 + Panasonic JpgFromRaw(0x2E)（RW2/DNG/CR2…）
-//!   3. FFD8..FFD9 标记扫描（取最大 JPEG 块，一切 RAW 兜底）
+//!   3. CR3 ISOBMFF box 遍历（meta/iprp/ipco 里的 JPEG item；Phase 2 F03）
+//!   4. FFD8..FFD9 标记扫描（取最大 JPEG 块，一切 RAW 兜底）
 //!
 //! 解码路径：
 //!   内嵌图（尺寸达标直接用）→ jpeg-decoder DCT 缩放（1/8~1/1，比全解码快数倍）
@@ -244,16 +245,118 @@ fn marker_scan_jpeg(src: &Path) -> Option<Vec<u8>> {
     Some(data[start..start + len].to_vec())
 }
 
-/// 内嵌预览策略链：TIFF 遍历（含 JPEG 容器定位）→ 标记扫描
+/// CR3 内嵌预览（Phase 2 F03）：CR3 是 ISOBMFF 容器（非 TIFF），
+/// TIFF 遍历够不着。沿 box 树走 meta→iprp→ipco，取最大的 JPEG item。
+fn cr3_embedded_jpeg(src: &Path) -> Option<Vec<u8>> {
+    let mut f = std::fs::File::open(src).ok()?;
+    let mut head = [0u8; 8];
+    f.read_exact(&mut head).ok()?;
+    // CR3 特征：ftyp box 且 major brand 为 crx
+    if &head[4..8] != b"ftyp" {
+        return None;
+    }
+    let file_len = f.metadata().ok()?.len();
+    f.seek(SeekFrom::Start(0)).ok()?;
+    walk_isobmff(&mut f, 0, file_len, 0)
+}
+
+/// ISOBMFF box 遍历：只递归容器 box（moov/meta/iprp/ipco/iprp），
+/// 大体积 box（mdat 等）直接按声明长度 seek 跳过，绝不逐字节扫
+fn walk_isobmff(f: &mut std::fs::File, start: u64, end: u64, depth: u32) -> Option<Vec<u8>> {
+    if depth > 8 {
+        return None;
+    }
+    let mut off = start;
+    let mut best: Option<Vec<u8>> = None;
+    while off + 8 <= end {
+        f.seek(SeekFrom::Start(off)).ok()?;
+        let mut hdr = [0u8; 8];
+        if f.read_exact(&mut hdr).is_err() {
+            break;
+        }
+        let mut size = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) as u64;
+        let typ = &hdr[4..8];
+        let mut content_off = off + 8;
+        if size == 1 {
+            // 64bit largesize
+            let mut lg = [0u8; 8];
+            if f.read_exact(&mut lg).is_err() {
+                break;
+            }
+            size = u64::from_be_bytes(lg);
+            content_off = off + 16;
+        } else if size == 0 {
+            size = end - off; // 延伸到文件尾
+        }
+        if size < 8 || off + size > end {
+            break;
+        }
+        let next = off + size;
+        match typ {
+            b"moov" | b"iprp" | b"ipco" => {
+                if let Some(j) = walk_isobmff(f, content_off, next, depth + 1) {
+                    if best.as_ref().map(|b| j.len() > b.len()).unwrap_or(true) {
+                        best = Some(j);
+                    }
+                }
+            }
+            b"meta" => {
+                // FullBox：4 字节 version/flags 后才到子 box
+                if let Some(j) = walk_isobmff(f, content_off + 4, next, depth + 1) {
+                    if best.as_ref().map(|b| j.len() > b.len()).unwrap_or(true) {
+                        best = Some(j);
+                    }
+                }
+            }
+            _ => {
+                // 叶子 box：可能是 JPEG 内嵌图（CR3 的 ipco item），
+                // 只读小于 64MB 的，前几字节验 SOI 再交给 cut_jpeg 宽容裁剪
+                let content_len = next - content_off;
+                if content_len > 1024 && content_len < 64 * 1024 * 1024 {
+                    f.seek(SeekFrom::Start(content_off)).ok()?;
+                    let mut peek = [0u8; 64];
+                    if f.read_exact(&mut peek).is_ok() && peek[..2] == [0xFF, 0xD8] {
+                        if let Some(j) = cut_jpeg_from_offset(f, content_off, content_len) {
+                            if best.as_ref().map(|b| j.len() > b.len()).unwrap_or(true) {
+                                best = Some(j);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        off = next;
+    }
+    best
+}
+
+/// 从指定偏移读整段并抠 JPEG（复用 cut_jpeg 的宽容裁剪逻辑）
+fn cut_jpeg_from_offset(f: &mut std::fs::File, offset: u64, len: u64) -> Option<Vec<u8>> {
+    f.seek(SeekFrom::Start(offset)).ok()?;
+    let mut buf = vec![0u8; len as usize];
+    f.read_exact(&mut buf).ok()?;
+    let soi = buf[..buf.len().min(64)]
+        .windows(2)
+        .position(|w| w[0] == 0xFF && w[1] == 0xD8)?;
+    let eoi = buf.windows(2).rposition(|w| w[0] == 0xFF && w[1] == 0xD9)?;
+    if eoi <= soi {
+        return None;
+    }
+    Some(buf[soi..eoi + 2].to_vec())
+}
+
+/// 内嵌预览策略链：TIFF 遍历（含 JPEG 容器定位）→ CR3 ISOBMFF → 标记扫描
 /// 标记扫描对 .jpg 文件禁用（整个文件就是 JPEG，会误抓主图）
 pub fn embedded_preview(src: &Path) -> Option<Vec<u8>> {
-    tiff_embedded_jpeg(src).or_else(|| {
-        if is_jpeg_like(src) {
-            None
-        } else {
-            marker_scan_jpeg(src)
-        }
-    })
+    tiff_embedded_jpeg(src)
+        .or_else(|| cr3_embedded_jpeg(src))
+        .or_else(|| {
+            if is_jpeg_like(src) {
+                None
+            } else {
+                marker_scan_jpeg(src)
+            }
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -289,7 +392,29 @@ pub fn decode_thumb(src: &Path, max_px: u32) -> Option<DynamicImage> {
     //    24MP 全解码 ~370ms——实测比 jpeg-decoder 的 DCT 缩放路径还快，故精简掉后者）
     image::open(src)
         .ok()
+        .or_else(|| {
+            // 3. 真解码兜底（Phase 2 F02/F04）：仅高清按需层；占位层（≤320px）禁用，
+            //    避免 HEVC/RAW 全解码拖垮入库速度（PHASE2_FORMATS.md 红线）
+            if max_px > 320 {
+                special_decode(src)
+            } else {
+                None
+            }
+        })
         .map(|img| img.thumbnail(max_px, max_px))
+}
+
+/// 特殊格式真解码分派：HEIC/HEIF → libheif；RAW 系 → rawler
+fn special_decode(src: &Path) -> Option<DynamicImage> {
+    let ext = src
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    match ext.as_str() {
+        "heic" | "heif" => super::heic_decode::decode_heic(src),
+        _ => super::raw_decode::decode_raw(src),
+    }
 }
 
 /// 解码并写 webp 缩略图到 out
@@ -351,6 +476,64 @@ mod tests {
         assert!(cut_jpeg(&f, 0, 6).is_some());
         assert!(cut_jpeg(&f, 1, 4).is_none()); // 缺 SOI
         assert!(cut_jpeg(&f, 0, 0).is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 合成 CR3：ftyp + meta(FullBox)→iprp→ipco→JPEG 叶子 box + 大 mdat（验证 seek 跳过）
+    fn be32(v: u32) -> [u8; 4] {
+        v.to_be_bytes()
+    }
+
+    #[test]
+    fn cr3_walk_finds_embedded_jpeg() {
+        let dir = std::env::temp_dir().join(format!("bagertea_cr3_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("fake.cr3");
+
+        // 假 JPEG（>1KB 才进候选）
+        let mut jpeg = vec![0xFFu8, 0xD8];
+        jpeg.extend(vec![7u8; 2000]);
+        jpeg.extend_from_slice(&[0xFF, 0xD9]);
+
+        // ipco 叶子 box（非 JPEG item）+ JPEG item box
+        let mut ipco_content = Vec::new();
+        ipco_content.extend_from_slice(&be32(16));
+        ipco_content.extend_from_slice(b"ispe");
+        ipco_content.extend_from_slice(&[0u8; 8]);
+        ipco_content.extend_from_slice(&be32((jpeg.len() + 8) as u32));
+        ipco_content.extend_from_slice(b"avc1");
+        ipco_content.extend_from_slice(&jpeg);
+        let ipco_box: Vec<u8> = [
+            &be32((ipco_content.len() + 8) as u32)[..],
+            b"ipco",
+            &ipco_content,
+        ]
+        .concat();
+        let iprp_box: Vec<u8> =
+            [&be32((ipco_box.len() + 8) as u32)[..], b"iprp", &ipco_box].concat();
+        // meta = FullBox：4 字节 version/flags
+        let meta_content: Vec<u8> = [&[0u8; 4][..], &iprp_box].concat();
+        let meta_box: Vec<u8> = [
+            &be32((meta_content.len() + 8) as u32)[..],
+            b"meta",
+            &meta_content,
+        ]
+        .concat();
+        // 假 mdat（RAW 数据所在，必须被 seek 跳过而非读入）
+        let mdat_box: Vec<u8> = [&be32(16)[..], b"mdat", &[0xAB; 8]].concat();
+        // ftyp：size 声明必须与实际字节数一致（4+4+4=12），否则遍历错位
+        let ftyp_box: Vec<u8> = [&be32(12)[..], b"ftyp", b"crx "].concat();
+
+        let file: Vec<u8> = [&ftyp_box[..], &meta_box, &mdat_box].concat();
+        std::fs::write(&f, &file).unwrap();
+
+        let got = cr3_embedded_jpeg(&f).unwrap();
+        assert_eq!(got.len(), jpeg.len());
+        assert_eq!(&got[..2], &[0xFF, 0xD8]);
+        // 非 ftyp 开头（普通 JPEG 文件）不该进 CR3 分支
+        let f2 = dir.join("plain.jpg");
+        std::fs::write(&f2, &jpeg).unwrap();
+        assert!(cr3_embedded_jpeg(&f2).is_none());
         std::fs::remove_dir_all(&dir).ok();
     }
 }

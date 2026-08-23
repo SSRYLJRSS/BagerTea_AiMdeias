@@ -98,13 +98,7 @@ fn render_name(
     // 文件名非法字符净化（含路径分隔符，杜绝穿越）
     let sanitized: String = out
         .chars()
-        .map(|c| {
-            if "<>:\"/\\|?*..".contains(c) && c != '.' {
-                '_'
-            } else {
-                c
-            }
-        })
+        .map(|c| if "<>:\"/\\|?*".contains(c) { '_' } else { c })
         .collect();
     let sanitized = sanitized
         .replace("..", "_")
@@ -124,6 +118,18 @@ fn validate_collection(name: &str) -> AppResult<()> {
     if n.is_empty() || n.contains("..") || n.contains('/') || n.contains('\\') || n.contains(':') {
         return Err(AppError::msg("非法分库名称"));
     }
+    Ok(())
+}
+
+/// 原子创建复制：create_new 保证目标文件此前不存在。
+/// 并行 stage 同名文件时各线程依次尝试候选名，谁先创建成功谁占用，杜绝互相覆盖
+fn copy_create_new(from: &Path, to: &Path) -> std::io::Result<()> {
+    let mut src = std::fs::File::open(from)?;
+    let mut dst = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(to)?;
+    std::io::copy(&mut src, &mut dst)?;
     Ok(())
 }
 
@@ -172,33 +178,35 @@ fn stage_file(file: &Path, opts: &ImportOptions, seq: usize) -> AppResult<PathBu
             .to_string_lossy()
             .into_owned()
     };
-    // 同名冲突加 (n) 后缀
-    let mut dest = dest_dir.join(&base_name);
-    if dest.exists() {
-        let stem = Path::new(&base_name)
-            .file_stem()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .into_owned();
-        for i in 1..1000 {
-            let c = dest_dir.join(format!("{stem}({i}).{ext}"));
-            if !c.exists() {
-                dest = c;
-                break;
-            }
-            // B06a：同名冲突耗尽时报错，不再回退覆盖已有文件
-            if i == 999 {
-                return Err(AppError::msg(format!("同名文件过多: {base_name}")));
-            }
+    // 同名冲突加 (n) 后缀：create_new 原子创建，②a 并行 stage 的多个同名文件
+    // 各自依次尝试候选名，先创建成功者占用——不再依赖 exists() 检查后复制（有竞态，
+    // 两线程会同时通过检查互相覆盖 → 数据丢失）
+    let stem = Path::new(&base_name)
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+    for i in 0..1000 {
+        let dest = if i == 0 {
+            dest_dir.join(&base_name)
+        } else {
+            dest_dir.join(format!("{stem}({i}).{ext}"))
+        };
+        match copy_create_new(file, &dest) {
+            Ok(()) => return Ok(dest),
+            // 该名字已被（并行任务或磁盘已有文件）占用，尝试下一个候选
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.into()),
         }
     }
-    std::fs::copy(file, &dest)?;
-    Ok(dest)
+    // B06a：同名冲突耗尽时报错，不再回退覆盖已有文件
+    Err(AppError::msg(format!("同名文件过多: {base_name}")))
 }
 
 // ── B01：元数据提取与回写（拆自原 import_one） ──
 
 /// 锁外提取的元数据（image_dimensions + EXIF + ffprobe）
+#[derive(Default)]
 struct AssetMeta {
     width: Option<i64>,
     height: Option<i64>,
@@ -206,19 +214,6 @@ struct AssetMeta {
     video_codec: Option<String>,
     audio_codec: Option<String>,
     exif: Option<exif_meta::ExifData>,
-}
-
-impl Default for AssetMeta {
-    fn default() -> Self {
-        Self {
-            width: None,
-            height: None,
-            duration_ms: None,
-            video_codec: None,
-            audio_codec: None,
-            exif: None,
-        }
-    }
 }
 
 /// B01：从已复制文件提取元数据（锁外，②a 阶段调用）
@@ -311,6 +306,10 @@ struct Processed {
     meta: Option<AssetMeta>,
 }
 
+/// 单文件处理结果：New 带完整元数据（大）、Duplicate/Failed 轻量。
+/// large_enum_variant：设计上 Failed(String)/Duplicate 高频创建，Box 化反而多一次分配；
+/// New 分支承载 90% 使用路径。集中豁免。
+#[allow(clippy::large_enum_variant)]
 enum ProcResult {
     New(Processed),
     Duplicate,
@@ -392,9 +391,7 @@ pub fn import_paths<F: Fn(ImportProgress) + Sync>(
                     .into_owned(),
             });
             let hash = match &hashes[idx] {
-                None => {
-                    return ProcResult::Failed(format!("{}: 读取文件失败", file.display()))
-                }
+                None => return ProcResult::Failed(format!("{}: 读取文件失败", file.display())),
                 Some(h) => h.clone(),
             };
             // precheck 用短锁（单次查询，微秒级）；TOCTOU 由 UNIQUE 约束兜底
@@ -466,11 +463,36 @@ pub fn import_paths<F: Fn(ImportProgress) + Sync>(
 
     // ②b：短锁批量写库（单事务，纯 INSERT/UPDATE，毫秒级）
     let mut pending_thumbs: Vec<(i64, PathBuf, String)> = Vec::new();
+    // 托管模式下 staged 是副本，重复跳过时需清理副本避免孤儿文件；原位模式 staged 即源文件，绝不能删
+    let managed = !opts
+        .library_root
+        .as_deref()
+        .unwrap_or_default()
+        .trim()
+        .is_empty();
     {
         let conn = db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
         let tx = conn.unchecked_transaction()?;
         for r in &processed {
             if let ProcResult::New(p) = r {
+                // 二次查重：②a 的并行 precheck 互不可见，同批同 hash 的两条会双双通过；
+                // 此处串行事务内逐条「查+写」，同批后到的与跨批并发（单写连接全串行）都能拦住
+                match dedup::hash_exists(&tx, &p.hash) {
+                    Ok(true) => {
+                        result.duplicates += 1;
+                        if managed {
+                            // 罕见路径：单 syscall 级清理，不破坏「锁外慢 IO」纪律
+                            let _ = std::fs::remove_file(&p.staged);
+                        }
+                        continue;
+                    }
+                    Ok(false) => {}
+                    Err(e) => {
+                        result.failed += 1;
+                        result.errors.push(format!("{}: {e}", p.staged.display()));
+                        continue;
+                    }
+                }
                 // B01：UNIQUE 约束兜底 TOCTOU——单条失败不中断整批
                 match write_one(&tx, p) {
                     Ok(id) => {
@@ -600,6 +622,13 @@ pub fn inspect_paths(paths: &[String]) -> ImportPlan {
         });
     }
     plan
+}
+
+/// 改名模板预览（前端 RenameBuilder 用）：与入库 stage 的 render_name 同源，
+/// 消除前后端双实现 drift；日期无源文件 mtime，以当前时间示意
+pub fn preview_rename(template: &str, collection: &str, orig_stem: &str, seq: usize) -> String {
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    render_name(template, collection, orig_stem, now_ms, seq)
 }
 
 #[cfg(test)]

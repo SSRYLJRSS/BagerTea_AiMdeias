@@ -1,6 +1,7 @@
 /** AI 打标（批次管理 + 确认流） */
 
-export type AiMode = "cloud" | "local" | "manual";
+/** 打标模式；auto = 建批时按激活档案 kind 解析为 cloud/local（P3-01a） */
+export type AiMode = "cloud" | "local" | "manual" | "auto";
 
 export interface AiBatch {
   id: number;
@@ -23,6 +24,8 @@ export interface AiSuggestion {
   suggestedTags: CategorizedTags;
   status: "pending" | "confirmed" | "rejected" | "modified";
   confirmedTags: CategorizedTags;
+  /** 单条打标失败原因（v6：失败详情落库，前端展示） */
+  lastError: string | null;
   createdAt: number;
 }
 

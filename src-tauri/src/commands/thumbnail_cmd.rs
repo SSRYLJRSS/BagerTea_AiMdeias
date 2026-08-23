@@ -63,9 +63,11 @@ pub async fn get_preview(state: State<'_, AppState>, path: String) -> AppResult<
 
 /// 清空缩略图缓存；B27：删文件后回写 DB（placeholder_path/hd_thumbnail_path = NULL），
 /// 避免 DB 仍指向已删文件导致前端破图
+/// P2-06：文件删除与 DB 回写拆锁——缓存较大/磁盘慢时不再长时间阻塞全部 DB 读写。
+/// 顺序固定为「短锁清库字段 → 锁外删文件」：先清 DB 后删文件，任何一步失败都不会
+/// 留下「DB 指向已删文件」的破图态（B27 语义保持）
 #[tauri::command]
 pub fn clear_thumbnail_cache(state: State<AppState>, kind: Option<String>) -> AppResult<()> {
-    let thumbs = ThumbnailService::new(&state.data_dir)?;
     {
         let conn = state
             .db
@@ -73,22 +75,21 @@ pub fn clear_thumbnail_cache(state: State<AppState>, kind: Option<String>) -> Ap
             .map_err(|_| AppError::msg("数据库锁中毒"))?;
         match kind.as_deref() {
             Some("placeholder") => {
-                thumbs.clear(Some("placeholder"))?;
                 // B27：回写 placeholder_path = NULL
                 assets::clear_all_placeholder_paths(&conn)?;
             }
             Some("hd") => {
-                thumbs.clear(Some("hd"))?;
                 // B27：回写 hd_thumbnail_path = NULL
                 assets::clear_all_hd_thumbnail_paths(&conn)?;
             }
             _ => {
-                thumbs.clear(None)?;
                 // B27：回写所有缩略图路径 = NULL
                 assets::clear_all_placeholder_paths(&conn)?;
                 assets::clear_all_hd_thumbnail_paths(&conn)?;
             }
         }
-    }
+    } // 短锁即放，文件删除在锁外执行
+    let thumbs = ThumbnailService::new(&state.data_dir)?;
+    thumbs.clear(kind.as_deref())?;
     Ok(())
 }

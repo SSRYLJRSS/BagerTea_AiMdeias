@@ -5,14 +5,17 @@ import { useShallow } from "zustand/react/shallow";
 import { open as pickDir } from "@tauri-apps/plugin-dialog";
 import Button from "@/components/common/Button";
 import ModelSelect from "@/components/common/ModelSelect";
+import { ollamaInstallStatus, ollamaRemoveInstaller } from "@/api/ollama";
 import { clearThumbnailCache, getDataDir, openDataDir } from "@/api/settings";
-import { useSettingsStore } from "@/stores/settingsStore";
+import LocalModelGroup from "@/components/settings/LocalModelGroup";
+import { applyTheme, useSettingsStore } from "@/stores/settingsStore";
 import type { ApiProfile, Settings } from "@/types/settings";
 
-type GroupKey = "ai" | "tags" | "library" | "cloud" | "general" | "data";
+type GroupKey = "ai" | "local" | "tags" | "library" | "cloud" | "general" | "data";
 
 const GROUPS: { key: GroupKey; label: string }[] = [
-  { key: "ai", label: "AI 打标" },
+  { key: "ai", label: "在线打标" },
+  { key: "local", label: "本地打标" },
   { key: "tags", label: "标签分类" },
   { key: "library", label: "入库与总库" },
   { key: "cloud", label: "网盘（M2）" },
@@ -21,8 +24,15 @@ const GROUPS: { key: GroupKey; label: string }[] = [
 ];
 
 export default function SettingsPage() {
-  const { settings, loaded, saving, load, save } = useSettingsStore(
-    useShallow((s) => ({ settings: s.settings, loaded: s.loaded, saving: s.saving, load: s.load, save: s.save })),
+  const { settings, loaded, saving, load, save, loadError } = useSettingsStore(
+    useShallow((s) => ({
+      settings: s.settings,
+      loaded: s.loaded,
+      saving: s.saving,
+      load: s.load,
+      save: s.save,
+      loadError: s.loadError,
+    })),
   );
   const [draft, setDraft] = useState<Settings | null>(null);
   const [group, setGroup] = useState<GroupKey>("ai");
@@ -31,6 +41,10 @@ export default function SettingsPage() {
   const [saved, setSaved] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+
+  // A3：安装包缓存（「数据与缓存」分组展示占用/清理）
+  const [installerInfo, setInstallerInfo] = useState<{ path: string; size: number } | null>(null);
+  const [removingInstaller, setRemovingInstaller] = useState(false);
 
   useEffect(() => {
     if (!loaded) void load();
@@ -44,7 +58,43 @@ export default function SettingsPage() {
     getDataDir().then(setDataDir).catch(() => undefined);
   }, []);
 
+  // 进入「数据与缓存」分组时刷新安装包缓存信息
+  useEffect(() => {
+    if (group !== "data") return;
+    ollamaInstallStatus()
+      .then((s) =>
+        s.installerPath ? setInstallerInfo({ path: s.installerPath, size: s.installerSize }) : setInstallerInfo(null),
+      )
+      .catch(() => setInstallerInfo(null));
+  }, [group]);
+
+  const onRemoveInstaller = async () => {
+    setRemovingInstaller(true);
+    try {
+      await ollamaRemoveInstaller();
+      setInstallerInfo(null);
+      setNotice("Ollama 安装包已删除");
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setRemovingInstaller(false);
+    }
+  };
+
   if (!draft) {
+    // P2-03：加载失败不能永久停留在「加载设置中…」——给出错误与重试入口；
+    // 且 settings 未加载时表单根本不渲染，天然杜绝「在默认设置上保存覆盖真实配置」
+    if (loadError) {
+      return (
+        <div className="flex h-full flex-col items-center justify-center gap-3 text-sm">
+          <p className="text-[var(--color-danger)]">设置加载失败：{loadError}</p>
+          <Button onClick={() => void load()}>重试</Button>
+          <p className="text-xs text-[var(--color-text-secondary)]">
+            加载成功前设置页不可编辑，避免覆盖真实配置
+          </p>
+        </div>
+      );
+    }
     return (
       <div className="flex h-full items-center justify-center text-sm text-[var(--color-text-secondary)]">
         加载设置中…
@@ -60,26 +110,27 @@ export default function SettingsPage() {
   const isDirty = !!settings && JSON.stringify(draft) !== JSON.stringify(settings);
   const patchAi = (patch: Partial<Settings["ai"]>) => dirty({ ...draft, ai: { ...draft.ai, ...patch } });
 
-  // ---- API 配置档案（多套中转站） ----
-  const profiles = draft.ai.profiles;
+  // ---- API 配置档案（在线打标：仅云端服务商/中转站；本地档案由「本地打标」分组管理） ----
+  const profiles = draft.ai.profiles.filter((p) => (p.kind ?? "cloud") !== "local");
   const editingProfile =
     profiles.find((p) => p.id === editProfileId) ?? profiles.find((p) => p.id === draft.ai.activeProfile) ?? profiles[0] ?? null;
   const updateProfile = (id: string, patch: Partial<ApiProfile>) =>
-    patchAi({ profiles: profiles.map((p) => (p.id === id ? { ...p, ...patch } : p)) });
+    patchAi({ profiles: draft.ai.profiles.map((p) => (p.id === id ? { ...p, ...patch } : p)) });
   const addProfile = () => {
     const p: ApiProfile = {
       id: crypto.randomUUID(),
       name: `配置 ${profiles.length + 1}`,
       apiMode: "openai",
+      kind: "cloud",
       baseUrl: "",
       apiKey: "",
       model: "qwen-vl-plus",
     };
-    patchAi({ profiles: [...profiles, p], activeProfile: p.id });
+    patchAi({ profiles: [...draft.ai.profiles, p], activeProfile: p.id });
     setEditProfileId(p.id);
   };
   const removeProfile = (id: string) => {
-    const rest = profiles.filter((p) => p.id !== id);
+    const rest = draft.ai.profiles.filter((p) => p.id !== id);
     patchAi({ profiles: rest, activeProfile: draft.ai.activeProfile === id ? (rest[0]?.id ?? "") : draft.ai.activeProfile });
     if (editProfileId === id) setEditProfileId(null);
   };
@@ -138,10 +189,13 @@ export default function SettingsPage() {
       <div className="min-w-0 flex-1 overflow-y-auto p-6">
         <div className="mx-auto flex max-w-xl flex-col gap-6">
           {group === "ai" && (
-            <Group title="AI 打标">
+            <Group title="在线打标">
+              <p className="-mt-2 text-xs text-[var(--color-text-secondary)]">
+                使用云端 API（中转站/服务商，如通义、智谱）识别素材；需要本地离线免费打标请到「本地打标」分组配置。
+              </p>
               <Field label="API 配置" hint="可添加多套中转站/服务商，点圆圈切换当前使用的一套">
                 <div className="flex flex-col gap-1.5">
-                  {draft.ai.profiles.map((p) => (
+                  {profiles.map((p) => (
                     <div key={p.id} className="flex items-center gap-2">
                       <button
                         onClick={() => patchAi({ activeProfile: p.id })}
@@ -184,7 +238,7 @@ export default function SettingsPage() {
 
               {editingProfile && (
                 <>
-                  <Field label="配置名称" hint="便于区分各中转站，如「通义官方」「中转 A」">
+                  <Field label="配置名称" hint="便于区分各中转站，如「通义官方」「智谱官方」">
                     <TextInput value={editingProfile.name} onChange={(v) => updateProfile(editingProfile.id, { name: v })} placeholder="中转站 A" />
                   </Field>
                   <Field label="API Mode" hint="接口协议格式，需与服务商匹配">
@@ -197,13 +251,20 @@ export default function SettingsPage() {
                       <option value="anthropic">Anthropic Messages（/messages）</option>
                     </select>
                   </Field>
-                  <Field label="Base URL" hint="云端打标 API 地址">
-                    <TextInput value={editingProfile.baseUrl} onChange={(v) => updateProfile(editingProfile.id, { baseUrl: v })} placeholder="https://api.example.com/v1" />
+                  <Field label="Base URL" hint="云端打标 API 地址（中转站/服务商）">
+                    <TextInput
+                      value={editingProfile.baseUrl}
+                      onChange={(v) => updateProfile(editingProfile.id, { baseUrl: v })}
+                      placeholder="https://api.example.com/v1"
+                    />
                   </Field>
                   <Field label="API Key" hint="仅存储在本地数据库">
                     <TextInput type="password" value={editingProfile.apiKey} onChange={(v) => updateProfile(editingProfile.id, { apiKey: v })} placeholder="sk-…" />
                   </Field>
-                  <Field label="模型" hint="自动从服务商拉取可选模型，也可手动输入">
+                  <Field
+                    label="模型"
+                    hint="自动从服务商拉取可选模型，也可手动输入"
+                  >
                     <ModelSelect apiMode={editingProfile.apiMode} baseUrl={editingProfile.baseUrl} apiKey={editingProfile.apiKey} value={editingProfile.model} onChange={(v) => updateProfile(editingProfile.id, { model: v })} />
                   </Field>
                 </>
@@ -228,6 +289,21 @@ export default function SettingsPage() {
                   onChange={(v) => patchAi({ batchLimit: Math.max(1, Number(v) || 1) })}
                 />
               </Field>
+            </Group>
+          )}
+
+          {group === "local" && (
+            <Group title="本地打标">
+              <p className="-mt-2 text-xs text-[var(--color-text-secondary)]">
+                使用本机 Ollama/LM Studio 视觉模型离线打标，免费且不联网。可一键安装引擎、拉取模型，并管理已下载的模型（删除释放磁盘空间）。
+              </p>
+              <LocalModelGroup
+                draft={draft}
+                onPatchAi={patchAi}
+                onPatchSettings={(patch) => dirty({ ...draft, ...patch })}
+                notify={(m) => setNotice(m)}
+                fail={(m) => setError(m)}
+              />
             </Group>
           )}
 
@@ -309,16 +385,27 @@ export default function SettingsPage() {
 
           {group === "general" && (
             <Group title="通用外观">
-              <Field label="主题" hint="跟随系统 / 浅色 / 深色">
+              <Field label="主题" hint="跟随系统 / 浅色 / 深色；切换即时预览，保存后记住">
                 <select
                   value={draft.theme}
-                  onChange={(e) => dirty({ ...draft, theme: e.target.value as Settings["theme"] })}
+                  onChange={(e) => {
+                    const t = e.target.value as Settings["theme"];
+                    applyTheme(t); // R-24：即时预览，不等保存
+                    dirty({ ...draft, theme: t });
+                  }}
                   className="rounded-md border border-[var(--color-border)] bg-[var(--color-surface)] px-2 py-1.5 text-sm outline-none"
                 >
                   <option value="system">跟随系统</option>
                   <option value="light">浅色</option>
                   <option value="dark">深色</option>
                 </select>
+              </Field>
+              <Field label="回收站保留天数" hint="超期后启动时自动彻底清理；0 = 不自动清理">
+                <TextInput
+                  type="number"
+                  value={String(draft.trashRetentionDays)}
+                  onChange={(v) => dirty({ ...draft, trashRetentionDays: Math.max(0, Number(v) || 0) })}
+                />
               </Field>
               <Field label="高清缩略图缓存上限" hint="单位 MB，超出后清理最久未用">
                 <TextInput
@@ -343,6 +430,20 @@ export default function SettingsPage() {
               <Field label="清除缓存" hint="手动清除高清缩略图缓存（浏览时会重新生成）">
                 <Button onClick={() => void onClearCache()}>立即清除</Button>
               </Field>
+              <Field
+                label="Ollama 安装包缓存"
+                hint={
+                  installerInfo
+                    ? `约 ${(installerInfo.size / 1024 / 1024).toFixed(0)} MB，供离线重装；删除后需重新下载`
+                    : "未缓存安装包（一键安装时自动下载）"
+                }
+              >
+                {installerInfo && (
+                  <Button variant="danger" disabled={removingInstaller} onClick={() => void onRemoveInstaller()}>
+                    {removingInstaller ? "删除中…" : "删除安装包"}
+                  </Button>
+                )}
+              </Field>
               <Field label="关于" hint="茶包素材 BagerTea AiMdeias V2 · 本地素材库">
                 <span className="text-sm text-[var(--color-text-secondary)]">v0.1.0</span>
               </Field>
@@ -351,7 +452,7 @@ export default function SettingsPage() {
 
           {/* 保存按钮统一在最后一项设置之后 */}
           <div className="flex items-center gap-3">
-            <Button variant="primary" disabled={saving || !isDirty} onClick={onSave}>
+            <Button variant="primary" disabled={saving || !isDirty || !!loadError} onClick={onSave}>
               {saving ? "保存中…" : "保存设置"}
             </Button>
             {isDirty && !saved && (

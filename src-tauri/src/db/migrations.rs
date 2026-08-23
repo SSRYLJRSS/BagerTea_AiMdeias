@@ -194,10 +194,7 @@ fn migrate_v2(conn: &Connection) -> AppResult<()> {
     };
     for (col, ty) in SCHEMA_V2_COLUMNS {
         if !existing.contains(*col) {
-            conn.execute(
-                &format!("ALTER TABLE assets ADD COLUMN {col} {ty}"),
-                [],
-            )?;
+            conn.execute(&format!("ALTER TABLE assets ADD COLUMN {col} {ty}"), [])?;
         }
     }
     Ok(())
@@ -255,6 +252,65 @@ INSERT INTO fts_content(asset_id, file_name, tag_names)
 INSERT INTO assets_fts(assets_fts) VALUES('rebuild');
 "#;
 
+/// v4：M3-02 去重扫描索引（hash GROUP BY 走索引，3 万素材红线）
+const SCHEMA_V4: &str = r#"
+CREATE INDEX IF NOT EXISTS idx_assets_hash ON assets(hash);
+"#;
+
+/// v5：S3 包——排序索引（R-21）+ 回收站 deleted_at（R-22）+ 打标流水 tag_ops（R-25）
+const SCHEMA_V5: &str = r#"
+CREATE INDEX IF NOT EXISTS idx_assets_taken_at ON assets(taken_at);
+CREATE INDEX IF NOT EXISTS idx_assets_size     ON assets(file_size);
+CREATE INDEX IF NOT EXISTS idx_assets_deleted  ON assets(deleted_at);
+
+-- 打标操作流水（R-25）：确认/摘标签写入，撤销按 batch_id 反向操作
+CREATE TABLE IF NOT EXISTS tag_ops (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  asset_id   INTEGER NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+  tag_id     INTEGER NOT NULL REFERENCES tags(id)  ON DELETE CASCADE,
+  op         TEXT    NOT NULL,             -- add | remove
+  actor      TEXT    NOT NULL,             -- manual | ai_cloud | ai_local
+  batch_id   INTEGER,                      -- AI 批次 id（手工操作为 NULL）
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_tag_ops_batch   ON tag_ops(batch_id);
+CREATE INDEX IF NOT EXISTS idx_tag_ops_created ON tag_ops(created_at);
+"#;
+
+/// B37 同款容错：检查表是否已有某列（SQLite ALTER ADD COLUMN 不支持 IF NOT EXISTS，
+/// 逐列检查再 ALTER，幂等可重入——中途崩溃重启重跑不会 panic）
+fn has_column(conn: &Connection, table: &str, column: &str) -> AppResult<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let rows = stmt.query_map([], |r| r.get::<_, String>(1))?;
+    let mut names = rows.filter_map(|r| r.ok());
+    Ok(names.any(|name| name == column))
+}
+
+/// B37 同款容错：先查列再 ALTER（deleted_at；SQLite ALTER 不支持 IF NOT EXISTS）
+fn migrate_v5(conn: &Connection) -> AppResult<()> {
+    if !has_column(conn, "assets", "deleted_at")? {
+        conn.execute("ALTER TABLE assets ADD COLUMN deleted_at INTEGER", [])?;
+    }
+    conn.execute_batch(SCHEMA_V5)?;
+    Ok(())
+}
+
+/// v6：本地打标错误详情——ai_suggestions 增加 last_error（单条失败原因落库供前端展示）
+fn migrate_v6(conn: &Connection) -> AppResult<()> {
+    if !has_column(conn, "ai_suggestions", "last_error")? {
+        conn.execute("ALTER TABLE ai_suggestions ADD COLUMN last_error TEXT", [])?;
+    }
+    Ok(())
+}
+
+/// v7：P1-04 导出任务软提示——export_tasks 增加 warning 列（status=done 时的注意事项）
+fn migrate_v7(conn: &Connection) -> AppResult<()> {
+    if !has_column(conn, "export_tasks", "warning")? {
+        conn.execute("ALTER TABLE export_tasks ADD COLUMN warning TEXT", [])?;
+    }
+    Ok(())
+}
+
 pub fn migrate(conn: &Connection) -> AppResult<()> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     if version < 1 {
@@ -270,6 +326,22 @@ pub fn migrate(conn: &Connection) -> AppResult<()> {
         // 先完成重建再提交 user_version=3：中途崩溃重启能重跑（V3 天然幂等）
         conn.execute_batch(SCHEMA_V3)?;
         conn.pragma_update(None, "user_version", 3)?;
+    }
+    if version < 4 {
+        conn.execute_batch(SCHEMA_V4)?;
+        conn.pragma_update(None, "user_version", 4)?;
+    }
+    if version < 5 {
+        migrate_v5(conn)?;
+        conn.pragma_update(None, "user_version", 5)?;
+    }
+    if version < 6 {
+        migrate_v6(conn)?;
+        conn.pragma_update(None, "user_version", 6)?;
+    }
+    if version < 7 {
+        migrate_v7(conn)?;
+        conn.pragma_update(None, "user_version", 7)?;
     }
     Ok(())
 }

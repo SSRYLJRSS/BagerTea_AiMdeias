@@ -2,15 +2,53 @@
 import { create } from "zustand";
 import { listAssets, listAssetIds } from "@/api/assets";
 import { useSelectionStore } from "@/stores/selectionStore";
-import type { Asset, AssetType } from "@/types/asset";
+import type { Asset, AssetFilter, AssetType } from "@/types/asset";
 
 const PAGE_SIZE = 200;
+
+/** 请求代际计数（模块级，跨 set 调用共享）：refresh/loadMore 响应回写前校验，
+ *  过期请求（筛选已变更/已有新请求发出）直接丢弃，防异步响应覆盖竞态（P1-01） */
+let requestSeq = 0;
+
+/** 按 id 去重（保持原顺序）：refresh/loadMore 统一走这里，防后端 offset 分页
+ *  在数据变动时返回重复 id → React 重复 key 警告（P2-08） */
+function dedupItems(arr: Asset[]): Asset[] {
+  const seen = new Set<number>();
+  const out: Asset[] = [];
+  for (const a of arr) {
+    if (!seen.has(a.id)) {
+      seen.add(a.id);
+      out.push(a);
+    }
+  }
+  return out;
+}
 
 export interface LibraryFilter {
   assetType: AssetType;
   untaggedOnly: boolean;
   tagId: number | null;
   search: string;
+  /** R-21 排序：created_at（默认）| taken_at | size | resolution */
+  sortBy: "created_at" | "taken_at" | "size" | "resolution";
+  sortDir: "desc" | "asc";
+  /** R-22：true = 回收站视图 */
+  trashOnly: boolean;
+}
+
+/** LibraryFilter → 后端 AssetFilter（统一出口，refresh/loadMore/fetchAllIds 共用） */
+function toApiFilter(f: LibraryFilter, offset: number, limit?: number): AssetFilter {
+  return {
+    assetType: f.assetType,
+    untaggedOnly: f.untaggedOnly,
+    tagId: f.tagId ?? undefined,
+    search: f.search || undefined,
+    sortBy: f.sortBy,
+    sortDir: f.sortDir,
+    trashOnly: f.trashOnly,
+    offset,
+    limit,
+  };
 }
 
 interface LibraryState {
@@ -34,28 +72,51 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
   total: 0,
   loading: false,
   error: null,
-  filter: { assetType: "all", untaggedOnly: false, tagId: null, search: "" },
+  filter: {
+    assetType: "all",
+    untaggedOnly: false,
+    tagId: null,
+    search: "",
+    sortBy: "created_at",
+    sortDir: "desc",
+    trashOnly: false,
+  },
 
   setFilter: (patch) => {
-    set((s) => ({ filter: { ...s.filter, ...patch } }));
+    // F18：筛选值未变化时 no-op（不刷新、不清选）。
+    // 根因：GridToolbar 重渲染导致 SearchInput 的 onSearch 引用变化、防抖定时器重启，
+    // 会把空串/相同值再次提交给 setFilter → 触发 B09 clear() → 「单击选中后自动取消」。
+    // 任何调用源（搜索/排序/标签/类型/回收站）提交相同筛选都不应产生副作用。
+    const prev = get().filter;
+    const next = { ...prev, ...patch };
+    if (
+      prev.assetType === next.assetType &&
+      prev.untaggedOnly === next.untaggedOnly &&
+      prev.tagId === next.tagId &&
+      prev.search === next.search &&
+      prev.sortBy === next.sortBy &&
+      prev.sortDir === next.sortDir &&
+      prev.trashOnly === next.trashOnly
+    ) {
+      return;
+    }
+    set({ filter: next });
     useSelectionStore.getState().clear(); // B09：筛选变更清空选中，避免跨筛选残留不可见 id
     void get().refresh();
   },
 
   refresh: async () => {
+    const seq = ++requestSeq;
+    const f = get().filter;
     set({ loading: true, error: null });
     try {
-      const f = get().filter;
-      const page = await listAssets({
-        assetType: f.assetType,
-        untaggedOnly: f.untaggedOnly,
-        tagId: f.tagId ?? undefined,
-        search: f.search || undefined,
-        offset: 0,
-        limit: PAGE_SIZE,
-      });
-      set({ items: page.items, total: page.total, loading: false });
+      const page = await listAssets(toApiFilter(f, 0, PAGE_SIZE));
+      // P1-01：响应返回时筛选可能已变更/更新请求已发出——过期响应直接丢弃，
+      // 不写 items/total、不碰 loading（loading 归最新请求管）
+      if (seq !== requestSeq) return;
+      set({ items: dedupItems(page.items), total: page.total, loading: false });
     } catch (e) {
+      if (seq !== requestSeq) return;
       set({ error: e instanceof Error ? e.message : String(e), loading: false });
     }
   },
@@ -63,16 +124,13 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
   loadMore: async () => {
     const { items, total, loading, filter } = get();
     if (loading || items.length >= total) return;
+    const seq = ++requestSeq;
     set({ loading: true });
     try {
-      const page = await listAssets({
-        assetType: filter.assetType,
-        untaggedOnly: filter.untaggedOnly,
-        tagId: filter.tagId ?? undefined,
-        search: filter.search || undefined,
-        offset: items.length,
-        limit: PAGE_SIZE,
-      });
+      // P1-01：用旧 items.length 做 offset 的请求在筛选变更后 offset 必然错位，
+      // 若期间已有新请求（refresh/loadMore），旧响应必须丢弃
+      const page = await listAssets(toApiFilter(filter, items.length, PAGE_SIZE));
+      if (seq !== requestSeq) return;
       const known = new Set(items.map((a) => a.id));
       set({
         items: [...items, ...page.items.filter((a) => !known.has(a.id))],
@@ -80,6 +138,7 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
         loading: false,
       });
     } catch (e) {
+      if (seq !== requestSeq) return;
       set({ error: e instanceof Error ? e.message : String(e), loading: false });
     }
   },
@@ -87,12 +146,7 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
   fetchAllIds: async () => {
     const { filter } = get();
     // 走 list_asset_ids：只取 id 数组，不拉完整 Asset、不依赖 total/limit
-    return listAssetIds({
-      assetType: filter.assetType,
-      untaggedOnly: filter.untaggedOnly,
-      tagId: filter.tagId ?? undefined,
-      search: filter.search || undefined,
-    });
+    return listAssetIds(toApiFilter(filter, 0));
   },
 
   removeLocal: (ids) => {
