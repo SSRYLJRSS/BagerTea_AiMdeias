@@ -5,13 +5,15 @@
 import { useCallback, useEffect, useState } from "react";
 import Modal from "@/components/common/Modal";
 import Button from "@/components/common/Button";
-import { deactivateTag, listTagGovernance, mergeTags, updateTag } from "@/api/tags";
+import { addTagAlias, deactivateTag, listTagGovernance, mergeTags, updateTag } from "@/api/tags";
 import { useTagStore } from "@/stores/tagStore";
 import type { Tag, TagFacetGovernance, TagNode } from "@/types/tag";
 
 interface TagManageDialogProps {
   open: boolean;
   onClose: () => void;
+  /** 上下文标题（§9.3）：分面详情内打开时体现上下文，如「分类词条：人物服装颜色」；缺省为「标签管理」 */
+  title?: string;
 }
 
 type RowAction = { kind: "merge" | "move" | "deactivate"; id: number } | null;
@@ -33,13 +35,15 @@ function collectSubtree(node: TagNode, acc: Set<number>): Set<number> {
   return acc;
 }
 
-export default function TagManageDialog({ open, onClose }: TagManageDialogProps) {
+export default function TagManageDialog({ open, onClose, title = "标签管理" }: TagManageDialogProps) {
   const tree = useTagStore((s) => s.tree);
   const refresh = useTagStore((s) => s.refresh);
   const [editing, setEditing] = useState<{ id: number; name: string } | null>(null);
   const [action, setAction] = useState<RowAction>(null);
   const [targetId, setTargetId] = useState<number | null>(null);
   const [confirmDel, setConfirmDel] = useState(false);
+  const [aliasRow, setAliasRow] = useState<{ id: number; name: string } | null>(null); // §6.5 别名
+  const [aliasInput, setAliasInput] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [governance, setGovernance] = useState<TagFacetGovernance[]>([]);
@@ -67,6 +71,8 @@ export default function TagManageDialog({ open, onClose }: TagManageDialogProps)
     setAction(null);
     setTargetId(null);
     setConfirmDel(false);
+    setAliasRow(null);
+    setAliasInput("");
     setError(null);
   };
 
@@ -120,6 +126,19 @@ export default function TagManageDialog({ open, onClose }: TagManageDialogProps)
     void run(() => deactivateTag(action.id));
   };
 
+  // §6.5 别名：新增别名（可搜索），复用现有 add_tag_alias 命令
+  const doAddAlias = () => {
+    if (!aliasRow) return;
+    const alias = aliasInput.trim();
+    if (!alias) {
+      setError("别名不能为空");
+      return;
+    }
+    void run(async () => {
+      await addTagAlias(aliasRow.id, alias);
+    });
+  };
+
   /** 合并/移动目标选项：排除自身子树（防环，后端也兜底校验） */
   const optionsFor = (id: number) => {
     const self = rows.find((r) => r.tag.id === id)?.node;
@@ -128,7 +147,7 @@ export default function TagManageDialog({ open, onClose }: TagManageDialogProps)
   };
 
   return (
-    <Modal open={open} title="标签管理" onClose={close} wide
+    <Modal open={open} title={title} onClose={close} wide
       footer={
         <>
           {error && <p className="mr-auto self-center text-xs text-[var(--color-danger)]">{error}</p>}
@@ -178,6 +197,7 @@ export default function TagManageDialog({ open, onClose }: TagManageDialogProps)
                     <RowBtn label="重命名" onClick={() => { reset(); setEditing({ id: tag.id, name: tag.name }); }} />
                     <RowBtn label="合并到…" onClick={() => { reset(); setAction({ kind: "merge", id: tag.id }); }} />
                     <RowBtn label="移动到…" onClick={() => { reset(); setAction({ kind: "move", id: tag.id }); }} />
+                    <RowBtn label="别名" onClick={() => { reset(); setAliasRow({ id: tag.id, name: tag.name }); }} />
                     <RowBtn label="停用" danger onClick={() => { reset(); setAction({ kind: "deactivate", id: tag.id }); }} />
                   </>
                 )}
@@ -250,6 +270,36 @@ export default function TagManageDialog({ open, onClose }: TagManageDialogProps)
                   {busy ? "停用中…" : confirmDel ? "确认停用" : "确认停用"}
                 </Button>
                 <Button disabled={busy} onClick={reset}>取消</Button>
+              </div>
+            )}
+
+            {/* §6.5 别名：显示现有别名 + 新增 */}
+            {aliasRow && aliasRow.id === tag.id && (
+              <div className="flex flex-col gap-1.5 px-2 py-1.5" style={{ paddingLeft: 8 + depth * 18 }}>
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <span className="text-xs text-[var(--color-text-secondary)]">别名：</span>
+                  {tag.aliases.length > 0 ? (
+                    tag.aliases.map((a) => (
+                      <span key={a} className="rounded bg-[var(--color-surface-hover)] px-1.5 py-0.5 text-[11px] text-[var(--color-text)]">
+                        {a}
+                      </span>
+                    ))
+                  ) : (
+                    <span className="text-[11px] text-[var(--color-text-tertiary)]">暂无别名</span>
+                  )}
+                </div>
+                <div className="flex items-center gap-2">
+                  <input
+                    autoFocus
+                    value={aliasInput}
+                    onChange={(e) => setAliasInput(e.target.value)}
+                    onKeyDown={(e) => e.key === "Enter" && doAddAlias()}
+                    placeholder="输入别名（可搜索）…"
+                    className="flex-1 rounded border border-[var(--color-border)] bg-[var(--color-surface)] px-2 py-1 text-sm text-[var(--color-text)] outline-none"
+                  />
+                  <Button variant="primary" disabled={busy} onClick={doAddAlias}>{busy ? "保存中…" : "添加"}</Button>
+                  <Button disabled={busy} onClick={reset}>关闭</Button>
+                </div>
               </div>
             )}
           </div>

@@ -4,8 +4,8 @@ import type { TagFacet } from "@/types/tag";
 import type { AiFacetConfig } from "@/types/settings";
 
 const baseFacets: TagFacet[] = [
-  { key: "subject", displayName: "主体/对象", description: "照片主体", selectionMode: "multi", maxItems: 5, sortOrder: 1, isSystem: true, status: "active" },
-  { key: "scene", displayName: "场景/地点", description: "拍摄场景", selectionMode: "multi", maxItems: 3, sortOrder: 2, isSystem: true, status: "active" },
+  { key: "subject", displayName: "主体/对象", description: "照片主体", selectionMode: "multi", maxItems: 5, sortOrder: 1, isSystem: true, status: "active", appliesTo: "all", createdAt: 1, updatedAt: 1 },
+  { key: "scene", displayName: "场景/地点", description: "拍摄场景", selectionMode: "multi", maxItems: 3, sortOrder: 2, isSystem: true, status: "active", appliesTo: "all", createdAt: 1, updatedAt: 1 },
 ];
 
 describe("buildWorkbenchFacets（指导书 §9.2/§9.3）", () => {
