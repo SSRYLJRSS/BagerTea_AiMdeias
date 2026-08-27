@@ -139,7 +139,11 @@ pub fn extract_frame(path: &Path, time_ms: i64, out: &Path, size: u32) -> bool {
                 if std::time::Instant::now() >= deadline {
                     let _ = child.kill();
                     let _ = child.wait();
-                    tracing::warn!("ffmpeg 抽帧超时（>{:?}），已终止：{}", FFMPEG_TIMEOUT, path.display());
+                    tracing::warn!(
+                        "ffmpeg 抽帧超时（>{:?}），已终止：{}",
+                        FFMPEG_TIMEOUT,
+                        path.display()
+                    );
                     break false;
                 }
                 std::thread::sleep(Duration::from_millis(50));

@@ -3,10 +3,20 @@ import { invoke, on } from "./client";
 import type { ImportResult } from "@/types/asset";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 
+/** 入库阶段（阶段 1 契约，见指导书 §4.4）：后端只发阶段进度，前端按权重计算整体进度。 */
+export type ImportPhase = "queued" | "scanning" | "hashing" | "processing" | "previewing" | "done";
+
 export interface ImportProgress {
-  current: number;
-  total: number;
-  file: string;
+  taskId: string;
+  phase: ImportPhase;
+  phaseCurrent: number;
+  /** 未知时必须显示不确定进度（不伪造百分比） */
+  phaseTotal: number | null;
+  file?: string;
+  imported: number;
+  duplicates: number;
+  failed: number;
+  message?: string;
 }
 
 export interface ImportOptions {

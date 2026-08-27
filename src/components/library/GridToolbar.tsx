@@ -5,6 +5,7 @@ import { useState } from "react";
 import SearchInput from "@/components/common/SearchInput";
 import Button from "@/components/common/Button";
 import ContextActionBar from "@/components/library/ContextActionBar";
+import SelectedFilterTags from "@/components/library/SelectedFilterTags";
 import { useShallow } from "zustand/react/shallow";
 import { useLibraryStore } from "@/stores/libraryStore";
 import { useSelectionStore } from "@/stores/selectionStore";
@@ -16,20 +17,23 @@ interface GridToolbarProps {
   onExport: () => void;
   onMove: () => void;
   onDelete: () => void;
-  onDedup: () => void;
+  /** 查找重复入口（暂隐藏，保留接线便于重新开启） */
+  onDedup?: () => void;
   /** R-22：回收站模式下的「彻底删除」（弹窗由 LibraryPage 托管） */
   onPurge: () => void;
 }
 
 /** R-21 排序选项（与后端 AssetFilter.sortBy 对齐） */
-const SORT_OPTIONS: { value: "created_at" | "taken_at" | "size" | "resolution"; label: string }[] = [
+const SORT_OPTIONS: { value: "created_at" | "taken_at" | "size" | "resolution" | "name" | "modified_at"; label: string }[] = [
   { value: "created_at", label: "入库时间" },
   { value: "taken_at", label: "拍摄时间" },
+  { value: "modified_at", label: "修改时间" },
+  { value: "name", label: "文件名" },
   { value: "size", label: "文件大小" },
   { value: "resolution", label: "分辨率" },
 ];
 
-export default function GridToolbar({ onAiTag, onAssignTags, onExport, onMove, onDelete, onDedup, onPurge }: GridToolbarProps) {
+export default function GridToolbar({ onAiTag, onAssignTags, onExport, onMove, onDelete, onPurge }: GridToolbarProps) {
   const { setFilter, total, sortBy, sortDir, trashOnly, removeLocal } = useLibraryStore(
     useShallow((s) => ({
       setFilter: s.setFilter,
@@ -58,7 +62,16 @@ export default function GridToolbar({ onAiTag, onAssignTags, onExport, onMove, o
 
   return (
     <div className="flex h-11 shrink-0 items-center gap-3 border-b border-[var(--color-border)] px-3">
+      {/* 设置入口（库页顶栏左侧，与搜索同行） */}
+      <button
+        onClick={() => window.dispatchEvent(new CustomEvent("app:navigate", { detail: "settings" }))}
+        className="shrink-0 rounded px-2 py-1 text-sm text-[var(--color-text-secondary)] transition-colors hover:bg-[var(--color-surface)] hover:text-[var(--color-text)]"
+      >
+        设置
+      </button>
+
       <SearchInput onSearch={(kw) => setFilter({ search: kw })} />
+      <SelectedFilterTags />
 
       {trashOnly ? (
         /* R-22 回收站操作条：恢复 / 彻底删除 */
@@ -80,13 +93,6 @@ export default function GridToolbar({ onAiTag, onAssignTags, onExport, onMove, o
       ) : (
         <>
           <ContextActionBar onAiTag={onAiTag} onAssignTags={onAssignTags} onExport={onExport} onMove={onMove} onDelete={onDelete} />
-          {/* 查找重复（M3-02）：不依赖选中，常驻入口 */}
-          <button
-            onClick={onDedup}
-            className="shrink-0 rounded px-2 py-1 text-xs text-[var(--color-text-secondary)] transition-colors hover:bg-[var(--color-surface)] hover:text-[var(--color-text)]"
-          >
-            查找重复
-          </button>
           {/* R-21 排序下拉 + 方向切换 */}
           <div className="flex shrink-0 items-center gap-0.5">
             <select

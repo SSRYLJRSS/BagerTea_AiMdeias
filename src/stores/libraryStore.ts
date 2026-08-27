@@ -2,7 +2,7 @@
 import { create } from "zustand";
 import { listAssets, listAssetIds } from "@/api/assets";
 import { useSelectionStore } from "@/stores/selectionStore";
-import type { Asset, AssetFilter, AssetType } from "@/types/asset";
+import type { Asset, AssetFilter, AssetType, FacetTagFilter, MetadataFilter } from "@/types/asset";
 
 const PAGE_SIZE = 200;
 
@@ -28,9 +28,12 @@ export interface LibraryFilter {
   assetType: AssetType;
   untaggedOnly: boolean;
   tagId: number | null;
+  facetFilters?: FacetTagFilter[];
+  excludeTagIds?: number[];
+  metadataFilters?: MetadataFilter[];
   search: string;
-  /** R-21 排序：created_at（默认）| taken_at | size | resolution */
-  sortBy: "created_at" | "taken_at" | "size" | "resolution";
+  /** R-21 排序：created_at（默认）| taken_at | modified_at | name | size | resolution */
+  sortBy: "created_at" | "taken_at" | "modified_at" | "name" | "size" | "resolution";
   sortDir: "desc" | "asc";
   /** R-22：true = 回收站视图 */
   trashOnly: boolean;
@@ -42,6 +45,9 @@ function toApiFilter(f: LibraryFilter, offset: number, limit?: number): AssetFil
     assetType: f.assetType,
     untaggedOnly: f.untaggedOnly,
     tagId: f.tagId ?? undefined,
+    facetFilters: f.facetFilters ?? [],
+    excludeTagIds: f.excludeTagIds ?? [],
+    metadataFilters: f.metadataFilters ?? [],
     search: f.search || undefined,
     sortBy: f.sortBy,
     sortDir: f.sortDir,
@@ -76,6 +82,9 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
     assetType: "all",
     untaggedOnly: false,
     tagId: null,
+    facetFilters: [],
+    excludeTagIds: [],
+    metadataFilters: [],
     search: "",
     sortBy: "created_at",
     sortDir: "desc",
@@ -93,6 +102,9 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
       prev.assetType === next.assetType &&
       prev.untaggedOnly === next.untaggedOnly &&
       prev.tagId === next.tagId &&
+      JSON.stringify(prev.facetFilters ?? []) === JSON.stringify(next.facetFilters ?? []) &&
+      JSON.stringify(prev.excludeTagIds ?? []) === JSON.stringify(next.excludeTagIds ?? []) &&
+      JSON.stringify(prev.metadataFilters ?? []) === JSON.stringify(next.metadataFilters ?? []) &&
       prev.search === next.search &&
       prev.sortBy === next.sortBy &&
       prev.sortDir === next.sortDir &&

@@ -7,8 +7,12 @@ pub mod cloud;
 pub mod dedup;
 pub mod export;
 pub mod migrations;
+pub mod query_expr;
 pub mod search;
+pub mod search_query;
 pub mod settings;
+mod sql_utils;
+pub mod tag_facets;
 pub mod tag_ops;
 pub mod tags;
 

@@ -1,11 +1,11 @@
-﻿//! QA 实测集成测试（2026-08-14 严过关）
+//! QA 实测集成测试（2026-08-14 严过关）
 //! 覆盖：migrations 幂等 / assets CRUD+级联删除 / LIKE 转义(% _ \) / FTS 搜索(海边vs上海湖边、引号文件名、ASCII 子串)
 //!       批量删除 / tag 父子/循环校验 / 分页边界
 //! 运行：cargo test --test qa_edge_tests
 
-use bagertea_ai_media_v2_lib::db::{self, ai, asset_tags, assets, migrations, tags};
 use bagertea_ai_media_v2_lib::db::ai::CategorizedTags;
 use bagertea_ai_media_v2_lib::db::assets::AssetFilter;
+use bagertea_ai_media_v2_lib::db::{self, ai, asset_tags, assets, migrations, tags};
 use bagertea_ai_media_v2_lib::error::AppResult;
 
 fn setup() -> rusqlite::Connection {
@@ -28,7 +28,7 @@ fn migrate_twice_is_idempotent() -> AppResult<()> {
     // 再次执行 migrate（user_version 已=7，幂等）
     migrations::migrate(&conn)?;
     let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    assert_eq!(v, 7);
+    assert_eq!(v, 11);
     // 表仍存在且可用
     add_asset(&conn, "d:/p/a.jpg", "a.jpg", "jpg", "image/jpeg");
     Ok(())
@@ -52,7 +52,13 @@ fn migrate_after_data_preserves_rows() -> AppResult<()> {
 #[test]
 fn delete_asset_cascades_tags_fts() -> AppResult<()> {
     let conn = setup();
-    let id = add_asset(&conn, "d:/p/海边日落.jpg", "海边日落.jpg", "jpg", "image/jpeg");
+    let id = add_asset(
+        &conn,
+        "d:/p/海边日落.jpg",
+        "海边日落.jpg",
+        "jpg",
+        "image/jpeg",
+    );
     let tag = tags::create(&conn, "海边", None)?;
     asset_tags::assign(&conn, &[id], &[tag.id], "manual")?;
     // 级联前
@@ -82,8 +88,17 @@ fn delete_tag_cascades_assignments_and_refreshes_fts() -> AppResult<()> {
     tags::delete(&conn, tag.id)?;
     // 关联清除 + FTS 无幻影；素材仍在库（变未打标）
     assert_eq!(count(&conn, "SELECT COUNT(*) FROM asset_tags"), 0);
-    assert!(db::search::search_asset_ids(&conn, "山野花")?.is_empty(), "删标签后 FTS 幻影命中");
-    let page = assets::list(&conn, &AssetFilter { untagged_only: true, ..Default::default() })?;
+    assert!(
+        db::search::search_asset_ids(&conn, "山野花")?.is_empty(),
+        "删标签后 FTS 幻影命中"
+    );
+    let page = assets::list(
+        &conn,
+        &AssetFilter {
+            untagged_only: true,
+            ..Default::default()
+        },
+    )?;
     assert_eq!(page.total, 1);
     Ok(())
 }
@@ -98,7 +113,11 @@ fn delete_parent_tag_cascades_children() -> AppResult<()> {
     asset_tags::assign(&conn, &[id], &[grand.id], "manual")?;
 
     tags::delete(&conn, parent.id)?;
-    assert_eq!(count(&conn, "SELECT COUNT(*) FROM tags"), 0, "子标签应级联删除");
+    assert_eq!(
+        count(&conn, "SELECT COUNT(*) FROM tags"),
+        0,
+        "子标签应级联删除"
+    );
     assert_eq!(count(&conn, "SELECT COUNT(*) FROM asset_tags"), 0);
     assert!(db::search::search_asset_ids(&conn, "日出")?.is_empty());
     Ok(())
@@ -109,13 +128,37 @@ fn delete_parent_tag_cascades_children() -> AppResult<()> {
 #[test]
 fn like_escape_percent() -> AppResult<()> {
     let conn = setup();
-    let hit = add_asset(&conn, "d:/p/进度100%.jpg", "进度100%.jpg", "jpg", "image/jpeg");
-    add_asset(&conn, "d:/p/进度100X.jpg", "进度100X.jpg", "jpg", "image/jpeg");
+    let hit = add_asset(
+        &conn,
+        "d:/p/进度100%.jpg",
+        "进度100%.jpg",
+        "jpg",
+        "image/jpeg",
+    );
+    add_asset(
+        &conn,
+        "d:/p/进度100X.jpg",
+        "进度100X.jpg",
+        "jpg",
+        "image/jpeg",
+    );
     // 1 字 → LIKE 兜底；% 必须转义为字面量（不应命中不含 % 的 100X）
     assert_eq!(db::search::search_asset_ids(&conn, "%")?, vec![hit]);
     // 2 字组合：%_ 连写 → LIKE 转义后应字面匹配
-    let hit2 = add_asset(&conn, "d:/p/50%_off.jpg", "50%_off.jpg", "jpg", "image/jpeg");
-    add_asset(&conn, "d:/p/50%Xoff.jpg", "50%Xoff.jpg", "jpg", "image/jpeg");
+    let hit2 = add_asset(
+        &conn,
+        "d:/p/50%_off.jpg",
+        "50%_off.jpg",
+        "jpg",
+        "image/jpeg",
+    );
+    add_asset(
+        &conn,
+        "d:/p/50%Xoff.jpg",
+        "50%Xoff.jpg",
+        "jpg",
+        "image/jpeg",
+    );
     assert_eq!(db::search::search_asset_ids(&conn, "%_")?, vec![hit2]);
     Ok(())
 }
@@ -126,15 +169,31 @@ fn like_escape_underscore() -> AppResult<()> {
     let hit = add_asset(&conn, "d:/p/a_b.jpg", "a_b.jpg", "jpg", "image/jpeg");
     add_asset(&conn, "d:/p/axb.jpg", "axb.jpg", "jpg", "image/jpeg");
     // "_" 必须转义为字面量，不能当单字符通配
-    assert_eq!(db::search::search_asset_ids(&conn, "_")?, vec![hit], "搜单下划线应只命中含 _ 的文件");
+    assert_eq!(
+        db::search::search_asset_ids(&conn, "_")?,
+        vec![hit],
+        "搜单下划线应只命中含 _ 的文件"
+    );
     Ok(())
 }
 
 #[test]
 fn like_escape_backslash() -> AppResult<()> {
     let conn = setup();
-    let hit = add_asset(&conn, "d:/p/dir\\file.jpg", "dir\\file.jpg", "jpg", "image/jpeg");
-    add_asset(&conn, "d:/p/dirXfile.jpg", "dirXfile.jpg", "jpg", "image/jpeg");
+    let hit = add_asset(
+        &conn,
+        "d:/p/dir\\file.jpg",
+        "dir\\file.jpg",
+        "jpg",
+        "image/jpeg",
+    );
+    add_asset(
+        &conn,
+        "d:/p/dirXfile.jpg",
+        "dirXfile.jpg",
+        "jpg",
+        "image/jpeg",
+    );
     // 单反斜杠 1 字 → LIKE；反斜杠作为字面量（同时验证转义本身不把 \ 当转义符吞掉）
     assert_eq!(db::search::search_asset_ids(&conn, "\\")?, vec![hit]);
     Ok(())
@@ -159,10 +218,20 @@ fn like_tag_name_with_special_char() -> AppResult<()> {
 #[test]
 fn fts_special_char_percent_query() -> AppResult<()> {
     let conn = setup();
-    add_asset(&conn, "d:/p/进度100%.jpg", "进度100%.jpg", "jpg", "image/jpeg");
+    add_asset(
+        &conn,
+        "d:/p/进度100%.jpg",
+        "进度100%.jpg",
+        "jpg",
+        "image/jpeg",
+    );
     // 预期（用户直觉）：含 % 文件名可被检索；实际：FTS 短语命中 token "100" 但索引 token 是 "度100" → 空
     let got = db::search::search_asset_ids(&conn, "100%")?;
-    assert_eq!(got, vec![1], "搜索「100%」应命中进度100%.jpg；实际返回 {got:?}（FTS token 边界缺陷）");
+    assert_eq!(
+        got,
+        vec![1],
+        "搜索「100%」应命中进度100%.jpg；实际返回 {got:?}（FTS token 边界缺陷）"
+    );
     Ok(())
 }
 
@@ -171,8 +240,20 @@ fn fts_special_char_percent_query() -> AppResult<()> {
 #[test]
 fn fts_cjk_phrase_3char_no_false_positive() -> AppResult<()> {
     let conn = setup();
-    let hit = add_asset(&conn, "d:/p/海边日落.jpg", "海边日落.jpg", "jpg", "image/jpeg");
-    add_asset(&conn, "d:/p/上海公园湖边合影.jpg", "上海公园湖边合影.jpg", "jpg", "image/jpeg");
+    let hit = add_asset(
+        &conn,
+        "d:/p/海边日落.jpg",
+        "海边日落.jpg",
+        "jpg",
+        "image/jpeg",
+    );
+    add_asset(
+        &conn,
+        "d:/p/上海公园湖边合影.jpg",
+        "上海公园湖边合影.jpg",
+        "jpg",
+        "image/jpeg",
+    );
     // 3 字 → FTS 短语：海边日 不得误命中「上海…湖边」
     assert_eq!(db::search::search_asset_ids(&conn, "海边日")?, vec![hit]);
     Ok(())
@@ -181,8 +262,20 @@ fn fts_cjk_phrase_3char_no_false_positive() -> AppResult<()> {
 #[test]
 fn fts_cjk_phrase_no_false_positive_4char() -> AppResult<()> {
     let conn = setup();
-    let hit = add_asset(&conn, "d:/p/海边日落.jpg", "海边日落.jpg", "jpg", "image/jpeg");
-    add_asset(&conn, "d:/p/上海公园湖边合影.jpg", "上海公园湖边合影.jpg", "jpg", "image/jpeg");
+    let hit = add_asset(
+        &conn,
+        "d:/p/海边日落.jpg",
+        "海边日落.jpg",
+        "jpg",
+        "image/jpeg",
+    );
+    add_asset(
+        &conn,
+        "d:/p/上海公园湖边合影.jpg",
+        "上海公园湖边合影.jpg",
+        "jpg",
+        "image/jpeg",
+    );
     assert_eq!(db::search::search_asset_ids(&conn, "海边日落")?, vec![hit]);
     Ok(())
 }
@@ -190,7 +283,13 @@ fn fts_cjk_phrase_no_false_positive_4char() -> AppResult<()> {
 #[test]
 fn fts_cjk_prefix_tokens_ok() -> AppResult<()> {
     let conn = setup();
-    let hit = add_asset(&conn, "d:/p/上海公园湖边合影.jpg", "上海公园湖边合影.jpg", "jpg", "image/jpeg");
+    let hit = add_asset(
+        &conn,
+        "d:/p/上海公园湖边合影.jpg",
+        "上海公园湖边合影.jpg",
+        "jpg",
+        "image/jpeg",
+    );
     // 「上海湖」跨 token 组合不应命中；「上海公园」应命中
     assert!(db::search::search_asset_ids(&conn, "上海湖")?.is_empty());
     assert_eq!(db::search::search_asset_ids(&conn, "上海公园")?, vec![hit]);
@@ -203,7 +302,10 @@ fn fts_filename_with_double_quote() -> AppResult<()> {
     let conn = setup();
     let name = "海边\"落日\".jpg";
     let hit = add_asset(&conn, &format!("d:/p/{name}"), name, "jpg", "image/jpeg");
-    assert_eq!(db::search::search_asset_ids(&conn, "海边\"落日\"")?, vec![hit]);
+    assert_eq!(
+        db::search::search_asset_ids(&conn, "海边\"落日\"")?,
+        vec![hit]
+    );
     Ok(())
 }
 
@@ -221,13 +323,23 @@ fn fts_filename_with_star() -> AppResult<()> {
 #[test]
 fn fts_ascii_partial_token_substring() -> AppResult<()> {
     let conn = setup();
-    let hit = add_asset(&conn, "d:/p/IMG_2024_001.jpg", "IMG_2024_001.jpg", "jpg", "image/jpeg");
+    let hit = add_asset(
+        &conn,
+        "d:/p/IMG_2024_001.jpg",
+        "IMG_2024_001.jpg",
+        "jpg",
+        "image/jpeg",
+    );
     // token 对齐：整词可命中
     assert_eq!(db::search::search_asset_ids(&conn, "IMG_2024")?, vec![hit]);
     assert_eq!(db::search::search_asset_ids(&conn, "001")?, vec![hit]);
     // token 内部子串：预期应命中（子串搜索一致性），实际待验证
     let got = db::search::search_asset_ids(&conn, "202")?;
-    assert_eq!(got, vec![hit], "搜索「202」应命中 IMG_2024_001.jpg（子串）；实际返回 {got:?}");
+    assert_eq!(
+        got,
+        vec![hit],
+        "搜索「202」应命中 IMG_2024_001.jpg（子串）；实际返回 {got:?}"
+    );
     let got2 = db::search::search_asset_ids(&conn, "IMG_202")?;
     assert_eq!(got2, vec![hit], "搜索「IMG_202」应命中；实际返回 {got2:?}");
     Ok(())
@@ -236,10 +348,20 @@ fn fts_ascii_partial_token_substring() -> AppResult<()> {
 #[test]
 fn fts_ascii_partial_token_photo() -> AppResult<()> {
     let conn = setup();
-    let hit = add_asset(&conn, "d:/p/photo001.jpg", "photo001.jpg", "jpg", "image/jpeg");
+    let hit = add_asset(
+        &conn,
+        "d:/p/photo001.jpg",
+        "photo001.jpg",
+        "jpg",
+        "image/jpeg",
+    );
     // "photo" 5 字 → FTS；预期子串命中，实际待验证
     let got = db::search::search_asset_ids(&conn, "photo")?;
-    assert_eq!(got, vec![hit], "搜索「photo」应命中 photo001.jpg；实际返回 {got:?}");
+    assert_eq!(
+        got,
+        vec![hit],
+        "搜索「photo」应命中 photo001.jpg；实际返回 {got:?}"
+    );
     Ok(())
 }
 
@@ -259,7 +381,15 @@ fn fts_punctuation_only_no_crash() -> AppResult<()> {
 fn batch_delete_assets() -> AppResult<()> {
     let conn = setup();
     let ids: Vec<i64> = (0..5)
-        .map(|i| add_asset(&conn, &format!("d:/p/b{i}.jpg"), &format!("b{i}.jpg"), "jpg", "image/jpeg"))
+        .map(|i| {
+            add_asset(
+                &conn,
+                &format!("d:/p/b{i}.jpg"),
+                &format!("b{i}.jpg"),
+                "jpg",
+                "image/jpeg",
+            )
+        })
         .collect();
     let tag = tags::create(&conn, "批量", None)?;
     asset_tags::assign(&conn, &ids, &[tag.id], "manual")?;
@@ -267,7 +397,11 @@ fn batch_delete_assets() -> AppResult<()> {
     let n = assets::delete(&conn, &[ids[0], ids[2], ids[4]])?;
     assert_eq!(n, 3);
     assert_eq!(count(&conn, "SELECT COUNT(*) FROM assets"), 2);
-    assert_eq!(count(&conn, "SELECT COUNT(*) FROM asset_tags"), 2, "级联后只剩 2 条关联");
+    assert_eq!(
+        count(&conn, "SELECT COUNT(*) FROM asset_tags"),
+        2,
+        "级联后只剩 2 条关联"
+    );
     assert_eq!(count(&conn, "SELECT COUNT(*) FROM fts_content"), 2);
     Ok(())
 }
@@ -343,7 +477,10 @@ fn tag_reparent_valid_moves() -> AppResult<()> {
 fn tag_reparent_to_nonexistent_rejected() -> AppResult<()> {
     let conn = setup();
     let a = tags::create(&conn, "A", None)?;
-    assert!(tags::update(&conn, a.id, None, Some(Some(424242))).is_err(), "挂到不存在父级应被 FK 拒绝");
+    assert!(
+        tags::update(&conn, a.id, None, Some(Some(424242))).is_err(),
+        "挂到不存在父级应被 FK 拒绝"
+    );
     Ok(())
 }
 
@@ -354,7 +491,13 @@ fn pagination_limit_zero_clamped() -> AppResult<()> {
     let conn = setup();
     add_asset(&conn, "d:/p/p0.jpg", "p0.jpg", "jpg", "image/jpeg");
     add_asset(&conn, "d:/p/p1.jpg", "p1.jpg", "jpg", "image/jpeg");
-    let page = assets::list(&conn, &AssetFilter { limit: 0, ..Default::default() })?;
+    let page = assets::list(
+        &conn,
+        &AssetFilter {
+            limit: 0,
+            ..Default::default()
+        },
+    )?;
     assert_eq!(page.items.len(), 1, "limit=0 应被钳制为 1");
     assert_eq!(page.total, 2);
     Ok(())
@@ -364,7 +507,13 @@ fn pagination_limit_zero_clamped() -> AppResult<()> {
 fn pagination_negative_offset_clamped() -> AppResult<()> {
     let conn = setup();
     add_asset(&conn, "d:/p/p0.jpg", "p0.jpg", "jpg", "image/jpeg");
-    let page = assets::list(&conn, &AssetFilter { offset: -5, ..Default::default() })?;
+    let page = assets::list(
+        &conn,
+        &AssetFilter {
+            offset: -5,
+            ..Default::default()
+        },
+    )?;
     assert_eq!(page.items.len(), 1, "负 offset 应钳制为 0");
     assert!(!page.has_more);
     Ok(())
@@ -374,7 +523,13 @@ fn pagination_negative_offset_clamped() -> AppResult<()> {
 fn pagination_offset_beyond_total() -> AppResult<()> {
     let conn = setup();
     add_asset(&conn, "d:/p/p0.jpg", "p0.jpg", "jpg", "image/jpeg");
-    let page = assets::list(&conn, &AssetFilter { offset: 10, ..Default::default() })?;
+    let page = assets::list(
+        &conn,
+        &AssetFilter {
+            offset: 10,
+            ..Default::default()
+        },
+    )?;
     assert!(page.items.is_empty(), "offset 超界应返回空");
     assert!(!page.has_more);
     assert_eq!(page.total, 1);
@@ -385,11 +540,30 @@ fn pagination_offset_beyond_total() -> AppResult<()> {
 fn pagination_has_more_boundary() -> AppResult<()> {
     let conn = setup();
     for i in 0..5 {
-        add_asset(&conn, &format!("d:/p/m{i}.jpg"), &format!("m{i}.jpg"), "jpg", "image/jpeg");
+        add_asset(
+            &conn,
+            &format!("d:/p/m{i}.jpg"),
+            &format!("m{i}.jpg"),
+            "jpg",
+            "image/jpeg",
+        );
     }
-    let p1 = assets::list(&conn, &AssetFilter { limit: 3, ..Default::default() })?;
+    let p1 = assets::list(
+        &conn,
+        &AssetFilter {
+            limit: 3,
+            ..Default::default()
+        },
+    )?;
     assert!(p1.has_more);
-    let p2 = assets::list(&conn, &AssetFilter { limit: 3, offset: 3, ..Default::default() })?;
+    let p2 = assets::list(
+        &conn,
+        &AssetFilter {
+            limit: 3,
+            offset: 3,
+            ..Default::default()
+        },
+    )?;
     assert!(!p2.has_more, "恰好取完应 has_more=false");
     assert_eq!(p2.items.len(), 2);
     Ok(())
@@ -407,7 +581,10 @@ fn fts_consistency_tag_rename() -> AppResult<()> {
 
     tags::update(&conn, tag.id, Some("大山花"), None)?;
     // 触发器应刷新 tag_names
-    assert!(db::search::search_asset_ids(&conn, "山野花")?.is_empty(), "改名后旧标签不应命中");
+    assert!(
+        db::search::search_asset_ids(&conn, "山野花")?.is_empty(),
+        "改名后旧标签不应命中"
+    );
     assert_eq!(db::search::search_asset_ids(&conn, "大山花")?, vec![id]);
     Ok(())
 }
@@ -416,7 +593,10 @@ fn fts_consistency_tag_rename() -> AppResult<()> {
 fn fts_consistency_asset_rename() -> AppResult<()> {
     let conn = setup();
     let id = add_asset(&conn, "d:/p/old.jpg", "old.jpg", "jpg", "image/jpeg");
-    conn.execute("UPDATE assets SET file_name = '新名字.jpg' WHERE id = ?1", [id])?;
+    conn.execute(
+        "UPDATE assets SET file_name = '新名字.jpg' WHERE id = ?1",
+        [id],
+    )?;
     assert_eq!(db::search::search_asset_ids(&conn, "新名字")?, vec![id]);
     assert!(db::search::search_asset_ids(&conn, "old")?.is_empty());
     Ok(())
@@ -439,15 +619,35 @@ fn fts_asset_tag_join_order_independent() -> AppResult<()> {
 #[test]
 fn fts_ascii_middle_substring() -> AppResult<()> {
     let conn = setup();
-    let hit = add_asset(&conn, "d:/p/IMG_2024_001.jpg", "IMG_2024_001.jpg", "jpg", "image/jpeg");
-    let hit2 = add_asset(&conn, "d:/p/photo001.jpg", "photo001.jpg", "jpg", "image/jpeg");
+    let hit = add_asset(
+        &conn,
+        "d:/p/IMG_2024_001.jpg",
+        "IMG_2024_001.jpg",
+        "jpg",
+        "image/jpeg",
+    );
+    let hit2 = add_asset(
+        &conn,
+        "d:/p/photo001.jpg",
+        "photo001.jpg",
+        "jpg",
+        "image/jpeg",
+    );
     // token 中部子串（非前缀）：024 命中 2024；oto 命中 photo001
     let mut got = db::search::search_asset_ids(&conn, "024")?;
     got.sort();
-    assert_eq!(got, vec![hit], "搜「024」应命中 IMG_2024_001.jpg（token 中部子串）");
+    assert_eq!(
+        got,
+        vec![hit],
+        "搜「024」应命中 IMG_2024_001.jpg（token 中部子串）"
+    );
     let mut got2 = db::search::search_asset_ids(&conn, "oto")?;
     got2.sort();
-    assert_eq!(got2, vec![hit2], "搜「oto」应命中 photo001.jpg（token 中部子串）");
+    assert_eq!(
+        got2,
+        vec![hit2],
+        "搜「oto」应命中 photo001.jpg（token 中部子串）"
+    );
     Ok(())
 }
 
@@ -456,7 +656,13 @@ fn fts_ascii_middle_substring() -> AppResult<()> {
 #[test]
 fn fts_cjk_ascii_mixed_substring() -> AppResult<()> {
     let conn = setup();
-    let id = add_asset(&conn, "d:/p/进度100%.jpg", "进度100%.jpg", "jpg", "image/jpeg");
+    let id = add_asset(
+        &conn,
+        "d:/p/进度100%.jpg",
+        "进度100%.jpg",
+        "jpg",
+        "image/jpeg",
+    );
     for q in ["100%", "100", "进度10"] {
         let mut got = db::search::search_asset_ids(&conn, q)?;
         got.sort();
@@ -520,7 +726,10 @@ fn list_ids_matches_list_filter() -> AppResult<()> {
     let tag = tags::create(&conn, "动物", None)?;
     asset_tags::assign(&conn, &[a1, a2], &[tag.id], "manual")?;
 
-    let mk = |asset_type: Option<&str>, untagged: bool, tag_id: Option<i64>, search: Option<&str>| AssetFilter {
+    let mk = |asset_type: Option<&str>,
+              untagged: bool,
+              tag_id: Option<i64>,
+              search: Option<&str>| AssetFilter {
         asset_type: asset_type.map(String::from),
         untagged_only: untagged,
         tag_id,
@@ -553,7 +762,13 @@ fn list_ids_matches_list_filter() -> AppResult<()> {
 #[test]
 fn v3_rebuild_normalizes_fts_content() -> AppResult<()> {
     let conn = setup(); // 已是 V3
-    let id = add_asset(&conn, "d:/p/进度100%.jpg", "进度100%.jpg", "jpg", "image/jpeg");
+    let id = add_asset(
+        &conn,
+        "d:/p/进度100%.jpg",
+        "进度100%.jpg",
+        "jpg",
+        "image/jpeg",
+    );
 
     // 模拟 V2 旧索引产物（旧 cjk_bigram：CJK↔非CJK 边界无空格 → "进 度100%.jpg"）
     conn.execute(
@@ -579,9 +794,9 @@ fn v3_rebuild_normalizes_fts_content() -> AppResult<()> {
     got.sort();
     assert_eq!(got, vec![id]);
 
-    // user_version 已升到 7（V3 及后续迁移链全部执行）
+    // user_version 已升到 9（V3 及后续迁移链全部执行）
     let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    assert_eq!(v, 7);
+    assert_eq!(v, 11);
 
     // 幂等：再跑一次 migrate 无副作用（version 已=7，不重跑）
     migrations::migrate(&conn)?;
@@ -592,7 +807,7 @@ fn v3_rebuild_normalizes_fts_content() -> AppResult<()> {
     )?;
     assert_eq!(fname2, "进 度 100%.jpg");
     let v2: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    assert_eq!(v2, 7);
+    assert_eq!(v2, 11);
     Ok(())
 }
 
@@ -601,10 +816,31 @@ fn v3_rebuild_normalizes_fts_content() -> AppResult<()> {
 #[test]
 fn fts_pure_symbols_no_false_positive() -> AppResult<()> {
     let conn = setup();
-    add_asset(&conn, "d:/p/海边日落.jpg", "海边日落.jpg", "jpg", "image/jpeg");
-    add_asset(&conn, "d:/p/photo001.jpg", "photo001.jpg", "jpg", "image/jpeg");
+    add_asset(
+        &conn,
+        "d:/p/海边日落.jpg",
+        "海边日落.jpg",
+        "jpg",
+        "image/jpeg",
+    );
+    add_asset(
+        &conn,
+        "d:/p/photo001.jpg",
+        "photo001.jpg",
+        "jpg",
+        "image/jpeg",
+    );
     // 3+ 字纯符号串 → FTS∪LIKE 混合分支：不得崩溃、不得误命中普通文件
-    for q in ["!!!", "@@@", "$$$", "^^^", "(((", "~~~", "!@#", "~!@#$%^&*()"] {
+    for q in [
+        "!!!",
+        "@@@",
+        "$$$",
+        "^^^",
+        "(((",
+        "~~~",
+        "!@#",
+        "~!@#$%^&*()",
+    ] {
         let got = db::search::search_asset_ids(&conn, q)?;
         assert!(got.is_empty(), "纯符号「{q}」应返回空；实际 {got:?}");
     }
@@ -625,7 +861,13 @@ fn fts_space_only_no_crash() -> AppResult<()> {
         assert!(got.is_empty(), "纯空白「{q:?}」应返回空；实际 {got:?}");
     }
     // 尾随空白应被 trim 忽略后正常命中
-    let hit = add_asset(&conn, "d:/p/海边日落.jpg", "海边日落.jpg", "jpg", "image/jpeg");
+    let hit = add_asset(
+        &conn,
+        "d:/p/海边日落.jpg",
+        "海边日落.jpg",
+        "jpg",
+        "image/jpeg",
+    );
     let got = db::search::search_asset_ids(&conn, "海边  ")?;
     assert_eq!(got, vec![hit], "尾随空白应被 trim 后命中；实际 {got:?}");
     Ok(())
@@ -634,8 +876,20 @@ fn fts_space_only_no_crash() -> AppResult<()> {
 #[test]
 fn fts_emoji_query_no_false_positive() -> AppResult<()> {
     let conn = setup();
-    add_asset(&conn, "d:/p/海边日落.jpg", "海边日落.jpg", "jpg", "image/jpeg");
-    add_asset(&conn, "d:/p/photo001.jpg", "photo001.jpg", "jpg", "image/jpeg");
+    add_asset(
+        &conn,
+        "d:/p/海边日落.jpg",
+        "海边日落.jpg",
+        "jpg",
+        "image/jpeg",
+    );
+    add_asset(
+        &conn,
+        "d:/p/photo001.jpg",
+        "photo001.jpg",
+        "jpg",
+        "image/jpeg",
+    );
     // 纯 emoji（非 CJK，3+ 字）→ 混合分支：不得崩溃、不得误命中
     let got = db::search::search_asset_ids(&conn, "😀😀😀")?;
     assert!(got.is_empty(), "纯 emoji 应返回空；实际 {got:?}");
@@ -650,9 +904,21 @@ fn fts_emoji_query_no_false_positive() -> AppResult<()> {
 #[test]
 fn fts_mixed_cjk_ascii_routing() -> AppResult<()> {
     let conn = setup();
-    let hit = add_asset(&conn, "d:/p/海边100.jpg", "海边100.jpg", "jpg", "image/jpeg");
+    let hit = add_asset(
+        &conn,
+        "d:/p/海边100.jpg",
+        "海边100.jpg",
+        "jpg",
+        "image/jpeg",
+    );
     let other = add_asset(&conn, "d:/p/海边10.jpg", "海边10.jpg", "jpg", "image/jpeg");
-    let cjk = add_asset(&conn, "d:/p/上海公园湖边合影.jpg", "上海公园湖边合影.jpg", "jpg", "image/jpeg");
+    let cjk = add_asset(
+        &conn,
+        "d:/p/上海公园湖边合影.jpg",
+        "上海公园湖边合影.jpg",
+        "jpg",
+        "image/jpeg",
+    );
 
     // 「海边100」：子串语义，仅命中 海边100.jpg（海边10.jpg 不含完整子串）
     let mut got = db::search::search_asset_ids(&conn, "海边100")?;
@@ -661,15 +927,27 @@ fn fts_mixed_cjk_ascii_routing() -> AppResult<()> {
     // 「海边1」：两个都含子串
     let mut got1 = db::search::search_asset_ids(&conn, "海边1")?;
     got1.sort();
-    assert_eq!(got1, vec![hit, other], "「海边1」应命中海边100与海边10；实际 {got1:?}");
+    assert_eq!(
+        got1,
+        vec![hit, other],
+        "「海边1」应命中海边100与海边10；实际 {got1:?}"
+    );
     // 「100」：纯 ASCII 3 字 → 并集，FTS token 100 与 LIKE 均命中
     let mut got100 = db::search::search_asset_ids(&conn, "100")?;
     got100.sort();
-    assert_eq!(got100, vec![hit], "「100」应命中海边100.jpg；实际 {got100:?}");
+    assert_eq!(
+        got100,
+        vec![hit],
+        "「100」应命中海边100.jpg；实际 {got100:?}"
+    );
     // 纯 CJK 4 字走 2 字块 AND：不受混合查询影响，仍命中上海公园湖边合影
     let mut gotc = db::search::search_asset_ids(&conn, "上海公园")?;
     gotc.sort();
-    assert_eq!(gotc, vec![cjk], "「上海公园」应命中上海公园湖边合影；实际 {gotc:?}");
+    assert_eq!(
+        gotc,
+        vec![cjk],
+        "「上海公园」应命中上海公园湖边合影；实际 {gotc:?}"
+    );
     Ok(())
 }
 
@@ -687,7 +965,10 @@ fn list_ids_matches_list_tag_subtree_and_combined() -> AppResult<()> {
     asset_tags::assign(&conn, &[a1], &[child.id], "manual")?;
     asset_tags::assign(&conn, &[a2], &[parent.id], "manual")?;
 
-    let mk = |asset_type: Option<&str>, untagged: bool, tag_id: Option<i64>, search: Option<&str>| AssetFilter {
+    let mk = |asset_type: Option<&str>,
+              untagged: bool,
+              tag_id: Option<i64>,
+              search: Option<&str>| AssetFilter {
         asset_type: asset_type.map(String::from),
         untagged_only: untagged,
         tag_id,
@@ -717,7 +998,10 @@ fn list_ids_matches_list_tag_subtree_and_combined() -> AppResult<()> {
         let mut from_ids = assets::list_ids(&conn, &f)?;
         from_list.sort();
         from_ids.sort();
-        assert_eq!(from_list, from_ids, "list_ids 与 list 的 id 集合应一致（filter={f:?}）");
+        assert_eq!(
+            from_list, from_ids,
+            "list_ids 与 list 的 id 集合应一致（filter={f:?}）"
+        );
     }
     Ok(())
 }
@@ -744,12 +1028,18 @@ fn v3_tag_names_follow_sort_order() -> AppResult<()> {
     let pos = |s: &str, c: char| s.find(c).expect("tag_names 应含该标签");
     // 默认同 sort_order=0 → 按 t.id 升序：甲 在 乙 前
     let n1 = names()?;
-    assert!(pos(&n1, '甲') < pos(&n1, '乙'), "同 sort_order 应按 id 升序聚合；实际 {n1:?}");
+    assert!(
+        pos(&n1, '甲') < pos(&n1, '乙'),
+        "同 sort_order 应按 id 升序聚合；实际 {n1:?}"
+    );
     // 把乙的 sort_order 调小，并用改名触发器强制重算（UPDATE OF name 即使值不变也会触发）
     conn.execute("UPDATE tags SET sort_order = -1 WHERE id = ?1", [t2.id])?;
     conn.execute("UPDATE tags SET name = '乙' WHERE id = ?1", [t2.id])?;
     let n2 = names()?;
-    assert!(pos(&n2, '乙') < pos(&n2, '甲'), "sort_order 更小的乙应排前（ORDER BY t.sort_order, t.id）；实际 {n2:?}");
+    assert!(
+        pos(&n2, '乙') < pos(&n2, '甲'),
+        "sort_order 更小的乙应排前（ORDER BY t.sort_order, t.id）；实际 {n2:?}"
+    );
     Ok(())
 }
 
@@ -769,10 +1059,13 @@ fn b19_list_limit_hard_cap_1000() -> AppResult<()> {
         );
     }
     // 前端传 limit=999999 → 服务端应钳制为 1000 上限
-    let page = assets::list(&conn, &AssetFilter {
-        limit: 999_999,
-        ..Default::default()
-    })?;
+    let page = assets::list(
+        &conn,
+        &AssetFilter {
+            limit: 999_999,
+            ..Default::default()
+        },
+    )?;
     assert_eq!(
         page.items.len(),
         1000,
@@ -797,11 +1090,18 @@ fn b19_list_ids_capped_at_100000() -> AppResult<()> {
         );
     }
     // list_ids 用于全选，上限 100000（远大于 5）→ 返回全部 5
-    let ids = assets::list_ids(&conn, &AssetFilter {
-        limit: 999_999,
-        ..Default::default()
-    })?;
-    assert_eq!(ids.len(), 5, "list_ids 应返回全部 5 条（上限 100000 未触发）");
+    let ids = assets::list_ids(
+        &conn,
+        &AssetFilter {
+            limit: 999_999,
+            ..Default::default()
+        },
+    )?;
+    assert_eq!(
+        ids.len(),
+        5,
+        "list_ids 应返回全部 5 条（上限 100000 未触发）"
+    );
     Ok(())
 }
 
@@ -822,20 +1122,26 @@ fn b37_v2_crash_recovery_all_columns_present() -> AppResult<()> {
     // 场景：V2 迁移中途崩溃（列已全部添加但 user_version 未提交为 2）
     // 重启后 version 仍为 1 → 重跑 V2 → migrate_v2 跳过已存在列 → 不 panic
     let conn = setup(); // version=3, 全部列存在
-    // 回退 version 到 1（模拟崩溃：列已加但 version 未提交）
+                        // 回退 version 到 1（模拟崩溃：列已加但 version 未提交）
     conn.pragma_update(None, "user_version", 1)?;
     // 重新迁移
     migrations::migrate(&conn)?;
-    // version 应升到 7（当前迁移链终版）
+    // version 应升到 11（当前迁移链终版）
     let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    assert_eq!(v, 7);
+    assert_eq!(v, 11);
     // 所有 V2 列仍在
     let cols = asset_columns(&conn);
     for c in V2_COLS {
         assert!(cols.contains(*c), "列 {c} 应存在");
     }
     // 库仍可用
-    add_asset(&conn, "d:/p/recover.jpg", "recover.jpg", "jpg", "image/jpeg");
+    add_asset(
+        &conn,
+        "d:/p/recover.jpg",
+        "recover.jpg",
+        "jpg",
+        "image/jpeg",
+    );
     Ok(())
 }
 
@@ -844,7 +1150,7 @@ fn b37_v2_partial_columns_recovery() -> AppResult<()> {
     // 场景：V2 迁移只加了一部分列就崩溃（如断电）
     // 重启后 version=1 + 部分列已存在 → migrate_v2 只添加缺失列
     let conn = setup(); // version=3, 全部列存在
-    // 模拟部分迁移：先回退 version，再删掉 3 个列
+                        // 模拟部分迁移：先回退 version，再删掉 3 个列
     conn.pragma_update(None, "user_version", 1)?;
     conn.execute("ALTER TABLE assets DROP COLUMN lens", [])?;
     conn.execute("ALTER TABLE assets DROP COLUMN aperture", [])?;
@@ -866,7 +1172,7 @@ fn b37_v2_partial_columns_recovery() -> AppResult<()> {
         assert!(cols_after.contains(*c), "迁移后列 {c} 应存在");
     }
     let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    assert_eq!(v, 7);
+    assert_eq!(v, 11);
     Ok(())
 }
 
@@ -879,7 +1185,7 @@ fn b37_fresh_install_all_v2_columns() -> AppResult<()> {
         assert!(cols.contains(*c), "全新安装后列 {c} 应存在");
     }
     let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    assert_eq!(v, 7);
+    assert_eq!(v, 11);
     Ok(())
 }
 
@@ -941,6 +1247,34 @@ fn b20_confirm_all_pending_no_pending_is_noop() -> AppResult<()> {
     // 不应有异常，confirmed 仍为 1
     let b = ai::get_batch(&conn, batch.id)?;
     assert_eq!(b.confirmed, 1);
+    Ok(())
+}
+
+// B-2：confirm_all_pending 只处理解析后标签非空的建议；空建议（{} / [] / 空白 JSON）不确认、不虚增计数。
+#[test]
+fn b21_confirm_all_pending_skips_empty_tags() -> AppResult<()> {
+    let conn = setup();
+    let a1 = add_asset(&conn, "d:/p/b21_1.jpg", "b21_1.jpg", "jpg", "image/jpeg");
+    let a2 = add_asset(&conn, "d:/p/b21_2.jpg", "b21_2.jpg", "jpg", "image/jpeg");
+    let batch = ai::create_batch(&conn, &[a1, a2], "cloud")?;
+    let suggs = ai::list_suggestions(&conn, batch.id)?;
+    assert_eq!(suggs.len(), 2);
+    // 第 1 条设非空标签；第 2 条保持空（create_batch 写入 '[]'）
+    ai::set_suggestion_tags(&conn, suggs[0].id, &mk_categorized_tags())?;
+
+    ai::confirm_all_pending(&conn, batch.id)?;
+
+    let after = ai::list_suggestions(&conn, batch.id)?;
+    let confirmed = after.iter().filter(|s| s.status == "confirmed").count();
+    let pending_empty = after
+        .iter()
+        .filter(|s| s.status == "pending" && s.suggested_tags.is_empty())
+        .count();
+    assert_eq!(confirmed, 1, "只应确认非空建议");
+    assert_eq!(pending_empty, 1, "空建议应保持 pending 不被误确认");
+    let b = ai::get_batch(&conn, batch.id)?;
+    assert_eq!(b.confirmed, 1, "空建议不应虚增 confirmed 计数");
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM asset_tags"), 1);
     Ok(())
 }
 

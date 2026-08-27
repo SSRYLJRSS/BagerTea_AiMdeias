@@ -5,6 +5,29 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::AppResult;
 
+/// AI 分面配置（P1B：tag_facets 是唯一事实源，设置只保存 facetKey/hint/enabledForAi/displayName）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiFacetConfig {
+    pub facet_key: String,
+    #[serde(default)]
+    pub hint: String,
+    /// 是否参与 AI 打标与 AI 搜索提示词
+    #[serde(default = "default_enabled_for_ai")]
+    pub enabled_for_ai: bool,
+    /// 可选本地化显示名；为空时用 tag_facets.display_name
+    #[serde(default)]
+    pub display_name: Option<String>,
+    /// 是否显示在人工打标工作台（独立于 enabled_for_ai）。
+    /// None = 未显式设置（前端按 WORKBENCH_DEFAULT_KEYS 决定默认显示；缺省不序列化）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visible_in_workbench: Option<bool>,
+}
+
+fn default_enabled_for_ai() -> bool {
+    true
+}
+
 /// 一套 API 配置档案（一个中转站/服务商）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -136,6 +159,7 @@ fn default_category_max() -> i64 {
 pub fn default_tag_categories() -> Vec<TagCategory> {
     [
         ("场景", "如公园/街道/室内，选最主要的一个", true),
+        ("色彩", "主色、色调与色彩关系，如青橙/暗调/冷调", false),
         ("色彩风格", "如胶片感/低饱和/高对比/清新", false),
         ("人物", "人物数量、年龄段、动作姿态，无人物则留空", false),
         ("物体", "画面中的关键物体", false),
@@ -190,8 +214,12 @@ pub struct Settings {
     #[serde(default = "default_cache_mb")]
     pub thumbnail_cache_mb: i64,
     /// 标签分类（PRD 5.5，设置页可管理）
-    #[serde(default = "default_tag_categories")]
+    /// 已弃用：机器协议迁移到 ai_facet_configs。保留字段作反序列化兼容，仅作迁移输入。
+    #[serde(default, skip_serializing)]
     pub tag_categories: Vec<TagCategory>,
+    /// AI 分面配置（P1B 唯一事实源，facet_key 稳定不可修改）
+    #[serde(default)]
+    pub ai_facet_configs: Vec<AiFacetConfig>,
     /// 总库位置（R-32）；空 = 原位索引模式
     #[serde(default)]
     pub library_root: String,
@@ -222,7 +250,8 @@ impl Default for Settings {
             ai: AiSettings::default(),
             theme: default_theme(),
             thumbnail_cache_mb: default_cache_mb(),
-            tag_categories: default_tag_categories(),
+            tag_categories: Vec::new(),
+            ai_facet_configs: Vec::new(),
             library_root: String::new(),
             trash_retention_days: default_trash_retention_days(),
             custom_download_sources: default_custom_sources(),
@@ -245,16 +274,98 @@ pub fn remove_custom_source(s: &mut Settings, id: &str) -> bool {
 
 const KEY: &str = "app_settings";
 
+/// 把旧的 tag_categories（中文分类名）映射为 ai_facet_configs（稳定 facet_key）。
+/// 这是唯一一次迁移：此后业务只读 ai_facet_configs。
+fn migrate_tag_categories_to_facets(s: &mut Settings) {
+    if s.tag_categories.is_empty() {
+        return;
+    }
+    let mut existing: std::collections::HashSet<String> = s
+        .ai_facet_configs
+        .iter()
+        .map(|c| c.facet_key.clone())
+        .collect();
+    for cat in &s.tag_categories {
+        let facet = super::tag_facets::key_for_legacy_name(&cat.name).to_string();
+        if existing.contains(&facet) {
+            // 同分面重复：合并 hint（旧 hint 非空则保留）
+            if let Some(cfg) = s.ai_facet_configs.iter_mut().find(|c| c.facet_key == facet) {
+                if cfg.hint.is_empty() && !cat.hint.is_empty() {
+                    cfg.hint = cat.hint.clone();
+                }
+            }
+            continue;
+        }
+        existing.insert(facet.clone());
+        s.ai_facet_configs.push(AiFacetConfig {
+            facet_key: facet,
+            hint: cat.hint.clone(),
+            enabled_for_ai: true,
+            display_name: None,
+            visible_in_workbench: None,
+        });
+    }
+    s.tag_categories.clear();
+}
+
+/// 全新/无配置时，用默认分面清单充实 ai_facet_configs（保证 AI 打标有提示词上下文）。
+fn normalize_ai_facet_defaults(s: &mut Settings) {
+    if s.ai_facet_configs.is_empty() {
+        for cat in default_tag_categories() {
+            let facet = super::tag_facets::key_for_legacy_name(&cat.name).to_string();
+            if s.ai_facet_configs.iter().any(|c| c.facet_key == facet) {
+                continue;
+            }
+            s.ai_facet_configs.push(AiFacetConfig {
+                facet_key: facet,
+                hint: cat.hint,
+                enabled_for_ai: true,
+                display_name: None,
+                visible_in_workbench: None,
+            });
+        }
+    }
+}
+
+/// C-5/V11：存量库补齐独立 color 分面的 AI 配置 —— 老库可能已把「色彩风格」归 style 而缺少 color。
+/// 幂等：已有 color 配置则不变；只补默认，不覆盖用户已有的 style hint 或任何配置内容。
+pub fn ensure_color_facet_config(conn: &Connection) -> AppResult<()> {
+    let mut stmt = conn.prepare("SELECT value FROM settings WHERE key = ?1")?;
+    let mut rows = stmt.query([KEY])?;
+    let Some(row) = rows.next()? else {
+        return Ok(());
+    };
+    let raw: String = row.get(0)?;
+    let mut s: Settings = serde_json::from_str(&raw).unwrap_or_default();
+    if s.ai_facet_configs.iter().any(|c| c.facet_key == "color") {
+        return Ok(());
+    }
+    s.ai_facet_configs.push(AiFacetConfig {
+        facet_key: "color".into(),
+        hint: "主色、色调与色彩关系，如青橙/暗调/冷调".into(),
+        enabled_for_ai: true,
+        display_name: None,
+        visible_in_workbench: None,
+    });
+    save_settings(conn, &s)?;
+    Ok(())
+}
+
 pub fn get_settings(conn: &Connection) -> AppResult<Settings> {
     let mut stmt = conn.prepare("SELECT value FROM settings WHERE key = ?1")?;
     let mut rows = stmt.query([KEY])?;
     if let Some(row) = rows.next()? {
         let raw: String = row.get(0)?;
         let mut s: Settings = serde_json::from_str(&raw).unwrap_or_default();
+        // 兼容迁移：旧 tag_categories → ai_facet_configs；全空则用默认分面清单
+        migrate_tag_categories_to_facets(&mut s);
+        normalize_ai_facet_defaults(&mut s);
         s.ai.normalize();
         return Ok(s);
     }
-    Ok(Settings::default())
+    let mut d = Settings::default();
+    normalize_ai_facet_defaults(&mut d);
+    Ok(d)
 }
 
 pub fn save_settings(conn: &Connection, s: &Settings) -> AppResult<()> {
@@ -263,6 +374,24 @@ pub fn save_settings(conn: &Connection, s: &Settings) -> AppResult<()> {
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         rusqlite::params![KEY, serde_json::to_string(s)?],
     )?;
+    Ok(())
+}
+
+/// V10 迁移：读 settings JSON → 旧 tag_categories 转 ai_facet_configs → 写回。
+/// 幂等：已转（tag_categories 为空）则不变。立即落库，保证重启后无需再转。
+pub fn normalize_settings_persist(conn: &Connection) -> AppResult<()> {
+    let mut stmt = conn.prepare("SELECT value FROM settings WHERE key = ?1")?;
+    let mut rows = stmt.query([KEY])?;
+    let Some(row) = rows.next()? else {
+        return Ok(());
+    };
+    let raw: String = row.get(0)?;
+    let mut s: Settings = serde_json::from_str(&raw).unwrap_or_default();
+    // 标记是否需要写回（tag_categories 有值说明未迁移）
+    if !s.tag_categories.is_empty() {
+        migrate_tag_categories_to_facets(&mut s);
+        save_settings(conn, &s)?;
+    }
     Ok(())
 }
 
@@ -343,5 +472,65 @@ mod tests {
         assert!(remove_custom_source(&mut s, "custom-1"));
         assert_eq!(s.custom_download_sources.len(), 0);
         assert!(!remove_custom_source(&mut s, "custom-1"));
+    }
+
+    #[test]
+    fn legacy_tag_categories_migrate_to_facet_configs() {
+        let mut s: Settings = serde_json::from_str(
+            r#"{"tagCategories":[{"name":"场景","hint":"如公园/街道","single":true,"max":1},
+                {"name":"未知分类","hint":"hint-x","single":false,"max":3}]}"#,
+        )
+        .unwrap();
+        // get_settings 会调用的迁移
+        super::migrate_tag_categories_to_facets(&mut s);
+        assert!(s.tag_categories.is_empty());
+        let scene = s
+            .ai_facet_configs
+            .iter()
+            .find(|c| c.facet_key == "scene")
+            .expect("场景应映射到 scene");
+        assert_eq!(scene.hint, "如公园/街道");
+        assert!(scene.enabled_for_ai);
+        // 未知分类 → custom
+        let custom = s
+            .ai_facet_configs
+            .iter()
+            .find(|c| c.facet_key == "custom")
+            .expect("未知分类应归 custom");
+        assert_eq!(custom.hint, "hint-x");
+    }
+
+    #[test]
+    fn facet_config_roundtrip_json() {
+        let c = AiFacetConfig {
+            facet_key: "scene".into(),
+            hint: "海边".into(),
+            enabled_for_ai: true,
+            display_name: Some("场景".into()),
+            visible_in_workbench: None,
+        };
+        let json = serde_json::to_string(&c).unwrap();
+        let back: AiFacetConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.facet_key, "scene");
+        assert_eq!(back.display_name.as_deref(), Some("场景"));
+        // 未显式设置 visibleInWorkbench 不序列化（前端按白名单兜底）
+        assert!(back.visible_in_workbench.is_none());
+        assert!(!json.contains("visibleInWorkbench"));
+    }
+
+    #[test]
+    fn old_serialization_skips_legacy_tag_categories() {
+        let mut s = Settings::default();
+        s.tag_categories.push(TagCategory {
+            name: "场景".into(),
+            hint: String::new(),
+            single: false,
+            max: 3,
+        });
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(
+            !json.contains("tagCategories"),
+            "tag_categories 不应再序列化"
+        );
     }
 }

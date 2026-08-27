@@ -146,27 +146,26 @@ beforeEach(() => {
 });
 
 describe("AssetGrid 单击选择语义", () => {
-  it("单击未选中卡片 → 独占选中它；再击已选中卡片 → 取消选择（v2.8）", async () => {
+  it("单击未选中卡片 → 选中它；再击已选中卡片 → 取消（E-1 切换语义）", async () => {
     const assets = [mkAsset(1), mkAsset(2)];
     useLibraryStore.setState({ items: assets, total: 2 });
     renderGrid();
     const card1 = cardByName("a1.jpg");
     expect(card1).toBeTruthy();
 
-    // F19：普通单击 = 追加多选
+    // 普通单击 = 交给 store 决定加/删
     fireEvent.click(card1);
     expect(Array.from(useSelectionStore.getState().selected)).toEqual([1]);
     expect(card1.getAttribute("aria-selected")).toBe("true");
 
-    // 再单击另一张 → 追加（都选上，不是独占替换）
+    // 再单击另一张 → 追加（都选上）
     const card2 = cardByName("a2.jpg");
     fireEvent.click(card2);
     expect(Array.from(useSelectionStore.getState().selected).sort()).toEqual([1, 2]);
 
-    // 单击已选中的卡片 → 保持不变（不再取消；减选走 Ctrl+单击/Esc/空白）
+    // 单击已选中的卡片 → 取消该素材（不再是「保持不变」）
     fireEvent.click(card1);
-    fireEvent.click(card2);
-    expect(Array.from(useSelectionStore.getState().selected).sort()).toEqual([1, 2]);
+    expect(Array.from(useSelectionStore.getState().selected)).toEqual([2]);
   });
 
   it("选中集有跨筛选残留时单击追加：不误清已有选中", async () => {
@@ -242,28 +241,28 @@ describe("AssetGrid 单击选择语义", () => {
 });
 
 describe("AssetGrid 双击预览（F19 语义）", () => {
-  it("单击选中 → 双击预览：选中保持（第二击不丢选中）", () => {
+  it("双击预览：第二次点击按 E-1 切换（取消选中），但仍打开预览", () => {
     const assets = [mkAsset(1), mkAsset(2)];
     useLibraryStore.setState({ items: assets, total: 2 });
     const preview = vi.fn();
     renderGrid(preview);
     const card = cardByName("a1.jpg");
 
-    fireEvent.click(card);
-    fireEvent.click(card); // 双击的第二击
-    fireEvent.dblClick(card);
-    expect(Array.from(useSelectionStore.getState().selected)).toEqual([1]);
+    fireEvent.click(card); // 单击选中 a1（但双击的第二击会 cancel 掉）
+    fireEvent.click(card); // 双击的第二击（E-1：已在选中 → 取消）
+    fireEvent.dblClick(card); // 打开预览
+    expect(Array.from(useSelectionStore.getState().selected)).toEqual([]);
     expect(preview).toHaveBeenCalledTimes(1);
   });
 
-  it("单击已选中卡片保持不动（不再取消；取消走 Esc/空白/菜单）", () => {
+  it("单击已选中的卡片再击 → 取消（E-1 不再「保持不变」）", () => {
     const assets = [mkAsset(1), mkAsset(2)];
     useLibraryStore.setState({ items: assets, total: 2 });
     renderGrid();
     const card = cardByName("a1.jpg");
 
     fireEvent.click(card);
-    fireEvent.click(card); // 再击已选中：保持不变
-    expect(Array.from(useSelectionStore.getState().selected)).toEqual([1]);
+    fireEvent.click(card); // 再击已选中：取消
+    expect(Array.from(useSelectionStore.getState().selected)).toEqual([]);
   });
 });

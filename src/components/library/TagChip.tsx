@@ -13,10 +13,10 @@ export default function TagChip({ label, active, onClick, onRemove }: TagChipPro
     <span
       onClick={onClick}
       className={clsx(
-        "inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-xs transition-colors",
+        "inline-flex items-center gap-1 rounded-[4px] border px-2 py-1 text-xs transition-colors",
         active
           ? "border-[var(--color-accent)] bg-[var(--color-accent)] text-[var(--color-accent-text)]"
-          : "border-[var(--color-border)] text-[var(--color-text)] hover:border-[var(--color-accent)]",
+          : "border-[var(--color-border)] bg-[var(--color-surface)] text-[var(--color-text)] hover:border-[var(--color-status)]",
         onClick && "cursor-pointer",
       )}
     >

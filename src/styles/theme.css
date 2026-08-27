@@ -4,29 +4,47 @@
  * R-24：<html> 的 data-theme 属性控制 light|dark；system（或属性缺失）时跟随 prefers-color-scheme。
  */
 @theme {
-  --color-bg: #ffffff;
-  --color-surface: #f7f7f5;
-  --color-border: #e9e9e7;
-  --color-text: #37352f;
-  --color-text-secondary: #787774;
+  /* Bagertea visual language: warm gallery neutrals, ink actions, restrained amber status. */
+  --color-bg: #fafaf8;
+  --color-surface: #f3f2ee;
+  --color-surface-raised: #ffffff;
+  --color-surface-hover: #eeece7;
+  --color-border: #e2e0da;
+  --color-border-strong: #d2cfc7;
+  --color-text: #292824;
+  --color-text-secondary: #716e66;
+  --color-text-tertiary: #96928a;
   /* 黑白灰高级感（PRD v2.4 老板拍板）：强调色=近黑，按钮文字=白 */
   --color-accent: #37352f;
   --color-accent-hover: #000000;
   --color-accent-text: #ffffff;
+  --color-status: #a66d2f;
+  --color-status-soft: #f3e8d8;
+  --color-success: #566856;
   --color-danger: #eb5757;
-  --font-sans: ui-sans-serif, system-ui, "Segoe UI", "Microsoft YaHei", sans-serif;
+  --shadow-soft: 0 10px 30px rgb(48 47 43 / 8%);
+  --radius-control: 8px;
+  --radius-item: 6px;
+  --font-sans: "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", sans-serif;
 }
 
 /* 暗色：显式指定 dark（Notion 暗色系配色） */
 :root[data-theme="dark"] {
   --color-bg: #191919;
   --color-surface: #202020;
+  --color-surface-raised: #242424;
+  --color-surface-hover: #292929;
   --color-border: #2f2f2f;
+  --color-border-strong: #3b3b3b;
   --color-text: #d4d4d2;
-  --color-text-secondary: #9b9b9b;
+  --color-text-secondary: #aaa9a4;
+  --color-text-tertiary: #888781;
   --color-accent: #e8e8e6;
   --color-accent-hover: #ffffff;
   --color-accent-text: #191919;
+  --color-status: #d2a367;
+  --color-status-soft: #3a3025;
+  --color-success: #99aa95;
   --color-danger: #eb5757;
 }
 
@@ -36,12 +54,19 @@
   :root[data-theme="system"] {
     --color-bg: #191919;
     --color-surface: #202020;
+    --color-surface-raised: #242424;
+    --color-surface-hover: #292929;
     --color-border: #2f2f2f;
+    --color-border-strong: #3b3b3b;
     --color-text: #d4d4d2;
-    --color-text-secondary: #9b9b9b;
+    --color-text-secondary: #aaa9a4;
+    --color-text-tertiary: #888781;
     --color-accent: #e8e8e6;
     --color-accent-hover: #ffffff;
     --color-accent-text: #191919;
+    --color-status: #d2a367;
+    --color-status-soft: #3a3025;
+    --color-success: #99aa95;
     --color-danger: #eb5757;
   }
 }

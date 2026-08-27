@@ -22,19 +22,37 @@ fn probe_real_files() {
 
         let t = Instant::now();
         let emb = imaging::embedded_preview(p);
-        println!("{label} 内嵌提取: {:?} → {}", t.elapsed(), emb.as_ref().map(|b| format!("{}KB", b.len() / 1024)).unwrap_or("无".into()));
+        println!(
+            "{label} 内嵌提取: {:?} → {}",
+            t.elapsed(),
+            emb.as_ref()
+                .map(|b| format!("{}KB", b.len() / 1024))
+                .unwrap_or("无".into())
+        );
 
         let t = Instant::now();
         let thumb = imaging::decode_thumb(p, 320);
-        println!("{label} decode_thumb(320): {:?} → {:?}", t.elapsed(), thumb.as_ref().map(image::GenericImageView::dimensions));
+        println!(
+            "{label} decode_thumb(320): {:?} → {:?}",
+            t.elapsed(),
+            thumb.as_ref().map(image::GenericImageView::dimensions)
+        );
 
         let t = Instant::now();
         let hd = imaging::decode_thumb(p, 1280);
-        println!("{label} decode_thumb(1280): {:?} → {:?}", t.elapsed(), hd.as_ref().map(image::GenericImageView::dimensions));
+        println!(
+            "{label} decode_thumb(1280): {:?} → {:?}",
+            t.elapsed(),
+            hd.as_ref().map(image::GenericImageView::dimensions)
+        );
 
         let t = Instant::now();
         let full = image::open(p).ok();
-        println!("{label} 全解码(对照): {:?} → {:?}\n", t.elapsed(), full.as_ref().map(image::GenericImageView::dimensions));
+        println!(
+            "{label} 全解码(对照): {:?} → {:?}\n",
+            t.elapsed(),
+            full.as_ref().map(image::GenericImageView::dimensions)
+        );
     }
 }
 
@@ -45,13 +63,95 @@ fn probe_exif_error() {
     let f = std::fs::File::open(p).unwrap();
     match exif::Reader::new().read_from_container(&mut std::io::BufReader::new(f)) {
         Ok(ex) => {
-            for tag in [exif::Tag::JPEGInterchangeFormat, exif::Tag::JPEGInterchangeFormatLength] {
-                println!("THUMB  {:?}: {:?}", tag, ex.get_field(tag, exif::In::THUMBNAIL).map(|f| &f.value));
-                println!("PRIM   {:?}: {:?}", tag, ex.get_field(tag, exif::In::PRIMARY).map(|f| &f.value));
+            for tag in [
+                exif::Tag::JPEGInterchangeFormat,
+                exif::Tag::JPEGInterchangeFormatLength,
+            ] {
+                println!(
+                    "THUMB  {:?}: {:?}",
+                    tag,
+                    ex.get_field(tag, exif::In::THUMBNAIL).map(|f| &f.value)
+                );
+                println!(
+                    "PRIM   {:?}: {:?}",
+                    tag,
+                    ex.get_field(tag, exif::In::PRIMARY).map(|f| &f.value)
+                );
             }
         }
         Err(e) => println!("kamadak 解析失败: {e}"),
     }
+}
+
+/// 阶段2 §5.2：RAW 样本基准——逐文件记录 format/file_size/resolution/embedded_preview_found/
+/// embedded_preview_ms/placeholder_ms/hd_preview_ms/failure_reason。
+/// 真实样本到位后跑：设环境变量 RAW_SAMPLES_DIR 指向含 CR3/NEF/ARW/RAF/RW2/DNG 的目录。
+#[test]
+#[ignore = "手动性能探针（需真实 RAW 样本目录）"]
+fn probe_raw_benchmark() {
+    let dir = std::path::PathBuf::from(
+        std::env::var("RAW_SAMPLES_DIR").unwrap_or_else(|_| r"F:\raw_samples".into()),
+    );
+    if !dir.exists() {
+        println!("RAW_BENCH 样本目录不存在: {dir:?}（设 RAW_SAMPLES_DIR 指向真实 RAW 目录后再跑）");
+        return;
+    }
+    let raws = ["cr3", "nef", "arw", "raf", "rw2", "dng", "cr2", "orf", "pef", "srw", "x3f"];
+    let mut entries: Vec<_> = std::fs::read_dir(&dir)
+        .map(|rd| rd.filter_map(|e| e.ok()).map(|e| e.path()).collect())
+        .unwrap_or_default();
+    entries.sort();
+    let mut rows = Vec::new();
+    for p in entries {
+        let ext = p
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or_default()
+            .to_lowercase();
+        if !raws.contains(&ext.as_str()) {
+            continue;
+        }
+        let file_size = p.metadata().map(|m| m.len()).unwrap_or(0);
+        let format = ext.clone();
+
+        let t = Instant::now();
+        let emb = imaging::embedded_preview(&p);
+        let embedded_preview_ms = t.elapsed().as_millis() as u64;
+        let embedded_preview_found = emb.is_some();
+
+        let t = Instant::now();
+        let ph = imaging::decode_thumb(&p, 320);
+        let placeholder_ms = t.elapsed().as_millis() as u64;
+
+        let t = Instant::now();
+        let hd = imaging::decode_thumb(&p, 1280);
+        let hd_preview_ms = t.elapsed().as_millis() as u64;
+
+        let resolution = hd
+            .as_ref()
+            .or(ph.as_ref())
+            .map(|i| {
+                let (w, h) = image::GenericImageView::dimensions(i);
+                format!("{w}x{h}")
+            })
+            .unwrap_or_default();
+        let failure_reason = if hd.is_none() && ph.is_none() {
+            "双黑图（须归因）".to_string()
+        } else {
+            String::new()
+        };
+        println!(
+            "RAW_BENCH |{format}|{file_size}|{resolution}|emb={embedded_preview_found}|{embedded_preview_ms}ms|ph={placeholder_ms}ms|hd={hd_preview_ms}ms|{failure_reason}"
+        );
+        rows.push((format, file_size, resolution, embedded_preview_found, embedded_preview_ms, placeholder_ms, hd_preview_ms, failure_reason));
+    }
+    let found = rows.iter().filter(|r| r.3).count();
+    println!(
+        "RAW_BENCH 汇总: {} 样本，内嵌预览命中 {}，占比 {:.1}%",
+        rows.len(),
+        found,
+        if rows.is_empty() { 0.0 } else { found as f64 / rows.len() as f64 * 100.0 }
+    );
 }
 
 /// F06：100 张混合格式占位层解码吞吐（合成样本，模拟入库占位图阶段）

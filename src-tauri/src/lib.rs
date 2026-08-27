@@ -28,8 +28,8 @@ pub fn run() {
         tracing::error!(?db_path, "数据库初始化失败: {e}");
         panic!("数据库初始化失败: {e}");
     });
-    if let Err(e) = db::tags::seed_presets(&conn) {
-        tracing::warn!("预置标签播种失败: {e}");
+    if let Err(e) = db::tags::retire_unused_presets(&conn) {
+        tracing::warn!("旧预置标签清理失败: {e}");
     }
 
     // asset 协议放行用（data_dir 稍后会 move 进 AppState）
@@ -93,6 +93,15 @@ pub fn run() {
                     });
                 }
             }
+            // 阶段 5 §8.2：应用重启时把遗留 processing 批次标记为 interrupted（可一键续跑）
+            {
+                let conn = state.db.lock().map_err(|_| AppError::msg("数据库锁中毒"));
+                if let Ok(c) = conn {
+                    if let Err(e) = db::ai::mark_interrupted_batches(&c) {
+                        tracing::warn!("标记中断批次失败: {e}");
+                    }
+                }
+            }
             Ok(())
         })
         .plugin(tauri_plugin_dialog::init())
@@ -104,12 +113,15 @@ pub fn run() {
             // 素材
             commands::list_assets,
             commands::list_asset_ids,
+            commands::list_metadata_facets,
             commands::get_asset,
             commands::delete_assets,
             commands::trash_restore,
             commands::dedup_scan,
             commands::get_asset_urls,
             commands::reveal_in_folder,
+            // 超级搜索
+            commands::ai_parse_search_query,
             // 入库
             commands::import_files,
             commands::inspect_import,
@@ -117,10 +129,18 @@ pub fn run() {
             commands::preview_rename,
             // 标签
             commands::list_tags,
+            commands::list_tag_facets,
+            commands::list_tags_by_facet,
+            commands::list_tag_governance,
+            commands::search_tag_candidates,
+            commands::create_canonical_tag,
+            commands::add_tag_alias,
             commands::create_tag,
             commands::update_tag,
             commands::delete_tag,
+            commands::deactivate_tag,
             commands::tag_merge,
+            commands::merge_tags_preserve_alias,
             commands::assign_tags,
             commands::remove_tags,
             commands::get_asset_tags,
@@ -141,6 +161,8 @@ pub fn run() {
             commands::ai_cancel_batch,
             commands::ai_list_batches,
             commands::ai_list_suggestions,
+            commands::ai_list_suggestion_items,
+            commands::ai_decide_suggestion_item,
             commands::ai_confirm_suggestion,
             commands::ai_reject_suggestion,
             commands::ai_restore_suggestion,

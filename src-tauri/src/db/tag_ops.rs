@@ -70,10 +70,24 @@ pub fn recent(conn: &Connection, limit: i64) -> AppResult<Vec<TagOp>> {
     Ok(rows)
 }
 
-/// 批次撤销（R-25）：按流水倒序反向操作——add→摘除、remove→挂回（actor 沿用原值）；
+/// 批次撤销（R-25 + 指导书 D）：按流水倒序反向操作——add→摘除、remove→挂回（actor 沿用原值）；
 /// 反向操作本身不再写流水（撤销即回滚，历史保留原记录）。
-/// 幂等：重复撤销无副作用（摘除已不在的关联 / 挂回已存在的关联均被跳过）。
+/// D-2/D-3：摘除关联必须带来源批次约束（source_batch_id = 当前批次）且排除手工来源（source != 'manual'），
+///          保证撤销不误删用户后续手工/重新添加的标签。
+/// D-4：撤销成功后置批次状态为 undone；重复撤销幂等返回 0（已撤销批次直接返回，不修改数据）。
+/// D-5：remove 反串挂回的关联 source_batch_id 为 NULL（恢复后的关联不再属于被撤销批次）；本轮不实现 redo。
 pub fn undo_batch(conn: &Connection, batch_id: i64) -> AppResult<u64> {
+    // D-4：已撤销批次重复撤销幂等返回 0
+    let status: String = conn
+        .query_row(
+            "SELECT status FROM ai_batches WHERE id = ?1",
+            [batch_id],
+            |r| r.get(0),
+        )
+        .unwrap_or_default();
+    if status == "undone" {
+        return Ok(0);
+    }
     let ops: Vec<(i64, i64, String, String)> = {
         let mut stmt = conn.prepare(
             "SELECT asset_id, tag_id, op, actor FROM tag_ops
@@ -100,15 +114,19 @@ pub fn undo_batch(conn: &Connection, batch_id: i64) -> AppResult<u64> {
     for (asset_id, tag_id, op, actor) in &ops {
         match op.as_str() {
             "add" => {
+                // D-3：只删「当前批次写入且非手工」的关联，防误删用户后续手工/重新添加的标签
                 applied += tx.execute(
-                    "DELETE FROM asset_tags WHERE asset_id = ?1 AND tag_id = ?2",
-                    rusqlite::params![asset_id, tag_id],
+                    "DELETE FROM asset_tags WHERE asset_id = ?1 AND tag_id = ?2
+                        AND source_batch_id = ?3 AND source != 'manual'",
+                    rusqlite::params![asset_id, tag_id, batch_id],
                 )? as u64;
             }
             "remove" => {
+                // D-5：重插不写 source_batch_id（恢复后的关联不再属于被撤销批次）
                 let inserted = tx.execute(
-                    "INSERT OR IGNORE INTO asset_tags (asset_id, tag_id, source, created_at)
-                     VALUES (?1, ?2, ?3, ?4)",
+                    "INSERT OR IGNORE INTO asset_tags
+                     (asset_id, tag_id, source, created_at, confirmation, confirmed_at, confirmed_by)
+                     VALUES (?1, ?2, ?3, ?4, 'confirmed', ?4, ?3)",
                     rusqlite::params![asset_id, tag_id, actor, now],
                 )?;
                 applied += inserted as u64;
@@ -116,6 +134,11 @@ pub fn undo_batch(conn: &Connection, batch_id: i64) -> AppResult<u64> {
             _ => {}
         }
     }
+    // D-4：撤销成功后置 undone（不再显示可点击撤销；不影响历史 confirmed 计数语义）
+    tx.execute(
+        "UPDATE ai_batches SET status = 'undone' WHERE id = ?1",
+        [batch_id],
+    )?;
     tx.commit()?;
     Ok(applied)
 }

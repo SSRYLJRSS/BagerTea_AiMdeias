@@ -116,7 +116,7 @@ impl ThumbnailService {
                     None
                 }
             }; // 释放 DB 锁
-            // B05：锁外执行 LRU 清理（纯文件系统操作，不持锁）
+               // B05：锁外执行 LRU 清理（纯文件系统操作，不持锁）
             if let Some(max_mb) = cleanup_mb {
                 let _ = self.cleanup_lru(max_mb);
             }

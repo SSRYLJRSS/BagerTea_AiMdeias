@@ -37,6 +37,10 @@ cargo test --test perf_probe -- --ignored   # 真实文件性能探针（默认 
 
 **三关交付线**（每次交付前必须全过）：`cargo test` 全绿 ＋ `npm run typecheck` 零报错 ＋ `npm run build` 通过。
 
+### 2.1 UI 开发规范
+
+界面开发必须遵循 [UI_DESIGN_SYSTEM.md](./UI_DESIGN_SYSTEM.md)。新增页面和组件应优先复用 `src/styles/theme.css` 的语义变量，以及 `src/styles/index.css` 中的基础控件、区块标题和导航状态类，不在业务组件内另建一套无语义灰色、圆角和选中态。
+
 ## 三、铁律（不可协商）
 
 ### 3.1 文档先行

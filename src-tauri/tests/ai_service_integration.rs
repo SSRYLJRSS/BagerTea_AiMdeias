@@ -12,7 +12,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use bagertea_ai_media_v2_lib::db::ai::{self, AiSuggestion};
-use bagertea_ai_media_v2_lib::db::settings::{AiSettings, ApiProfile, TagCategory};
+use bagertea_ai_media_v2_lib::db::settings::{AiSettings, ApiProfile};
+use bagertea_ai_media_v2_lib::db::tag_facets::FacetPromptContext;
 use bagertea_ai_media_v2_lib::db::{self, assets};
 use bagertea_ai_media_v2_lib::error::AppResult;
 use bagertea_ai_media_v2_lib::services::thumbnail::ThumbnailService;
@@ -55,7 +56,9 @@ macro_rules! conn_retry_test {
         #[test]
         fn $name() -> AppResult<()> {
             let attempt = || {
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> AppResult<()> { $body }))
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> AppResult<()> {
+                    $body
+                }))
             };
             for n in 0..=2u32 {
                 match attempt() {
@@ -76,7 +79,10 @@ macro_rules! conn_retry_test {
                             .unwrap_or_default();
                         if is_conn_err_text(&msg) && n < 2 {
                             let shown: String = msg.chars().take(200).collect();
-                            eprintln!("[conn-retry {}] 断言含连接层错误特征，重建环境重跑: {shown}", n + 1);
+                            eprintln!(
+                                "[conn-retry {}] 断言含连接层错误特征，重建环境重跑: {shown}",
+                                n + 1
+                            );
                             continue;
                         }
                         std::panic::resume_unwind(payload);
@@ -89,9 +95,7 @@ macro_rules! conn_retry_test {
 }
 
 fn make_image(dir: &Path, name: &str, salt: u32) {
-    let img = image::RgbImage::from_fn(8, 8, |x, y| {
-        image::Rgb([x as u8, (y + salt) as u8, 128])
-    });
+    let img = image::RgbImage::from_fn(8, 8, |x, y| image::Rgb([x as u8, (y + salt) as u8, 128]));
     image::DynamicImage::ImageRgb8(img)
         .save_with_format(dir.join(name), image::ImageFormat::Jpeg)
         .expect("生成测试图失败");
@@ -157,12 +161,14 @@ fn settings_with(profile: ApiProfile) -> AiSettings {
     }
 }
 
-fn categories() -> Vec<TagCategory> {
-    vec![TagCategory {
-        name: "场景".into(),
+fn categories() -> Vec<FacetPromptContext> {
+    vec![FacetPromptContext {
+        key: "scene".into(),
+        display_name: "场景".into(),
+        description: "场景".into(),
         hint: String::new(),
-        single: true,
-        max: 3,
+        selection_mode: "single".into(),
+        max_items: Some(3),
     }]
 }
 
@@ -186,7 +192,10 @@ fn assert_ok_json_req(req: &RecordedRequest, path: &str, auth_prefix: &str) {
         .header_authorization
         .as_ref()
         .expect("应带 authorization 头");
-    assert!(auth.starts_with(auth_prefix), "authorization 应为 {auth_prefix}…，实际 {auth}");
+    assert!(
+        auth.starts_with(auth_prefix),
+        "authorization 应为 {auth_prefix}…，实际 {auth}"
+    );
 }
 
 fn openai_ok_body(tags_json: &str) -> String {
@@ -200,9 +209,8 @@ fn openai_ok_body(tags_json: &str) -> String {
 // OpenAI 兼容模式：批次 pending→processing→done，建议 tags 落库，progress 回调推进
 conn_retry_test!(openai_success_writes_suggestions_and_progress, {
     let _g = common::net_lock_guard();
-    let srv = MockServer::start(|_req| {
-        HttpResponse::ok_json(&openai_ok_body(r#"{"场景":["公园"]}"#))
-    });
+    let srv =
+        MockServer::start(|_req| HttpResponse::ok_json(&openai_ok_body(r#"{"场景":["公园"]}"#)));
     let dbm = Arc::new(Mutex::new(db::init_memory()?));
     let tmp = tempfile::tempdir()?;
     let thumbs = ThumbnailService::new(&tmp.path().join("data"))?;
@@ -228,7 +236,7 @@ conn_retry_test!(openai_success_writes_suggestions_and_progress, {
     assert_eq!(b.processed, 1);
     let sug = suggestion_tags(&dbm.lock().unwrap(), batch.id);
     assert_eq!(sug.len(), 1);
-    let got = sug[0].suggested_tags.get("场景").cloned();
+    let got = sug[0].suggested_tags.get("scene").cloned();
     assert_eq!(
         got,
         Some(vec!["公园".to_string()]),
@@ -236,7 +244,11 @@ conn_retry_test!(openai_success_writes_suggestions_and_progress, {
         sug[0].status,
         sug[0].last_error,
     );
-    assert_eq!(sug[0].status, "pending", "status={} last_error={:?}", sug[0].status, sug[0].last_error); // 仅候选，未确认
+    assert_eq!(
+        sug[0].status, "pending",
+        "status={} last_error={:?}",
+        sug[0].status, sug[0].last_error
+    ); // 仅候选，未确认
 
     let events = sink.lock().unwrap().clone();
     assert_eq!(events.len(), 1);
@@ -245,7 +257,13 @@ conn_retry_test!(openai_success_writes_suggestions_and_progress, {
     assert_eq!(events[0].current_asset_id, ids[0]);
 
     let reqs = srv.requests();
-    assert_eq!(reqs.len(), 1, "accepts={} io_failures={}", srv.accepts(), srv.io_failures());
+    assert_eq!(
+        reqs.len(),
+        1,
+        "accepts={} io_failures={}",
+        srv.accepts(),
+        srv.io_failures()
+    );
     assert_ok_json_req(&reqs[0], "/chat/completions", "Bearer test-key");
     Ok(())
 });
@@ -277,14 +295,20 @@ conn_retry_test!(anthropic_mode_sends_messages_and_key_header, {
 
     let sug = suggestion_tags(&dbm.lock().unwrap(), batch.id);
     assert_eq!(
-        sug[0].suggested_tags.get("光线"),
+        sug[0].suggested_tags.get("lighting"),
         Some(&vec!["逆光".to_string()]),
         "status={} last_error={:?}",
         sug[0].status,
         sug[0].last_error,
     );
     let reqs = srv.requests();
-    assert_eq!(reqs.len(), 1, "accepts={} io_failures={}", srv.accepts(), srv.io_failures());
+    assert_eq!(
+        reqs.len(),
+        1,
+        "accepts={} io_failures={}",
+        srv.accepts(),
+        srv.io_failures()
+    );
     assert_eq!(reqs[0].header_x_api_key.as_deref(), Some("test-key"));
     Ok(())
 });
@@ -296,8 +320,9 @@ conn_retry_test!(empty_tags_marks_rejected_and_batch_continues, {
     let calls2 = Arc::clone(&calls);
     let srv = MockServer::start(move |_| {
         let n = calls2.fetch_add(1, Ordering::SeqCst);
-        if n == 0 {
-            HttpResponse::ok_json(&openai_ok_body("{}")) // 第 1 张：模型返回空对象
+        // 阶段 5 §8.3：单项失败重试 1 次——前 2 次返回空对象（重试仍失败→rejected），第 3 次起正常
+        if n < 2 {
+            HttpResponse::ok_json(&openai_ok_body("{}")) // 第 1 张：模型返回空对象（失败）
         } else {
             HttpResponse::ok_json(&openai_ok_body(r#"{"场景":["海边"]}"#))
         }
@@ -328,10 +353,13 @@ conn_retry_test!(empty_tags_marks_rejected_and_batch_continues, {
     assert_eq!(sug[0].status, "rejected");
     assert_eq!(sug[0].suggested_tags.len(), 0);
     let err = sug[0].last_error.as_ref().expect("应记录失败原因");
-    assert!(err.contains("未返回可解析"), "错误应带模型原始内容提示: {err}");
+    assert!(
+        err.contains("未返回可解析"),
+        "错误应带模型原始内容提示: {err}"
+    );
     // 其余条正常出建议
     assert_eq!(
-        sug[1].suggested_tags.get("场景"),
+        sug[1].suggested_tags.get("scene"),
         Some(&vec!["海边".to_string()]),
         "第 2 条建议未收到标签：status={} last_error={:?}",
         sug[1].status,
@@ -347,7 +375,8 @@ conn_retry_test!(http_500_marks_rejected_and_batch_done, {
     let calls2 = Arc::clone(&calls);
     let srv = MockServer::start(move |_| {
         let n = calls2.fetch_add(1, Ordering::SeqCst);
-        if n == 0 {
+        // 阶段 5 §8.3：单项失败重试 1 次——前 2 次返回 500（重试仍失败→rejected），第 3 次起正常
+        if n < 2 {
             HttpResponse::status_only(500)
         } else {
             HttpResponse::ok_json(&openai_ok_body(r#"{"场景":["街景"]}"#))
@@ -375,7 +404,11 @@ conn_retry_test!(http_500_marks_rejected_and_batch_done, {
     assert_eq!(b.status, "done", "last_error 见下");
     assert_eq!(b.processed, 2);
     let sug = ai::list_suggestions(&conn, batch.id)?;
-    assert_eq!(sug[0].status, "rejected", "status={} last_error={:?}", sug[0].status, sug[0].last_error);
+    assert_eq!(
+        sug[0].status, "rejected",
+        "status={} last_error={:?}",
+        sug[0].status, sug[0].last_error
+    );
     assert!(sug[0].last_error.as_ref().is_some());
     assert_eq!(
         sug[1].status,
@@ -422,9 +455,12 @@ conn_retry_test!(cancel_mid_batch_keeps_remaining_pending, {
     let sug = ai::list_suggestions(&conn, batch.id)?;
     for (i, s) in sug.iter().enumerate() {
         assert_eq!(
-            s.status, "pending",
+            s.status,
+            "pending",
             "第 {} 条 status={} last_error={:?}",
-            i + 1, s.status, s.last_error,
+            i + 1,
+            s.status,
+            s.last_error,
         );
     }
     Ok(())
@@ -452,7 +488,15 @@ conn_retry_test!(limit_two_then_resume_rest, {
 
     // 第一轮：只处理前 2 条
     let (_, progress) = progress_sink();
-    ai_cloud::run_cloud_batch(&dbm, batch.id, &cfg, &categories(), Some(2), &Arc::new(AtomicBool::new(false)), progress)?;
+    ai_cloud::run_cloud_batch(
+        &dbm,
+        batch.id,
+        &cfg,
+        &categories(),
+        Some(2),
+        &Arc::new(AtomicBool::new(false)),
+        progress,
+    )?;
     {
         let conn = dbm.lock().unwrap();
         let b = ai::get_batch(&conn, batch.id)?;
@@ -460,7 +504,7 @@ conn_retry_test!(limit_two_then_resume_rest, {
         assert_eq!(b.processed, 2);
         let sug = ai::list_suggestions(&conn, batch.id)?;
         assert_eq!(
-            sug[0].suggested_tags.get("场景"),
+            sug[0].suggested_tags.get("scene"),
             Some(&vec!["续跑".to_string()]),
             "第 1 条建议未收到标签：status={} last_error={:?}",
             sug[0].status,
@@ -480,7 +524,15 @@ conn_retry_test!(limit_two_then_resume_rest, {
 
     // 第二轮：续跑剩余 3 条（F15a 修复后不重复处理前 2 条）
     let (_, progress) = progress_sink();
-    ai_cloud::run_cloud_batch(&dbm, batch.id, &cfg, &categories(), None, &Arc::new(AtomicBool::new(false)), progress)?;
+    ai_cloud::run_cloud_batch(
+        &dbm,
+        batch.id,
+        &cfg,
+        &categories(),
+        None,
+        &Arc::new(AtomicBool::new(false)),
+        progress,
+    )?;
     {
         let conn = dbm.lock().unwrap();
         let b = ai::get_batch(&conn, batch.id)?;
@@ -491,7 +543,7 @@ conn_retry_test!(limit_two_then_resume_rest, {
             // 带诊断上下文：偶发失败时区分「请求未到达/IO 失败」（mock 侧计数）
             // 与「被测状态机真错」（last_error 内容）
             assert_eq!(
-                s.suggested_tags.get("场景"),
+                s.suggested_tags.get("scene"),
                 Some(&vec!["续跑".to_string()]),
                 "第 {} 条建议未收到标签：status={} last_error={:?}",
                 s.id,
@@ -508,7 +560,11 @@ conn_retry_test!(limit_two_then_resume_rest, {
         srv.io_failures(),
         srv.requests(),
     );
-    assert_eq!(calls.load(Ordering::SeqCst), 5, "修复后总请求应 5 次（第二轮仅 3 次）");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        5,
+        "修复后总请求应 5 次（第二轮仅 3 次）"
+    );
     Ok(())
 });
 
@@ -530,7 +586,15 @@ conn_retry_test!(no_pending_run_errors_with_clear_message, {
     let cfg = settings_with(profile(&srv.url(), "openai", "cloud"));
 
     let (_, progress) = progress_sink();
-    ai_cloud::run_cloud_batch(&dbm, batch.id, &cfg, &categories(), None, &Arc::new(AtomicBool::new(false)), progress)?;
+    ai_cloud::run_cloud_batch(
+        &dbm,
+        batch.id,
+        &cfg,
+        &categories(),
+        None,
+        &Arc::new(AtomicBool::new(false)),
+        progress,
+    )?;
     assert_eq!(
         calls.load(Ordering::SeqCst),
         1,
@@ -549,7 +613,15 @@ conn_retry_test!(no_pending_run_errors_with_clear_message, {
 
     // 再次开跑：明确报错，不空跑、不发请求、状态不留 processing
     let (_, progress) = progress_sink();
-    let r = ai_cloud::run_cloud_batch(&dbm, batch.id, &cfg, &categories(), None, &Arc::new(AtomicBool::new(false)), progress);
+    let r = ai_cloud::run_cloud_batch(
+        &dbm,
+        batch.id,
+        &cfg,
+        &categories(),
+        None,
+        &Arc::new(AtomicBool::new(false)),
+        progress,
+    );
     let err = r.expect_err("应报「无待打标」").to_string();
     assert!(err.contains("没有待打标"), "错误应可操作: {err}");
     let b = ai::get_batch(&dbm.lock().unwrap(), batch.id)?;
@@ -603,7 +675,15 @@ conn_retry_test!(resume_after_cancel_skips_generated, {
 
     // 第二轮：续跑跳过第 1 张（已有候选），只处理 2、3 张
     let (_, progress) = progress_sink();
-    ai_cloud::run_cloud_batch(&dbm, batch.id, &cfg, &categories(), None, &Arc::new(AtomicBool::new(false)), progress)?;
+    ai_cloud::run_cloud_batch(
+        &dbm,
+        batch.id,
+        &cfg,
+        &categories(),
+        None,
+        &Arc::new(AtomicBool::new(false)),
+        progress,
+    )?;
     {
         let conn = dbm.lock().unwrap();
         let b = ai::get_batch(&conn, batch.id)?;
@@ -612,7 +692,7 @@ conn_retry_test!(resume_after_cancel_skips_generated, {
         let sug = ai::list_suggestions(&conn, batch.id)?;
         for s in &sug {
             assert_eq!(
-                s.suggested_tags.get("场景"),
+                s.suggested_tags.get("scene"),
                 Some(&vec!["公园".to_string()]),
                 "第 {} 条建议未收到标签：status={} last_error={:?}",
                 s.id,
@@ -636,7 +716,9 @@ conn_retry_test!(list_models_parses_openai_response, {
     let _g = common::net_lock_guard();
     let srv = MockServer::start(|req| {
         assert_eq!(req.path, "/models");
-        HttpResponse::ok_json(r#"{"object":"list","data":[{"id":"qwen-vl-plus"},{"id":"qwen-vl-max"}]}"#)
+        HttpResponse::ok_json(
+            r#"{"object":"list","data":[{"id":"qwen-vl-plus"},{"id":"qwen-vl-max"}]}"#,
+        )
     });
     let models = ai_cloud::list_models(&srv.url(), "k", "openai")?;
     assert_eq!(models, vec!["qwen-vl-plus", "qwen-vl-max"]);
@@ -680,6 +762,9 @@ conn_retry_test!(connection_refused_local_profile_hint, {
     let sug = ai::list_suggestions(&conn, batch.id)?;
     assert_eq!(sug[0].status, "rejected");
     let err = sug[0].last_error.as_ref().expect("应记录失败原因");
-    assert!(err.contains("无法连接本地服务"), "本地档案提示应可操作: {err}");
+    assert!(
+        err.contains("无法连接本地服务"),
+        "本地档案提示应可操作: {err}"
+    );
     Ok(())
 });

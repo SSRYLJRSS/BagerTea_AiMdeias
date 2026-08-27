@@ -21,16 +21,77 @@ use crate::db::assets::{self, ImportResult};
 use crate::error::{AppError, AppResult};
 use crate::utils::{mime, path};
 
+/// 入库阶段（阶段 1 契约，见《入库标签与素材库改造开发指导书》§4.4）：
+/// 后端只发阶段进度；前端按权重计算整体展示进度。不新增 committing 阶段（写库在 processing 内部）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImportPhase {
+    Queued,
+    Scanning,
+    Hashing,
+    Processing,
+    Previewing,
+    Done,
+}
+
+impl ImportPhase {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ImportPhase::Queued => "queued",
+            ImportPhase::Scanning => "scanning",
+            ImportPhase::Hashing => "hashing",
+            ImportPhase::Processing => "processing",
+            ImportPhase::Previewing => "previewing",
+            ImportPhase::Done => "done",
+        }
+    }
+}
+
+/// 入库进度事件。task_id 用于防止旧任务事件污染新任务（前端监听 import://progress）。
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ImportProgress {
-    pub current: i64,
-    pub total: i64,
-    pub file: String,
+    pub task_id: String,
+    /// queued|scanning|hashing|processing|previewing|done
+    pub phase: String,
+    pub phase_current: i64,
+    /// 未知时前端必须显示不确定进度（不伪造百分比）
+    pub phase_total: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    pub imported: i64,
+    pub duplicates: i64,
+    pub failed: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
 }
 
-/// 展开输入路径为候选文件列表（目录递归 + 类型过滤）
-fn collect_files(paths: &[String]) -> Vec<PathBuf> {
+impl ImportProgress {
+    fn new(task_id: &str, phase: ImportPhase) -> Self {
+        ImportProgress {
+            task_id: task_id.to_string(),
+            phase: phase.as_str().to_string(),
+            phase_current: 0,
+            phase_total: None,
+            file: None,
+            imported: 0,
+            duplicates: 0,
+            failed: 0,
+            message: None,
+        }
+    }
+}
+
+/// 任务 ID 生成：时间戳 + 进程内自增序号，保证同一次运行内唯一、可区分新旧任务。
+fn next_task_id() -> String {
+    static TASK_SEQ: AtomicI64 = AtomicI64::new(0);
+    let seq = TASK_SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("import-{}-{}", chrono::Utc::now().timestamp_millis(), seq)
+}
+
+/// 展开输入路径为候选文件列表（目录递归 + 类型过滤）。
+/// on_scan 每发现一个候选文件上报一次当前计数（供 scanning 阶段进度展示）。
+fn collect_files(paths: &[String], on_scan: impl Fn(i64) + Sync) -> Vec<PathBuf> {
     let mut out = Vec::new();
     for p in paths {
         let pb = PathBuf::from(p);
@@ -38,10 +99,12 @@ fn collect_files(paths: &[String]) -> Vec<PathBuf> {
             for e in WalkDir::new(&pb).follow_links(false).into_iter().flatten() {
                 if e.file_type().is_file() && is_supported(e.path()) {
                     out.push(e.path().to_path_buf());
+                    on_scan(out.len() as i64);
                 }
             }
         } else if pb.is_file() && is_supported(&pb) {
             out.push(pb);
+            on_scan(out.len() as i64);
         }
     }
     out
@@ -332,6 +395,23 @@ fn write_one(conn: &Connection, p: &Processed) -> AppResult<i64> {
     Ok(id)
 }
 
+/// 发送 done 阶段事件（含最终 imported/duplicates/failed 统计）。
+fn emit_done<F: Fn(ImportProgress)>(
+    task_id: &str,
+    result: &ImportResult,
+    message: Option<String>,
+    progress: &F,
+) {
+    let mut done = ImportProgress::new(task_id, ImportPhase::Done);
+    done.phase_current = result.imported;
+    done.phase_total = Some(result.imported);
+    done.imported = result.imported;
+    done.duplicates = result.duplicates;
+    done.failed = result.failed;
+    done.message = message;
+    progress(done);
+}
+
 /// 三段式入库管线（B01 重构）：
 /// ① 并行算 hash（IO/CPU 密集，不占库锁）
 /// ②a 锁外并行处理（rayon）：precheck 短锁 → 托管复制 → 元数据提取
@@ -351,7 +431,20 @@ pub fn import_paths<F: Fn(ImportProgress) + Sync>(
             validate_collection(c)?;
         }
     }
-    let files = collect_files(paths);
+    // 阶段 1 契约：后端只发阶段进度，task_id 隔离新旧任务事件。
+    let task_id = next_task_id();
+    // queued：任务已接受
+    let mut queued = ImportProgress::new(&task_id, ImportPhase::Queued);
+    queued.message = Some("准备入库".into());
+    progress(queued);
+    // scanning：目录递归收集候选文件（phaseTotal 未知 → 前端显示不确定进度）
+    let files = collect_files(paths, |n| {
+        let mut sc = ImportProgress::new(&task_id, ImportPhase::Scanning);
+        sc.phase_current = n;
+        sc.phase_total = None;
+        sc.message = Some("正在扫描目录".into());
+        progress(sc);
+    });
     let total = files.len() as i64;
     let mut result = ImportResult {
         imported: 0,
@@ -360,13 +453,34 @@ pub fn import_paths<F: Fn(ImportProgress) + Sync>(
         errors: Vec::new(),
     };
     if files.is_empty() {
+        let mut done = ImportProgress::new(&task_id, ImportPhase::Done);
+        done.message = Some("未发现可入库文件".into());
+        progress(done);
         return Ok(result);
     }
 
-    // ① 并行 hash（取消在②③阶段间生效）
+    // ① 并行 hash（hashing 阶段；取消在②③阶段间仍生效，此处每文件上报进度）
+    let hash_done = AtomicI64::new(0);
     let hashes: Vec<Option<String>> = files
         .par_iter()
-        .map(|f| crate::utils::hash::sha256_16(f).ok())
+        .map(|f| {
+            if cancel.load(Ordering::Relaxed) {
+                return None;
+            }
+            let h = crate::utils::hash::sha256_16(f).ok();
+            let n = hash_done.fetch_add(1, Ordering::Relaxed) + 1;
+            let mut he = ImportProgress::new(&task_id, ImportPhase::Hashing);
+            he.phase_current = n;
+            he.phase_total = Some(total);
+            he.file = Some(
+                f.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+            progress(he);
+            h
+        })
         .collect();
 
     // ②a：锁外并行处理（复制 + 元数据提取），precheck 用短锁单次查询
@@ -379,17 +493,18 @@ pub fn import_paths<F: Fn(ImportProgress) + Sync>(
             if cancel.load(Ordering::Relaxed) {
                 return ProcResult::Failed("用户取消".into());
             }
-            // 进度在②a上报（处理是慢阶段，写库是快阶段）
+            // processing 阶段进度（处理是慢阶段，②b 写库在 processing 内部，不单独计阶段）
             let n = proc_done.fetch_add(1, Ordering::Relaxed) + 1;
-            progress(ImportProgress {
-                current: n,
-                total,
-                file: file
-                    .file_name()
+            let mut pe = ImportProgress::new(&task_id, ImportPhase::Processing);
+            pe.phase_current = n;
+            pe.phase_total = Some(total);
+            pe.file = Some(
+                file.file_name()
                     .unwrap_or_default()
                     .to_string_lossy()
                     .into_owned(),
-            });
+            );
+            progress(pe);
             let hash = match &hashes[idx] {
                 None => return ProcResult::Failed(format!("{}: 读取文件失败", file.display())),
                 Some(h) => h.clone(),
@@ -515,6 +630,7 @@ pub fn import_paths<F: Fn(ImportProgress) + Sync>(
             "用户取消（已导入 {} 条，重复 {} 条）",
             result.imported, result.duplicates
         ));
+        emit_done(&task_id, &result, Some("已取消，保留已导入记录".into()), &progress);
         return Ok(result);
     }
 
@@ -530,14 +646,17 @@ pub fn import_paths<F: Fn(ImportProgress) + Sync>(
             }
             let p = thumbs.extract_placeholder(*id, file, mime_type);
             let n = thumb_done.fetch_add(1, Ordering::Relaxed) + 1;
-            progress(ImportProgress {
-                current: n,
-                total: thumb_total,
-                file: format!(
-                    "缩略图 · {}",
-                    file.file_name().unwrap_or_default().to_string_lossy()
-                ),
-            });
+            let mut pe = ImportProgress::new(&task_id, ImportPhase::Previewing);
+            pe.phase_current = n;
+            pe.phase_total = Some(thumb_total);
+            pe.file = Some(format!(
+                "缩略图 · {}",
+                file.file_name().unwrap_or_default().to_string_lossy()
+            ));
+            pe.imported = result.imported;
+            pe.duplicates = result.duplicates;
+            pe.failed = result.failed;
+            progress(pe);
             (*id, p)
         })
         .collect();
@@ -560,9 +679,16 @@ pub fn import_paths<F: Fn(ImportProgress) + Sync>(
             "用户取消（已导入 {} 条，部分占位图待下次浏览时补生成）",
             result.imported
         ));
+        emit_done(
+            &task_id,
+            &result,
+            Some("已取消，部分占位图待补".into()),
+            &progress,
+        );
         return Ok(result);
     }
 
+    emit_done(&task_id, &result, Some("入库完成".into()), &progress);
     Ok(result)
 }
 
@@ -598,7 +724,7 @@ pub struct ImportPlan {
 
 /// 扫描路径展开为待入库清单（不落库，仅统计）
 pub fn inspect_paths(paths: &[String]) -> ImportPlan {
-    let files = collect_files(paths);
+    let files = collect_files(paths, |_| {});
     let mut plan = ImportPlan {
         items: Vec::new(),
         images: 0,

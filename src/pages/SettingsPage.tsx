@@ -8,7 +8,9 @@ import ModelSelect from "@/components/common/ModelSelect";
 import { ollamaInstallStatus, ollamaRemoveInstaller } from "@/api/ollama";
 import { clearThumbnailCache, getDataDir, openDataDir } from "@/api/settings";
 import LocalModelGroup from "@/components/settings/LocalModelGroup";
+import TagManageDialog from "@/components/dialogs/TagManageDialog";
 import { applyTheme, useSettingsStore } from "@/stores/settingsStore";
+import { WORKBENCH_DEFAULT_KEYS } from "@/stores/tagStore";
 import type { ApiProfile, Settings } from "@/types/settings";
 
 type GroupKey = "ai" | "local" | "tags" | "library" | "cloud" | "general" | "data";
@@ -23,7 +25,7 @@ const GROUPS: { key: GroupKey; label: string }[] = [
   { key: "data", label: "数据与缓存" },
 ];
 
-export default function SettingsPage() {
+export default function SettingsPage({ onBack }: { onBack?: () => void }) {
   const { settings, loaded, saving, load, save, loadError } = useSettingsStore(
     useShallow((s) => ({
       settings: s.settings,
@@ -37,6 +39,7 @@ export default function SettingsPage() {
   const [draft, setDraft] = useState<Settings | null>(null);
   const [group, setGroup] = useState<GroupKey>("ai");
   const [dataDir, setDataDir] = useState("");
+  const [dataDirError, setDataDirError] = useState(false);
   const [editProfileId, setEditProfileId] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
@@ -55,7 +58,13 @@ export default function SettingsPage() {
   }, [settings, draft]);
 
   useEffect(() => {
-    getDataDir().then(setDataDir).catch(() => undefined);
+    // A-3：数据目录读取失败只显示「暂不可用」，不抛出到页面边界
+    getDataDir()
+      .then((dir) => {
+        setDataDir(dir);
+        setDataDirError(false);
+      })
+      .catch(() => setDataDirError(true));
   }, []);
 
   // 进入「数据与缓存」分组时刷新安装包缓存信息
@@ -135,9 +144,10 @@ export default function SettingsPage() {
     if (editProfileId === id) setEditProfileId(null);
   };
 
-  // ---- 标签分类（PRD 5.5） ----
-  const patchCategory = (i: number, patch: Partial<Settings["tagCategories"][number]>) =>
-    dirty({ ...draft, tagCategories: draft.tagCategories.map((c, j) => (j === i ? { ...c, ...patch } : c)) });
+  // ---- AI 分面配置（P1B：facet_key 稳定，single/max 以数据库为准） ----
+  const patchFacet = (i: number, patch: Partial<NonNullable<Settings["aiFacetConfigs"]>[number]>) =>
+    dirty({ ...draft, aiFacetConfigs: draft.aiFacetConfigs.map((c, j) => (j === i ? { ...c, ...patch } : c)) });
+  const [manageOpen, setManageOpen] = useState(false);
 
   const chooseLibraryRoot = async () => {
     const dir = await pickDir({ directory: true });
@@ -168,21 +178,31 @@ export default function SettingsPage() {
   return (
     <div className="flex h-full">
       {/* 左侧分组导航 */}
-      <aside className="w-[150px] shrink-0 border-r border-[var(--color-border)] p-2">
-        {GROUPS.map((g) => (
+      <aside className="w-[150px] shrink-0 border-r border-[var(--color-border)]">
+        {onBack && (
           <button
-            key={g.key}
-            onClick={() => setGroup(g.key)}
-            className={clsx(
-              "block w-full rounded px-2 py-1.5 text-left text-sm transition-colors",
-              group === g.key
-                ? "bg-[var(--color-surface)] font-medium text-[var(--color-text)]"
-                : "text-[var(--color-text-secondary)] hover:bg-[var(--color-surface)] hover:text-[var(--color-text)]",
-            )}
+            onClick={onBack}
+            className="w-full border-b border-[var(--color-border)] px-3 py-2 text-left text-sm text-[var(--color-text-secondary)] transition-colors hover:bg-[var(--color-surface)] hover:text-[var(--color-text)]"
           >
-            {g.label}
+            ← 返回
           </button>
-        ))}
+        )}
+        <div className="p-2">
+          {GROUPS.map((g) => (
+            <button
+              key={g.key}
+              onClick={() => setGroup(g.key)}
+              className={clsx(
+                "block w-full rounded px-2 py-1.5 text-left text-sm transition-colors",
+                group === g.key
+                  ? "bg-[var(--color-surface)] font-medium text-[var(--color-text)]"
+                  : "text-[var(--color-text-secondary)] hover:bg-[var(--color-surface)] hover:text-[var(--color-text)]",
+              )}
+            >
+              {g.label}
+            </button>
+          ))}
+        </div>
       </aside>
 
       {/* 右侧分组内容 */}
@@ -282,7 +302,7 @@ export default function SettingsPage() {
               <Field label="视频 AI 打标" hint="对视频抽帧后打标（耗时更长）">
                 <Toggle checked={draft.ai.videoTagging} onChange={(v) => patchAi({ videoTagging: v })} />
               </Field>
-              <Field label="批量上限" hint="单批次最多打标素材数（控制 API 成本）">
+              <Field label="执行分块大小" hint="单次请求分块大小：执行层按此内存分块、限流、重试，不截断总批次">
                 <TextInput
                   type="number"
                   value={String(draft.ai.batchLimit)}
@@ -308,45 +328,45 @@ export default function SettingsPage() {
           )}
 
           {group === "tags" && (
-            <Group title="标签分类">
+            <Group title="AI 分面">
               <p className="-mt-2 text-xs text-[var(--color-text-secondary)]">
-                分类即素材库里的父标签；AI 会按分类出标签，可自定义增删。hint 会写进 AI 提示词。
+                分面 key 稳定不可修改；AI 打标与 AI 搜索共用此配置。显示名可本地化，单选/上限由数据库决定。
               </p>
-              {draft.tagCategories.map((c, i) => (
-                <div key={i} className="flex items-center gap-2">
-                  <TextInput value={c.name} onChange={(v) => patchCategory(i, { name: v })} placeholder="分类名" />
-                  <TextInput value={c.hint} onChange={(v) => patchCategory(i, { hint: v })} placeholder="提示词 hint（可选）" />
-                  <label className="flex shrink-0 items-center gap-1 text-xs text-[var(--color-text-secondary)]">
-                    <input type="checkbox" checked={c.single} onChange={(e) => patchCategory(i, { single: e.target.checked })} />
-                    单选
+              <p className="-mt-1 mb-1 text-[11px] text-[var(--color-text-secondary)]">
+                两个开关语义独立：「AI」= 是否参与 AI 打标/搜索提示词；「工作台」= 是否显示在人工打标面板。
+              </p>
+              {draft.aiFacetConfigs.map((c, i) => (
+                <div key={c.facetKey} className="flex items-center gap-2">
+                  <span className="w-28 shrink-0 truncate rounded-md border border-[var(--color-border)] bg-[var(--color-surface)] px-2 py-1.5 text-sm text-[var(--color-text)]" title={c.facetKey}>
+                    {c.facetKey}
+                  </span>
+                  <TextInput value={c.hint} onChange={(v) => patchFacet(i, { hint: v })} placeholder="提示词 hint（可选）" />
+                  <TextInput value={c.displayName ?? ""} onChange={(v) => patchFacet(i, { displayName: v || undefined })} placeholder="显示名（可选）" />
+                  <label className="flex shrink-0 items-center gap-1 text-xs text-[var(--color-text-secondary)]" title="是否参与 AI 打标与搜索提示词">
+                    <input type="checkbox" checked={c.enabledForAi} onChange={(e) => patchFacet(i, { enabledForAi: e.target.checked })} />
+                    AI
                   </label>
-                  <label className="flex shrink-0 items-center gap-1 text-xs text-[var(--color-text-secondary)]" title="每类标签数量上限">
-                    上限
+                  <label className="flex shrink-0 items-center gap-1 text-xs text-[var(--color-text-secondary)]" title="是否显示在人工打标工作台">
                     <input
-                      value={c.max || ""}
-                      disabled={c.single}
-                      onChange={(e) => {
-                        const n = parseInt(e.target.value.replace(/\D/g, ""), 10);
-                        patchCategory(i, { max: Number.isNaN(n) ? 0 : Math.min(n, 20) });
-                      }}
-                      inputMode="numeric"
-                      className="w-10 rounded border border-[var(--color-border)] bg-[var(--color-surface)] px-1 py-0.5 text-center text-xs outline-none focus:border-[var(--color-accent)] disabled:opacity-40"
+                      type="checkbox"
+                      checked={c.visibleInWorkbench ?? (WORKBENCH_DEFAULT_KEYS as readonly string[]).includes(c.facetKey)}
+                      onChange={(e) => patchFacet(i, { visibleInWorkbench: e.target.checked })}
                     />
+                    工作台
                   </label>
-                  <button
-                    onClick={() => dirty({ ...draft, tagCategories: draft.tagCategories.filter((_, j) => j !== i) })}
-                    className="shrink-0 rounded px-1.5 py-1 text-xs text-[var(--color-text-secondary)] hover:text-red-500"
-                  >
-                    删
-                  </button>
                 </div>
               ))}
-              <button
-                onClick={() => dirty({ ...draft, tagCategories: [...draft.tagCategories, { name: "", hint: "", single: false, max: 3 }] })}
-                className="rounded-md border border-dashed border-[var(--color-border)] px-2 py-1.5 text-sm text-[var(--color-text-secondary)] transition-colors hover:text-[var(--color-text)]"
-              >
-                + 新增分类
-              </button>
+
+              {/* §9.6 标签治理：搜索/新建/重命名/移动/合并/加别名/停用/影响范围（复用现有 TagManageDialog + 治理命令） */}
+              <div className="mt-4 rounded-md border border-[var(--color-border)] bg-[var(--color-surface)] p-3">
+                <h4 className="mb-1 text-xs font-medium text-[var(--color-text)]">标签治理</h4>
+                <p className="mb-2 text-[11px] leading-4 text-[var(--color-text-secondary)]">
+                  搜索、新建、重命名、移动、合并、添加别名、停用标签，并查看影响范围。
+                </p>
+                <Button className="w-full" onClick={() => setManageOpen(true)}>
+                  打开标签管理
+                </Button>
+              </div>
             </Group>
           )}
 
@@ -422,7 +442,7 @@ export default function SettingsPage() {
               <Field label="软件数据保存位置" hint="数据库与缩略图所在目录，备份/转移素材库时复制此目录">
                 <div className="flex items-center gap-2">
                   <span className="max-w-52 truncate text-xs text-[var(--color-text-secondary)]" title={dataDir}>
-                    {dataDir || "…"}
+                    {dataDirError ? "暂不可用" : dataDir || "…"}
                   </span>
                   <Button onClick={() => void openDataDir()}>打开文件夹</Button>
                 </div>
@@ -464,6 +484,9 @@ export default function SettingsPage() {
           </div>
         </div>
       </div>
+
+      {/* §9.6 标签治理入口：搜索/新建/重命名/移动/合并/加别名/停用/影响范围 */}
+      <TagManageDialog open={manageOpen} onClose={() => setManageOpen(false)} />
     </div>
   );
 }

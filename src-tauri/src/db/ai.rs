@@ -3,7 +3,7 @@
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
-use super::{asset_tags, tags};
+use super::{asset_tags, tag_facets, tags};
 use crate::error::AppResult;
 
 /// 分类标签：{ 分类名: [标签...] }（PRD 5.5；BTreeMap 保证序列化键序稳定）
@@ -34,11 +34,17 @@ fn categorized_tag_ids(conn: &Connection, tags: &CategorizedTags) -> AppResult<V
         if category.is_empty() {
             continue;
         }
-        let parent = tags::find_or_create_root(conn, category)?;
+        let facet_key = tag_facets::key_for_legacy_name(category);
         for name in names {
             let name = name.trim();
             if !name.is_empty() {
-                ids.push(tags::find_or_create_child(conn, parent, name)?);
+                // 旧 AI 协议传中文分类名时保留根节点兼容；新协议传稳定 facet key 时直接创建规范标签。
+                if category == facet_key {
+                    ids.push(tags::find_or_create_canonical(conn, facet_key, name)?);
+                } else {
+                    let parent = tags::find_or_create_facet_root(conn, facet_key, category)?;
+                    ids.push(tags::find_or_create_child(conn, parent, name)?);
+                }
             }
         }
     }
@@ -64,6 +70,8 @@ pub struct AiSuggestion {
     pub batch_id: i64,
     pub asset_id: i64,
     pub asset_path: String,
+    /// B-3/B-4：素材 MIME（供前端判断批次是否含视频、是否需提示开启视频打标）
+    pub mime_type: Option<String>,
     pub suggested_tags: CategorizedTags,
     pub status: String, // pending|confirmed|rejected|modified
     pub confirmed_tags: CategorizedTags,
@@ -131,6 +139,16 @@ pub fn set_batch_status(conn: &Connection, id: i64, status: &str) -> AppResult<(
     Ok(())
 }
 
+/// 应用启动/任务中断时：把遗留的 processing 批次置为 interrupted（指导书阶段 5 §8.2）。
+/// 允许一键续跑剩余 pending（避免僵尸 processing 态无法重试）。
+pub fn mark_interrupted_batches(conn: &Connection) -> AppResult<()> {
+    conn.execute(
+        "UPDATE ai_batches SET status = 'interrupted' WHERE status = 'processing'",
+        [],
+    )?;
+    Ok(())
+}
+
 pub fn inc_batch_processed(conn: &Connection, id: i64) -> AppResult<()> {
     conn.execute(
         "UPDATE ai_batches SET processed = processed + 1 WHERE id = ?1",
@@ -145,7 +163,54 @@ pub fn set_suggestion_tags(conn: &Connection, id: i64, tags: &CategorizedTags) -
         "UPDATE ai_suggestions SET suggested_tags = ?1 WHERE id = ?2",
         rusqlite::params![serde_json::to_string(tags)?, id],
     )?;
+    conn.execute(
+        "DELETE FROM ai_suggestion_items WHERE suggestion_id = ?1",
+        [id],
+    )?;
+    let now = chrono::Utc::now().timestamp_millis();
+    for (category, names) in tags {
+        let facet_key = tag_facets::key_for_legacy_name(category);
+        for name in names {
+            let raw = name.trim();
+            if raw.is_empty() {
+                continue;
+            }
+            let normalized = tags::normalize_name(raw);
+            let tag_id: Option<i64> = conn
+                .query_row(
+                    "SELECT t.id FROM tags t
+                       LEFT JOIN tag_aliases ta ON ta.tag_id=t.id
+                      WHERE t.facet_key=?1 AND t.status='active'
+                        AND (t.normalized_name=?2 OR ta.normalized_alias=?2)
+                      ORDER BY t.is_system DESC, t.id LIMIT 1",
+                    rusqlite::params![facet_key, normalized],
+                    |r| r.get(0),
+                )
+                .ok();
+            conn.execute(
+                "INSERT INTO ai_suggestion_items
+                 (suggestion_id, facet_key, raw_name, normalized_name, tag_id, decision, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6)",
+                rusqlite::params![id, facet_key, raw, normalized, tag_id, now],
+            )?;
+        }
+    }
     Ok(())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiSuggestionItem {
+    pub id: i64,
+    pub suggestion_id: i64,
+    pub facet_key: String,
+    pub raw_name: String,
+    pub normalized_name: String,
+    pub tag_id: Option<i64>,
+    pub confidence: Option<f64>,
+    pub decision: String,
+    pub decision_reason: Option<String>,
+    pub created_at: i64,
 }
 
 fn suggestion_from_row(r: &rusqlite::Row) -> rusqlite::Result<AiSuggestion> {
@@ -157,6 +222,7 @@ fn suggestion_from_row(r: &rusqlite::Row) -> rusqlite::Result<AiSuggestion> {
         batch_id: r.get(1)?,
         asset_id: r.get(2)?,
         asset_path: r.get(3)?,
+        mime_type: r.get(9)?,
         suggested_tags: parse_tags_json(&suggested),
         status: r.get(5)?,
         confirmed_tags: confirmed.map(|s| parse_tags_json(&s)).unwrap_or_default(),
@@ -165,7 +231,7 @@ fn suggestion_from_row(r: &rusqlite::Row) -> rusqlite::Result<AiSuggestion> {
     })
 }
 
-const SUGG_COLS: &str = "s.id, s.batch_id, s.asset_id, a.file_path, s.suggested_tags, s.status, s.confirmed_tags, s.created_at, s.last_error";
+const SUGG_COLS: &str = "s.id, s.batch_id, s.asset_id, a.file_path, s.suggested_tags, s.status, s.confirmed_tags, s.created_at, s.last_error, a.mime_type";
 
 pub fn list_suggestions(conn: &Connection, batch_id: i64) -> AppResult<Vec<AiSuggestion>> {
     let mut stmt = conn.prepare(&format!(
@@ -176,6 +242,102 @@ pub fn list_suggestions(conn: &Connection, batch_id: i64) -> AppResult<Vec<AiSug
         .query_map([batch_id], suggestion_from_row)?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(rows)
+}
+
+pub fn list_suggestion_items(
+    conn: &Connection,
+    suggestion_id: i64,
+) -> AppResult<Vec<AiSuggestionItem>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, suggestion_id, facet_key, raw_name, normalized_name, tag_id,
+                confidence, decision, decision_reason, created_at
+           FROM ai_suggestion_items
+          WHERE suggestion_id = ?1 ORDER BY id",
+    )?;
+    let rows = stmt
+        .query_map([suggestion_id], |r| {
+            Ok(AiSuggestionItem {
+                id: r.get(0)?,
+                suggestion_id: r.get(1)?,
+                facet_key: r.get(2)?,
+                raw_name: r.get(3)?,
+                normalized_name: r.get(4)?,
+                tag_id: r.get(5)?,
+                confidence: r.get(6)?,
+                decision: r.get(7)?,
+                decision_reason: r.get(8)?,
+                created_at: r.get(9)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+fn tag_matches_facet(conn: &Connection, tag_id: i64, facet_key: &str) -> AppResult<bool> {
+    let found: Option<String> = conn
+        .query_row(
+            "SELECT facet_key FROM tags WHERE id = ?1 AND status = 'active'",
+            [tag_id],
+            |r| r.get(0),
+        )
+        .ok();
+    Ok(found.as_deref() == Some(facet_key))
+}
+
+/// 逐条处理候选项。这个接口只改变候选审计状态，不提前把标签写入素材；
+/// 整条建议仍需通过 confirm_suggestion 才会落入 asset_tags。
+pub fn decide_suggestion_item(
+    conn: &Connection,
+    item_id: i64,
+    decision: &str,
+    replacement_tag_id: Option<i64>,
+    replacement_name: Option<&str>,
+    reason: Option<&str>,
+) -> AppResult<()> {
+    if !matches!(decision, "accepted" | "modified" | "rejected") {
+        return Err(crate::error::AppError::msg("无效的候选决策"));
+    }
+    let tx = conn.unchecked_transaction()?;
+    let (facet_key, current_tag_id): (String, Option<i64>) = tx.query_row(
+        "SELECT facet_key, tag_id FROM ai_suggestion_items WHERE id = ?1",
+        [item_id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let tag_id = match decision {
+        "rejected" => None,
+        "accepted" => {
+            let id = replacement_tag_id.or(current_tag_id).ok_or_else(|| {
+                crate::error::AppError::msg("未知候选必须先选择规范标签或明确修改名称")
+            })?;
+            if !tag_matches_facet(&tx, id, &facet_key)? {
+                return Err(crate::error::AppError::msg("候选标签与分面不匹配"));
+            }
+            Some(id)
+        }
+        "modified" => {
+            if let Some(id) = replacement_tag_id {
+                if !tag_matches_facet(&tx, id, &facet_key)? {
+                    return Err(crate::error::AppError::msg("替换标签与分面不匹配"));
+                }
+                Some(id)
+            } else if let Some(name) = replacement_name.map(str::trim).filter(|v| !v.is_empty()) {
+                Some(tags::find_or_create_canonical(&tx, &facet_key, name)?)
+            } else {
+                return Err(crate::error::AppError::msg(
+                    "修改候选时必须提供规范标签或名称",
+                ));
+            }
+        }
+        _ => unreachable!(),
+    };
+    tx.execute(
+        "UPDATE ai_suggestion_items
+            SET tag_id = ?1, decision = ?2, decision_reason = ?3
+          WHERE id = ?4",
+        rusqlite::params![tag_id, decision, reason, item_id],
+    )?;
+    tx.commit()?;
+    Ok(())
 }
 
 /// 确认建议（内部版，不开事务）：供外层已开事务的调用方使用（confirm_all_pending）
@@ -198,8 +360,35 @@ fn confirm_suggestion_inner(conn: &Connection, id: i64, tags: &CategorizedTags) 
     };
 
     let tag_ids = categorized_tag_ids(conn, tags)?;
+    let final_pairs: Vec<(String, String, i64)> = tags
+        .iter()
+        .flat_map(|(category, names)| {
+            let facet_key = tag_facets::key_for_legacy_name(category).to_string();
+            names.iter().filter_map(move |name| {
+                let normalized = tags::normalize_name(name);
+                if normalized.is_empty() { return None; }
+                let id = conn
+                    .query_row(
+                        "SELECT id FROM tags WHERE facet_key = ?1 AND normalized_name = ?2 AND status = 'active' ORDER BY id LIMIT 1",
+                        rusqlite::params![facet_key, normalized],
+                        |r| r.get(0),
+                    )
+                    .ok()?;
+                Some((facet_key.clone(), normalized, id))
+            })
+        })
+        .collect();
     asset_tags::assign_inner(conn, &[asset_id], &tag_ids, source, Some(batch_id))?;
-    let status = "confirmed";
+    let original: String = conn.query_row(
+        "SELECT suggested_tags FROM ai_suggestions WHERE id = ?1",
+        [id],
+        |r| r.get(0),
+    )?;
+    let status = if parse_tags_json(&original) == *tags {
+        "confirmed"
+    } else {
+        "modified"
+    };
     conn.execute(
         "UPDATE ai_suggestions SET status = ?1, confirmed_tags = ?2 WHERE id = ?3",
         rusqlite::params![status, serde_json::to_string(tags)?, id],
@@ -208,6 +397,41 @@ fn confirm_suggestion_inner(conn: &Connection, id: i64, tags: &CategorizedTags) 
         "UPDATE ai_batches SET confirmed = confirmed + 1 WHERE id = ?1",
         [batch_id],
     )?;
+    let items = list_suggestion_items(conn, id)?;
+    for item in items {
+        if item.decision != "pending" {
+            continue;
+        }
+        if let Some((_, _, tag_id)) = final_pairs.iter().find(|(facet, normalized, _)| {
+            facet == &item.facet_key && normalized == &item.normalized_name
+        }) {
+            conn.execute(
+                "UPDATE ai_suggestion_items SET decision='accepted', decision_reason='confirmed', tag_id=?1 WHERE id=?2",
+                rusqlite::params![tag_id, item.id],
+            )?;
+        } else {
+            conn.execute(
+                "UPDATE ai_suggestion_items SET decision='rejected', decision_reason='removed during review' WHERE id=?1",
+                [item.id],
+            )?;
+        }
+    }
+    for (facet, normalized, tag_id) in &final_pairs {
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM ai_suggestion_items WHERE suggestion_id=?1 AND facet_key=?2 AND normalized_name=?3)",
+            rusqlite::params![id, facet, normalized],
+            |r| r.get(0),
+        )?;
+        if !exists {
+            let now = chrono::Utc::now().timestamp_millis();
+            conn.execute(
+                "INSERT INTO ai_suggestion_items
+                 (suggestion_id, facet_key, raw_name, normalized_name, tag_id, decision, decision_reason, created_at)
+                 SELECT ?1, ?2, t.name, ?3, ?4, 'modified', 'added during review', ?5 FROM tags t WHERE t.id=?4",
+                rusqlite::params![id, facet, normalized, tag_id, now],
+            )?;
+        }
+    }
     Ok(())
 }
 
@@ -238,6 +462,11 @@ pub fn restore_suggestion(conn: &Connection, id: i64) -> AppResult<()> {
         "UPDATE ai_suggestions SET status = 'pending' WHERE id = ?1 AND status = 'rejected'",
         rusqlite::params![id],
     )?;
+    conn.execute(
+        "UPDATE ai_suggestion_items SET decision = 'pending', decision_reason = NULL
+          WHERE suggestion_id = ?1 AND decision = 'rejected'",
+        [id],
+    )?;
     Ok(())
 }
 
@@ -251,15 +480,24 @@ pub fn set_suggestion_error(conn: &Connection, id: i64, error: &str) -> AppResul
 }
 
 pub fn reject_suggestion(conn: &Connection, id: i64) -> AppResult<()> {
-    conn.execute(
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
         "UPDATE ai_suggestions SET status = 'rejected' WHERE id = ?1",
         [id],
     )?;
+    tx.execute(
+        "UPDATE ai_suggestion_items SET decision='rejected', decision_reason='suggestion rejected'
+          WHERE suggestion_id=?1 AND decision='pending'",
+        [id],
+    )?;
+    tx.commit()?;
     Ok(())
 }
 
 /// 批量确认某批次全部 pending 建议（按 AI 原建议写入）
 /// B20：外层包裹单事务，保证原子性（部分失败整批回滚）
+/// B-2：只处理解析后标签非空的建议——历史数据可能有 `{}`、空数组或空白 JSON，
+///     不能只依赖 SQL 字符串比较；空建议不写入、不虚增批次 confirmed 计数。
 pub fn confirm_all_pending(conn: &Connection, batch_id: i64) -> AppResult<()> {
     let pendings: Vec<(i64, CategorizedTags)> = {
         let mut stmt = conn.prepare(
@@ -273,6 +511,15 @@ pub fn confirm_all_pending(conn: &Connection, batch_id: i64) -> AppResult<()> {
             .collect::<Result<Vec<_>, _>>()?;
         rows
     };
+    // B-2：过滤解析后的空标签建议（不把无内容的建议误写成 confirmed）
+    let pendings: Vec<(i64, CategorizedTags)> = pendings
+        .into_iter()
+        .filter(|(_, tags)| !tags.is_empty())
+        .collect();
+    // B-2：没有可确认项目时返回成功空操作，不把批次错误计数
+    if pendings.is_empty() {
+        return Ok(());
+    }
     // B20：外层单事务，部分失败整批回滚
     let tx = conn.unchecked_transaction()?;
     for (id, tags) in pendings {

@@ -5,6 +5,7 @@ dist/
 
 # Rust / Tauri
 src-tauri/target/
+src-tauri/target-codex-verify/
 src-tauri/gen/
 
 # 系统

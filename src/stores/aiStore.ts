@@ -12,7 +12,6 @@ import {
   aiStartBatch,
 } from "@/api/ai";
 import type { AiBatch, AiSuggestion, CategorizedTags } from "@/types/ai";
-import { useSettingsStore } from "@/stores/settingsStore";
 
 interface AiState {
   batches: AiBatch[];
@@ -57,16 +56,11 @@ export const useAiStore = create<AiState>((set, get) => ({
   createBatch: async (mode) => {
     const ids = get().pendingAssetIds;
     if (ids.length === 0) return;
-    // P2-07：前端先按批量上限拦截并提示（后端 take 保留作兜底防线）
-    const limit = useSettingsStore.getState().settings?.ai.batchLimit;
-    const capNotice =
-      limit != null && ids.length > limit
-        ? `选中 ${ids.length} 张超过批量上限 ${limit}，仅前 ${limit} 张进入批次`
-        : null;
-    const submitIds = capNotice ? ids.slice(0, limit!) : ids;
-    set({ pendingAssetIds: [], error: capNotice });
+    // 阶段 5 §8.1/§8.3：所选素材完整进入逻辑批次，不做静默截断。
+    // 「批量上限」已改名为「执行分块大小」，仅指执行层内存分块，不再限制总批次。
+    set({ pendingAssetIds: [], error: null });
     try {
-      const batch = await aiCreateBatch(submitIds, mode);
+      const batch = await aiCreateBatch(ids, mode);
       set((s) => ({ batches: [batch, ...s.batches], currentBatchId: batch.id }));
       if (mode === "manual") {
         // 手动模式：后端直接置 done，不调 AI；建议占位载入后即可人工编辑
@@ -122,16 +116,10 @@ export const useAiStore = create<AiState>((set, get) => ({
       set({ error: "请先在素材库选中素材再发起打标" });
       return;
     }
-    // P2-07：前端先按批量上限拦截并提示（后端 take 保留作兜底防线）
-    const limit = useSettingsStore.getState().settings?.ai.batchLimit;
-    const capNotice =
-      limit != null && ids.length > limit
-        ? `选中 ${ids.length} 张超过批量上限 ${limit}，仅前 ${limit} 张进入批次`
-        : null;
-    const submitIds = capNotice ? ids.slice(0, limit!) : ids;
-    set({ running: true, error: capNotice });
+    // 阶段 5 §8.1/§8.3：所选素材完整进入逻辑批次，不做静默截断。
+    set({ running: true, error: null });
     try {
-      const batch = await aiCreateBatch(submitIds, mode);
+      const batch = await aiCreateBatch(ids, mode);
       set({ pendingAssetIds: [], currentBatchId: batch.id });
       await aiStartBatch(batch.id); // 同步等跑完，进度走事件
       await Promise.all([get().refreshBatches(), get().openBatch(batch.id)]);

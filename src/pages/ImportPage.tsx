@@ -1,11 +1,11 @@
-/** 入库页（PRD v2.6 编排层）：左侧任务栏 + 右侧拖拽区/清单；
- *  组件拆分：RenameBuilder（改名构造器）/ PendingList（双视图清单） */
+/** 入库页（PRD v2.6 编排层；阶段 1 改造）：左侧任务栏 + 右侧拖拽区/清单。
+ *  页面只保留结果摘要（当前文件/成功/重复/失败/阶段），不再绘制第二条进度条——
+ *  统一进度条由底栏上方任务层（taskStore 驱动）承担。 */
 import { useCallback, useEffect, useState } from "react";
 import clsx from "clsx";
-import { open as pickFiles } from "@tauri-apps/plugin-dialog";
+import { open as pickFiles, open as pickDir } from "@tauri-apps/plugin-dialog";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import Button from "@/components/common/Button";
-import ProgressBar from "@/components/common/ProgressBar";
 import PendingList, { formatSize } from "@/components/import/PendingList";
 import RenameBuilder from "@/components/import/RenameBuilder";
 import {
@@ -17,7 +17,9 @@ import {
   type ImportProgress,
 } from "@/api/import";
 import { useLibraryStore } from "@/stores/libraryStore";
+import { useMetadataStore } from "@/stores/metadataStore";
 import { useSettingsStore } from "@/stores/settingsStore";
+import { markImportCancelling } from "@/stores/taskStore";
 import type { ImportResult } from "@/types/asset";
 
 // 与后端 utils/mime.rs asset_type_from_ext 白名单同步（选择器过滤，拖拽入口由后端扫描过滤）
@@ -53,7 +55,7 @@ export default function ImportPage() {
     if (!settingsLoaded) void loadSettings();
   }, [settingsLoaded, loadSettings]);
 
-  /** 选文件/拖文件 → 只生成清单，不入库（PRD v2.4 手动确认） */
+  /** 选文件/拖文件 → 只生成清单，不入库（PRD v2.4 手动确认）；追加期间保留旧清单 */
   const stage = useCallback(
     async (paths: string[]) => {
       if (paths.length === 0 || running) return;
@@ -65,7 +67,7 @@ export default function ImportPage() {
           setError("未发现可入库的图片/视频文件");
           return;
         }
-        // 追加合并（按路径去重）
+        // 追加合并（按规范化路径去重；哈希去重由正式入库兜底）
         setPlan((prev) => {
           if (!prev) return scanned;
           const known = new Set(prev.items.map((i) => i.path));
@@ -85,7 +87,8 @@ export default function ImportPage() {
     [running],
   );
 
-  // 进度事件订阅
+  // 阶段 1：页面只保留结果摘要（当前文件/计数/阶段），不绘制进度条。
+  // 进度事件仍订阅用于汇总文本；统一进度条由 taskStore/底栏任务层承担。
   useEffect(() => {
     let un: (() => void) | undefined;
     let cancelled = false;
@@ -123,8 +126,17 @@ export default function ImportPage() {
   }, [stage]);
 
   const choose = async () => {
+    if (running) return;
     const picked = await pickFiles({ multiple: true, filters: FILE_FILTERS });
     if (Array.isArray(picked)) void stage(picked);
+    else if (typeof picked === "string") void stage([picked]);
+  };
+
+  /** 添加文件夹：目录选择器，同样走 stage(paths) */
+  const chooseFolder = async () => {
+    if (running) return;
+    const picked = await pickDir({ directory: true, multiple: true });
+    if (picked && Array.isArray(picked)) void stage(picked);
     else if (typeof picked === "string") void stage([picked]);
   };
 
@@ -140,6 +152,11 @@ export default function ImportPage() {
       };
     });
 
+  const clearPlan = () => {
+    if (running) return;
+    setPlan(null);
+  };
+
   /** 手动确认入库 */
   const run = async () => {
     if (!plan || plan.items.length === 0 || running) return;
@@ -154,6 +171,7 @@ export default function ImportPage() {
       setResult(r);
       setPlan(null);
       void refreshLibrary();
+      void useMetadataStore.getState().refresh();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -164,7 +182,7 @@ export default function ImportPage() {
 
   return (
     <div className="flex h-full">
-      {/* 左侧任务栏：统计 + 选项 */}
+      {/* 左侧任务栏：统计 + 选项 + 开始/清空（运行中改为取消） */}
       <aside className="flex w-[180px] shrink-0 flex-col border-r border-[var(--color-border)]">
         <div className="border-b border-[var(--color-border)] p-3">
           <h3 className="mb-2 text-xs font-medium tracking-wide text-[var(--color-text-secondary)] uppercase">
@@ -202,44 +220,68 @@ export default function ImportPage() {
           />
         </div>
 
-        {plan && plan.items.length > 0 && !running && (
+        {plan && plan.items.length > 0 && (
           <div className="mt-auto p-3">
-            <Button variant="primary" className="w-full" onClick={() => void run()}>
-              开始入库（{plan.items.length}）
-            </Button>
-            <Button className="mt-1 w-full" onClick={() => setPlan(null)}>
-              清空清单
-            </Button>
+            {running ? (
+              <Button
+                className="w-full"
+                onClick={() => {
+                  markImportCancelling();
+                  void cancelImport();
+                }}
+              >
+                取消入库
+              </Button>
+            ) : (
+              <>
+                <Button variant="primary" className="w-full" onClick={() => void run()}>
+                  开始入库（{plan.items.length}）
+                </Button>
+                <Button className="mt-1 w-full" onClick={clearPlan}>
+                  清空清单
+                </Button>
+              </>
+            )}
           </div>
         )}
       </aside>
 
-      {/* 右侧：拖拽区 / 清单 / 进度 */}
+      {/* 右侧：拖拽区 / 清单 + 结果摘要（不绘制进度条） */}
       <div className="flex min-w-0 flex-1 flex-col p-6">
-        {progress && (
-          <div className="mb-3 flex flex-col gap-1.5">
-            <ProgressBar value={progress.total ? progress.current / progress.total : 0} />
-            <p className="truncate text-xs text-[var(--color-text-secondary)]">
-              {progress.current}/{progress.total} · {progress.file}
-            </p>
-            <Button className="self-start" onClick={() => void cancelImport()}>
-              取消
-            </Button>
+        {/* 结果摘要：当前文件 + 成功/重复/失败 + 阶段（不是进度条） */}
+        {(progress || result) && (
+          <div className="mb-3 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-[var(--color-text-secondary)]">
+            {progress && progress.file && (
+              <span className="truncate text-[var(--color-text)]" title={progress.file}>
+                当前文件：{progress.file}
+              </span>
+            )}
+            {result ? (
+              <span>
+                成功 {result.imported} · 重复 {result.duplicates} · 失败 {result.failed}
+              </span>
+            ) : (
+              <span>
+                成功 {progress?.imported ?? 0} · 重复 {progress?.duplicates ?? 0} · 失败 {progress?.failed ?? 0}
+              </span>
+            )}
+            {progress && progress.message && <span>阶段：{progress.message}</span>}
           </div>
-        )}
-
-        {result && (
-          <p className="mb-3 text-sm text-[var(--color-text)]">
-            入库完成：成功 {result.imported} · 重复 {result.duplicates} · 失败 {result.failed}
-          </p>
         )}
         {result && result.errors.length > 0 && (
           <p className="mb-3 max-w-lg truncate text-xs text-[var(--color-danger)]">{result.errors[0]}</p>
         )}
-        {error && <p className="mb-3 text-xs text-[var(--color-danger)]">{error}</p>}
+        {error && !running && <p className="mb-3 text-xs text-[var(--color-danger)]">{error}</p>}
 
         {plan && plan.items.length > 0 ? (
-          <PendingList items={plan.items} running={running} onRemove={removeItem} />
+          <PendingList
+            items={plan.items}
+            running={running}
+            onRemove={removeItem}
+            onAddFiles={choose}
+            onAddFolder={chooseFolder}
+            onClear={clearPlan}
+          />
         ) : (
           <div
             className={clsx(
@@ -252,9 +294,12 @@ export default function ImportPage() {
               支持文件夹递归，重复文件自动识别；选中后先入清单，手动确认才入库
             </p>
             {!running && (
-              <Button variant="primary" onClick={choose}>
-                选择文件…
-              </Button>
+              <div className="flex gap-2">
+                <Button variant="primary" onClick={choose}>
+                  选择文件…
+                </Button>
+                <Button onClick={chooseFolder}>选择文件夹…</Button>
+              </div>
             )}
           </div>
         )}

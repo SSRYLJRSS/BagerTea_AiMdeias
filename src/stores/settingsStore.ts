@@ -1,6 +1,7 @@
 /** 应用设置状态：启动加载，保存即落库 */
 import { create } from "zustand";
 import { getSettings, saveSettings } from "@/api/settings";
+import { normalizeSettings } from "@/utils/normalizeSettings";
 import type { Settings } from "@/types/settings";
 
 /** R-24：主题写入 <html> 的 data-theme（system 时 media query 接管，light/dark 显式生效） */
@@ -25,7 +26,9 @@ export const useSettingsStore = create<SettingsState>((set) => ({
 
   load: async () => {
     try {
-      const settings = await getSettings();
+      const raw = await getSettings();
+      // A-2：后端返回先做运行时归一化（缺字段兜底），再写入 store，避免 SettingsPage 因缺字段白屏
+      const settings = normalizeSettings(raw);
       set({ settings, loaded: true, loadError: null });
       applyTheme(settings.theme); // R-24：启动即应用已保存主题
     } catch (e) {

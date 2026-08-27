@@ -13,6 +13,7 @@ import type { Asset, AssetPage } from "@/types/asset";
 const mocks = vi.hoisted(() => ({
   listAssets: vi.fn(),
   listAssetIds: vi.fn(),
+  listMetadataFacets: vi.fn(),
   getAssetUrls: vi.fn(),
   revealInFolder: vi.fn(),
   trashRestore: vi.fn(),
@@ -22,6 +23,7 @@ const mocks = vi.hoisted(() => ({
 vi.mock("@/api/assets", () => ({
   listAssets: mocks.listAssets,
   listAssetIds: mocks.listAssetIds,
+  listMetadataFacets: mocks.listMetadataFacets,
   getAssetUrls: mocks.getAssetUrls,
   revealInFolder: mocks.revealInFolder,
   trashRestore: mocks.trashRestore,
@@ -98,6 +100,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   mocks.listAssets.mockResolvedValue(pageOf([mkAsset(1), mkAsset(2), mkAsset(3)]));
   mocks.listAssetIds.mockResolvedValue([1, 2, 3]);
+  mocks.listMetadataFacets.mockResolvedValue([]);
   mocks.getAssetUrls.mockResolvedValue([]);
   mocks.revealInFolder.mockResolvedValue(undefined);
   mocks.trashRestore.mockResolvedValue(undefined);
@@ -112,6 +115,9 @@ beforeEach(() => {
       assetType: "all",
       untaggedOnly: false,
       tagId: null,
+      facetFilters: [],
+      excludeTagIds: [],
+      metadataFilters: [],
       search: "",
       sortBy: "created_at",
       sortDir: "desc",

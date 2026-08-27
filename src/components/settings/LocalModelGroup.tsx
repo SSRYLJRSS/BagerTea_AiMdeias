@@ -66,6 +66,7 @@ interface Props {
 
 export default function LocalModelGroup({ draft, onPatchAi, onPatchSettings, notify, fail }: Props) {
     const [status, setStatus] = useState<InstallStatus | null>(null);
+    const [detectError, setDetectError] = useState(false);
     const [hw, setHw] = useState<HardwareReport | null>(null);
     const [installProg, setInstallProg] = useState<InstallProgress | null>(null);
     const [busy, setBusy] = useState(false);
@@ -130,13 +131,16 @@ export default function LocalModelGroup({ draft, onPatchAi, onPatchSettings, not
     }, [logs]);
 
     const refresh = useCallback(async () => {
+        setDetectError(false);
         try {
             const st = await ollamaInstallStatus();
             setStatus(st);
             if (st.running) setHw(await probeOllamaHardware().catch(() => null));
             else setHw(null);
         } catch {
+            // A-3：检测失败只在「本地打标」分组显示局部错误，不阻塞在线打标/视频开关
             setStatus(null);
+            setDetectError(true);
         }
     }, []);
 
@@ -373,6 +377,21 @@ export default function LocalModelGroup({ draft, onPatchAi, onPatchSettings, not
     };
 
     if (!status) {
+        if (detectError) {
+            return (
+                <div className="flex flex-col gap-2 p-3">
+                    <p className="text-sm text-[var(--color-danger)]">本地环境检测失败</p>
+                    <p className="text-xs leading-5 text-[var(--color-text-secondary)]">
+                        无法判断 Ollama 是否已安装。这不影响「在线打标」和视频 AI 打标；可稍后重试，或到「在线打标」分组使用云端 API。
+                    </p>
+                    <div>
+                        <Button variant="ghost" onClick={() => void refresh()}>
+                            重试检测
+                        </Button>
+                    </div>
+                </div>
+            );
+        }
         return <p className="p-3 text-xs text-[var(--color-text-secondary)]">正在检测本地环境…</p>;
     }
 

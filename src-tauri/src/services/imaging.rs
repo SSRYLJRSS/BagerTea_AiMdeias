@@ -214,9 +214,34 @@ fn tiff_embedded_jpeg(src: &Path) -> Option<Vec<u8>> {
     None
 }
 
+/// marker_scan_jpeg 单次最多扫描的字节数（有界上限，指导书 §5.4）。
+/// 禁止 `std::fs::read` 整文件读入：超大 RAW（可达数 GB）会被整体载入内存拖垮。
+/// 超过上限即封顶，只扫描前部（内嵌预览通常位于文件头附近）；找不到则返回 None，走通用占位图。
+const MARKER_SCAN_MAX_BYTES: usize = 64 * 1024 * 1024;
+/// 分块读取块大小（固定块，跨块边界由合并后的连续 buffer 处理）
+const MARKER_SCAN_BLOCK: usize = 256 * 1024;
+
 /// 策略 3：FFD8..FFD9 标记扫描（取最大 JPEG 块；一切格式的最后兜底）
+/// 有界、分块读取：绝不无界整读；遇到超过上限的大 RAW 只扫描前部。
 fn marker_scan_jpeg(src: &Path) -> Option<Vec<u8>> {
-    let data = std::fs::read(src).ok()?;
+    let mut f = std::fs::File::open(src).ok()?;
+    let file_len = f.metadata().ok()?.len();
+    if file_len < 4 {
+        return None;
+    }
+    let scan_end = (file_len as usize).min(MARKER_SCAN_MAX_BYTES);
+    // 分块累积到 scan_end（有界），内存开销受 MARKER_SCAN_MAX_BYTES 约束
+    let mut data = Vec::with_capacity(scan_end.min(MARKER_SCAN_BLOCK));
+    let mut pos = 0usize;
+    while pos < scan_end {
+        let want = MARKER_SCAN_BLOCK.min(scan_end - pos);
+        let mut block = vec![0u8; want];
+        if f.read_exact(&mut block).is_err() {
+            break;
+        }
+        data.extend_from_slice(&block);
+        pos += want;
+    }
     if data.len() < 4 {
         return None;
     }
@@ -464,6 +489,24 @@ mod tests {
         std::fs::write(&f, &data).unwrap();
         let j = marker_scan_jpeg(&f).unwrap();
         assert_eq!(j.len(), 5004);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn marker_scan_finds_jpeg_spanning_blocks() {
+        let dir = std::env::temp_dir().join(format!("bagertea_marker_blk_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("huge.raw");
+        // JPEG 内容超过一个 block（MARKER_SCAN_BLOCK），验证分块读取仍能完整提取跨块 JPEG
+        let mut data = vec![0u8; 100];
+        data.extend_from_slice(&[0xFF, 0xD8]);
+        data.extend_from_slice(&vec![7u8; 300 * 1024]);
+        data.extend_from_slice(&[0xFF, 0xD9]);
+        std::fs::write(&f, &data).unwrap();
+        let j = marker_scan_jpeg(&f).unwrap();
+        assert!(j.len() > 300 * 1024, "应提取到跨块完整 JPEG，实际 {}", j.len());
+        assert_eq!(&j[..2], &[0xFF, 0xD8]);
+        assert_eq!(&j[j.len() - 2..], &[0xFF, 0xD9]);
         std::fs::remove_dir_all(&dir).ok();
     }
 

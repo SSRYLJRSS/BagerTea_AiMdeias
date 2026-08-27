@@ -7,10 +7,109 @@ body,
   height: 100%;
 }
 
+html {
+  font-size: 15px;
+  -webkit-text-size-adjust: 100%;
+  text-rendering: optimizeLegibility;
+}
+
 body {
   margin: 0;
   background-color: var(--color-bg);
   color: var(--color-text);
   font-family: var(--font-sans);
-  -webkit-font-smoothing: antialiased;
+  font-size: 13px;
+  font-weight: 400;
+  line-height: 1.45;
+  font-synthesis: none;
+  /* Keep the platform's ClearType treatment on Windows WebView2. */
+  -webkit-font-smoothing: auto;
+}
+
+button,
+input,
+select {
+  font: inherit;
+}
+
+button {
+  cursor: pointer;
+}
+
+button:disabled {
+  cursor: not-allowed;
+}
+
+::selection {
+  background: var(--color-status-soft);
+  color: var(--color-text);
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, var(--color-text-secondary) 38%, transparent) transparent;
+}
+
+*::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+*::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--color-text-secondary) 38%, transparent);
+  border-radius: 999px;
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background: color-mix(in srgb, var(--color-text) 50%, transparent);
+}
+
+.ui-section-title {
+  color: var(--color-text-secondary);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.ui-nav-item {
+  position: relative;
+  border-radius: var(--radius-item);
+}
+
+.ui-nav-item[data-active="true"] {
+  background: var(--color-surface-hover);
+  color: var(--color-text);
+  font-weight: 600;
+}
+
+.ui-nav-item[data-active="true"]::before {
+  content: "";
+  position: absolute;
+  inset: 7px auto 7px 0;
+  width: 2px;
+  border-radius: 999px;
+  background: var(--color-status);
+}
+
+.ui-control {
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-control);
+  background: var(--color-surface-raised);
+  color: var(--color-text);
+  outline: none;
+  transition: border-color 160ms ease, box-shadow 160ms ease, background-color 160ms ease;
+}
+
+.ui-control:hover {
+  border-color: var(--color-border-strong);
+}
+
+.ui-control:focus {
+  border-color: var(--color-status);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-status) 14%, transparent);
 }

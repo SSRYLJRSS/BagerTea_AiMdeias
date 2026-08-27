@@ -20,7 +20,10 @@ pub async fn get_thumbnail(
     tauri::async_runtime::spawn_blocking(move || {
         let thumbs = ThumbnailService::new(&data_dir)?;
         match kind.as_str() {
-            "placeholder" => Ok(thumbs.placeholder_path(asset_id).to_string_lossy().into_owned()),
+            "placeholder" => Ok(thumbs
+                .placeholder_path(asset_id)
+                .to_string_lossy()
+                .into_owned()),
             "hd" => {
                 let p = thumbs.get_or_create_hd(&db, asset_id, size)?;
                 Ok(p.to_string_lossy().into_owned())
@@ -42,10 +45,7 @@ pub async fn get_preview(state: State<'_, AppState>, path: String) -> AppResult<
     }
     // B24：校验支持的文件类型
     let p = std::path::Path::new(&path);
-    let ext = p
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or_default();
+    let ext = p.extension().and_then(|e| e.to_str()).unwrap_or_default();
     if crate::utils::mime::asset_type_from_ext(ext).is_none() {
         return Err(AppError::msg("不支持的文件类型"));
     }
@@ -69,10 +69,7 @@ pub async fn get_preview(state: State<'_, AppState>, path: String) -> AppResult<
 #[tauri::command]
 pub fn clear_thumbnail_cache(state: State<AppState>, kind: Option<String>) -> AppResult<()> {
     {
-        let conn = state
-            .db
-            .lock()
-            .map_err(|_| AppError::msg("数据库锁中毒"))?;
+        let conn = state.db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
         match kind.as_deref() {
             Some("placeholder") => {
                 // B27：回写 placeholder_path = NULL

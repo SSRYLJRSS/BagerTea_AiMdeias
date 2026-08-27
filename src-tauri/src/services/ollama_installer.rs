@@ -54,8 +54,7 @@ pub struct DownloadSource {
 /// gh-proxy 与 GitHub 直连作降级兜底。
 pub fn builtin_sources() -> Vec<DownloadSource> {
     let official = "https://ollama.com/download/OllamaSetup.exe";
-    let gh =
-        "https://github.com/ollama/ollama/releases/latest/download/OllamaSetup.exe";
+    let gh = "https://github.com/ollama/ollama/releases/latest/download/OllamaSetup.exe";
     vec![
         DownloadSource {
             id: "ghfast".into(),
@@ -491,11 +490,7 @@ pub fn resolve_sources_ordered(
     }
 
     // 有效 preferred：该源置顶，其余按测速降序
-    let pref = all
-        .iter()
-        .find(|s| s.id == preferred)
-        .cloned()
-        .unwrap();
+    let pref = all.iter().find(|s| s.id == preferred).cloned().unwrap();
     let mut rest: Vec<DownloadSource> = all.into_iter().filter(|s| s.id != preferred).collect();
     rest.sort_by(|a, b| {
         let sa = speed_of(&a.id);
@@ -785,14 +780,12 @@ pub fn remove_installer() -> AppResult<bool> {
 pub fn remove_installer_at(path: &Path) -> AppResult<bool> {
     let mut removed = false;
     if path.exists() {
-        std::fs::remove_file(path)
-            .map_err(|e| AppError::msg(format!("删除安装包失败: {e}")))?;
+        std::fs::remove_file(path).map_err(|e| AppError::msg(format!("删除安装包失败: {e}")))?;
         removed = true;
     }
     let (part, meta) = part_paths(path);
     if part.exists() {
-        std::fs::remove_file(&part)
-            .map_err(|e| AppError::msg(format!("删除临时文件失败: {e}")))?;
+        std::fs::remove_file(&part).map_err(|e| AppError::msg(format!("删除临时文件失败: {e}")))?;
         removed = true;
     }
     if meta.exists() {
@@ -848,8 +841,12 @@ mod tests {
         assert_eq!(s[2].id, "ghproxy");
         assert_eq!(s[3].id, "github");
         // 官源必须是真实二分直链，而非 HTML 下载页
-        assert!(s[1].url.starts_with("https://ollama.com/download/OllamaSetup.exe"));
-        assert!(s[0].url.starts_with("https://ghfast.top/https://github.com/"));
+        assert!(s[1]
+            .url
+            .starts_with("https://ollama.com/download/OllamaSetup.exe"));
+        assert!(s[0]
+            .url
+            .starts_with("https://ghfast.top/https://github.com/"));
         assert!(s[3].url.starts_with("https://github.com/"));
     }
 
@@ -917,7 +914,8 @@ mod tests {
 
     #[test]
     fn part_meta_roundtrip() {
-        let meta = std::env::temp_dir().join(format!("bagertea_partmeta_{}.json", std::process::id()));
+        let meta =
+            std::env::temp_dir().join(format!("bagertea_partmeta_{}.json", std::process::id()));
         let _ = std::fs::remove_file(&meta);
         PartMeta::write(&meta, "ghproxy");
         assert_eq!(PartMeta::read(&meta).as_deref(), Some("ghproxy"));

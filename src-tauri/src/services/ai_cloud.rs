@@ -13,9 +13,10 @@ use rusqlite::Connection;
 use serde::Serialize;
 
 use crate::db::ai::{self, CategorizedTags};
+use crate::db::tag_facets::FacetPromptContext;
 use crate::db::{
     assets,
-    settings::{AiSettings, ApiProfile, TagCategory},
+    settings::{AiSettings, ApiProfile},
 };
 use crate::error::{AppError, AppResult};
 
@@ -28,19 +29,23 @@ pub struct AiProgress {
     pub current_asset_id: i64,
 }
 
-/// 单张图片请求标签（纯函数易测部分之外的网络调用）
-/// 按分类组装提示词（PRD 5.5）：分类名 + hint + 单/多选约束
-fn build_prompt(categories: &[TagCategory]) -> String {
-    let mut lines = String::from("请为这张图片按以下分类生成简短中文标签。分类与要求：\n");
-    for c in categories {
-        let rule = if c.single {
+/// 按分面组装提示词（P1B + C-3）：使用稳定英文 facetKey 作为 JSON 键，中文显示名仅作说明；
+/// 避免模型返回中文分类名导致归类不稳定，也确保 color 独立于 style。
+fn build_prompt(facets: &[FacetPromptContext]) -> String {
+    let mut lines = String::from(
+        "请为这张图片按以下分面生成简短中文标签。只返回 JSON 对象，键必须为英文分面 key，值为标签字符串数组，无合适标签的分面给空数组，不要其他内容。\n",
+    );
+    lines.push_str("分面与要求：\n");
+    for c in facets {
+        let rule = if c.selection_mode == "single" {
             "（单选，最多 1 个）".to_string()
         } else {
-            format!("（可多选，1-{} 个）", c.max.max(1))
+            format!("（可多选，1-{} 个）", c.max_items.unwrap_or(3).max(1))
         };
         lines.push_str(&format!(
-            "- {}{}{}\n",
-            c.name,
+            "- {}(key: {}){}{}\n",
+            c.display_name,
+            c.key,
             rule,
             if c.hint.is_empty() {
                 String::new()
@@ -49,7 +54,10 @@ fn build_prompt(categories: &[TagCategory]) -> String {
             }
         ));
     }
-    lines.push_str("只返回 JSON 对象，键为分类名、值为标签字符串数组，无合适标签的分类给空数组，不要其他内容。");
+    lines.push_str(
+        "示例：{\"subject\":[\"人\"],\"scene\":[\"海边\"],\"color\":[\"青橙\"]}。\
+         颜色类标签只归 color，不归 style；时间/光线只归 lighting；构图归 composition；人物归 people。",
+    );
     lines
 }
 
@@ -94,6 +102,37 @@ pub fn parse_categorized(content: &str) -> CategorizedTags {
         }
     }
     out
+}
+
+/// C-4：解析并校验 AI 回复的分面键。
+/// 返回（稳定 facetKey 归一后的标签, warnings）：稳定 key / 兼容旧中文 key 都归一为稳定 facetKey；
+/// 未知 key 记入 warnings 并归入自定义，但绝不静默丢失（调用方应记录/展示 warning）。
+pub fn parse_categorized_checked(
+    content: &str,
+    valid_keys: &[&str],
+) -> (CategorizedTags, Vec<String>) {
+    let raw = parse_categorized(content);
+    let mut warnings = Vec::new();
+    let mut out = CategorizedTags::new();
+    for (k, list) in &raw {
+        let trimmed = k.trim();
+        let mapped = crate::db::tag_facets::key_for_legacy_name(trimmed);
+        let known = valid_keys.contains(&mapped)
+            || valid_keys.contains(&trimmed)
+            || trimmed.eq_ignore_ascii_case("custom");
+        if !known {
+            warnings.push(format!("未知分面 key「{trimmed}」已归入自定义，建议改用稳定 facetKey"));
+        }
+        let target = if valid_keys.contains(&mapped) {
+            mapped.to_string()
+        } else if mapped == "custom" {
+            "custom".to_string()
+        } else {
+            mapped.to_string()
+        };
+        out.entry(target).or_default().extend(list.iter().cloned());
+    }
+    (out, warnings)
 }
 
 /// 退化输出检测（Ollama 长驻状态损坏的已知症状，见 ollama/ollama#8235/#17587）：
@@ -145,9 +184,13 @@ fn unload_ollama_model(cfg: &ApiProfile) {
 }
 
 /// 解析模型回复并要求非空（v2.12）：空结果视为失败——通常意味着模型不支持图片输入或未遵循提示词。
+/// C-4：通过 parse_categorized_checked 归一化稳定 key 并记录未知 key warning，绝不静默丢到 custom。
 /// 失败时把模型原始返回内容（截断）带进错误信息，便于定位“模型没按 JSON 输出”类问题
-fn parse_tags_strict(content: &str) -> AppResult<CategorizedTags> {
-    let tags = parse_categorized(content);
+fn parse_tags_strict(content: &str, valid_keys: &[&str]) -> AppResult<CategorizedTags> {
+    let (tags, warnings) = parse_categorized_checked(content, valid_keys);
+    for w in &warnings {
+        tracing::warn!("AI 打标未知分面 key：{w}");
+    }
     if tags.is_empty() {
         let snippet: String = content.chars().take(300).collect();
         let shown = if snippet.chars().count() < content.chars().count() {
@@ -165,7 +208,7 @@ fn parse_tags_strict(content: &str) -> AppResult<CategorizedTags> {
 fn request_tags(
     client: &reqwest::blocking::Client,
     cfg: &ApiProfile,
-    categories: &[TagCategory],
+    facets: &[FacetPromptContext],
     image_path: &std::path::Path,
 ) -> AppResult<CategorizedTags> {
     // 连接失败引导（P3-01a）：本地档案连不上时明示安装/启动本地服务
@@ -194,7 +237,7 @@ fn request_tags(
         _ => "image/jpeg",
     };
 
-    let prompt = build_prompt(categories);
+    let prompt = build_prompt(facets);
     let base = cfg.base_url.trim_end_matches('/');
 
     // 发起一次请求并取回模型文本回复（不同协议分支各自组包）
@@ -255,13 +298,17 @@ fn request_tags(
                     // 把原始响应（截断）带进错误，便于判断是错误页/限流/空 choices
                     let raw = serde_json::to_string(&resp).unwrap_or_default();
                     let snippet: String = raw.chars().take(300).collect();
-                    AppError::msg(format!("服务未返回可选内容（choices 为空）。原始响应：{snippet}"))
+                    AppError::msg(format!(
+                        "服务未返回可选内容（choices 为空）。原始响应：{snippet}"
+                    ))
                 })
         })
     };
 
     let mut content = fetch()?;
-    if let Ok(t) = parse_tags_strict(&content) {
+    // C-4：有效分面 key 集合（稳定 facetKey），用于校验未知 key 并记录 warning
+    let valid_keys: Vec<&str> = facets.iter().map(|f| f.key.as_str()).collect();
+    if let Ok(t) = parse_tags_strict(&content, &valid_keys) {
         return Ok(t);
     }
     // 本地档案失败自愈：任何解析失败（@@@@ 退化 / 乱码 / 答非所问）都先卸载重载一次再重试。
@@ -269,7 +316,7 @@ fn request_tags(
     if cfg.is_local() {
         unload_ollama_model(cfg);
         if let Ok(c) = fetch() {
-            if let Ok(t) = parse_tags_strict(&c) {
+            if let Ok(t) = parse_tags_strict(&c, &valid_keys) {
                 return Ok(t);
             }
             content = c;
@@ -283,7 +330,7 @@ fn request_tags(
         }
     }
     // 非退化（模型正常回复但没按提示词输出 JSON）：保留原始错误信息便于定位
-    parse_tags_strict(&content)
+    parse_tags_strict(&content, &valid_keys)
 }
 
 /// 从 Anthropic Messages 响应中取第一个 text 内容块
@@ -305,6 +352,225 @@ pub fn parse_model_ids(v: &serde_json::Value) -> Vec<String> {
         .filter(|s| !s.is_empty())
         .map(String::from)
         .collect()
+}
+
+/// 结构化输出的降级等级（P3 §9.3）：
+/// 第 1 级 = API 级结构化输出（Anthropic tool use / OpenAI json_schema）
+/// 第 2 级 = json_object + prompt 内嵌 schema
+/// 第 3 级 = 纯 prompt + 宽容 JSON 解析（含截取 {} 片段 + 带错误重试一次）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum TextJsonTier {
+    Plain,
+    JsonObject,
+    Structured,
+}
+
+/// 发起一次纯文本 JSON 请求，返回模型文本回复。
+/// 统一 OpenAI 兼容与 Anthropic 两种协议；不解析语义，由调用方校验。
+/// structured_schema 仅在 Tier::Structured 下使用（OpenAI json_schema 或 Anthropic tool input_schema）。
+fn request_text_raw(
+    client: &reqwest::blocking::Client,
+    cfg: &ApiProfile,
+    system: &str,
+    user: &str,
+    tier: TextJsonTier,
+    structured_schema: Option<serde_json::Value>,
+) -> AppResult<String> {
+    let conn_err = |e: reqwest::Error| {
+        if cfg.is_local() {
+            AppError::msg(format!(
+                "无法连接本地服务 {base}：请确认 Ollama/LM Studio 已启动，或在设置页切回云端档案: {e}",
+                base = cfg.base_url
+            ))
+        } else {
+            AppError::msg(format!("云端请求失败: {e}"))
+        }
+    };
+    let base = cfg.base_url.trim_end_matches('/');
+    let messages = serde_json::json!([
+        { "role": "system", "content": system },
+        { "role": "user", "content": user }
+    ]);
+
+    let fetch: Box<dyn Fn() -> AppResult<String>> = if cfg.api_mode == "anthropic" {
+        Box::new(move || {
+            let mut body = serde_json::json!({
+                "model": cfg.model,
+                "max_tokens": 1024,
+                "system": system,
+                "messages": [ { "role": "user", "content": user } ]
+            });
+            // 第 1 级：tool use + 强制 tool_choice（schema 作为工具 input_schema）
+            if tier == TextJsonTier::Structured {
+                if let Some(sch) = &structured_schema {
+                    body["tools"] = serde_json::json!([{
+                        "name": "emit_search_intent",
+                        "description": "输出自然语言解析后的查询意图。只调用一次，用返回的 JSON 作为最终结果。",
+                        "input_schema": sch
+                    }]);
+                    body["tool_choice"] = serde_json::json!({
+                        "type": "tool", "name": "emit_search_intent"
+                    });
+                }
+            }
+            let resp: serde_json::Value = client
+                .post(format!("{base}/messages"))
+                .header("x-api-key", &cfg.api_key)
+                .header("anthropic-version", "2023-06-01")
+                .json(&body)
+                .send()
+                .map_err(conn_err)?
+                .json()
+                .map_err(|e| AppError::msg(format!("响应解析失败: {e}")))?;
+            // Anthropic tool use：取 tool_use 块的 input 作为结构化结果
+            if tier == TextJsonTier::Structured {
+                if let Some(tool_input) = extract_anthropic_tool_input(&resp) {
+                    return Ok(tool_input);
+                }
+            }
+            extract_anthropic_text(&resp)
+                .ok_or_else(|| AppError::msg("Anthropic 返回缺少 text 内容块"))
+        })
+    } else {
+        // OpenAI 兼容：Bearer 鉴权 + /chat/completions；Tier::Structured 用 response_format json_schema
+        Box::new(move || {
+            let mut body = serde_json::json!({
+                "model": cfg.model,
+                "messages": messages,
+                "max_tokens": 1024
+            });
+            if tier == TextJsonTier::Structured {
+                if let Some(sch) = &structured_schema {
+                    body["response_format"] = serde_json::json!({
+                        "type": "json_schema",
+                        "json_schema": { "name": "search_intent", "strict": true, "schema": sch }
+                    });
+                }
+            } else if tier == TextJsonTier::JsonObject {
+                body["response_format"] = serde_json::json!({ "type": "json_object" });
+            }
+            let resp: serde_json::Value = if cfg.api_key.trim().is_empty() {
+                client
+                    .post(format!("{base}/chat/completions"))
+                    .json(&body)
+                    .send()
+                    .map_err(conn_err)?
+                    .json()
+                    .map_err(|e| AppError::msg(format!("响应解析失败: {e}")))?
+            } else {
+                client
+                    .post(format!("{base}/chat/completions"))
+                    .bearer_auth(&cfg.api_key)
+                    .json(&body)
+                    .send()
+                    .map_err(conn_err)?
+                    .json()
+                    .map_err(|e| AppError::msg(format!("响应解析失败: {e}")))?
+            };
+            resp["choices"][0]["message"]["content"]
+                .as_str()
+                .map(str::to_string)
+                .ok_or_else(|| {
+                    let raw = serde_json::to_string(&resp).unwrap_or_default();
+                    let snippet: String = raw.chars().take(300).collect();
+                    AppError::msg(format!("服务未返回内容。原始响应：{snippet}"))
+                })
+        })
+    };
+    fetch()
+}
+
+/// 从 Anthropic 响应中提取 tool_use 块的 input（结构化输出第 1 级）
+fn extract_anthropic_tool_input(v: &serde_json::Value) -> Option<String> {
+    for block in v["content"].as_array()? {
+        if block["type"].as_str() == Some("tool_use") {
+            if let Some(input) = block["input"].as_object() {
+                // 序列化为紧凑 JSON 字符串（保持与 OpenAI content 路径一致）
+                return serde_json::to_string(input).ok();
+            }
+        }
+    }
+    None
+}
+
+/// 三级降级的文本 JSON 请求：第 1 级结构化 → 第 2 级 json_object → 第 3 级纯文本。
+/// 每级失败（含 400/unknown field）自动降级；返回 (tier_used, 模型文本)。
+/// 最终仍失败返回最后一次错误。profile 级能力缓存由调用方（super_search_ai）维护。
+pub fn request_text_json(
+    cfg: &ApiProfile,
+    system: &str,
+    user: &str,
+    structured_schema: Option<serde_json::Value>,
+    max_structured_tier: TextJsonTier,
+) -> AppResult<(TextJsonTier, String)> {
+    let client = reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(15))
+        .timeout(Duration::from_secs(90))
+        .build()
+        .map_err(|e| AppError::msg(format!("HTTP 客户端初始化失败: {e}")))?;
+
+    // 第 3 级失败时带错误重试逻辑单独处理；一级一级降级。
+    let mut last_err: Option<String> = None;
+
+    let should_fallback = |message: &str| {
+        let lower = message.to_ascii_lowercase();
+        !lower.contains("无法连接")
+            && !lower.contains("connect")
+            && !lower.contains("timed out")
+            && !lower.contains("timeout")
+            && !lower.contains("401")
+            && !lower.contains("403")
+            && !lower.contains("unauthorized")
+            && !lower.contains("forbidden")
+            && !lower.contains("api key")
+            && !lower.contains("authentication")
+    };
+
+    if max_structured_tier >= TextJsonTier::Structured {
+        match request_text_raw(
+            &client,
+            cfg,
+            system,
+            user,
+            TextJsonTier::Structured,
+            structured_schema.clone(),
+        ) {
+            Ok(t) => return Ok((TextJsonTier::Structured, t)),
+            Err(e) => {
+                let message = e.to_string();
+                if !should_fallback(&message) {
+                    return Err(e);
+                }
+                last_err = Some(message);
+            }
+        }
+    }
+    if max_structured_tier >= TextJsonTier::JsonObject {
+        match request_text_raw(&client, cfg, system, user, TextJsonTier::JsonObject, None) {
+            Ok(t) => return Ok((TextJsonTier::JsonObject, t)),
+            Err(e) => {
+                let message = e.to_string();
+                if !should_fallback(&message) {
+                    return Err(e);
+                }
+                last_err = Some(message);
+            }
+        }
+    }
+    match request_text_raw(&client, cfg, system, user, TextJsonTier::Plain, None) {
+        Ok(t) => Ok((TextJsonTier::Plain, t)),
+        Err(e) => {
+            let detail = last_err.unwrap_or_default();
+            Err(AppError::msg(format!(
+                "AI 请求降级仍失败：{detail}；最后尝试：{e}"
+            )))
+        }
+    }
+}
+
+/// 纯文本 JSON 请求的本地退化检测（复用 is_degenerate）
+pub fn is_degenerate_text(content: &str) -> bool {
+    is_degenerate(content)
 }
 
 /// 拉取服务商可用模型列表（GET {base_url}/models；两种模式的响应同为 {data:[{id}]}）
@@ -383,7 +649,7 @@ pub fn merge_frame_tags(frames: &[CategorizedTags]) -> CategorizedTags {
 fn tag_video(
     client: &reqwest::blocking::Client,
     cfg: &ApiProfile,
-    categories: &[TagCategory],
+    facets: &[FacetPromptContext],
     asset: &assets::Asset,
 ) -> AppResult<CategorizedTags> {
     let dir = std::env::temp_dir().join(format!(
@@ -406,7 +672,7 @@ fn tag_video(
     }
     let mut results: Vec<CategorizedTags> = Vec::new();
     for f in &frames {
-        if let Ok(t) = request_tags(client, cfg, categories, f) {
+        if let Ok(t) = request_tags(client, cfg, facets, f) {
             results.push(t);
         }
     }
@@ -423,11 +689,17 @@ fn tag_video(
 
 /// 执行批次：逐条「读库 → 网络请求 → 写库」，进度回调 + 取消；
 /// 每次 DB 操作短锁即用即放，网络等待期间不持锁，避免阻塞全应用其它 DB 读写
+/// 本地模型子批大小（§8.3：按模型能力 10~20；此处取 15）。云端子批大小由「执行分块大小」设置驱动，
+/// 执行层内存分块，不新增 chunk 表。
+const LOCAL_SUBBATCH_SIZE: usize = 15;
+/// 单项失败重试前退避（秒）：指数退避首段
+const RETRY_SECONDS: u64 = 1;
+
 pub fn run_cloud_batch<F: Fn(AiProgress)>(
     db: &Arc<Mutex<Connection>>,
     batch_id: i64,
     cfg: &AiSettings,
-    categories: &[TagCategory],
+    facets: &[FacetPromptContext],
     limit: Option<i64>,
     cancel: &Arc<AtomicBool>,
     progress: F,
@@ -475,6 +747,14 @@ pub fn run_cloud_batch<F: Fn(AiProgress)>(
         Some(n) => pending.into_iter().take(n.max(0) as usize).collect(),
         None => pending,
     };
+    // 指导书 §8.2/§8.3：逻辑批次完整保留（用户所选全部素材都在批内），执行层本地分块。
+    // 云端子批大小 = 设置「执行分块大小」（batch_limit），限 [10,50]；本地按模型能力用 LOCAL_SUBBATCH_SIZE(15)；
+    // 并发 1；单项失败重试 1 次（指数退避），仍失败置 rejected。
+    let chunk_size = if profile.is_local() {
+        LOCAL_SUBBATCH_SIZE
+    } else {
+        (cfg.batch_limit as usize).clamp(10, 50)
+    };
     let total = todo.len() as i64;
     // F15b（2026-08-22）：无待打标项（全部已处理/已确认/已拒绝）不再空转 done——
     // 明确报错；并先把批次状态复位，避免留下 processing 僵尸态
@@ -482,54 +762,65 @@ pub fn run_cloud_batch<F: Fn(AiProgress)>(
     if todo.is_empty() {
         let conn = lock()?;
         ai::set_batch_status(&conn, batch_id, "done")?;
-        return Err(AppError::msg(
-            "当前没有待打标的建议（已全部处理或确认）",
-        ));
+        return Err(AppError::msg("当前没有待打标的建议（已全部处理或确认）"));
     }
 
-    for (i, s) in todo.iter().enumerate() {
-        if cancel.load(Ordering::Relaxed) {
-            let conn = lock()?;
-            ai::set_batch_status(&conn, batch_id, "cancelled")?;
-            return Ok(());
-        }
-        let asset = {
-            let conn = lock()?;
-            assets::get(&conn, s.asset_id)?
-        };
-        // 按资产类型分发（P3-02）：视频抽帧打标（受 video_tagging 开关控制），图片走原路径
+    // 单条打标计算（网络请求不持 DB 锁）；失败由调用方决定重试/降级
+    let compute = |asset: &crate::db::assets::Asset| -> AppResult<CategorizedTags> {
         let is_video = asset.mime_type.starts_with("video/");
-        let tags = if is_video && !cfg.video_tagging {
-            Err(AppError::msg(
-                "视频 AI 打标未开启（设置 → AI 打标 → 视频 AI 打标）",
-            ))
-        } else if is_video {
-            tag_video(&client, profile, categories, &asset)
+        if is_video && !cfg.video_tagging {
+            return Err(AppError::msg(
+                "视频 AI 打标未开启。请打开设置 → 在线打标 → 视频 AI 打标，保存后重新开始批次。",
+            ));
+        }
+        if is_video {
+            tag_video(&client, profile, facets, asset)
         } else {
             // 网络请求（可能耗时数十秒）：不持 DB 锁
-            request_tags(&client, profile, categories, &pick_image(&asset))
-        };
-        {
-            let conn = lock()?;
-            match tags {
-                Ok(t) => ai::set_suggestion_tags(&conn, s.id, &t)?,
-                Err(e) => {
-                    // 单条失败不阻塞批次：建议置 rejected 并记录空标签与失败原因（v6 详情落库）
-                    let err = e.to_string();
-                    tracing::warn!("asset {} 打标失败: {err}", s.asset_id);
-                    let _ = ai::set_suggestion_error(&conn, s.id, &err);
-                    ai::reject_suggestion(&conn, s.id)?;
-                }
-            }
-            ai::inc_batch_processed(&conn, batch_id)?;
+            request_tags(&client, profile, facets, &pick_image(asset))
         }
-        let processed = i as i64 + 1;
-        progress(AiProgress {
-            batch_id,
-            processed,
-            total,
-            current_asset_id: s.asset_id,
-        });
+    };
+
+    let mut processed = 0i64;
+    for chunk in todo.chunks(chunk_size) {
+        for s in chunk {
+            if cancel.load(Ordering::Relaxed) {
+                let conn = lock()?;
+                ai::set_batch_status(&conn, batch_id, "cancelled")?;
+                return Ok(());
+            }
+            let asset = {
+                let conn = lock()?;
+                assets::get(&conn, s.asset_id)?
+            };
+            // 单项失败：指数退避后重试 1 次，仍失败置 rejected（不阻塞其他素材）
+            let mut tags = compute(&asset);
+            if tags.is_err() {
+                std::thread::sleep(Duration::from_millis(RETRY_SECONDS * 1000));
+                tags = compute(&asset);
+            }
+            {
+                let conn = lock()?;
+                match tags {
+                    Ok(t) => ai::set_suggestion_tags(&conn, s.id, &t)?,
+                    Err(e) => {
+                        // 单条失败不阻塞批次：建议置 rejected 并记录空标签与失败原因（v6 详情落库）
+                        let err = e.to_string();
+                        tracing::warn!("asset {} 打标失败: {err}", s.asset_id);
+                        let _ = ai::set_suggestion_error(&conn, s.id, &err);
+                        ai::reject_suggestion(&conn, s.id)?;
+                    }
+                }
+                ai::inc_batch_processed(&conn, batch_id)?;
+            }
+            processed += 1;
+            progress(AiProgress {
+                batch_id,
+                processed,
+                total,
+                current_asset_id: s.asset_id,
+            });
+        }
     }
 
     {
@@ -575,13 +866,42 @@ mod tests {
 
     #[test]
     fn strict_garbage_is_err() {
-        assert!(super::parse_tags_strict("我无法查看这张图片").is_err());
+        assert!(super::parse_tags_strict("我无法查看这张图片", &[]).is_err());
     }
 
     #[test]
     fn strict_valid_object_ok() {
-        let r = super::parse_tags_strict("{\"场景\": [\"公园\"]}").unwrap();
-        assert_eq!(r.get("场景").unwrap(), &vec!["公园".to_string()]);
+        let valid = ["scene", "style", "color"];
+        let r = super::parse_tags_strict("{\"场景\": [\"公园\"]}", &valid).unwrap();
+        assert_eq!(r.get("scene").unwrap(), &vec!["公园".to_string()]);
+    }
+
+    #[test]
+    fn checked_unknown_key_warns_not_silent_custom() {
+        // C-4：未知 key 应产生 warning 并归入自定义，不静默丢失
+        let valid = ["subject", "scene", "color"];
+        let (tags, warnings) = super::parse_categorized_checked(
+            "{\"subject\":[\"人\"],\"foobar\":[\"奇怪\"]}",
+            &valid,
+        );
+        assert_eq!(tags.get("subject").unwrap(), &vec!["人".to_string()]);
+        assert_eq!(tags.get("custom").unwrap(), &vec!["奇怪".to_string()]);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("foobar"));
+    }
+
+    #[test]
+    fn checked_legacy_chinese_maps_to_stable_key() {
+        // C-4：兼容旧中文 key 且不产生 warning
+        let valid = ["subject", "scene", "color", "lighting"];
+        let (tags, warnings) = super::parse_categorized_checked(
+            "{\"色彩\":[\"蓝\"],\"光线/时间\":[\"黄昏\"],\"主体\":[\"树\"]}",
+            &valid,
+        );
+        assert_eq!(tags.get("color").unwrap(), &vec!["蓝".to_string()]);
+        assert_eq!(tags.get("lighting").unwrap(), &vec!["黄昏".to_string()]);
+        assert_eq!(tags.get("subject").unwrap(), &vec!["树".to_string()]);
+        assert!(warnings.is_empty(), "已知中文 key 不应产生 warning");
     }
 
     #[test]
@@ -652,19 +972,17 @@ mod tests {
     #[test]
     fn degenerate_mojibake_detected() {
         // UTF-8 中文被按 Latin-1 误读的典型乱码（ollama 分词器字节错切症状，实测样本）
-        assert!(super::is_degenerate(
-            "å¯¹ä¸èµ·ï¼ææ æ³å¸®å©æ¨è§£è¯»å¾åå®¹ã"
-        ));
-        assert!(super::is_degenerate(
-            "ä»¥ä¸æ¯æ´çå¥½å¹¶è§æ ¼åçJSONæ ¼å¼ï¼"
-        ));
+        assert!(super::is_degenerate("å¯¹ä¸èµ·ï¼ææ æ³å¸®å©æ¨è§£è¯»å¾åå®¹ã"));
+        assert!(super::is_degenerate("ä»¥ä¸æ¯æ´çå¥½å¹¶è§æ ¼åçJSONæ ¼å¼ï¼"));
     }
 
     #[test]
     fn normal_replies_not_degenerate() {
         assert!(!super::is_degenerate("这张图片是一张纯红色的图片。"));
         assert!(!super::is_degenerate("{\"场景\": [\"公园\"]}"));
-        assert!(!super::is_degenerate("This image shows a bridge in a city."));
+        assert!(!super::is_degenerate(
+            "This image shows a bridge in a city."
+        ));
         // 中文标点+ASCII 混排不误报
         assert!(!super::is_degenerate("1 + 1 = 2"));
     }

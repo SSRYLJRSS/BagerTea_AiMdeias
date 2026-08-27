@@ -41,8 +41,7 @@ export default function ModelSelect({ apiMode, baseUrl, apiKey, value, onChange 
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const inputCls =
-    "w-full rounded-md border border-[var(--color-border)] bg-[var(--color-surface)] px-2 py-1.5 text-sm text-[var(--color-text)] outline-none";
+  const inputCls = "ui-control w-full px-3 py-2 text-sm";
 
   return (
     <div className="flex flex-col gap-1.5">
@@ -67,12 +66,12 @@ export default function ModelSelect({ apiMode, baseUrl, apiKey, value, onChange 
         <button
           onClick={() => void fetchModels()}
           disabled={loading}
-          className="shrink-0 rounded-md border border-[var(--color-border)] px-2.5 py-1.5 text-xs text-[var(--color-text-secondary)] transition-colors hover:bg-[var(--color-surface)] hover:text-[var(--color-text)] disabled:opacity-50"
+          className="ui-control shrink-0 px-2.5 py-2 text-xs text-[var(--color-text-secondary)] transition-colors hover:bg-[var(--color-surface)] hover:text-[var(--color-text)] disabled:opacity-50"
         >
           {loading ? "获取中…" : models.length > 0 ? "刷新" : "获取模型列表"}
         </button>
       </div>
-      {error && <span className="text-xs text-red-500">{error}</span>}
+      {error && <span className="text-xs text-[var(--color-danger)]">{error}</span>}
     </div>
   );
 }

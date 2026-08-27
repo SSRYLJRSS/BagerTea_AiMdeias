@@ -311,6 +311,330 @@ fn migrate_v7(conn: &Connection) -> AppResult<()> {
     Ok(())
 }
 
+/// v8：标签系统地基——稳定分面、规范标签、别名、AI 候选明细与关联确认元数据。
+/// 迁移仅增列/增表，保留现有 tag id 和 asset_tags 关联；所有步骤均可重入。
+const SCHEMA_V8: &str = r#"
+CREATE TABLE IF NOT EXISTS tag_facets (
+  key            TEXT PRIMARY KEY,
+  display_name   TEXT NOT NULL,
+  description    TEXT NOT NULL DEFAULT '',
+  selection_mode TEXT NOT NULL DEFAULT 'multi',
+  max_items      INTEGER,
+  sort_order     INTEGER NOT NULL DEFAULT 0,
+  is_system      INTEGER NOT NULL DEFAULT 1,
+  status         TEXT NOT NULL DEFAULT 'active',
+  created_at     INTEGER NOT NULL,
+  updated_at     INTEGER NOT NULL,
+  CHECK(selection_mode IN ('single', 'multi')),
+  CHECK(status IN ('active', 'deprecated'))
+);
+
+CREATE TABLE IF NOT EXISTS tag_aliases (
+  id               INTEGER PRIMARY KEY AUTOINCREMENT,
+  tag_id           INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
+  alias            TEXT NOT NULL,
+  normalized_alias TEXT NOT NULL,
+  locale           TEXT NOT NULL DEFAULT '',
+  alias_type       TEXT NOT NULL DEFAULT 'synonym',
+  is_searchable    INTEGER NOT NULL DEFAULT 1,
+  created_at       INTEGER NOT NULL,
+  UNIQUE(tag_id, normalized_alias, locale),
+  CHECK(alias_type IN ('synonym', 'old_name', 'translation', 'typo'))
+);
+CREATE INDEX IF NOT EXISTS idx_tag_aliases_lookup
+  ON tag_aliases(normalized_alias, locale);
+
+CREATE TABLE IF NOT EXISTS ai_suggestion_items (
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  suggestion_id   INTEGER NOT NULL REFERENCES ai_suggestions(id) ON DELETE CASCADE,
+  facet_key       TEXT NOT NULL,
+  raw_name        TEXT NOT NULL,
+  normalized_name TEXT NOT NULL,
+  tag_id          INTEGER REFERENCES tags(id) ON DELETE SET NULL,
+  confidence      REAL,
+  decision        TEXT NOT NULL DEFAULT 'pending',
+  decision_reason TEXT,
+  created_at      INTEGER NOT NULL,
+  CHECK(confidence IS NULL OR (confidence >= 0 AND confidence <= 1)),
+  CHECK(decision IN ('pending', 'accepted', 'modified', 'rejected'))
+);
+CREATE INDEX IF NOT EXISTS idx_ai_suggestion_items_suggestion
+  ON ai_suggestion_items(suggestion_id);
+CREATE INDEX IF NOT EXISTS idx_ai_suggestion_items_tag
+  ON ai_suggestion_items(tag_id);
+
+CREATE INDEX IF NOT EXISTS idx_tags_facet_status
+  ON tags(facet_key, status, sort_order, id);
+CREATE INDEX IF NOT EXISTS idx_tags_normalized
+  ON tags(facet_key, normalized_name);
+CREATE INDEX IF NOT EXISTS idx_asset_tags_confirmation
+  ON asset_tags(confirmation, tag_id, asset_id);
+"#;
+
+fn add_column_if_missing(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> AppResult<()> {
+    if !has_column(conn, table, column)? {
+        conn.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+fn migrate_v8(conn: &Connection) -> AppResult<()> {
+    add_column_if_missing(conn, "tags", "canonical_name", "TEXT")?;
+    add_column_if_missing(conn, "tags", "normalized_name", "TEXT")?;
+    add_column_if_missing(conn, "tags", "facet_key", "TEXT NOT NULL DEFAULT 'custom'")?;
+    add_column_if_missing(conn, "tags", "status", "TEXT NOT NULL DEFAULT 'active'")?;
+    add_column_if_missing(conn, "tags", "is_system", "INTEGER NOT NULL DEFAULT 0")?;
+    add_column_if_missing(conn, "tags", "description", "TEXT NOT NULL DEFAULT ''")?;
+
+    add_column_if_missing(conn, "asset_tags", "confidence", "REAL")?;
+    add_column_if_missing(
+        conn,
+        "asset_tags",
+        "confirmation",
+        "TEXT NOT NULL DEFAULT 'confirmed'",
+    )?;
+    add_column_if_missing(conn, "asset_tags", "confirmed_at", "INTEGER")?;
+    add_column_if_missing(conn, "asset_tags", "confirmed_by", "TEXT")?;
+    add_column_if_missing(conn, "asset_tags", "source_batch_id", "INTEGER")?;
+
+    conn.execute_batch(SCHEMA_V8)?;
+    let now = chrono::Utc::now().timestamp_millis();
+    const FACETS: &[(&str, &str, &str, i64, i64)] = &[
+        ("subject", "主体/对象", "画面中可观察到的主要对象", 5, 10),
+        ("scene", "场景/地点", "素材发生的环境或地点", 3, 20),
+        ("purpose", "用途", "稳定的发布或设计用途", 3, 30),
+        ("style", "风格/氛围", "视觉风格与整体情绪", 4, 40),
+        ("color", "色彩", "主色、色调与色彩关系", 3, 50),
+        ("composition", "构图/视角", "景别、视角和构图关系", 4, 60),
+        ("lighting", "光线/时间", "光线方向、质感和时间氛围", 3, 70),
+        ("people", "人物属性", "人物数量、年龄段和可观察动作", 4, 80),
+        (
+            "technical",
+            "可用性/技术特征",
+            "透明背景、可裁切等非文件格式属性",
+            4,
+            90,
+        ),
+        (
+            "custom",
+            "自定义",
+            "用户自定义且暂未归入固定分面的标签",
+            0,
+            100,
+        ),
+    ];
+    for (key, name, description, max_items, sort_order) in FACETS {
+        conn.execute(
+            "INSERT OR IGNORE INTO tag_facets
+             (key, display_name, description, selection_mode, max_items, sort_order, is_system, status, created_at, updated_at)
+             VALUES (?1, ?2, ?3, 'multi', NULLIF(?4, 0), ?5, 1, 'active', ?6, ?6)",
+            rusqlite::params![key, name, description, max_items, sort_order, now],
+        )?;
+    }
+
+    conn.execute(
+        "UPDATE tags SET canonical_name = name WHERE canonical_name IS NULL OR canonical_name = ''",
+        [],
+    )?;
+    conn.execute(
+        "UPDATE tags SET normalized_name = lower(trim(name)) WHERE normalized_name IS NULL OR normalized_name = ''",
+        [],
+    )?;
+    conn.execute(
+        "UPDATE asset_tags SET confirmed_by = 'migration', confirmed_at = created_at
+          WHERE confirmed_by IS NULL",
+        [],
+    )?;
+
+    // 旧分类根节点映射到稳定分面；未知根节点及其后代保留为 custom。
+    const ROOT_MAPPINGS: &[(&str, &str)] = &[
+        ("主体", "subject"),
+        ("物体", "subject"),
+        ("场景", "scene"),
+        ("用途", "purpose"),
+        ("风格", "style"),
+        ("色彩风格", "style"),
+        ("氛围情绪", "style"),
+        ("色彩", "color"),
+        ("构图视角", "composition"),
+        ("构图/视角", "composition"),
+        ("光线", "lighting"),
+        ("光线/时间", "lighting"),
+        ("人物", "people"),
+        ("人物属性", "people"),
+        ("技术", "technical"),
+        ("可用性/技术特征", "technical"),
+    ];
+    for (root_name, facet_key) in ROOT_MAPPINGS {
+        conn.execute(
+            "WITH RECURSIVE sub(id) AS (
+               SELECT id FROM tags WHERE parent_id IS NULL AND name = ?1
+               UNION ALL SELECT t.id FROM tags t JOIN sub s ON t.parent_id = s.id
+             )
+             UPDATE tags SET facet_key = ?2,
+                    is_system = CASE WHEN parent_id IS NULL THEN 1 ELSE is_system END
+              WHERE id IN (SELECT id FROM sub)",
+            rusqlite::params![root_name, facet_key],
+        )?;
+    }
+
+    // FTS 文档包含规范标签名和可搜索别名；别名变化也会刷新相关素材。
+    conn.execute_batch(
+        r#"
+DROP TRIGGER IF EXISTS trg_at_ai;
+DROP TRIGGER IF EXISTS trg_at_ad;
+DROP TRIGGER IF EXISTS trg_tags_au;
+DROP TRIGGER IF EXISTS trg_tag_alias_ai;
+DROP TRIGGER IF EXISTS trg_tag_alias_au;
+DROP TRIGGER IF EXISTS trg_tag_alias_ad;
+
+CREATE TRIGGER trg_at_ai AFTER INSERT ON asset_tags BEGIN
+  UPDATE fts_content SET tag_names = (
+    SELECT cjk_bigram(COALESCE(group_concat(x.term, ' '), '')) FROM (
+      SELECT t.name AS term, t.sort_order AS ord, t.id AS tid, 0 AS kind
+        FROM asset_tags at JOIN tags t ON t.id = at.tag_id
+       WHERE at.asset_id = new.asset_id AND t.status = 'active'
+      UNION ALL
+      SELECT ta.alias AS term, t.sort_order AS ord, t.id AS tid, 1 AS kind
+        FROM asset_tags at JOIN tags t ON t.id = at.tag_id
+        JOIN tag_aliases ta ON ta.tag_id = t.id AND ta.is_searchable = 1
+       WHERE at.asset_id = new.asset_id AND t.status = 'active'
+      ORDER BY ord, tid, kind, term
+    ) x
+  ) WHERE asset_id = new.asset_id;
+END;
+CREATE TRIGGER trg_at_ad AFTER DELETE ON asset_tags BEGIN
+  UPDATE fts_content SET tag_names = (
+    SELECT cjk_bigram(COALESCE(group_concat(x.term, ' '), '')) FROM (
+      SELECT t.name AS term, t.sort_order AS ord, t.id AS tid, 0 AS kind
+        FROM asset_tags at JOIN tags t ON t.id = at.tag_id
+       WHERE at.asset_id = old.asset_id AND t.status = 'active'
+      UNION ALL
+      SELECT ta.alias AS term, t.sort_order AS ord, t.id AS tid, 1 AS kind
+        FROM asset_tags at JOIN tags t ON t.id = at.tag_id
+        JOIN tag_aliases ta ON ta.tag_id = t.id AND ta.is_searchable = 1
+       WHERE at.asset_id = old.asset_id AND t.status = 'active'
+      ORDER BY ord, tid, kind, term
+    ) x
+  ) WHERE asset_id = old.asset_id;
+END;
+CREATE TRIGGER trg_tags_au AFTER UPDATE OF name, status ON tags BEGIN
+  UPDATE fts_content SET tag_names = (
+    SELECT cjk_bigram(COALESCE(group_concat(x.term, ' '), '')) FROM (
+      SELECT t.name AS term, t.sort_order AS ord, t.id AS tid, 0 AS kind
+        FROM asset_tags at JOIN tags t ON t.id = at.tag_id
+       WHERE at.asset_id = fts_content.asset_id AND t.status = 'active'
+      UNION ALL
+      SELECT ta.alias AS term, t.sort_order AS ord, t.id AS tid, 1 AS kind
+        FROM asset_tags at JOIN tags t ON t.id = at.tag_id
+        JOIN tag_aliases ta ON ta.tag_id = t.id AND ta.is_searchable = 1
+       WHERE at.asset_id = fts_content.asset_id AND t.status = 'active'
+      ORDER BY ord, tid, kind, term
+    ) x
+  ) WHERE asset_id IN (SELECT asset_id FROM asset_tags WHERE tag_id = new.id);
+END;
+CREATE TRIGGER trg_tag_alias_ai AFTER INSERT ON tag_aliases BEGIN
+  UPDATE fts_content SET tag_names = (
+    SELECT cjk_bigram(COALESCE(group_concat(x.term, ' '), '')) FROM (
+      SELECT t.name AS term, t.sort_order AS ord, t.id AS tid, 0 AS kind
+        FROM asset_tags at JOIN tags t ON t.id = at.tag_id
+       WHERE at.asset_id = fts_content.asset_id AND t.status = 'active'
+      UNION ALL
+      SELECT ta.alias AS term, t.sort_order AS ord, t.id AS tid, 1 AS kind
+        FROM asset_tags at JOIN tags t ON t.id = at.tag_id
+        JOIN tag_aliases ta ON ta.tag_id = t.id AND ta.is_searchable = 1
+       WHERE at.asset_id = fts_content.asset_id AND t.status = 'active'
+      ORDER BY ord, tid, kind, term
+    ) x
+  ) WHERE asset_id IN (SELECT asset_id FROM asset_tags WHERE tag_id = new.tag_id);
+END;
+CREATE TRIGGER trg_tag_alias_au AFTER UPDATE ON tag_aliases BEGIN
+  UPDATE fts_content SET tag_names = (
+    SELECT cjk_bigram(COALESCE(group_concat(x.term, ' '), '')) FROM (
+      SELECT t.name AS term, t.sort_order AS ord, t.id AS tid, 0 AS kind
+        FROM asset_tags at JOIN tags t ON t.id = at.tag_id
+       WHERE at.asset_id = fts_content.asset_id AND t.status = 'active'
+      UNION ALL
+      SELECT ta.alias AS term, t.sort_order AS ord, t.id AS tid, 1 AS kind
+        FROM asset_tags at JOIN tags t ON t.id = at.tag_id
+        JOIN tag_aliases ta ON ta.tag_id = t.id AND ta.is_searchable = 1
+       WHERE at.asset_id = fts_content.asset_id AND t.status = 'active'
+      ORDER BY ord, tid, kind, term
+    ) x
+  ) WHERE asset_id IN (SELECT asset_id FROM asset_tags WHERE tag_id IN (old.tag_id, new.tag_id));
+END;
+CREATE TRIGGER trg_tag_alias_ad AFTER DELETE ON tag_aliases BEGIN
+  UPDATE fts_content SET tag_names = (
+    SELECT cjk_bigram(COALESCE(group_concat(x.term, ' '), '')) FROM (
+      SELECT t.name AS term, t.sort_order AS ord, t.id AS tid, 0 AS kind
+        FROM asset_tags at JOIN tags t ON t.id = at.tag_id
+       WHERE at.asset_id = fts_content.asset_id AND t.status = 'active'
+      UNION ALL
+      SELECT ta.alias AS term, t.sort_order AS ord, t.id AS tid, 1 AS kind
+        FROM asset_tags at JOIN tags t ON t.id = at.tag_id
+        JOIN tag_aliases ta ON ta.tag_id = t.id AND ta.is_searchable = 1
+       WHERE at.asset_id = fts_content.asset_id AND t.status = 'active'
+      ORDER BY ord, tid, kind, term
+    ) x
+  ) WHERE asset_id IN (SELECT asset_id FROM asset_tags WHERE tag_id = old.tag_id);
+END;
+
+UPDATE fts_content SET tag_names = (
+  SELECT cjk_bigram(COALESCE(group_concat(x.term, ' '), '')) FROM (
+    SELECT t.name AS term, t.sort_order AS ord, t.id AS tid, 0 AS kind
+      FROM asset_tags at JOIN tags t ON t.id = at.tag_id
+     WHERE at.asset_id = fts_content.asset_id AND t.status = 'active'
+    UNION ALL
+    SELECT ta.alias AS term, t.sort_order AS ord, t.id AS tid, 1 AS kind
+      FROM asset_tags at JOIN tags t ON t.id = at.tag_id
+      JOIN tag_aliases ta ON ta.tag_id = t.id AND ta.is_searchable = 1
+     WHERE at.asset_id = fts_content.asset_id AND t.status = 'active'
+    ORDER BY ord, tid, kind, term
+  ) x
+);
+INSERT INTO assets_fts(assets_fts) VALUES('rebuild');
+"#,
+    )?;
+    Ok(())
+}
+
+/// v9：超级搜索查询索引（P1A）。只加索引，不改业务行数。
+/// 评审 §三.3 取舍：只加 taken_at / camera / file_size / (width,height) 四个；
+/// file_ext 基数极低不做；lens / duration_ms 等真出现慢查询再说；aspect_ratio 为派生表达式暂无索引承诺。
+const SCHEMA_V9: &str = r#"
+CREATE INDEX IF NOT EXISTS idx_assets_taken_at ON assets(taken_at);
+CREATE INDEX IF NOT EXISTS idx_assets_camera   ON assets(camera);
+CREATE INDEX IF NOT EXISTS idx_assets_file_size ON assets(file_size);
+CREATE INDEX IF NOT EXISTS idx_assets_width_height ON assets(width, height);
+"#;
+
+/// v10：tagCategories（中文名机器协议）→ ai_facet_configs（稳定 facet_key）已在上方 migrate() 处理。
+
+/// v11：独立 color 分面补齐（指导书 C-3/C-5）。
+/// 老库 V8 已建 tag_facets，但默认 AI 配置曾把「色彩风格」归 style 而缺少独立 color；
+/// 新库由 default_tag_categories 覆盖（含「色彩」→color）。本迁移幂等：
+///  ① INSERT OR IGNORE 补齐 color tag_facets 行；
+///  ② 若 ai_facet_configs 缺 color 配置则补默认（不覆盖用户已有 style hint/配置内容）。
+fn migrate_v11(conn: &Connection) -> AppResult<()> {
+    let now = chrono::Utc::now().timestamp_millis();
+    conn.execute(
+        "INSERT OR IGNORE INTO tag_facets
+         (key, display_name, description, selection_mode, max_items, sort_order, is_system, status, created_at, updated_at)
+         VALUES ('color', '色彩', '主色、色调与色彩关系', 'multi', 3, 50, 1, 'active', ?1, ?1)",
+        rusqlite::params![now],
+    )?;
+    super::settings::ensure_color_facet_config(conn)?;
+    Ok(())
+}
+
 pub fn migrate(conn: &Connection) -> AppResult<()> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     if version < 1 {
@@ -342,6 +666,25 @@ pub fn migrate(conn: &Connection) -> AppResult<()> {
     if version < 7 {
         migrate_v7(conn)?;
         conn.pragma_update(None, "user_version", 7)?;
+    }
+    if version < 8 {
+        migrate_v8(conn)?;
+        conn.pragma_update(None, "user_version", 8)?;
+    }
+    if version < 9 {
+        conn.execute_batch(SCHEMA_V9)?;
+        conn.pragma_update(None, "user_version", 9)?;
+    }
+    if version < 10 {
+        // V10：旧 tagCategories（中文名机器协议）→ ai_facet_configs（稳定 facet_key）。
+        // 设置在键值表存 JSON，这里读出来转换后写回；幂等（已转则不变）。
+        super::settings::normalize_settings_persist(conn)?;
+        conn.pragma_update(None, "user_version", 10)?;
+    }
+    if version < 11 {
+        // V11：独立 color 分面补齐（新库/存量库都成立），幂等
+        migrate_v11(conn)?;
+        conn.pragma_update(None, "user_version", 11)?;
     }
     Ok(())
 }

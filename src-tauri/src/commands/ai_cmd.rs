@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use tauri::{AppHandle, Emitter, State};
 
-use crate::db::ai::{AiBatch, AiSuggestion, CategorizedTags};
+use crate::db::ai::{AiBatch, AiSuggestion, AiSuggestionItem, CategorizedTags};
 use crate::db::{ai, settings};
 use crate::error::{AppError, AppResult};
 use crate::services::ai_cloud::{self, AiProgress};
@@ -54,9 +54,10 @@ pub fn ai_create_batch(
             false => "cloud".to_string(),
         }
     };
-    // 批量上限（PRD 风险控制：防 API 成本失控）
-    let limit = s.ai.batch_limit;
-    let ids: Vec<i64> = asset_ids.into_iter().take(limit.max(1) as usize).collect();
+    // 指导书阶段 5 §8.1/§8.3：用户选择的素材**完整**进入逻辑批次，不做静默截断。
+    // 「批量上限」不再作为总批次截断——执行层按「分块大小」内存分块、限流、重试。
+    // 若确需保护上限，必须在提交前明确展示与阻断，而非默认取前 N 张。
+    let ids: Vec<i64> = asset_ids;
     ai::create_batch(&conn, &ids, &mode)
 }
 
@@ -106,13 +107,17 @@ pub async fn ai_start_batch(
             s
         };
         let cfg = all.ai;
-        let categories = all.tag_categories;
+        // P1B：ai_facet_configs 合并库内 tag_facets 生成提示词上下文（短锁立即释放）
+        let facets = {
+            let conn = db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
+            crate::db::tag_facets::build_prompt_context(&conn, &all.ai_facet_configs)?
+        };
         registry
             .lock()
             .map_err(|_| AppError::msg("锁中毒"))?
             .insert(batch_id, Arc::clone(&cancel));
 
-        let r = ai_cloud::run_cloud_batch(&db, batch_id, &cfg, &categories, limit, &cancel, |p: AiProgress| {
+        let r = ai_cloud::run_cloud_batch(&db, batch_id, &cfg, &facets, limit, &cancel, |p: AiProgress| {
             let _ = app.emit("ai://progress", p);
         });
         // B12：收尾清理 flag——锁中毒不再静默吞
@@ -161,6 +166,35 @@ pub fn ai_list_batches(state: State<AppState>) -> AppResult<Vec<AiBatch>> {
 pub fn ai_list_suggestions(state: State<AppState>, batch_id: i64) -> AppResult<Vec<AiSuggestion>> {
     let conn = lock_db(&state)?;
     ai::list_suggestions(&conn, batch_id)
+}
+
+#[tauri::command]
+pub fn ai_list_suggestion_items(
+    state: State<AppState>,
+    suggestion_id: i64,
+) -> AppResult<Vec<AiSuggestionItem>> {
+    let conn = lock_db(&state)?;
+    ai::list_suggestion_items(&conn, suggestion_id)
+}
+
+#[tauri::command]
+pub fn ai_decide_suggestion_item(
+    state: State<AppState>,
+    item_id: i64,
+    decision: String,
+    replacement_tag_id: Option<i64>,
+    replacement_name: Option<String>,
+    reason: Option<String>,
+) -> AppResult<()> {
+    let conn = lock_db(&state)?;
+    ai::decide_suggestion_item(
+        &conn,
+        item_id,
+        &decision,
+        replacement_tag_id,
+        replacement_name.as_deref(),
+        reason.as_deref(),
+    )
 }
 
 /// 确认单条建议（tags 为最终值，含人工修改）

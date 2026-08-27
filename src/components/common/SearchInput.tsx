@@ -28,7 +28,7 @@ export default function SearchInput({ placeholder = "搜索标签 / 文件名…
       value={value}
       onChange={(e) => setValue(e.target.value)}
       placeholder={placeholder}
-      className="w-64 px-3 py-1.5 text-sm rounded-md border border-[var(--color-border)] bg-[var(--color-surface)] outline-none focus:border-[var(--color-accent)] placeholder:text-[var(--color-text-secondary)]"
+      className="ui-control w-64 px-3 py-2 text-sm placeholder:text-[var(--color-text-secondary)]"
     />
   );
 }

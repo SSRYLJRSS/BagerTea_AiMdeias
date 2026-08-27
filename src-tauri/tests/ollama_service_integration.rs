@@ -22,10 +22,7 @@ fn tags_body(models: &[&str]) -> String {
     format!(r#"{{"models":[{}]}}"#, arr.join(","))
 }
 
-fn pull_sink() -> (
-    Arc<Mutex<Vec<PullProgress>>>,
-    impl Fn(PullProgress),
-) {
+fn pull_sink() -> (Arc<Mutex<Vec<PullProgress>>>, impl Fn(PullProgress)) {
     let sink: Arc<Mutex<Vec<PullProgress>>> = Arc::new(Mutex::new(Vec::new()));
     let sink2 = Arc::clone(&sink);
     (sink, move |p| sink2.lock().unwrap().push(p))
@@ -95,7 +92,12 @@ fn pull_streams_progress_until_success() -> AppResult<()> {
     let cancel = Arc::new(AtomicBool::new(false));
     let (sink, progress) = pull_sink();
     // 带 /v1 的档案 base_url：应剥离后请求 /api/pull
-    ollama_setup::pull(&format!("{}/v1", srv.url()), "qwen2.5vl:3b", &cancel, progress)?;
+    ollama_setup::pull(
+        &format!("{}/v1", srv.url()),
+        "qwen2.5vl:3b",
+        &cancel,
+        progress,
+    )?;
 
     let events = sink.lock().unwrap().clone();
     assert_eq!(events.len(), 5);
@@ -108,7 +110,10 @@ fn pull_streams_progress_until_success() -> AppResult<()> {
     assert!(last.error.is_none());
     let reqs = srv.requests();
     assert_eq!(reqs.len(), 1);
-    assert_eq!(reqs[0].path, "/api/pull", "应剥离开放兼容层 /v1 直连 Ollama 原生 API");
+    assert_eq!(
+        reqs[0].path, "/api/pull",
+        "应剥离开放兼容层 /v1 直连 Ollama 原生 API"
+    );
     Ok(())
 }
 
@@ -117,11 +122,21 @@ fn pull_streams_progress_until_success() -> AppResult<()> {
 fn pull_error_line_fails_with_server_message() {
     let _g = common::net_lock_guard();
     let srv = MockServer::start(|_| {
-        HttpResponse::ok_json("{\"status\":\"pulling manifest\"}\n{\"error\":\"file does not exist\"}\n")
+        HttpResponse::ok_json(
+            "{\"status\":\"pulling manifest\"}\n{\"error\":\"file does not exist\"}\n",
+        )
     });
-    let r = ollama_setup::pull(&srv.url(), "nope:latest", &Arc::new(AtomicBool::new(false)), |_| {});
+    let r = ollama_setup::pull(
+        &srv.url(),
+        "nope:latest",
+        &Arc::new(AtomicBool::new(false)),
+        |_| {},
+    );
     let err = r.expect_err("应失败").to_string();
-    assert!(err.contains("file does not exist"), "错误应透传服务端信息: {err}");
+    assert!(
+        err.contains("file does not exist"),
+        "错误应透传服务端信息: {err}"
+    );
 }
 
 /// pull：流提前结束（只有 downloading 无 success）→ Err「拉取流提前结束」
@@ -133,7 +148,12 @@ fn pull_stream_ends_without_success_fails() {
             "{\"status\":\"downloading digest\",\"total\":1000,\"completed\":500}\n",
         )
     });
-    let r = ollama_setup::pull(&srv.url(), "m:1b", &Arc::new(AtomicBool::new(false)), |_| {});
+    let r = ollama_setup::pull(
+        &srv.url(),
+        "m:1b",
+        &Arc::new(AtomicBool::new(false)),
+        |_| {},
+    );
     let err = r.expect_err("应失败").to_string();
     assert!(
         err.contains("提前结束") || err.contains("未完整下载"),
@@ -146,7 +166,9 @@ fn pull_stream_ends_without_success_fails() {
 fn pull_cancelled_fails_with_message() {
     let _g = common::net_lock_guard();
     let srv = MockServer::start(|_| {
-        HttpResponse::ok_json("{\"status\":\"pulling manifest\"}\n{\"status\":\"downloading digest\"}\n")
+        HttpResponse::ok_json(
+            "{\"status\":\"pulling manifest\"}\n{\"status\":\"downloading digest\"}\n",
+        )
     });
     let cancel = Arc::new(AtomicBool::new(false));
     let cancel_ref = Arc::clone(&cancel);
@@ -163,7 +185,12 @@ fn pull_cancelled_fails_with_message() {
 fn pull_non_200_status_fails() {
     let _g = common::net_lock_guard();
     let srv = MockServer::start(|_| HttpResponse::status_only(404));
-    let r = ollama_setup::pull(&srv.url(), "m:1b", &Arc::new(AtomicBool::new(false)), |_| {});
+    let r = ollama_setup::pull(
+        &srv.url(),
+        "m:1b",
+        &Arc::new(AtomicBool::new(false)),
+        |_| {},
+    );
     let err = r.expect_err("应失败").to_string();
     assert!(err.contains("404"), "错误应含状态码: {err}");
 }
@@ -186,7 +213,10 @@ fn list_models_returns_name_and_size() -> AppResult<()> {
     assert_eq!(list[1].size, 4096000000);
     let reqs = srv.requests();
     assert_eq!(reqs.len(), 1);
-    assert_eq!(reqs[0].path, "/api/tags", "应剥离开放兼容层 /v1 直连原生 API");
+    assert_eq!(
+        reqs[0].path, "/api/tags",
+        "应剥离开放兼容层 /v1 直连原生 API"
+    );
     Ok(())
 }
 
@@ -213,8 +243,15 @@ fn delete_model_sends_delete_with_name() -> AppResult<()> {
     ollama_setup::delete_model(&format!("{}/v1", srv.url()), "qwen2.5vl:3b")?;
     let reqs = srv.requests();
     assert_eq!(reqs.len(), 1);
-    assert_eq!(reqs[0].method, "DELETE", "应使用 DELETE 方法，实际: {:?}", reqs[0].method);
-    assert_eq!(reqs[0].path, "/api/delete", "应剥离开放兼容层 /v1 直连原生 API");
+    assert_eq!(
+        reqs[0].method, "DELETE",
+        "应使用 DELETE 方法，实际: {:?}",
+        reqs[0].method
+    );
+    assert_eq!(
+        reqs[0].path, "/api/delete",
+        "应剥离开放兼容层 /v1 直连原生 API"
+    );
     let body: serde_json::Value = serde_json::from_str(&reqs[0].body).unwrap();
     assert_eq!(body["name"], "qwen2.5vl:3b");
     Ok(())
@@ -224,12 +261,10 @@ fn delete_model_sends_delete_with_name() -> AppResult<()> {
 #[test]
 fn delete_model_non_200_fails_with_server_message() {
     let _g = common::net_lock_guard();
-    let srv = MockServer::start(|_| {
-        HttpResponse {
-            status: 404,
-            content_type: "application/json",
-            body: r#"{"error":"model 'nope:latest' not found"}"#.to_string(),
-        }
+    let srv = MockServer::start(|_| HttpResponse {
+        status: 404,
+        content_type: "application/json",
+        body: r#"{"error":"model 'nope:latest' not found"}"#.to_string(),
     });
     let err = ollama_setup::delete_model(&srv.url(), "nope:latest")
         .expect_err("应失败")

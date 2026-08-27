@@ -1,0 +1,121 @@
+/**
+ * 设置运行时归一化（指导书 A-2）：后端设置 JSON 可能缺失字段（旧库 / 部分返回 / 未来字段增减），
+ * 前端不能直接访问 draft.ai.xxx / draft.aiFacetConfigs.map(...) 而崩溃白屏。
+ * 本函数用类型守卫对 `unknown` 输入提供安全默认值，产生一份可安全渲染的 Settings。
+ *
+ * 注意：本函数只负责「前端运行时安全」，不取代 Rust 端迁移 —— 迁移仍是单一事实源。
+ * 对未知字段尽量保留，不无故丢弃未来配置。
+ */
+import type { AiFacetConfig, AiSettings, ApiProfile, CustomSource, Settings, TagCategory } from "@/types/settings";
+
+export const DEFAULT_MODEL = "qwen-vl-plus";
+export const DEFAULT_BATCH_LIMIT = 500;
+export const DEFAULT_CACHE_MB = 2048;
+export const DEFAULT_TRASH_RETENTION_DAYS = 30;
+
+function isRecord(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+function asStr(v: unknown, fallback: string): string {
+  return typeof v === "string" ? v : fallback;
+}
+
+function asNum(v: unknown, fallback: number): number {
+  return typeof v === "number" && Number.isFinite(v) ? v : fallback;
+}
+
+function asBool(v: unknown, fallback: boolean): boolean {
+  return typeof v === "boolean" ? v : fallback;
+}
+
+function normalizeProfile(p: unknown): ApiProfile {
+  const r = isRecord(p) ? p : {};
+  const apiMode = asStr(r.apiMode, "openai");
+  const kind = asStr(r.kind, "cloud");
+  return {
+    id: asStr(r.id, ""),
+    name: asStr(r.name, ""),
+    apiMode: apiMode === "anthropic" ? "anthropic" : "openai",
+    kind: kind === "local" ? "local" : "cloud",
+    baseUrl: asStr(r.baseUrl, ""),
+    apiKey: asStr(r.apiKey, ""),
+    model: asStr(r.model, DEFAULT_MODEL),
+  };
+}
+
+function normalizeAi(raw: unknown): AiSettings {
+  const r = isRecord(raw) ? raw : {};
+  const profiles: ApiProfile[] = Array.isArray(r.profiles)
+    ? r.profiles.map(normalizeProfile).filter((p) => p.id !== "")
+    : [];
+  const tier = asStr(r.localModelTier, "light");
+  return {
+    profiles,
+    activeProfile: asStr(r.activeProfile, ""),
+    autoTagging: asBool(r.autoTagging, false),
+    videoTagging: asBool(r.videoTagging, false),
+    localModelTier: tier === "standard" ? "standard" : "light",
+    batchLimit: Math.max(1, Math.round(asNum(r.batchLimit, DEFAULT_BATCH_LIMIT))),
+    ollamaSourceId: asStr(r.ollamaSourceId, "auto"),
+  };
+}
+
+function normalizeCategory(c: unknown): TagCategory {
+  const r = isRecord(c) ? c : {};
+  const single = asBool(r.single, false);
+  return {
+    name: asStr(r.name, ""),
+    hint: asStr(r.hint, ""),
+    single,
+    max: Math.max(1, Math.round(asNum(r.max, single ? 1 : 3))),
+  };
+}
+
+function normalizeFacetConfig(c: unknown): AiFacetConfig | null {
+  const r = isRecord(c) ? c : {};
+  const facetKey = asStr(r.facetKey, "").trim();
+  if (!facetKey) return null;
+  const hint = asStr(r.hint, "");
+  const displayName = asStr(r.displayName, "");
+  const visibleInWorkbench = r.visibleInWorkbench;
+  return {
+    facetKey,
+    hint,
+    enabledForAi: asBool(r.enabledForAi, true),
+    displayName: displayName === "" ? undefined : displayName,
+    visibleInWorkbench: typeof visibleInWorkbench === "boolean" ? visibleInWorkbench : undefined,
+  };
+}
+
+function normalizeCustomSource(c: unknown): CustomSource {
+  const r = isRecord(c) ? c : {};
+  return { id: asStr(r.id, ""), label: asStr(r.label, ""), url: asStr(r.url, "") };
+}
+
+/** 对一份 `unknown` 设置做运行时归一化，返回可安全渲染的完整 Settings。 */
+export function normalizeSettings(raw: unknown): Settings {
+  const r = isRecord(raw) ? raw : {};
+  const theme = asStr(r.theme, "system");
+  const ai = normalizeAi(r.ai);
+  // 若用户显式设置了激活档案但不匹配任何配置，回退为空（SettingsPage 会回退到第一套）
+  if (ai.activeProfile && ai.profiles.length > 0 && !ai.profiles.some((p) => p.id === ai.activeProfile)) {
+    ai.activeProfile = "";
+  }
+  const aiFacetConfigs: AiFacetConfig[] = Array.isArray(r.aiFacetConfigs)
+    ? r.aiFacetConfigs.map(normalizeFacetConfig).filter((c): c is AiFacetConfig => c !== null)
+    : [];
+  return {
+    ai,
+    theme: theme === "light" || theme === "dark" ? theme : "system",
+    thumbnailCacheMb: Math.max(0, Math.round(asNum(r.thumbnailCacheMb, DEFAULT_CACHE_MB))),
+    tagCategories: Array.isArray(r.tagCategories) ? r.tagCategories.map(normalizeCategory) : [],
+    aiFacetConfigs,
+    libraryRoot: asStr(r.libraryRoot, ""),
+    trashRetentionDays: Math.max(0, Math.round(asNum(r.trashRetentionDays, DEFAULT_TRASH_RETENTION_DAYS))),
+    customDownloadSources: Array.isArray(r.customDownloadSources)
+      ? r.customDownloadSources.map(normalizeCustomSource).filter((s) => s.id !== "")
+      : [],
+    modelDownloadProxy: asStr(r.modelDownloadProxy, ""),
+  };
+}

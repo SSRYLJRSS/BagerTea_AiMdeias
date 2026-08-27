@@ -44,14 +44,16 @@
 
 | 模块 | 职责 |
 |---|---|
-| `migrations.rs` | 版本化迁移（v2 EXIF 列 / v3 FTS 重建 / v4 去重索引 / v5 排序+回收站+tag_ops / v6 last_error / v7 导出任务 warning） |
-| `assets.rs` | 素材 CRUD + `set_exif`；Asset 含 EXIF 字段 |
-| `tags.rs` | 父子层级标签树；`find_or_create_root/child` |
+| `migrations.rs` | 版本化迁移（v2 EXIF 列 / v3 FTS 重建 / v4 去重索引 / v5 排序+回收站+tag_ops / v6 last_error / v7 导出任务 warning / **v9 查询索引 / v10 旧 tagCategories→facet configs / v11 独立 color 分面补齐**） |
+| `assets.rs` | 素材 CRUD + `set_exif`；Asset 含 EXIF 字段；`AssetFilter{metadata_filters, sort_by/sort_dir, …}` + `validate()` 参数校验 |
+| `search.rs` | FTS5 查询：库内谓词 `SearchPredicate{sql, params}`（不返回大 ID 列表）；`build_search_predicate` 编译 FTS/LIKE 分支 |
+| `search_query.rs` | 元数据白名单编译：`MetadataFilter{key, op, value, values, min, max}` → 参数化 SQL；key×op 校验、NULL 排除、日期左闭右开、resolution/aspect_ratio 派生表达式 |
+| `tags.rs` | 父子层级标签树；`find_or_create_root/child`；`search_candidates`（规范名/别名/候选） |
+| `tag_facets.rs` | 稳定分面（key 是机器协议）；`FacetPromptContext` + `build_prompt_context`（合并 AI facet 配置与 DB tag_facets） |
 | `asset_tags.rs` | 素材-标签关联 |
 | `tag_ops.rs` | 打标流水（R-25）：add/remove + 批次撤销 |
-| `search.rs` | FTS5 查询：fts_content 表 + 9 触发器 + cjk_bigram 逐字切分 + 短语查询 + ≤2 字 LIKE 兜底 |
 | `ai.rs` | 批次/建议表；`CategorizedTags = BTreeMap<String, Vec<String>>`；`parse_tags_json` 兼容旧扁平数组→「未分类」 |
-| `settings.rs` | `ApiProfile{id,name,api_mode,kind,base_url,api_key,model}` + `profiles[]/active_profile` + `TagCategory{name,hint,single,max}`；`normalize()` 旧扁平字段迁移（skip_serializing 只读，拒绝双数据源） |
+| `settings.rs` | `ApiProfile{id,name,api_mode,kind,base_url,api_key,model}` + `profiles[]/active_profile` + `AiFacetConfig{facet_key,hint,enabled_for_ai,display_name,visible_in_workbench}`（tag_categories 已弃用仅作迁移输入；`visible_in_workbench` 独立于 `enabled_for_ai` 控制工作台显隐，缺省前端按 `WORKBENCH_DEFAULT_KEYS` 白名单决定）；`normalize()` 旧扁平字段迁移（skip_serializing 只读，拒绝双数据源） |
 | `export.rs` | 导出任务持久化（copy/move/CSV 统一任务模型，含 warning 软提示列） |
 | `cloud.rs` | 网盘账号（M2 预留，前端置灰） |
 
@@ -59,17 +61,17 @@
 
 ### 2.3 commands/（Tauri 命令薄壳）
 
-ai_cmd / assets_cmd / import_cmd / thumbnail_cmd / tags_cmd / settings_cmd / export_cmd / ollama_cmd。
+ai_cmd / assets_cmd / import_cmd / thumbnail_cmd / tags_cmd / settings_cmd / export_cmd / ollama_cmd / super_search_cmd。
 网络请求一律 `spawn_blocking` 不堵主线程；进度走 `app.emit("ai://progress" / "export://progress" /
-"import://progress" / "ollama://pull-progress", …)`。
+"import://progress" / "ollama://pull-progress", …)`。超级搜索 `ai_parse_search_query` 同样短锁读配置→放锁→spawn_blocking 网络→短锁解析 tagId。
 
 ## 三、前端结构（src/）
 
 | 层 | 内容 |
 |---|---|
-| `pages/` | ImportPage（编排层瘦身）/ LibraryPage / AiTaggingPage / SettingsPage |
-| `stores/` | libraryStore / selectionStore / tagStore / aiStore / settingsStore / taskStore（全局任务条，M3-04） |
-| `api/` | invoke 封装 + 模块级缓存（preview.ts）；`client.ts` 统一错误 |
+| `pages/` | ImportPage（编排层瘦身）/ LibraryPage / AiTaggingPage / SettingsPage / SuperSearchPage |
+| `stores/` | libraryStore / selectionStore / tagStore / aiStore / settingsStore / taskStore（全局任务条，M3-04）/ superSearchStore（独立 query，防污染普通素材库） |
+| `api/` | invoke 封装 + 模块级缓存（preview.ts）；`client.ts` 统一错误；superSearch.ts 把 ResolvedSearchQuery 转 AssetFilter |
 | `types/` | 与 Rust 结构体 serde 对齐（改 Rust 字段必须同步改这里） |
 
 **关键组件**：
@@ -115,9 +117,11 @@ decode_thumb(path, target_px)
 - **EXIF 自身标签**：入库自动提取，只读展示，打标界面不显示、不参与 AI 打标
 - **AI 分类标签**：`CategorizedTags`（分类名→标签数组）；分类即父标签复用标签树（零新表）；`TagCategory.max` 写入提示词"可多选 1-N 个"；设置页可自定义分类与上限
 
-### 4.4 中文搜索
+### 4.4 中文搜索与超级搜索
 
-FTS5 `fts_content` 独立表 + 9 个触发器同步 + 自注册 `cjk_bigram` 分词（逐字切分）+ 短语查询 + ≤2 字 LIKE 兜底。**注意**：外部工具（python sqlite3）连接此库只能 SELECT，DELETE/UPDATE 会因缺 `cjk_bigram` 函数报错——清数据必须用应用内功能。
+**中文搜索**：FTS5 `fts_content` 独立表 + 触发器同步 + 自注册 `cjk_bigram` 分词（逐字切分）+ 短语查询 + ≤2 字 LIKE 兜底。**P1A 改造**：不再把全部命中 ID 拉回 Rust 拼长 IN 列表，`search.rs::build_search_predicate` 编译为 `SearchPredicate{sql, params}` 谓词（FTS 子查询 / LIKE EXISTS / 并集 OR），在数据库内与其他条件组合。
+
+**超级搜索**（一期）：两层查询对象——AI 输出 `SearchIntent`（文字/字段/op，无 id/SQL/分页），后端解析为 `ResolvedSearchQuery`（已解析 tagId + 合法字段）。元数据筛选走 `search_query.rs` 白名单编译（key×op 双白名单、全部参数绑定、NULL 排除、日期左闭右开、resolution=width*height、aspect_ratio=width/height）。`tag_facets.key` 是唯一机器协议，`selection_mode/max_items` 以数据库为准，设置不再存第二份。查询语义：同分面默认 OR、分面间 AND、父标签默认含后代、排除默认含后代、默认不查回收站、排序尾缀 `a.id DESC` 稳定分页。AI 搜索零数据库写入。**注意**：外部工具（python sqlite3）连接此库只能 SELECT，DELETE/UPDATE 会因缺 `cjk_bigram` 函数报错——清数据必须用应用内功能。
 
 ### 4.5 UI 规范（全局约束）
 
@@ -134,6 +138,8 @@ FTS5 `fts_content` 独立表 + 9 个触发器同步 + 自注册 `cjk_bigram` 分
 | AI 打标 | LibraryPage 选图 → aiStore.createBatch → ai_cmd → ai.create_batch（pending 占位）→ AiTaggingPage → startBatch → run_cloud_batch（逐条 request_tags→set_suggestion_tags，失败置 rejected）→ emit 进度 → Workbench 确认 → ai_apply_tags 写标签树 |
 | 本地模型 | LocalModelGroup → ollama_cmd → ollama_setup/ollama_installer（检测/推荐/拉取/一键安装） |
 | 搜索 | SearchInput（防抖）→ assets_cmd.list_assets → search.rs（FTS5 三策略） |
+| 超级搜索 | BottomBar 双击素材库 → SuperSearchPage → superSearchStore → assets.list（库内谓词） |
+| AI 超级搜索 | SuperSearchPage AiSearchBar → superSearchStore.applyAiSearch → ai_parse_search_query → super_search_ai（三级降级）→ resolve_query → superSearchStore 回填芯片并刷新 |
 | 配置 | SettingsPage → settingsStore → settings_cmd → settings.rs（normalize 迁移） |
 
 ## 六、已知设计约束（不要违反）

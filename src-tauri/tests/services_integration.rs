@@ -534,3 +534,44 @@ fn b06b_export_same_name_exhaustion_errors() -> AppResult<()> {
     );
     Ok(())
 }
+
+// 阶段 1：入库进度事件按 queued→scanning→hashing→processing→previewing→done 顺序上报，
+// 后端只发阶段进度（含 taskId），其中 hashing/processing/previewing 相对次序正确。
+#[test]
+fn import_phase_progress_sequence() -> AppResult<()> {
+    let tmp = tempfile::tempdir()?;
+    let src = tmp.path().join("src");
+    std::fs::create_dir_all(&src)?;
+    make_jpegs(&src, 3);
+
+    let dbm = std::sync::Arc::new(std::sync::Mutex::new(db::init_memory()?));
+    let thumbs = ThumbnailService::new(&tmp.path().join("data"))?;
+    let cancel = AtomicBool::new(false);
+
+    let phases = std::sync::Mutex::new(Vec::<String>::new());
+    let progress = |p: importer::ImportProgress| {
+        phases.lock().unwrap().push(p.phase.clone());
+    };
+    let r = importer::import_paths(
+        &dbm,
+        &thumbs,
+        &[src.to_string_lossy().into_owned()],
+        &Default::default(),
+        &cancel,
+        progress,
+    )?;
+    assert_eq!(r.imported, 3);
+
+    let phases = phases.into_inner().unwrap();
+    assert_eq!(phases.first().map(String::as_str), Some("queued"));
+    assert_eq!(phases.last().map(String::as_str), Some("done"));
+    for phase in ["scanning", "hashing", "processing", "previewing"] {
+        assert!(phases.iter().any(|p| p == phase), "缺少阶段事件：{phase}");
+    }
+    // 关键相对次序：hashing < processing < previewing < done
+    let idx = |s: &str| phases.iter().position(|x| x == s).expect("阶段应存在");
+    assert!(idx("hashing") < idx("processing"));
+    assert!(idx("processing") < idx("previewing"));
+    assert!(idx("previewing") < idx("done"));
+    Ok(())
+}

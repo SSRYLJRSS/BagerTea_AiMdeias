@@ -1,0 +1,502 @@
+//! 布尔查询表达式树（超级搜索 UI 构建器 → 数据库查询的桥接）。
+//!
+//! 现状：`AssetFilter` 是扁平结构（facet/metadata 间隐式 AND，exclude 隐式 NOT），
+//! 表达不了 `(A 或 B) 且 非C` 这类嵌套布尔。
+//! 本模块引入 `QueryExpr`（And/Or/Not/Leaf），由 `assets::build_where` 递归编译，
+//! 叶子直接复用现有白名单能力（facet EXISTS、exclude EXISTS、元数据编译、类型/未打标）。
+//!
+//! 原则：
+//! - 列名/操作符来自白名单匹配，绝对不来自外部输入；
+//! - 所有值参数绑定；
+//! - 递归深度与节点总数有上限；
+//! - 未知字段/操作符一律拒绝，不静默忽略。
+
+use serde::{Deserialize, Serialize};
+
+use rusqlite::types::Value;
+use rusqlite::Connection;
+
+use super::sql_utils::offset_placeholders;
+use crate::error::{AppError, AppResult};
+
+/// 单一叶子条件。字段都带 type 标记，便于前端序列化与校验。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(tag = "type")]
+pub enum LeafCond {
+    /// 标签分面：facetKey + tagIds，mode any/all，includeDescendants
+    Tag {
+        #[serde(default)]
+        facet_key: String,
+        tag_ids: Vec<i64>,
+        #[serde(default)]
+        mode: Option<String>,
+        #[serde(default = "default_true")]
+        include_descendants: bool,
+    },
+    /// 排除标签（含后代）
+    #[serde(rename_all = "camelCase")]
+    ExcludeTag {
+        #[serde(default)]
+        facet_key: String,
+        tag_ids: Vec<i64>,
+    },
+    /// 素材类型：all | image | video
+    AssetType { value: String },
+    /// 未打标
+    Untagged,
+    /// 元数据比较：复用 search_query::MetadataFilter
+    #[serde(rename_all = "camelCase")]
+    Metadata {
+        #[serde(flatten)]
+        filter: super::search_query::MetadataFilter,
+    },
+    /// 关键词（FTS/LIKE）
+    Search { value: String },
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// 布尔表达式树
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(tag = "op")]
+pub enum QueryExpr {
+    #[serde(rename_all = "camelCase")]
+    And { children: Vec<QueryExpr> },
+    #[serde(rename_all = "camelCase")]
+    Or { children: Vec<QueryExpr> },
+    #[serde(rename_all = "camelCase")]
+    Not { child: Box<QueryExpr> },
+    #[serde(rename_all = "camelCase")]
+    Leaf { cond: LeafCond },
+}
+
+pub const MAX_DEPTH: usize = 5;
+pub const MAX_NODES: usize = 100;
+
+/// 校验表达式树：深度/节点上限 + 叶子合法性。
+pub fn validate_expr(expr: &QueryExpr) -> AppResult<()> {
+    let mut count = 0;
+    validate_node(expr, 0, &mut count)?;
+    Ok(())
+}
+
+fn validate_node(expr: &QueryExpr, depth: usize, count: &mut usize) -> AppResult<()> {
+    if depth > MAX_DEPTH {
+        return Err(AppError::msg(format!("表达式嵌套过深（上限 {MAX_DEPTH}）")));
+    }
+    *count += 1;
+    if *count > MAX_NODES {
+        return Err(AppError::msg(format!("表达式节点过多（上限 {MAX_NODES}）")));
+    }
+    match expr {
+        QueryExpr::And { children } | QueryExpr::Or { children } => {
+            if children.is_empty() {
+                return Err(AppError::msg("且/或 分组不能为空"));
+            }
+            for c in children {
+                validate_node(c, depth + 1, count)?;
+            }
+        }
+        QueryExpr::Not { child } => validate_node(child, depth + 1, count)?,
+        QueryExpr::Leaf { cond } => validate_leaf(cond)?,
+    }
+    Ok(())
+}
+
+fn validate_leaf(cond: &LeafCond) -> AppResult<()> {
+    match cond {
+        LeafCond::Tag { tag_ids, mode, .. } => {
+            if tag_ids.is_empty() {
+                return Err(AppError::msg("标签条件不能为空"));
+            }
+            if let Some(m) = mode {
+                if !matches!(m.as_str(), "any" | "all") {
+                    return Err(AppError::msg(format!("非法标签 mode：{m}")));
+                }
+            }
+            Ok(())
+        }
+        LeafCond::ExcludeTag { tag_ids, .. } => {
+            if tag_ids.is_empty() {
+                return Err(AppError::msg("排除标签条件不能为空"));
+            }
+            Ok(())
+        }
+        LeafCond::AssetType { value } => {
+            if !matches!(value.as_str(), "all" | "image" | "video") {
+                return Err(AppError::msg(format!("非法 assetType：{value}")));
+            }
+            Ok(())
+        }
+        LeafCond::Untagged => Ok(()),
+        LeafCond::Metadata { filter } => super::search_query::compile_metadata(filter).map(|_| ()),
+        LeafCond::Search { value } => {
+            if value.chars().count() > 200 {
+                return Err(AppError::msg("搜索关键词过长"));
+            }
+            Ok(())
+        }
+    }
+}
+
+/// 将扁平 `AssetFilter` 拍平为一棵合规的 `QueryExpr`（多组 AND + 若干 NOT），
+/// 供统一走 expr 路径或前端回填构建器使用。
+pub fn from_filter(
+    search: Option<&str>,
+    asset_type: Option<&str>,
+    untagged_only: bool,
+    facet_filters: &[super::assets::FacetTagFilter],
+    exclude_tag_ids: &[i64],
+    metadata_filters: &[super::search_query::MetadataFilter],
+) -> QueryExpr {
+    let mut leaves = Vec::new();
+    if let Some(s) = search {
+        if !s.trim().is_empty() {
+            leaves.push(QueryExpr::Leaf {
+                cond: LeafCond::Search {
+                    value: s.to_string(),
+                },
+            });
+        }
+    }
+    if let Some(t) = asset_type {
+        if !t.is_empty() && t != "all" {
+            leaves.push(QueryExpr::Leaf {
+                cond: LeafCond::AssetType {
+                    value: t.to_string(),
+                },
+            });
+        }
+    }
+    if untagged_only {
+        leaves.push(QueryExpr::Leaf {
+            cond: LeafCond::Untagged,
+        });
+    }
+    for f in facet_filters {
+        if f.tag_ids.is_empty() {
+            continue;
+        }
+        leaves.push(QueryExpr::Leaf {
+            cond: LeafCond::Tag {
+                facet_key: f.facet_key.clone(),
+                tag_ids: f.tag_ids.clone(),
+                mode: f.mode.clone(),
+                include_descendants: f.include_descendants,
+            },
+        });
+    }
+    for &tid in exclude_tag_ids {
+        leaves.push(QueryExpr::Leaf {
+            cond: LeafCond::ExcludeTag {
+                facet_key: String::new(),
+                tag_ids: vec![tid],
+            },
+        });
+    }
+    for m in metadata_filters {
+        leaves.push(QueryExpr::Leaf {
+            cond: LeafCond::Metadata { filter: m.clone() },
+        });
+    }
+    if leaves.len() == 1 {
+        leaves.into_iter().next().unwrap()
+    } else {
+        QueryExpr::And { children: leaves }
+    }
+}
+
+/// 编译叶子为可嵌入 WHERE 的片段。素材表别名为 `a`；无搜索时 conn 仅用于 FTS 谓词。
+/// 返回的 SQL 使用从 ?1 起的占位符（与单独编译一致，由上层 offset）。
+pub fn compile_leaf(conn: &Connection, cond: &LeafCond) -> AppResult<(String, Vec<Value>)> {
+    match cond {
+        LeafCond::Search { value } => {
+            let pred = super::search::build_search_predicate(conn, value)?
+                .unwrap_or_else(|| super::search::SearchPredicate::empty());
+            let sql = if pred.sql.is_empty() {
+                "1=0".to_string()
+            } else {
+                pred.sql
+            };
+            Ok((sql, pred.params))
+        }
+        LeafCond::AssetType { value } => {
+            let sql = match value.as_str() {
+                "image" => "a.mime_type LIKE 'image/%'".to_string(),
+                "video" => "a.mime_type LIKE 'video/%'".to_string(),
+                _ => "1=1".to_string(),
+            };
+            Ok((sql, Vec::new()))
+        }
+        LeafCond::Untagged => Ok((
+            "NOT EXISTS (SELECT 1 FROM asset_tags at WHERE at.asset_id = a.id)".to_string(),
+            Vec::new(),
+        )),
+        LeafCond::Tag {
+            facet_key: _f,
+            tag_ids,
+            mode,
+            include_descendants,
+        } => compile_tag_leaf(tag_ids, mode.as_deref(), *include_descendants),
+        LeafCond::ExcludeTag { tag_ids, .. } => {
+            let mut sql = String::new();
+            let mut params: Vec<Value> = Vec::new();
+            for &tid in tag_ids {
+                params.push(tid.into());
+                sql.push_str(&format!(
+                    " AND NOT EXISTS (SELECT 1 FROM asset_tags ate WHERE ate.asset_id=a.id AND ate.tag_id IN (
+                        WITH RECURSIVE sub(id) AS (SELECT ?{} UNION ALL SELECT t.id FROM tags t JOIN sub s ON t.parent_id=s.id)
+                        SELECT id FROM sub))", params.len()
+                ));
+            }
+            Ok((sql.trim_start_matches(" AND ").to_string(), params))
+        }
+        LeafCond::Metadata { filter } => {
+            let compiled = super::search_query::compile_metadata(filter)?;
+            match compiled {
+                Some(c) => Ok((c.sql, c.params)),
+                None => Ok(("1=1".to_string(), Vec::new())),
+            }
+        }
+    }
+}
+
+/// 标签叶子（含后代/any-all），复用 build_where 的 EXISTS 形态。
+fn compile_tag_leaf(
+    tag_ids: &[i64],
+    mode: Option<&str>,
+    include_descendants: bool,
+) -> AppResult<(String, Vec<Value>)> {
+    let all_mode = mode == Some("all");
+    let mut params: Vec<Value> = Vec::new();
+    if all_mode {
+        // all：每个标签各一条 EXISTS，AND 连接（防 JOIN 行数爆炸）
+        let mut ands = String::new();
+        for &tid in tag_ids {
+            params.push(tid.into());
+            if !ands.is_empty() {
+                ands.push_str(" AND ");
+            }
+            if include_descendants {
+                ands.push_str(&format!(
+                    "EXISTS (SELECT 1 FROM asset_tags atf WHERE atf.asset_id=a.id AND atf.tag_id IN (
+                        WITH RECURSIVE sub(id) AS (SELECT ?{} UNION ALL SELECT t.id FROM tags t JOIN sub s ON t.parent_id=s.id)
+                        SELECT id FROM sub))", params.len()
+                ));
+            } else {
+                ands.push_str(&format!(
+                    "EXISTS (SELECT 1 FROM asset_tags atf WHERE atf.asset_id=a.id AND atf.tag_id=?{})",
+                    params.len()
+                ));
+            }
+        }
+        Ok((ands, params))
+    } else if include_descendants {
+        // any + 后代：多 seed 合一条 EXISTS
+        let mut seeds = String::new();
+        for &tid in tag_ids {
+            params.push(tid.into());
+            if !seeds.is_empty() {
+                seeds.push_str(" UNION ALL");
+            }
+            seeds.push_str(&format!(" SELECT ?{}", params.len()));
+        }
+        Ok((
+            format!(
+                "EXISTS (SELECT 1 FROM asset_tags atf WHERE atf.asset_id=a.id AND atf.tag_id IN (
+                    WITH RECURSIVE sub(id) AS ({seeds} UNION ALL SELECT t.id FROM tags t JOIN sub s ON t.parent_id=s.id)
+                    SELECT id FROM sub))"
+            ),
+            params,
+        ))
+    } else {
+        // any + 不含后代：tag_id IN (直接 id)
+        let placeholders = tag_ids
+            .iter()
+            .map(|tid| {
+                params.push((*tid).into());
+                format!("?{}", params.len())
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        Ok((
+            format!(
+                "EXISTS (SELECT 1 FROM asset_tags atf WHERE atf.asset_id=a.id AND atf.tag_id IN ({placeholders}))"
+            ),
+            params,
+        ))
+    }
+}
+
+/// 递归编译表达式树 → 可嵌入 WHERE 的片段。同样从 ?1 起占位（供上层 offset）。
+pub fn compile_expr(conn: &Connection, expr: &QueryExpr) -> AppResult<(String, Vec<Value>)> {
+    match expr {
+        QueryExpr::Leaf { cond } => compile_leaf(conn, cond),
+        QueryExpr::And { children } => compile_group(conn, children, "AND"),
+        QueryExpr::Or { children } => compile_group(conn, children, "OR"),
+        QueryExpr::Not { child } => {
+            let (sql, params) = compile_expr(conn, child)?;
+            Ok((format!("NOT ({sql})"), params))
+        }
+    }
+}
+
+fn compile_group(
+    conn: &Connection,
+    children: &[QueryExpr],
+    joiner: &str,
+) -> AppResult<(String, Vec<Value>)> {
+    let mut parts = Vec::new();
+    let mut params: Vec<Value> = Vec::new();
+    for c in children {
+        let (sql, p) = compile_expr(conn, c)?;
+        let shifted = offset_placeholders(&sql, params.len());
+        parts.push(format!("({shifted})"));
+        params.extend(p);
+    }
+    let combined = parts.join(&format!(" {joiner} "));
+    Ok((combined, params))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::init_memory;
+
+    #[test]
+    fn validates_nested_and_or_not() {
+        let expr = QueryExpr::And {
+            children: vec![
+                QueryExpr::Leaf {
+                    cond: LeafCond::Untagged,
+                },
+                QueryExpr::Or {
+                    children: vec![
+                        QueryExpr::Leaf {
+                            cond: LeafCond::AssetType {
+                                value: "image".into(),
+                            },
+                        },
+                        QueryExpr::Not {
+                            child: Box::new(QueryExpr::Leaf {
+                                cond: LeafCond::ExcludeTag {
+                                    facet_key: String::new(),
+                                    tag_ids: vec![9],
+                                },
+                            }),
+                        },
+                    ],
+                },
+            ],
+        };
+        assert!(validate_expr(&expr).is_ok());
+    }
+
+    #[test]
+    fn rejects_empty_group() {
+        let expr = QueryExpr::Or { children: vec![] };
+        assert!(validate_expr(&expr).is_err());
+    }
+
+    #[test]
+    fn rejects_bad_asset_type() {
+        let expr = QueryExpr::Leaf {
+            cond: LeafCond::AssetType {
+                value: "banana".into(),
+            },
+        };
+        assert!(validate_expr(&expr).is_err());
+    }
+
+    #[test]
+    fn rejects_bad_metadata_key() {
+        let expr = QueryExpr::Leaf {
+            cond: LeafCond::Metadata {
+                filter: crate::db::search_query::MetadataFilter {
+                    key: "nope".into(),
+                    op: "eq".into(),
+                    value: Some(serde_json::json!("x")),
+                    values: None,
+                    min: None,
+                    max: None,
+                },
+            },
+        };
+        assert!(validate_expr(&expr).is_err());
+    }
+
+    #[test]
+    fn rejects_too_deep() {
+        let mut expr = QueryExpr::Leaf {
+            cond: LeafCond::Untagged,
+        };
+        for _ in 0..8 {
+            expr = QueryExpr::Not {
+                child: Box::new(expr),
+            };
+        }
+        assert!(validate_expr(&expr).is_err());
+    }
+
+    #[test]
+    fn compiles_flat_expr_and_shifts_params() {
+        let conn = init_memory().unwrap();
+        let expr = QueryExpr::And {
+            children: vec![
+                QueryExpr::Leaf {
+                    cond: LeafCond::Tag {
+                        facet_key: "scene".into(),
+                        tag_ids: vec![1, 2],
+                        mode: Some("any".into()),
+                        include_descendants: true,
+                    },
+                },
+                QueryExpr::Leaf {
+                    cond: LeafCond::Metadata {
+                        filter: crate::db::search_query::MetadataFilter {
+                            key: "file_size".into(),
+                            op: "gte".into(),
+                            value: Some(serde_json::json!(5242880)),
+                            values: None,
+                            min: None,
+                            max: None,
+                        },
+                    },
+                },
+            ],
+        };
+        let (sql, params) = compile_expr(&conn, &expr).unwrap();
+        assert!(sql.contains("EXISTS"));
+        assert!(sql.contains(">="));
+        assert!(params.len() >= 3);
+        // 两次编译结果一致（参数偏移稳定）
+        let (sql2, params2) = compile_expr(&conn, &expr).unwrap();
+        assert_eq!(sql, sql2);
+        assert_eq!(params.len(), params2.len());
+    }
+
+    #[test]
+    fn from_filter_builds_and_root() {
+        let expr = from_filter(
+            Some("海边"),
+            Some("image"),
+            false,
+            &[crate::db::assets::FacetTagFilter {
+                facet_key: "scene".into(),
+                tag_ids: vec![8],
+                mode: Some("any".into()),
+                include_descendants: true,
+            }],
+            &[44],
+            &[],
+        );
+        match expr {
+            QueryExpr::And { children } => assert!(children.len() >= 4),
+            _ => panic!("应组装为 AND"),
+        }
+    }
+}

@@ -1,6 +1,6 @@
 /** 素材相关命令封装（对应 commands/assets_cmd.rs） */
 import { invoke } from "./client";
-import type { Asset, AssetFilter, AssetPage, DupGroup } from "@/types/asset";
+import type { Asset, AssetFilter, AssetPage, DupGroup, MetadataFacet } from "@/types/asset";
 
 export type DeleteStrategy = "remove_from_library" | "delete_file";
 
@@ -18,6 +18,11 @@ export function listAssets(filter: AssetFilter): Promise<AssetPage> {
  *  不拉完整 Asset，不触发 asset 协议放行） */
 export function listAssetIds(filter: AssetFilter): Promise<number[]> {
   return invoke<number[]>("list_asset_ids", { filter });
+}
+
+/** 文件自身携带的格式、时间、设备和拍摄参数分面。 */
+export function listMetadataFacets(): Promise<MetadataFacet[]> {
+  return invoke<MetadataFacet[]>("list_metadata_facets");
 }
 
 export function getAsset(id: number): Promise<Asset> {

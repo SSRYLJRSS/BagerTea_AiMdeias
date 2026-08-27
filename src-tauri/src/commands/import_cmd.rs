@@ -4,10 +4,10 @@ use tauri::{AppHandle, Emitter, State};
 
 use crate::db::assets::ImportResult;
 use crate::db::settings;
+use crate::error::{AppError, AppResult};
 use crate::services::importer::{self, ImportOptions, ImportProgress};
 use crate::services::thumbnail::ThumbnailService;
 use crate::state::AppState;
-use crate::error::{AppError, AppResult};
 
 /// 入库：async + spawn_blocking 工作线程（不堵主线程 IPC，取消即时生效）；
 /// collection/rename 来自入库页选项；总库位置以设置为准（R-32，单一事实源）
@@ -34,7 +34,11 @@ pub async fn import_files(
             settings::get_settings(&conn)?.library_root
         };
         let opts = ImportOptions {
-            library_root: if library_root.trim().is_empty() { None } else { Some(library_root) },
+            library_root: if library_root.trim().is_empty() {
+                None
+            } else {
+                Some(library_root)
+            },
             collection,
             rename_pattern: rename_pattern.filter(|p| !p.trim().is_empty()),
         };

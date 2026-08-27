@@ -9,5 +9,6 @@ pub mod ollama_installer;
 pub mod ollama_setup;
 pub mod preview;
 pub mod raw_decode;
+pub mod super_search_ai;
 pub mod thumbnail;
 pub mod video;

@@ -200,7 +200,10 @@ pub fn recommend(vram_gb: Option<f32>) -> Vec<ModelRec> {
         ],
         // 未知显存：默认轻量档 + 诚实预期
         None => vec![
-            rec(Q3, "未探测到显存，默认轻量档；纯 CPU 可跑但慢，批量建议插电"),
+            rec(
+                Q3,
+                "未探测到显存，默认轻量档；纯 CPU 可跑但慢，批量建议插电",
+            ),
             alt(MOON, "更轻，纯 CPU 更友好"),
         ],
     }
@@ -364,9 +367,7 @@ pub fn delete_model(base_url: &str, model: &str) -> AppResult<()> {
     let status = resp.status();
     if !status.is_success() {
         let body = resp.text().unwrap_or_default();
-        return Err(AppError::msg(format!(
-            "删除模型失败（{status}）: {body}"
-        )));
+        return Err(AppError::msg(format!("删除模型失败（{status}）: {body}")));
     }
     Ok(())
 }
@@ -392,9 +393,7 @@ pub fn model_dir() -> AppResult<String> {
     if p.exists() {
         return Ok(p.to_string_lossy().into_owned());
     }
-    Err(AppError::msg(
-        "未找到模型存储目录（默认 ~/.ollama/models）",
-    ))
+    Err(AppError::msg("未找到模型存储目录（默认 ~/.ollama/models）"))
 }
 
 #[cfg(test)]
@@ -462,7 +461,8 @@ mod tests {
 
     #[test]
     fn parse_tags_body_parses_name_and_size() {
-        let body = r#"{"models":[{"name":"llava:latest","size":1234567890},{"name":"qwen2.5vl:7b"}]}"#;
+        let body =
+            r#"{"models":[{"name":"llava:latest","size":1234567890},{"name":"qwen2.5vl:7b"}]}"#;
         let list = parse_tags_body(body);
         assert_eq!(list.len(), 2);
         assert_eq!(list[0].name, "llava:latest");

@@ -3,8 +3,9 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 use tauri::{Manager, State};
 
-use crate::db::assets::{self, Asset, AssetFilter, AssetPage};
+use crate::db::assets::{self, Asset, AssetFilter, AssetPage, MetadataFacet};
 use crate::db::dedup::{self, DupGroup};
+use crate::db::settings;
 use crate::error::{AppError, AppResult};
 use crate::services::thumbnail::ThumbnailService;
 use crate::state::AppState;
@@ -62,6 +63,13 @@ pub fn dedup_scan(app: tauri::AppHandle, state: State<AppState>) -> AppResult<Ve
 pub fn list_asset_ids(state: State<AppState>, filter: AssetFilter) -> AppResult<Vec<i64>> {
     let conn = lock_db(&state)?;
     assets::list_ids(&conn, &filter)
+}
+
+#[tauri::command]
+pub fn list_metadata_facets(state: State<AppState>) -> AppResult<Vec<MetadataFacet>> {
+    let conn = lock_db(&state)?;
+    let library_root = settings::get_settings(&conn)?.library_root;
+    assets::list_metadata_facets(&conn, Some(&library_root))
 }
 
 #[tauri::command]

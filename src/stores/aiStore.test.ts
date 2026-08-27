@@ -48,6 +48,7 @@ const mkSuggestion = (id: number, over: Partial<AiSuggestion> = {}): AiSuggestio
   batchId: 1,
   assetId: 100 + id,
   assetPath: `d:/lib/s${id}.jpg`,
+  mimeType: "image/jpeg",
   suggestedTags: {},
   status: "pending",
   confirmedTags: {},
@@ -73,6 +74,7 @@ const mkSettings = (over: Partial<Settings["ai"]> = {}): Settings => ({
   theme: "system",
   thumbnailCacheMb: 2048,
   tagCategories: [],
+  aiFacetConfigs: [],
   libraryRoot: "",
   trashRetentionDays: 30,
   customDownloadSources: [],
@@ -212,7 +214,7 @@ describe("aiStore 打标状态机", () => {
     expect(useAiStore.getState().suggestions.map((s) => s.id)).toEqual([201]);
   });
 
-  it("P2-07 回归：超过批量上限时截断并明确提示", async () => {
+  it("阶段5 §8.1：所选素材完整进入逻辑批次，不做静默截断", async () => {
     useSettingsStore.setState({ settings: mkSettings({ batchLimit: 2 }) });
     useAiStore.setState({ pendingAssetIds: [1, 2, 3, 4, 5], pendingMode: "auto" });
     vi.mocked(aiCreateBatch).mockResolvedValue(mkBatch(1));
@@ -220,9 +222,9 @@ describe("aiStore 打标状态机", () => {
 
     await useAiStore.getState().createBatch("auto");
 
-    // 只提交前 2 个 id，且用户看到截断提示
-    expect(aiCreateBatch).toHaveBeenCalledWith([1, 2], "auto");
-    expect(useAiStore.getState().error).toContain("超过批量上限 2");
+    // 全部 id 进入批次（batchLimit 仅作执行分块大小，不再是总批次上限）
+    expect(aiCreateBatch).toHaveBeenCalledWith([1, 2, 3, 4, 5], "auto");
+    expect(useAiStore.getState().error).toBeNull();
   });
 
   it("P2-01 回归：运行中 cancel 标记 cancelling（当前图完成前 UI 明示）", async () => {

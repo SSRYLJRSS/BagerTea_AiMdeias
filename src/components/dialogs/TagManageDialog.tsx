@@ -2,19 +2,19 @@
  *  借鉴 Eagle 标签合并交互（选目标标签吸收）；首期不做拖拽，菜单操作即可。
  *  删除不可逆：有关联素材时走 DeleteDialog 式二次确认。
  */
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import Modal from "@/components/common/Modal";
 import Button from "@/components/common/Button";
-import { deleteTag, mergeTags, updateTag } from "@/api/tags";
+import { deactivateTag, listTagGovernance, mergeTags, updateTag } from "@/api/tags";
 import { useTagStore } from "@/stores/tagStore";
-import type { Tag, TagNode } from "@/types/tag";
+import type { Tag, TagFacetGovernance, TagNode } from "@/types/tag";
 
 interface TagManageDialogProps {
   open: boolean;
   onClose: () => void;
 }
 
-type RowAction = { kind: "merge" | "move" | "delete"; id: number } | null;
+type RowAction = { kind: "merge" | "move" | "deactivate"; id: number } | null;
 
 /** 管理视图全展开，不受侧栏折叠状态影响 */
 function flattenAll(tree: TagNode[], depth = 0): { tag: Tag; depth: number; node: TagNode }[] {
@@ -42,10 +42,23 @@ export default function TagManageDialog({ open, onClose }: TagManageDialogProps)
   const [confirmDel, setConfirmDel] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [governance, setGovernance] = useState<TagFacetGovernance[]>([]);
+  // A-3：加载失败显示局部错误和重试（不阻塞打开弹窗本身）
+  const [loadError, setLoadError] = useState<string | null>(null);
+
+  const load = useCallback(async () => {
+    setLoadError(null);
+    void refresh();
+    try {
+      setGovernance(await listTagGovernance());
+    } catch (e) {
+      setLoadError(e instanceof Error ? e.message : String(e));
+    }
+  }, [refresh]);
 
   useEffect(() => {
-    if (open) void refresh();
-  }, [open, refresh]);
+    if (open) void load();
+  }, [open, load]);
 
   const rows = flattenAll(tree);
 
@@ -67,7 +80,7 @@ export default function TagManageDialog({ open, onClose }: TagManageDialogProps)
     setError(null);
     try {
       await fn();
-      await refresh();
+      await Promise.all([refresh(), listTagGovernance().then(setGovernance)]);
       reset();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -104,7 +117,7 @@ export default function TagManageDialog({ open, onClose }: TagManageDialogProps)
       setConfirmDel(true);
       return;
     }
-    void run(() => deleteTag(action.id));
+    void run(() => deactivateTag(action.id));
   };
 
   /** 合并/移动目标选项：排除自身子树（防环，后端也兜底校验） */
@@ -123,6 +136,27 @@ export default function TagManageDialog({ open, onClose }: TagManageDialogProps)
         </>
       }
     >
+      {governance.length > 0 && (
+        <div className="mb-3 grid grid-cols-2 gap-1.5 border-b border-[var(--color-border)] pb-3 sm:grid-cols-3">
+          {governance.map((g) => (
+            <div key={g.facetKey} className="rounded border border-[var(--color-border)] px-2 py-1.5 text-[11px]">
+              <div className="truncate font-medium text-[var(--color-text)]">{g.facetKey}</div>
+              <div className="mt-0.5 text-[var(--color-text-secondary)]">
+                {g.activeTagCount} 个有效标签 · {g.linkedAssetCount} 个素材
+              </div>
+              {g.pendingAiItemCount > 0 && (
+                <div className="text-[var(--color-accent)]">{g.pendingAiItemCount} 个 AI 候选待审</div>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+      {loadError && (
+        <div className="mb-3 flex items-center gap-2 rounded-md border border-[var(--color-danger)] px-3 py-2 text-xs">
+          <span className="flex-1 text-[var(--color-danger)]">加载失败：{loadError}</span>
+          <Button variant="ghost" onClick={() => void load()}>重试</Button>
+        </div>
+      )}
       <div className="max-h-[60vh] overflow-y-auto">
         {rows.length === 0 && (
           <p className="py-4 text-center text-xs text-[var(--color-text-secondary)]">暂无标签</p>
@@ -137,10 +171,16 @@ export default function TagManageDialog({ open, onClose }: TagManageDialogProps)
                   {tag.isPreset && <span className="ml-1 text-[10px] text-[var(--color-text-secondary)]">预置</span>}
                 </span>
                 <span className="text-xs text-[var(--color-text-secondary)]">{tag.totalCount}</span>
-                <RowBtn label="重命名" onClick={() => { reset(); setEditing({ id: tag.id, name: tag.name }); }} />
-                <RowBtn label="合并到…" onClick={() => { reset(); setAction({ kind: "merge", id: tag.id }); }} />
-                <RowBtn label="移动到…" onClick={() => { reset(); setAction({ kind: "move", id: tag.id }); }} />
-                <RowBtn label="删除" danger onClick={() => { reset(); setAction({ kind: "delete", id: tag.id }); }} />
+                {tag.isSystem ? (
+                  <span className="text-[10px] text-[var(--color-text-secondary)]">系统分面</span>
+                ) : (
+                  <>
+                    <RowBtn label="重命名" onClick={() => { reset(); setEditing({ id: tag.id, name: tag.name }); }} />
+                    <RowBtn label="合并到…" onClick={() => { reset(); setAction({ kind: "merge", id: tag.id }); }} />
+                    <RowBtn label="移动到…" onClick={() => { reset(); setAction({ kind: "move", id: tag.id }); }} />
+                    <RowBtn label="停用" danger onClick={() => { reset(); setAction({ kind: "deactivate", id: tag.id }); }} />
+                  </>
+                )}
               </div>
             )}
 
@@ -191,23 +231,23 @@ export default function TagManageDialog({ open, onClose }: TagManageDialogProps)
             )}
 
             {/* 删除确认 */}
-            {action && action.id === tag.id && action.kind === "delete" && (
+            {action && action.id === tag.id && action.kind === "deactivate" && (
               <div className="flex items-center gap-2 px-2 py-1.5" style={{ paddingLeft: 8 + depth * 18 }}>
                 <span className="flex-1 text-sm">
-                  <span className="text-[var(--color-text)]">删除「{tag.name}」</span>
+                  <span className="text-[var(--color-text)]">停用「{tag.name}」</span>
                   {tag.totalCount > 0 && (
                     <span className="ml-1 text-xs text-[var(--color-danger)]">
-                      将同时解除 {tag.totalCount} 个素材的关联（含子标签）
+                      将从搜索和新分配中隐藏，但保留历史关联
                     </span>
                   )}
                 </span>
                 {confirmDel && (
                   <span className="rounded bg-[var(--color-surface)] px-2 py-1 text-xs text-[var(--color-danger)]">
-                    此操作不可恢复！
+                    子标签也会一并停用
                   </span>
                 )}
                 <Button variant="danger" disabled={busy} onClick={doDelete}>
-                  {busy ? "删除中…" : confirmDel ? "确认永久删除" : "确认删除"}
+                  {busy ? "停用中…" : confirmDel ? "确认停用" : "确认停用"}
                 </Button>
                 <Button disabled={busy} onClick={reset}>取消</Button>
               </div>

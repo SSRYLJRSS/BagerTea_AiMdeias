@@ -1,25 +1,30 @@
-/** 打标工作台（PRD v2.11）：大图（底部居中悬浮导航条）+ EXIF 行 + 两列分类标签面板
+/** 打标工作台（PRD v2.11）：大图（底部居中悬浮导航条）+ EXIF 行 + 分面标签面板
  *  导航：←/→ 键、悬浮条按钮、跳转到第 N 张
- *  按钮规范：主 CTA 黑色实心（确认写入），其余幽灵文字按钮
+ *  指导书阶段 6 §9.2/§9.4：分面来自稳定 WorkbenchFacet[]（tag_facets 唯一事实源），
+ *  不再读 tagCategories；系统分面永远显示；标签 key 为稳定 facetKey。
+ *  按钮规范：主 CTA 黑色实心（确认写入），其余幽灵文字按钮。
  */
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
 import Button from "@/components/common/Button";
 import TagChip from "@/components/library/TagChip";
+import FacetTagInput from "@/components/ai/FacetTagInput";
 import { getAsset } from "@/api/assets";
 import { getThumbnailUrl, toFileUrl } from "@/api/thumbnail";
 import type { AiSuggestion, CategorizedTags } from "@/types/ai";
 import type { Asset } from "@/types/asset";
-import type { TagCategory } from "@/types/settings";
+import type { WorkbenchFacet } from "@/types/tag";
 
 type ImgStage = "hd" | "ph" | "orig";
 
 interface WorkbenchProps {
   suggestion: AiSuggestion;
-  categories: TagCategory[];
+  /** 稳定分面（阶段 6）：来自 tag_facets + aiFacetConfigs 覆盖，不含 tagCategories */
+  facets: WorkbenchFacet[];
   tags: CategorizedTags;
   onTagsChange: (t: CategorizedTags) => void;
   index: number; // 0 基
   total: number;
+  filmstrip?: ReactNode;
   onGoto: (i: number) => void;
   onConfirm: () => Promise<void>;
   onReject: () => Promise<void>;
@@ -41,11 +46,12 @@ function exifLine(a: Asset | null): string {
 
 export default function Workbench({
   suggestion: s,
-  categories,
+  facets,
   tags,
   onTagsChange,
   index,
   total,
+  filmstrip,
   onGoto,
   onConfirm,
   onReject,
@@ -100,33 +106,54 @@ export default function Workbench({
     };
   }, [s.assetId]);
 
-  // 面板分类 = 设置分类 ∪ 标签里已出现的分类
-  const panelCategories = useMemo(() => {
-    const names = categories.map((c) => c.name);
-    const extra = Object.keys(tags).filter((k) => !names.includes(k));
-    return [...categories, ...extra.map((name) => ({ name, hint: "", single: false, max: 3 }))];
-  }, [categories, tags]);
+  // 面板分面 = 稳定分面（系统分面恒显）∪ 标签里出现但不在分面中的 key（归 custom 显示）
+  const panelFacets = useMemo(() => {
+    const keys = facets.map((f) => f.key);
+    const extra = Object.keys(tags).filter((k) => !keys.includes(k));
+    return [
+      ...facets,
+      ...extra.map((key) => ({
+        key,
+        displayName: key,
+        description: "",
+        selectionMode: "multi" as const,
+        maxItems: null,
+        enabledForAi: false,
+        hint: "",
+      })),
+    ];
+  }, [facets, tags]);
 
-  const setCategoryTags = (name: string, list: string[]) => {
+  const setFacetTags = (key: string, list: string[]) => {
     const next = { ...tags };
-    if (list.length === 0) delete next[name];
-    else next[name] = list;
+    if (list.length === 0) delete next[key];
+    else next[key] = list;
     onTagsChange(next);
   };
 
-  const addTag = (c: TagCategory) => {
-    const t = (editing[c.name] ?? "").trim();
+  /** 添加标签：单选分面选择新标签时替换旧值（§9.4）；maxItems 超限给出明确反馈。
+   *  name 由 FacetTagInput 传入（可能为选中候选的规范名，或用户 Enter 的新词）。 */
+  const [capHint, setCapHint] = useState<Record<string, string>>({});
+  const addTag = (f: WorkbenchFacet, name?: string) => {
+    const key = f.key;
+    const t = (name ?? editing[key] ?? "").trim();
     if (!t) return;
-    const cur = tags[c.name] ?? [];
+    const cur = tags[key] ?? [];
     if (cur.includes(t)) {
-      setEditing({ ...editing, [c.name]: "" });
+      setEditing({ ...editing, [key]: "" });
       return;
     }
-    // 数量上限：单选恒 1，否则 c.max（v2.11）
-    const cap = c.single ? 1 : Math.max(1, c.max || 3);
-    if (cur.length >= cap && !c.single) return;
-    setCategoryTags(c.name, c.single ? [t] : [...cur, t]);
-    setEditing({ ...editing, [c.name]: "" });
+    // 数量上限：单选恒 1，否则 f.maxItems（§9.4 明确反馈）
+    const single = f.selectionMode === "single";
+    const cap = single ? 1 : Math.max(1, f.maxItems ?? 3);
+    if (!single && cur.length >= cap) {
+      setCapHint((m) => ({ ...m, [key]: `已达上限 ${cap} 个` }));
+      setTimeout(() => setCapHint((m) => ({ ...m, [key]: "" })), 2500);
+      return;
+    }
+    setFacetTags(key, single ? [t] : [...cur, t]);
+    setEditing({ ...editing, [key]: "" });
+    setCapHint((m) => ({ ...m, [key]: "" }));
   };
 
   const totalTags = Object.values(tags).reduce((n, l) => n + l.length, 0);
@@ -163,26 +190,26 @@ export default function Workbench({
   return (
     <>
       {/* ① 大图区 + 底部居中悬浮导航条 */}
-      <div className="relative flex min-h-0 flex-1 items-center justify-center overflow-hidden bg-[var(--color-surface)] p-4">
+      <div className="relative flex min-h-0 flex-1 items-center justify-center overflow-hidden bg-[var(--color-surface)] p-6">
         {imgUrl ? (
-          <img src={imgUrl} alt={fileName} onError={onImgError} className="max-h-full max-w-full rounded object-contain" />
+          <img src={imgUrl} alt={fileName} onError={onImgError} className="max-h-full max-w-full rounded-[5px] object-contain" />
         ) : (
           <div className="h-32 w-32 animate-pulse rounded bg-[var(--color-border)]" />
         )}
-        <span className="absolute top-2 right-3 rounded bg-black/50 px-2 py-0.5 text-xs text-white">
+        <span className="absolute top-3 right-4 rounded-md bg-black/55 px-2 py-1 text-[11px] font-medium text-white backdrop-blur-sm">
           {index + 1} / {total}
         </span>
-        <span className="absolute top-2 left-3 max-w-[60%] truncate rounded bg-black/50 px-2 py-0.5 text-xs text-white">
+        <span className="absolute top-3 left-4 max-w-[60%] truncate rounded-md bg-black/55 px-2 py-1 text-[11px] font-medium text-white backdrop-blur-sm">
           {fileName}
         </span>
 
         {/* 悬浮导航条（v2.11）：← 位置/跳转 → */}
-        <div className="absolute bottom-3 left-1/2 flex -translate-x-1/2 items-center gap-1 rounded-full border border-[var(--color-border)] bg-[var(--color-bg)]/90 px-1.5 py-1 shadow-lg backdrop-blur">
+        <div className="absolute bottom-4 left-1/2 flex -translate-x-1/2 items-center gap-1 rounded-[var(--radius-control)] border border-[var(--color-border)] bg-[var(--color-surface-raised)]/94 px-1.5 py-1 shadow-[var(--shadow-soft)] backdrop-blur">
           <button
             onClick={() => onGoto(index - 1)}
             disabled={index <= 0}
             title="上一张（←）"
-            className="flex h-6 w-7 items-center justify-center rounded-full text-sm text-[var(--color-text)] transition-colors hover:bg-[var(--color-surface)] disabled:opacity-30"
+            className="flex h-7 w-8 items-center justify-center rounded-md text-sm text-[var(--color-text)] transition-colors hover:bg-[var(--color-surface)] disabled:opacity-30"
           >
             ←
           </button>
@@ -193,7 +220,7 @@ export default function Workbench({
             onClick={() => onGoto(index + 1)}
             disabled={index >= total - 1}
             title="下一张（→）"
-            className="flex h-6 w-7 items-center justify-center rounded-full text-sm text-[var(--color-text)] transition-colors hover:bg-[var(--color-surface)] disabled:opacity-30"
+            className="flex h-7 w-8 items-center justify-center rounded-md text-sm text-[var(--color-text)] transition-colors hover:bg-[var(--color-surface)] disabled:opacity-30"
           >
             →
           </button>
@@ -204,14 +231,16 @@ export default function Workbench({
             onKeyDown={(e) => e.key === "Enter" && doJump()}
             placeholder="跳至"
             title="跳转到第 N 张，Enter 确认"
-            className="w-10 rounded-full border border-[var(--color-border)] bg-[var(--color-surface)] px-1.5 py-0.5 text-center text-xs outline-none focus:border-[var(--color-accent)]"
+            className="ui-control w-12 px-1.5 py-1 text-center text-xs"
           />
         </div>
       </div>
 
+      {filmstrip}
+
       {/* ② EXIF 只读参考行 */}
       {exif && (
-        <div className="shrink-0 border-t border-[var(--color-border)] px-3 py-1 text-[11px] text-[var(--color-text-secondary)]">
+        <div className="shrink-0 border-b border-[var(--color-border)] px-4 py-2 text-[11px] text-[var(--color-text-secondary)]">
           {exif}
         </div>
       )}
@@ -225,41 +254,56 @@ export default function Workbench({
       )}
 
       {/* ③ 分类标签面板：一排两个分类（v2.11） */}
-      <div className="max-h-52 shrink-0 overflow-y-auto border-t border-[var(--color-border)] p-3">
-        <div className="grid grid-cols-2 gap-x-4 gap-y-2">
-          {panelCategories.map((c) => {
-            const list = tags[c.name] ?? [];
+      <div className="max-h-64 shrink-0 overflow-y-auto bg-[var(--color-bg)] px-4 pt-3 pb-2">
+        <div className="mb-3 flex items-center justify-between">
+          <h3 className="ui-section-title">标签</h3>
+          <span className="text-[11px] text-[var(--color-text-tertiary)]">共 {totalTags} 个</span>
+        </div>
+        <div className="grid grid-cols-1 gap-x-6 gap-y-2 xl:grid-cols-2">
+          {panelFacets.map((f) => {
+            const list = tags[f.key] ?? [];
+            const hint = capHint[f.key];
+            const single = f.selectionMode === "single";
+            const cap = single ? 1 : Math.max(1, f.maxItems ?? 3);
+            const reached = !single && cap > 0 && list.length >= cap;
             return (
-              <div key={c.name} className="flex items-start gap-2">
-                <span className="mt-1 w-14 shrink-0 truncate text-xs font-medium text-[var(--color-text-secondary)]" title={c.name}>
-                  {c.name}
+              <div key={f.key} className="flex min-h-8 items-start gap-3 border-b border-[var(--color-border)]/70 pb-2">
+                <span className="mt-1.5 w-16 shrink-0 truncate text-xs font-medium text-[var(--color-text-secondary)]" title={f.key}>
+                  {f.displayName}
                 </span>
-                <div className="flex min-w-0 flex-1 flex-wrap items-center gap-1">
-                  {list.map((t) => (
-                    <TagChip key={t} label={t} onRemove={readOnly ? undefined : () => setCategoryTags(c.name, list.filter((x) => x !== t))} />
-                  ))}
-                  {!readOnly && (
-                    <input
-                      value={editing[c.name] ?? ""}
-                      onChange={(e) => setEditing({ ...editing, [c.name]: e.target.value })}
-                      onKeyDown={(e) => e.key === "Enter" && addTag(c)}
-                      placeholder="+ 加标签"
-                      className="w-16 rounded border border-[var(--color-border)] bg-[var(--color-surface)] px-1.5 py-0.5 text-xs outline-none focus:border-[var(--color-accent)]"
-                    />
+                <div className="min-w-0 flex-1">
+                  <div className="flex min-w-0 flex-wrap items-center gap-1">
+                    {list.map((t) => (
+                      <TagChip key={t} label={t} onRemove={readOnly ? undefined : () => setFacetTags(f.key, list.filter((x) => x !== t))} />
+                    ))}
+                    {!readOnly && (
+                      <FacetTagInput
+                        facetKey={f.key}
+                        value={editing[f.key] ?? ""}
+                        onValueChange={(v) => setEditing({ ...editing, [f.key]: v })}
+                        onCommit={(n) => addTag(f, n)}
+                      />
+                    )}
+                  </div>
+                  {!single && reached && (
+                    <span className="mt-0.5 block text-[10px] text-[var(--color-status)]" data-testid={`max-${f.key}`}>
+                      已达上限 {cap} 个
+                    </span>
                   )}
+                  {hint && <span className="mt-0.5 block text-[10px] text-[var(--color-status)]">{hint}</span>}
                 </div>
               </div>
             );
           })}
         </div>
-        <div className="mt-3 flex items-center gap-2">
-          <span className="text-xs text-[var(--color-text-secondary)]">共 {totalTags} 个标签</span>
+        <div className="sticky bottom-0 mt-3 flex items-center gap-2 border-t border-[var(--color-border)] bg-[var(--color-bg)] py-3">
+          <span className="text-xs text-[var(--color-text-secondary)]">{readOnly ? "当前结果为只读状态" : "Enter 添加标签，方向键切换图片"}</span>
           <div className="ml-auto flex gap-2">
             {isRejected ? (
               <Button onClick={() => void onRestore()}>恢复（撤销拒绝）</Button>
             ) : s.status === "confirmed" ? (
-              <span className="rounded bg-[var(--color-surface)] px-3 py-1.5 text-xs text-[var(--color-text-secondary)]">
-                本张已确认
+              <span className="inline-flex min-h-9 items-center rounded-md bg-[var(--color-surface)] px-3 text-xs font-medium text-[var(--color-success)]">
+                ✓ 已写入
               </span>
             ) : (
               <>
@@ -267,7 +311,7 @@ export default function Workbench({
                   拒绝
                 </Button>
                 <Button variant="primary" disabled={busy || totalTags === 0} onClick={() => void handleConfirm()}>
-                  {busy ? "写入中…" : "确认写入（Enter）"}
+                  {busy ? "写入中…" : "确认写入"}
                 </Button>
               </>
             )}

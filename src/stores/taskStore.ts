@@ -1,69 +1,160 @@
-/** 全局任务条状态（M3-04 R-17）：聚合入库/导出/AI 打标既有进度事件，
- *  只读事件不加新后端；完成（done>=total）后短暂停留再自动消失 */
+/** 全局任务条状态（阶段 1 契约，见指导书 §4.5/§4.6）：只由 taskStore 驱动。
+ *  入库任务按 taskId 隔离（旧任务事件不污染新任务）；后端只发阶段进度，前端按权重计算整体展示进度。
+ *  完成（done）后短暂停留再自动消失；失败保留文字与状态（不纯红）。 */
 import { create } from "zustand";
-import { onImportProgress } from "@/api/import";
+import { onImportProgress, type ImportPhase, type ImportProgress } from "@/api/import";
 import { onExportProgress } from "@/api/export";
 import { onAiProgress } from "@/api/ai";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 
-export interface GlobalTask {
-  key: "import" | "export" | "ai";
+export type TaskKind = "import" | "export" | "ai";
+
+export interface TaskItem {
+  /** 唯一键：入库用 taskId；导出/AI 用 kind */
+  id: string;
+  kind: TaskKind;
   label: string;
-  done: number;
-  total: number;
+  /** 0..1 整体展示进度；null = 不确定进度（前端显示相位文案 + 不确定条） */
+  overall: number | null;
+  /** 当前阶段/当前位置文案，如「正在生成快速预览」「12/120」 */
+  detail?: string;
+  /** 失败/取消文案（有失败项时显示文字与状态符号） */
+  error?: string | null;
+  /** 已入完成停留期 */
+  done?: boolean;
 }
 
 interface TaskState {
-  tasks: GlobalTask[];
+  tasks: TaskItem[];
+}
+
+/** 阶段权重（指导书 §4.5）：只作 UI 展示决策，不写入 Rust，也不作为业务完成条件。 */
+const IMPORT_PHASE_WEIGHTS: Partial<Record<ImportPhase, number>> = {
+  scanning: 0.05,
+  hashing: 0.25,
+  processing: 0.5,
+  previewing: 0.2,
+};
+const IMPORT_PHASE_ORDER: ImportPhase[] = ["scanning", "hashing", "processing", "previewing"];
+
+const PHASE_LABELS: Record<ImportPhase, string> = {
+  queued: "排队中",
+  scanning: "正在扫描目录",
+  hashing: "正在计算指纹",
+  processing: "正在入库",
+  previewing: "正在生成快速预览",
+  done: "已完成",
+};
+
+/** 由阶段进度计算整体展示进度；phaseTotal 未知时返回 null（不确定进度，不伪造百分比）。 */
+export function importOverall(phase: ImportPhase, current: number, total: number | null): number | null {
+  if (phase === "done") return 1;
+  if (!(phase in IMPORT_PHASE_WEIGHTS)) return null;
+  const idx = IMPORT_PHASE_ORDER.indexOf(phase);
+  let acc = 0;
+  for (let i = 0; i < idx; i++) acc += IMPORT_PHASE_WEIGHTS[IMPORT_PHASE_ORDER[i]]!;
+  if (total == null || total <= 0) return null;
+  const w = IMPORT_PHASE_WEIGHTS[phase]!;
+  return Math.min(1, acc + w * (current / total));
+}
+
+/** 展示明细：尽量给出「当前文件 / 计数」文本；无则给阶段文案。 */
+function importDetail(p: ImportProgress): string {
+  const phase = PHASE_LABELS[p.phase] ?? p.phase;
+  if (p.file) return `${phase} · ${p.file}`;
+  if (p.phaseTotal != null && p.phaseTotal > 0) return `${p.phaseCurrent}/${p.phaseTotal}`;
+  return phase;
 }
 
 export const useTaskStore = create<TaskState>(() => ({
   tasks: [],
 }));
 
-/** 完成条停留时长（毫秒）：让用户看到 100% 后再消失 */
+/** 完成条停留时长（毫秒）：让用户看到 100% 后再消失。 */
 const LINGER_MS = 1500;
-const clearTimers = new Map<GlobalTask["key"], ReturnType<typeof setTimeout>>();
+const lingerTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
-function upsert(key: GlobalTask["key"], label: string, done: number, total: number) {
+function scheduleLinger(id: string) {
+  const prev = lingerTimers.get(id);
+  if (prev) clearTimeout(prev);
+  lingerTimers.set(
+    id,
+    setTimeout(() => {
+      useTaskStore.setState((s) => ({ tasks: s.tasks.filter((t) => t.id !== id) }));
+      lingerTimers.delete(id);
+    }, LINGER_MS),
+  );
+}
+
+export function upsertImport(p: ImportProgress) {
+  const overall = importOverall(p.phase, p.phaseCurrent, p.phaseTotal);
+  const done = p.phase === "done";
   useTaskStore.setState((s) => {
-    const others = s.tasks.filter((t) => t.key !== key);
-    return { tasks: [...others, { key, label, done, total }] };
+    const others = s.tasks.filter((t) => t.id !== p.taskId);
+    const task: TaskItem = {
+      id: p.taskId,
+      kind: "import",
+      label: "入库",
+      overall,
+      detail: p.message && !done ? p.message : importDetail(p),
+      // 完成/失败时给出明确文案；失败不纯红，用文字+符号表达
+      error: done && p.failed > 0 ? `成功 ${p.imported} · 重复 ${p.duplicates} · 失败 ${p.failed}` : null,
+      done,
+    };
+    return { tasks: [...others, task] };
   });
-  if (total > 0 && done >= total) {
-    const prev = clearTimers.get(key);
-    if (prev) clearTimeout(prev);
-    clearTimers.set(
-      key,
-      setTimeout(() => {
-        useTaskStore.setState((s) => ({ tasks: s.tasks.filter((t) => t.key !== key) }));
-        clearTimers.delete(key);
-      }, LINGER_MS),
-    );
-  }
+  if (done) scheduleLinger(p.taskId);
+}
+
+function upsertGeneric(key: TaskKind, label: string, done: number, total: number) {
+  useTaskStore.setState((s) => {
+    const others = s.tasks.filter((t) => t.id !== key);
+    const task: TaskItem = {
+      id: key,
+      kind: key,
+      label,
+      overall: total > 0 ? done / total : null,
+      detail: total > 0 ? `${done}/${total}` : `${done}`,
+      done: total > 0 && done >= total,
+    };
+    return { tasks: [...others, task] };
+  });
+  if (total > 0 && done >= total) scheduleLinger(key);
+}
+
+/** 用户点击取消后标记最近的进行中入库任务为「取消中」（running → cancelling → cancelled）。 */
+export function markImportCancelling() {
+  useTaskStore.setState((s) => {
+    const tasks = [...s.tasks];
+    for (let i = tasks.length - 1; i >= 0; i--) {
+      if (tasks[i].kind === "import" && !tasks[i].done) {
+        tasks[i] = { ...tasks[i], detail: "取消中…" };
+        break;
+      }
+    }
+    return { tasks };
+  });
 }
 
 let subscribed = false;
 let unlisteners: UnlistenFn[] = [];
 
 /** 订阅三类进度事件（幂等，App 挂载时调用一次）；
- *  失败可恢复：部分成功时逐个回收已建立监听（allSettled 才能拿到已 resolve 的
- *  unlisten 函数），复位 subscribed 允许下次调用惰性重试（P2-02/P2-11） */
+ *  失败可恢复：部分成功时逐个回收已建立监听，复位 subscribed 允许下次调用惰性重试。 */
 export async function startGlobalTaskWatch(): Promise<void> {
   if (subscribed) return;
-  subscribed = true; // 先置位防并发重入（App 挂载可能多次调用）
+  subscribed = true;
   try {
     const results = await Promise.allSettled([
-      onImportProgress((p) => upsert("import", "入库中", p.current, p.total)),
-      onExportProgress((p) => upsert("export", "导出中", p.done, p.total)),
-      onAiProgress((p) => upsert("ai", "AI 打标中", p.processed, p.total)),
+      onImportProgress((p) => upsertImport(p)),
+      onExportProgress((p) => upsertGeneric("export", "导出中", p.done, p.total)),
+      onAiProgress((p) => upsertGeneric("ai", "AI 打标中", p.processed, p.total)),
     ]);
     const failures = results.filter((r) => r.status === "rejected").length;
     if (failures > 0) {
       for (const r of results) {
         if (r.status === "fulfilled") unlisteners.push(r.value);
       }
-      // 部分失败：整体回收，下次调用重试（避免半订阅 + 重复订阅叠加）
       for (const fn of unlisteners.splice(0)) fn();
       subscribed = false;
       console.error(`全局任务监听订阅失败 ${failures}/3 个事件，已回收并允许重试`);

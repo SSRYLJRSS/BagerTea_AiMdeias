@@ -37,9 +37,16 @@ fn from_row(r: &rusqlite::Row) -> rusqlite::Result<ExportTask> {
     })
 }
 
-const COLS: &str = "id, target, status, total, done, dest_dir, share_url, error, created_at, warning";
+const COLS: &str =
+    "id, target, status, total, done, dest_dir, share_url, error, created_at, warning";
 
-pub fn create_task(conn: &Connection, target: &str, total: i64, dest_dir: Option<&str>, account_id: Option<i64>) -> AppResult<ExportTask> {
+pub fn create_task(
+    conn: &Connection,
+    target: &str,
+    total: i64,
+    dest_dir: Option<&str>,
+    account_id: Option<i64>,
+) -> AppResult<ExportTask> {
     let now = chrono::Utc::now().timestamp_millis();
     conn.execute(
         "INSERT INTO export_tasks (target, status, total, dest_dir, account_id, created_at)
@@ -59,7 +66,9 @@ pub fn get_task(conn: &Connection, id: i64) -> AppResult<ExportTask> {
 
 pub fn list_tasks(conn: &Connection) -> AppResult<Vec<ExportTask>> {
     let mut stmt = conn.prepare(&format!("SELECT {COLS} FROM export_tasks ORDER BY id DESC"))?;
-    let rows = stmt.query_map([], from_row)?.collect::<Result<Vec<_>, _>>()?;
+    let rows = stmt
+        .query_map([], from_row)?
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(rows)
 }
 
@@ -71,7 +80,13 @@ pub fn update_progress(conn: &Connection, id: i64, done: i64, status: &str) -> A
     Ok(())
 }
 
-pub fn finish_task(conn: &Connection, id: i64, status: &str, share_url: Option<&str>, error: Option<&str>) -> AppResult<()> {
+pub fn finish_task(
+    conn: &Connection,
+    id: i64,
+    status: &str,
+    share_url: Option<&str>,
+    error: Option<&str>,
+) -> AppResult<()> {
     conn.execute(
         "UPDATE export_tasks SET status = ?1, share_url = ?2, error = ?3, warning = NULL WHERE id = ?4",
         rusqlite::params![status, share_url, error, id],

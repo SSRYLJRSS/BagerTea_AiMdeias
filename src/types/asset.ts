@@ -38,21 +38,134 @@ export interface AssetFilter {
   tagIds?: number[];
   /** any（默认）| all（同时含全部标签） */
   tagsMode?: "any" | "all";
+  facetFilters?: FacetTagFilter[];
+  excludeTagIds?: number[];
+  metadataFilters?: MetadataFilter[];
   search?: string;
-  /** 排序字段（R-21）：createdAt（默认）| takenAt | size | resolution */
-  sortBy?: "created_at" | "taken_at" | "size" | "resolution";
+  /** 排序字段（R-21）：createdAt（默认）| takenAt | modifiedAt | name | size | resolution */
+  sortBy?: "created_at" | "taken_at" | "modified_at" | "name" | "size" | "resolution";
   /** desc（默认）| asc */
   sortDir?: "desc" | "asc";
   /** true = 查回收站（R-22） */
   trashOnly?: boolean;
+  /** 布尔表达式树（P4 queryExpr）：存在时后端优先走表达式编译 */
+  expr?: import("./queryExpr").QueryExpr;
   offset?: number;
   limit?: number;
+}
+
+export interface FacetTagFilter {
+  facetKey: string;
+  tagIds: number[];
+  mode: "any" | "all";
+  includeDescendants: boolean;
+}
+
+export type MetadataFilterKey =
+  | "folder"
+  | "taken_month"
+  | "camera"
+  | "lens"
+  | "iso"
+  | "aperture"
+  | "shutter"
+  | "focal"
+  | "file_ext"
+  | "mime_type"
+  | "width"
+  | "height"
+  | "resolution"
+  | "aspect_ratio"
+  | "file_size"
+  | "duration_ms"
+  | "taken_at"
+  | "created_at"
+  | "modified_at"
+  | "video_codec"
+  | "audio_codec";
+
+export type MetadataOp =
+  | "eq"
+  | "in"
+  | "contains"
+  | "gt"
+  | "gte"
+  | "lt"
+  | "lte"
+  | "between";
+
+export type MetadataValue = string | number;
+
+export interface MetadataFilter {
+  key: MetadataFilterKey;
+  op: MetadataOp;
+  /** 单值操作符（eq / contains / gt / gte / lt / lte）使用 */
+  value?: MetadataValue;
+  /** in 操作符使用 */
+  values?: MetadataValue[];
+  /** between 操作符使用 */
+  min?: MetadataValue;
+  max?: MetadataValue;
+}
+
+export interface MetadataFacetItem {
+  value: string;
+  label: string;
+  count: number;
+}
+
+export interface MetadataFacet {
+  /** 分面展示键（可为 folder/duration/taken_month 等，未必是筛选 key） */
+  key: string;
+  displayName: string;
+  description: string;
+  items: MetadataFacetItem[];
 }
 
 export interface AssetPage {
   items: Asset[];
   total: number;
   hasMore: boolean;
+}
+
+/** 分面标签条件（ResolvedSearchQuery 内，tagIds 为后端解析结果） */
+export interface ResolvedFacetFilter {
+  facetKey: string;
+  tagIds: number[];
+  /** any（同分面内 OR，默认）| all */
+  mode: "any" | "all";
+  includeDescendants: boolean;
+}
+
+/** 执行对象：后端/前端统一查询协议（P0 contract-v1 §3） */
+export interface ResolvedSearchQuery {
+  search: string;
+  assetType: AssetType;
+  untaggedOnly: boolean;
+  facetFilters: ResolvedFacetFilter[];
+  excludeTagIds: number[];
+  missingFacetKeys: string[];
+  metadataFilters: MetadataFilter[];
+  sortBy: "created_at" | "taken_at" | "modified_at" | "name" | "size" | "resolution";
+  sortDir: "desc" | "asc";
+}
+
+/** AI 输出的标签条件（SearchIntent 内，text 为文字，不含 id） */
+export interface SearchIntentTag {
+  facetKey: string;
+  text: string;
+  includeDescendants?: boolean;
+}
+
+/** SearchIntent：AI 自然语言解析产物（P0 contract-v1 §2） */
+export interface SearchIntent {
+  search?: string;
+  assetType?: AssetType;
+  tags?: SearchIntentTag[];
+  excludeTags?: SearchIntentTag[];
+  metadata?: MetadataFilter[];
+  sortBy?: ResolvedSearchQuery["sortBy"];
+  sortDir?: "desc" | "asc";
 }
 
 export interface ImportResult {

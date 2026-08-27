@@ -218,7 +218,9 @@ where
     }
 }
 
-fn read_request(reader: &mut BufReader<&mut std::net::TcpStream>) -> std::io::Result<RecordedRequest> {
+fn read_request(
+    reader: &mut BufReader<&mut std::net::TcpStream>,
+) -> std::io::Result<RecordedRequest> {
     // 请求行：METHOD PATH HTTP/1.1
     let mut req_line = String::new();
     reader.read_line(&mut req_line)?;

@@ -1,6 +1,30 @@
 /** 标签相关命令封装（对应 commands/tags_cmd.rs） */
 import { invoke } from "./client";
-import type { Tag, TagNode } from "@/types/tag";
+import type { Tag, TagFacet, TagFacetGovernance, TagNode } from "@/types/tag";
+
+export function listTagFacets(): Promise<TagFacet[]> {
+  return invoke<TagFacet[]>("list_tag_facets");
+}
+
+export function listTagsByFacet(facetKey: string): Promise<TagNode[]> {
+  return invoke<TagNode[]>("list_tags_by_facet", { facetKey });
+}
+
+export function listTagGovernance(): Promise<TagFacetGovernance[]> {
+  return invoke<TagFacetGovernance[]>("list_tag_governance");
+}
+
+export function searchTagCandidates(facetKey: string | null, query: string): Promise<Tag[]> {
+  return invoke<Tag[]>("search_tag_candidates", { facetKey: facetKey ?? undefined, query });
+}
+
+export function createCanonicalTag(name: string, facetKey: string, parentId: number | null): Promise<Tag> {
+  return invoke<Tag>("create_canonical_tag", { name, facetKey, parentId });
+}
+
+export function addTagAlias(tagId: number, alias: string, locale?: string): Promise<void> {
+  return invoke<void>("add_tag_alias", { tagId, alias, locale });
+}
 
 export function listTags(): Promise<TagNode[]> {
   return invoke<TagNode[]>("list_tags");
@@ -19,9 +43,13 @@ export function deleteTag(id: number): Promise<void> {
   return invoke<void>("delete_tag", { id });
 }
 
+export function deactivateTag(id: number): Promise<void> {
+  return invoke<void>("deactivate_tag", { id });
+}
+
 /** 合并标签：src 的素材关联与子标签并入 dst，随后删除 src（M3-01） */
 export function mergeTags(srcId: number, dstId: number): Promise<void> {
-  return invoke<void>("tag_merge", { srcId, dstId });
+  return invoke<void>("merge_tags_preserve_alias", { srcId, dstId });
 }
 
 export function assignTags(assetIds: number[], tagIds: number[]): Promise<void> {

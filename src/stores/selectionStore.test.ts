@@ -32,13 +32,15 @@ describe("selectionStore 多选语义", () => {
     expect(useSelectionStore.getState().selected).toEqual(new Set([2]));
   });
 
-  it("Shift 范围选：从锚点到目标（正向，追加语义）", () => {
+  it("Shift 范围选：从锚点到目标（正向，范围内有未选 → 补选整个范围）", () => {
     const s = useSelectionStore.getState();
     s.toggle(10, 0, false); // 单击 index 0（id=10）为锚点
     s.rangeTo(4, [10, 11, 12, 13, 14]);
     expect(useSelectionStore.getState().selected).toEqual(
       new Set([10, 11, 12, 13, 14]),
     );
+    // E-3：锚点更新为当前 index
+    expect(useSelectionStore.getState().anchorIndex).toBe(4);
   });
 
   it("Shift 反向范围选（锚点 3 → 目标 1）", () => {
@@ -48,6 +50,24 @@ describe("selectionStore 多选语义", () => {
     expect(useSelectionStore.getState().selected).toEqual(
       new Set([11, 12, 13]),
     );
+    expect(useSelectionStore.getState().anchorIndex).toBe(1);
+  });
+
+  it("Shift 重复选同一范围：范围内全部已选 → 取消整个范围（E-2）", () => {
+    // 直接构造：锚点 index 0、范围 [0,2] 全部已选
+        
+    useSelectionStore.setState({ selected: new Set([10, 11, 12]), anchorIndex: 0 });
+    useSelectionStore.getState().rangeTo(2, [10, 11, 12]);
+    expect(useSelectionStore.getState().selected).toEqual(new Set());
+    expect(useSelectionStore.getState().anchorIndex).toBe(2);
+  });
+
+  it("Shift 范围选含 undefined 边界：不把 undefined 放进选中集（E-2）", () => {
+    const s = useSelectionStore.getState();
+    s.toggle(10, 0, false); // 锚点 index 0
+    s.rangeTo(2, [10, undefined as unknown as number, 20]);
+    // 范围内有效 id = [10,20]；10 已选、20 未选 → 补选整个范围；undefined 被跳过
+    expect(Array.from(useSelectionStore.getState().selected).sort()).toEqual([10, 20]);
   });
 
   it("Ctrl+A（setAll）：全选并更新锚点到末位", () => {

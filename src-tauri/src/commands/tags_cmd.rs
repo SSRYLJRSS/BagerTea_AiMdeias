@@ -1,6 +1,8 @@
 use tauri::State;
 
+use crate::db::tag_facets::TagFacet;
 use crate::db::tag_ops::TagOp;
+use crate::db::tags::TagFacetGovernance;
 use crate::db::tags::{Tag, TagNode};
 use crate::db::{asset_tags, tag_ops, tags};
 use crate::error::{AppError, AppResult};
@@ -14,6 +16,79 @@ fn lock_db(state: &AppState) -> AppResult<std::sync::MutexGuard<'_, rusqlite::Co
 pub fn list_tags(state: State<AppState>) -> AppResult<Vec<TagNode>> {
     let conn = lock_db(&state)?;
     tags::list_tree(&conn)
+}
+
+#[tauri::command]
+pub fn list_tag_facets(state: State<AppState>) -> AppResult<Vec<TagFacet>> {
+    let conn = lock_db(&state)?;
+    crate::db::tag_facets::list(&conn)
+}
+
+#[tauri::command]
+pub fn list_tags_by_facet(state: State<AppState>, facet_key: String) -> AppResult<Vec<TagNode>> {
+    let conn = lock_db(&state)?;
+    crate::db::tag_facets::get(&conn, &facet_key)?;
+    tags::list_by_facet(&conn, &facet_key)
+}
+
+#[tauri::command]
+pub fn list_tag_governance(state: State<AppState>) -> AppResult<Vec<TagFacetGovernance>> {
+    let conn = lock_db(&state)?;
+    tags::governance(&conn)
+}
+
+#[tauri::command]
+pub fn search_tag_candidates(
+    state: State<AppState>,
+    facet_key: Option<String>,
+    query: String,
+) -> AppResult<Vec<Tag>> {
+    let conn = lock_db(&state)?;
+    tags::search_candidates(&conn, facet_key.as_deref(), &query)
+}
+
+#[tauri::command]
+pub fn create_canonical_tag(
+    state: State<AppState>,
+    name: String,
+    facet_key: String,
+    parent_id: Option<i64>,
+) -> AppResult<Tag> {
+    let name = name.trim().to_string();
+    if name.is_empty() || name.chars().count() > 64 || name.chars().any(|c| c.is_control()) {
+        return Err(AppError::msg("标签名称无效或超过 64 个字符"));
+    }
+    let conn = lock_db(&state)?;
+    crate::db::tag_facets::get(&conn, &facet_key)?;
+    if let Some(pid) = parent_id {
+        let parent_facet: String = conn.query_row(
+            "SELECT facet_key FROM tags WHERE id = ?1 AND status = 'active'",
+            [pid],
+            |r| r.get(0),
+        )?;
+        if parent_facet != facet_key {
+            return Err(AppError::msg("标签不能挂到其他分面下"));
+        }
+    }
+    if parent_id.is_none() {
+        let id = tags::find_or_create_canonical(&conn, &facet_key, &name)?;
+        return tags::search_candidates(&conn, Some(&facet_key), &name)?
+            .into_iter()
+            .find(|tag| tag.id == id)
+            .ok_or_else(|| AppError::msg("创建标签后读取失败"));
+    }
+    tags::create_in_facet(&conn, &name, parent_id, Some(&facet_key))
+}
+
+#[tauri::command]
+pub fn add_tag_alias(
+    state: State<AppState>,
+    tag_id: i64,
+    alias: String,
+    locale: Option<String>,
+) -> AppResult<()> {
+    let conn = lock_db(&state)?;
+    tags::add_alias(&conn, tag_id, &alias, locale.as_deref(), "synonym")
 }
 
 #[tauri::command]
@@ -54,7 +129,7 @@ pub fn update_tag(
         }
     }
     let conn = lock_db(&state)?;
-    tags::update(&conn, id, name.as_deref(), parent_id)
+    tags::update_preserve_alias(&conn, id, name.as_deref(), parent_id)
 }
 
 #[tauri::command]
@@ -64,9 +139,32 @@ pub fn delete_tag(state: State<AppState>, id: i64) -> AppResult<()> {
 }
 
 #[tauri::command]
+pub fn deactivate_tag(state: State<AppState>, id: i64) -> AppResult<()> {
+    let conn = lock_db(&state)?;
+    let is_system: bool =
+        conn.query_row("SELECT is_system != 0 FROM tags WHERE id = ?1", [id], |r| {
+            r.get(0)
+        })?;
+    if is_system {
+        return Err(AppError::msg("系统分面根标签不能停用"));
+    }
+    tags::deactivate(&conn, id)
+}
+
+#[tauri::command]
 pub fn tag_merge(state: State<AppState>, src_id: i64, dst_id: i64) -> AppResult<()> {
     let conn = lock_db(&state)?;
     tags::merge(&conn, src_id, dst_id)
+}
+
+#[tauri::command]
+pub fn merge_tags_preserve_alias(
+    state: State<AppState>,
+    src_id: i64,
+    dst_id: i64,
+) -> AppResult<()> {
+    let conn = lock_db(&state)?;
+    tags::merge_preserve_alias(&conn, src_id, dst_id)
 }
 
 #[tauri::command]

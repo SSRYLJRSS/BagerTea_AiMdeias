@@ -4,11 +4,11 @@ import { useShallow } from "zustand/react/shallow";
 import Modal from "@/components/common/Modal";
 import Button from "@/components/common/Button";
 import TagChip from "@/components/library/TagChip";
-import { assignTags, createTag } from "@/api/tags";
+import { assignTags, createCanonicalTag } from "@/api/tags";
 import { useTagStore } from "@/stores/tagStore";
 import { useLibraryStore } from "@/stores/libraryStore";
 import { useSelectionStore } from "@/stores/selectionStore";
-import type { TagNode } from "@/types/tag";
+import type { Tag, TagNode } from "@/types/tag";
 
 interface TagAssignDialogProps {
   open: boolean;
@@ -17,10 +17,14 @@ interface TagAssignDialogProps {
 
 export default function TagAssignDialog({ open, onClose }: TagAssignDialogProps) {
   const { selected, clear } = useSelectionStore(useShallow((s) => ({ selected: s.selected, clear: s.clear })));
-  const { tree, refresh } = useTagStore(useShallow((s) => ({ tree: s.tree, refresh: s.refresh })));
+  const { tree, facets, refresh } = useTagStore(
+    useShallow((s) => ({ tree: s.tree, facets: s.facets, refresh: s.refresh })),
+  );
   const refreshLibrary = useLibraryStore((s) => s.refresh);
   const [picked, setPicked] = useState<Set<number>>(new Set());
   const [newName, setNewName] = useState("");
+  const [query, setQuery] = useState("");
+  const [facetKey, setFacetKey] = useState("custom");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -28,12 +32,16 @@ export default function TagAssignDialog({ open, onClose }: TagAssignDialogProps)
     if (open) {
       setPicked(new Set());
       setNewName("");
+      setQuery("");
       setError(null);
       if (tree.length === 0) void refresh();
     }
   }, [open, tree.length, refresh]);
 
-  const allTags = useMemo(() => flatten(tree), [tree]);
+  const allTags = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    return flatten(tree).filter((tag) => !tag.isSystem && (!q || tag.path.toLowerCase().includes(q) || tag.aliases.some((a) => a.toLowerCase().includes(q))));
+  }, [tree, query]);
 
   const toggle = (id: number) =>
     setPicked((s) => {
@@ -48,7 +56,7 @@ export default function TagAssignDialog({ open, onClose }: TagAssignDialogProps)
     if (!name) return;
     setBusy(true);
     try {
-      const tag = await createTag(name, null);
+      const tag = await createCanonicalTag(name, facetKey, null);
       await refresh();
       setPicked((s) => new Set(s).add(tag.id));
       setNewName("");
@@ -87,9 +95,24 @@ export default function TagAssignDialog({ open, onClose }: TagAssignDialogProps)
       }
     >
       <div className="flex flex-col gap-3">
+        <div className="flex gap-2">
+          <input
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="搜索标签、路径或别名…"
+            className="min-w-0 flex-1 rounded-md border border-[var(--color-border)] bg-[var(--color-surface)] px-2 py-1.5 text-sm outline-none focus:border-[var(--color-accent)]"
+          />
+          <select
+            value={facetKey}
+            onChange={(e) => setFacetKey(e.target.value)}
+            className="rounded-md border border-[var(--color-border)] bg-[var(--color-surface)] px-2 py-1.5 text-sm outline-none"
+          >
+            {facets.map((facet) => <option key={facet.key} value={facet.key}>{facet.displayName}</option>)}
+          </select>
+        </div>
         <div className="flex max-h-48 flex-wrap content-start gap-1.5 overflow-y-auto">
           {allTags.map((t) => (
-            <TagChip key={t.id} label={t.name} active={picked.has(t.id)} onClick={() => toggle(t.id)} />
+            <TagChip key={t.id} label={t.path || t.name} active={picked.has(t.id)} onClick={() => toggle(t.id)} />
           ))}
           {allTags.length === 0 && (
             <span className="text-xs text-[var(--color-text-secondary)]">还没有标签，先在下方新建一个</span>
@@ -113,6 +136,6 @@ export default function TagAssignDialog({ open, onClose }: TagAssignDialogProps)
   );
 }
 
-function flatten(tree: TagNode[]): { id: number; name: string }[] {
-  return tree.flatMap((n) => [{ id: n.tag.id, name: n.tag.name }, ...flatten(n.children)]);
+function flatten(tree: TagNode[]): Tag[] {
+  return tree.flatMap((n) => [n.tag, ...flatten(n.children)]);
 }

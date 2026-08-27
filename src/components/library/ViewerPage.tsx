@@ -7,6 +7,7 @@ import clsx from "clsx";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { useShallow } from "zustand/react/shallow";
 import TagChip from "@/components/library/TagChip";
+import VideoPlayer from "@/components/library/VideoPlayer";
 import TagAssignDialog from "@/components/dialogs/TagAssignDialog";
 import { getThumbnailUrl, toFileUrl } from "@/api/thumbnail";
 import { removeTags } from "@/api/tags";
@@ -276,7 +277,7 @@ export default function ViewerPage({ asset: initial, onClose }: ViewerPageProps)
         className="relative flex min-h-0 flex-1 items-center justify-center overflow-hidden bg-[var(--color-bg)]"
       >
         {isVideo ? (
-          <video src={convertFileSrc(current.filePath)} controls autoPlay className="max-h-full max-w-full" />
+          <VideoPlayer src={convertFileSrc(current.filePath)} fileName={current.fileName} className="h-full w-full" />
         ) : src ? (
           <img
             key={current.id}

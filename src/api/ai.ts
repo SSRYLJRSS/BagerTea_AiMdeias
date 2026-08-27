@@ -1,6 +1,6 @@
 /** AI 打标命令封装（对应 commands/ai_cmd.rs，T05a） */
 import { invoke, on } from "./client";
-import type { AiBatch, AiMode, AiSuggestion, CategorizedTags } from "@/types/ai";
+import type { AiBatch, AiMode, AiSuggestion, AiSuggestionItem, CategorizedTags } from "@/types/ai";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 
 export interface AiProgress {
@@ -28,6 +28,26 @@ export function aiListBatches(): Promise<AiBatch[]> {
 
 export function aiListSuggestions(batchId: number): Promise<AiSuggestion[]> {
   return invoke<AiSuggestion[]>("ai_list_suggestions", { batchId });
+}
+
+export function aiListSuggestionItems(suggestionId: number): Promise<AiSuggestionItem[]> {
+  return invoke<AiSuggestionItem[]>("ai_list_suggestion_items", { suggestionId });
+}
+
+export function aiDecideSuggestionItem(
+  itemId: number,
+  decision: "accepted" | "modified" | "rejected",
+  replacementTagId?: number | null,
+  replacementName?: string | null,
+  reason?: string | null,
+): Promise<void> {
+  return invoke<void>("ai_decide_suggestion_item", {
+    itemId,
+    decision,
+    replacementTagId: replacementTagId ?? null,
+    replacementName: replacementName ?? null,
+    reason: reason ?? null,
+  });
 }
 
 export function aiConfirmSuggestion(id: number, tags: CategorizedTags): Promise<void> {

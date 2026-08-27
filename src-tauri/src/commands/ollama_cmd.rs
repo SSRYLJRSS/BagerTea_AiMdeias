@@ -126,10 +126,7 @@ pub async fn ollama_install_status() -> AppResult<InstallStatus> {
 
 /// 从 settings 读取当前自定义源（installer::DownloadSource 形式）
 fn read_custom_sources(state: &State<AppState>) -> AppResult<Vec<installer::DownloadSource>> {
-    let conn = state
-        .db
-        .lock()
-        .map_err(|_| AppError::msg("数据库锁中毒"))?;
+    let conn = state.db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
     let s = db_settings::get_settings(&conn)?;
     Ok(s.custom_download_sources
         .into_iter()
@@ -156,10 +153,7 @@ pub async fn ollama_probe_sources(
 ) -> AppResult<Vec<installer::SourceProbe>> {
     let all = installer::all_sources(&read_custom_sources(&state)?);
     let targets: Vec<_> = match ids.as_ref().filter(|v| !v.is_empty()) {
-        Some(list) => all
-            .into_iter()
-            .filter(|s| list.contains(&s.id))
-            .collect(),
+        Some(list) => all.into_iter().filter(|s| list.contains(&s.id)).collect(),
         None => all,
     };
     if targets.is_empty() {
@@ -218,7 +212,10 @@ pub async fn ollama_download_install(
                 emit_log(lvl, m.to_string());
             },
         )?;
-        emit_log("info", "安装包下载完成，开始静默安装（约 1–2 分钟，请勿关闭应用）…".into());
+        emit_log(
+            "info",
+            "安装包下载完成，开始静默安装（约 1–2 分钟，请勿关闭应用）…".into(),
+        );
         let _ = app.emit(
             "ollama://install-progress",
             installer::InstallProgress {
@@ -246,17 +243,30 @@ pub async fn ollama_download_install(
                 source_id: String::new(),
             },
         );
-        if let Some(ver) = installer::wait_ready(installer::LOCAL_BASE_URL, Duration::from_secs(30)) {
-            emit_log("info", format!("✓ Ollama 服务已就绪（版本 {ver}），安装完成"));
+        if let Some(ver) = installer::wait_ready(installer::LOCAL_BASE_URL, Duration::from_secs(30))
+        {
+            emit_log(
+                "info",
+                format!("✓ Ollama 服务已就绪（版本 {ver}），安装完成"),
+            );
             return Ok(());
         }
         if installer::exit_code_ok(code) {
-            emit_log("warn", "安装已完成，但服务未在 30 秒内就绪，可点「启动服务并复检」".into());
+            emit_log(
+                "warn",
+                "安装已完成，但服务未在 30 秒内就绪，可点「启动服务并复检」".into(),
+            );
             Err(AppError::msg(
                 "安装已完成，但 Ollama 服务尚未就绪：点「启动服务并复检」",
             ))
         } else {
-            emit_log("error", format!("安装失败（退出码 {code}）：可能被安全软件拦截，请手动运行安装包：{}", dest.display()));
+            emit_log(
+                "error",
+                format!(
+                    "安装失败（退出码 {code}）：可能被安全软件拦截，请手动运行安装包：{}",
+                    dest.display()
+                ),
+            );
             Err(AppError::msg(format!(
                 "安装失败（退出码 {code}）：可能被安全软件拦截，请手动运行安装包：{}",
                 dest.display()
@@ -276,10 +286,7 @@ pub fn ollama_add_custom_source(
 ) -> AppResult<installer::DownloadSource> {
     installer::validate_custom_source(&label, &url)?;
     let id = format!("custom-{}", uuid::Uuid::new_v4());
-    let conn = state
-        .db
-        .lock()
-        .map_err(|_| AppError::msg("数据库锁中毒"))?;
+    let conn = state.db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
     let mut s = db_settings::get_settings(&conn)?;
     installer::validate_custom_count(s.custom_download_sources.len())?;
     let src = db_settings::CustomSource {
@@ -299,10 +306,7 @@ pub fn ollama_add_custom_source(
 /// 删除自定义下载源（即时落库；id 无效则忽略不报错）
 #[tauri::command]
 pub fn ollama_remove_custom_source(state: State<AppState>, id: String) -> AppResult<()> {
-    let conn = state
-        .db
-        .lock()
-        .map_err(|_| AppError::msg("数据库锁中毒"))?;
+    let conn = state.db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
     let mut s = db_settings::get_settings(&conn)?;
     db_settings::remove_custom_source(&mut s, &id);
     db_settings::save_settings(&conn, &s)?;
@@ -356,10 +360,7 @@ pub fn ollama_open_model_dir(app: AppHandle) -> AppResult<()> {
 pub async fn ollama_start_service(state: State<'_, AppState>) -> AppResult<()> {
     // 命令层读设置（拿代理），逻辑仍在 services（拉起+复检）
     let proxy = {
-        let conn = state
-            .db
-            .lock()
-            .map_err(|_| AppError::msg("数据库锁中毒"))?;
+        let conn = state.db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
         db_settings::get_settings(&conn)?.model_download_proxy
     };
     tauri::async_runtime::spawn_blocking(move || {
