@@ -44,7 +44,12 @@ pub fn ai_create_batch(
         return Err(AppError::msg("非法打标模式"));
     }
     let conn = lock_db(&state)?;
-    let s = settings::get_settings(&conn)?;
+    let mut s = settings::get_settings(&conn)?;
+    // §4.4：打标用途绑定优先（影响 auto/cloud 的本地/云端判定）
+    let _ = crate::db::ai_connections::apply_usage_binding(&conn, "tagging", &mut s.ai).map_err(|e| {
+        tracing::warn!("打标读取用途绑定失败，回退默认档案: {e}");
+        e
+    });
     // auto/cloud 统一按激活档案 kind 落实际模式：本地档案 → local，否则 cloud
     let mode = if mode == "manual" {
         mode
@@ -96,7 +101,15 @@ pub async fn ai_start_batch(
             if !has_pending {
                 return Err(AppError::msg("当前没有待打标的建议（已全部处理或确认）"));
             }
-            let s = settings::get_settings(&conn)?;
+            let mut s = settings::get_settings(&conn)?;
+            // §4.4：打标按用途绑定读取连接档案（含 keyring 密钥解析）；无绑定时回退默认 active 档案。
+            //       绑定修改不写 settings JSON，复用现有 AI HTTP service（run_cloud_batch 只读 cfg）。
+            let _ = crate::db::ai_connections::apply_usage_binding(&conn, "tagging", &mut s.ai).map_err(
+                |e| {
+                    tracing::warn!("打标读取用途绑定失败，回退默认档案: {e}");
+                    e
+                },
+            );
             // P3-01a：本地批次要求激活档案为本地端点（cloud/local 管线同构，只做一致性校验）
             let profile_is_local = s.ai.active().map(|p| p.is_local()).unwrap_or(false);
             if batch.mode == "local" && !profile_is_local {

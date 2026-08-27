@@ -1,10 +1,12 @@
 pub mod ai_cloud;
+pub mod credentials;
 pub mod dedup;
 pub mod exif_meta;
 pub mod export_local;
 pub mod heic_decode;
 pub mod imaging;
 pub mod importer;
+pub mod media_refill;
 pub mod ollama_installer;
 pub mod ollama_setup;
 pub mod preview;
@@ -12,3 +14,4 @@ pub mod raw_decode;
 pub mod super_search_ai;
 pub mod thumbnail;
 pub mod video;
+pub mod video_proxy;

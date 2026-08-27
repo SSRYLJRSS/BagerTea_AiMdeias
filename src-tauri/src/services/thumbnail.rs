@@ -4,9 +4,11 @@
 //! 注：EXIF 内嵌缩略图快速通道已评估放弃（kamadak-exif 不提供字节提取，需手解 TIFF 段，
 //! 性价比低；image crate 直接解码缩到 256px 实测可接受）——决策日志 2026-08-08。
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use image::ImageEncoder;
 use rusqlite::Connection;
@@ -21,6 +23,64 @@ pub const HD_SIZE: u32 = 512;
 /// B05：hd 缩略图生成计数器，每 LRU_CHECK_INTERVAL 次触发一次 LRU 清理
 static HD_GEN_COUNT: AtomicU64 = AtomicU64::new(0);
 const LRU_CHECK_INTERVAL: u64 = 100;
+
+/// 指导书 §9.4.1 single-flight：按 `asset_id:size` 去重，同一时刻只执行一个生成任务。
+/// 每个 key 一把互斥锁；后续调用方在锁上等待，锁释放后再二次检查文件已存在则直接复用。
+static HD_INFLIGHT: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
+
+fn hd_inflight() -> &'static Mutex<HashMap<String, Arc<Mutex<()>>>> {
+    HD_INFLIGHT.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 生成一个与目标同目录、同扩展名（保留 .webp/.jpg）的临时路径，用于「写入临时文件 → 原子 rename」。
+fn temp_path_for(out: &Path, uid: &str) -> PathBuf {
+    let stem = out.file_stem().and_then(|s| s.to_str()).unwrap_or("thumb");
+    let ext = out.extension().and_then(|s| s.to_str()).unwrap_or("bin");
+    let dir = out.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    dir.join(format!("{stem}.{uid}.{ext}"))
+}
+
+/// 原子生成：`gen` 写入临时文件，成功后再 rename 到正式路径，杜绝正式路径出现半成品。
+/// 失败/异常清理临时文件；Windows 下目标被占用（WebView/杀软）时重试数次并给出可解释失败。
+fn atomic_generate(out: &Path, gen: impl FnOnce(&Path) -> bool) -> bool {
+    let uid = uuid::Uuid::new_v4().to_string();
+    let tmp = temp_path_for(out, &uid);
+    let ok = gen(&tmp);
+    if !ok {
+        let _ = fs::remove_file(&tmp);
+        return false;
+    }
+    // 同文件系统内 rename 原子；Windows：目标可能正被 WebView/杀软读取 → 重试
+    let mut last_err = None;
+    for _ in 0..3 {
+        match fs::rename(&tmp, out) {
+            Ok(()) => return true,
+            Err(e) => {
+                last_err = Some(e);
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+    }
+    let _ = fs::remove_file(&tmp);
+    tracing::warn!(
+        "缩略图原子 rename 失败（目标可能被占用）：{} 最后错误：{:?}",
+        out.display(),
+        last_err
+    );
+    false
+}
+
+/// 按 key 执行 single-flight：同一 key 同一时刻只有一个任务在锁内执行。
+fn with_single_flight(key: &str, f: impl FnOnce() -> AppResult<PathBuf>) -> AppResult<PathBuf> {
+    let lock = {
+        let mut map = hd_inflight().lock().unwrap_or_else(|e| e.into_inner());
+        map.entry(key.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    };
+    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    f()
+}
 
 #[derive(Debug, Clone)]
 pub struct ThumbnailService {
@@ -51,16 +111,20 @@ impl ThumbnailService {
         if out.exists() {
             return out;
         }
+        let is_video = mime_type.starts_with("video/");
         let ok = if mime_type.starts_with("image/") {
-            imaging::write_thumb(src, &out, PLACEHOLDER_SIZE)
-        } else if mime_type.starts_with("video/") {
+            atomic_generate(&out, |tmp| imaging::write_thumb(src, tmp, PLACEHOLDER_SIZE))
+        } else if is_video {
             let _permit = imaging::acquire();
-            video::extract_frame(src, 0, &out, PLACEHOLDER_SIZE)
+            atomic_generate(&out, |tmp| video::extract_frame(src, 0, tmp, PLACEHOLDER_SIZE))
         } else {
             false
         };
         if !ok {
-            Self::write_generic(&out, mime_type.starts_with("video/"));
+            atomic_generate(&out, |tmp| {
+                Self::write_generic(tmp, is_video);
+                true
+            });
         }
         out
     }
@@ -77,7 +141,6 @@ impl ThumbnailService {
         asset_id: i64,
         size: Option<u32>,
     ) -> AppResult<PathBuf> {
-        // 并发由 imaging 全局信号量控制（4 许可）；同一 asset 重复生成无害（同产物）
         // 短暂读库（排队期间可能已被前一个任务生成）
         let (asset, out) = {
             let conn = db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
@@ -93,38 +156,49 @@ impl ThumbnailService {
         if out.exists() {
             return Ok(out);
         }
-        let src = Path::new(&asset.file_path);
-        let ok = if asset.mime_type.starts_with("video/") {
-            let _permit = imaging::acquire();
-            let t = asset.duration_ms.map(|d| d / 10).unwrap_or(0);
-            video::extract_frame(src, t, &out, size.unwrap_or(HD_SIZE))
-        } else {
-            imaging::write_thumb(src, &out, size.unwrap_or(HD_SIZE))
-        };
-        if ok {
-            // B05：回写 hd 路径（短锁）+ 节流触发 LRU 清理（先读 settings 短锁，再锁外清理）
-            let cleanup_mb = {
-                let conn = db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
-                assets::set_hd_thumbnail_path(&conn, asset_id, &out.to_string_lossy())?;
-                // B05：每生成 100 张触发一次 LRU 清理
-                let n = HD_GEN_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-                if n.is_multiple_of(LRU_CHECK_INTERVAL) {
-                    crate::db::settings::get_settings(&conn)
-                        .ok()
-                        .map(|s| s.thumbnail_cache_mb)
-                } else {
-                    None
-                }
-            }; // 释放 DB 锁
-               // B05：锁外执行 LRU 清理（纯文件系统操作，不持锁）
-            if let Some(max_mb) = cleanup_mb {
-                let _ = self.cleanup_lru(max_mb);
+        // 指导书 §9.4.1：single-flight 按 (asset, variant/size) 去重；锁内重新检查文件存在后再生成。
+        // 生成期间不持有 DB 锁（decode 在锁外），只短暂读行 + 回写路径。
+        let key = out.to_string_lossy().to_string();
+        let size = size.unwrap_or(HD_SIZE);
+        let asset_for_gen = asset.clone();
+        with_single_flight(&key, || {
+            let out = out.clone();
+            if out.exists() {
+                return Ok(out); // 其他调用方已生成
             }
-            Ok(out)
-        } else {
-            // 高清生成失败降级返回占位图，保证前端有图可显
-            Ok(self.placeholder_path(asset_id))
-        }
+            let src = Path::new(&asset_for_gen.file_path);
+            let ok = if asset_for_gen.mime_type.starts_with("video/") {
+                let _permit = imaging::acquire();
+                let t = asset_for_gen.duration_ms.map(|d| d / 10).unwrap_or(0);
+                atomic_generate(&out, |tmp| video::extract_frame(src, t, tmp, size))
+            } else {
+                atomic_generate(&out, |tmp| imaging::write_thumb(src, tmp, size))
+            };
+            if ok {
+                // B05：回写 hd 路径（短锁）+ 节流触发 LRU 清理（先读 settings 短锁，再锁外清理）
+                let cleanup_mb = {
+                    let conn = db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
+                    assets::set_hd_thumbnail_path(&conn, asset_id, &out.to_string_lossy())?;
+                    // B05：每生成 100 张触发一次 LRU 清理
+                    let n = HD_GEN_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n.is_multiple_of(LRU_CHECK_INTERVAL) {
+                        crate::db::settings::get_settings(&conn)
+                            .ok()
+                            .map(|s| s.thumbnail_cache_mb)
+                    } else {
+                        None
+                    }
+                }; // 释放 DB 锁
+                   // B05：锁外执行 LRU 清理（纯文件系统操作，不持锁）
+                if let Some(max_mb) = cleanup_mb {
+                    let _ = self.cleanup_lru(max_mb);
+                }
+                Ok(out)
+            } else {
+                // 高清生成失败降级返回占位图，保证前端有图可显
+                Ok(self.placeholder_path(asset_id))
+            }
+        })
     }
 
     // ── 缓存管理 ──
@@ -215,5 +289,88 @@ impl ThumbnailService {
                 image::ExtendedColorType::Rgba8,
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn temp_path_preserves_extension_and_parent() {
+        let dir = std::env::temp_dir();
+        let out = dir.join("100_512.webp");
+        let tmp = temp_path_for(&out, "abc123");
+        assert_eq!(tmp.parent(), Some(dir.as_path()));
+        assert!(tmp.extension().is_some());
+        assert!(tmp.to_string_lossy().contains("abc123"));
+        assert_ne!(tmp, out);
+    }
+
+    #[test]
+    fn atomic_generate_success_writes_and_renames() {
+        let dir = std::env::temp_dir().join(format!("bg_atomic_{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("out.webp");
+        // gen 在临时文件里写内容
+        let ok = atomic_generate(&out, |tmp| {
+            fs::write(tmp, b"hello").unwrap();
+            true
+        });
+        assert!(ok);
+        assert!(out.exists());
+        assert_eq!(fs::read(&out).unwrap(), b"hello");
+        // 无残留 .tmp
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn atomic_generate_failure_leaves_no_file() {
+        let dir = std::env::temp_dir().join(format!("bg_atomic_fail_{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("fail.jpg");
+        let ok = atomic_generate(&out, |tmp| {
+            fs::write(tmp, b"partial").unwrap();
+            false // 模拟生成失败
+        });
+        assert!(!ok);
+        assert!(!out.exists());
+        // 失败后清理临时文件
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn single_flight_serializes_same_key() {
+        // 同一 key：并发 3 个调用，只有 1 个能进入临界区（其余等待），用原子计数器验证
+        let entered = Arc::new(AtomicU64::new(0));
+        let in_crit = Arc::new(AtomicBool::new(false));
+        let max_seen = Arc::new(AtomicU64::new(0));
+        let mut handles = Vec::new();
+        for _ in 0..3 {
+            let entered = Arc::clone(&entered);
+            let in_crit = Arc::clone(&in_crit);
+            let max_seen = Arc::clone(&max_seen);
+            handles.push(std::thread::spawn(move || {
+                let _ = with_single_flight("a:512", || {
+                    entered.fetch_add(1, Ordering::SeqCst);
+                    if in_crit.swap(true, Ordering::SeqCst) {
+                        // 已在临界区（不应发生）
+                        max_seen.fetch_add(1, Ordering::SeqCst);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(30));
+                    in_crit.store(false, Ordering::SeqCst);
+                    Ok(std::path::PathBuf::from("x"))
+                });
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        // 临界区无并发进入
+        assert_eq!(max_seen.load(Ordering::SeqCst), 0);
+        assert_eq!(entered.load(Ordering::SeqCst), 3);
     }
 }

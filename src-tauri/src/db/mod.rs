@@ -1,9 +1,9 @@
 //! 数据层入口：连接初始化（WAL + foreign_keys + cjk_bigram 注册 + 迁移）
 
 pub mod ai;
+pub mod ai_connections;
 pub mod asset_tags;
 pub mod assets;
-pub mod cloud;
 pub mod dedup;
 pub mod export;
 pub mod migrations;
@@ -15,6 +15,7 @@ mod sql_utils;
 pub mod tag_facets;
 pub mod tag_ops;
 pub mod tags;
+pub mod video_proxy;
 
 use std::path::Path;
 

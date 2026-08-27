@@ -38,6 +38,26 @@ pub struct Asset {
     pub shutter: Option<String>,
     pub focal: Option<f64>,
     pub tags: Vec<Tag>,
+    // 媒体元数据（指导书 §7.3/§7.4，V12 迁移新增列；后端探测为事实源）
+    pub media_kind: Option<String>,
+    pub container_format: Option<String>,
+    pub video_profile: Option<String>,
+    pub pixel_format: Option<String>,
+    pub bit_depth: Option<i64>,
+    pub frame_rate: Option<f64>,
+    pub video_bit_rate: Option<i64>,
+    pub color_range: Option<String>,
+    pub color_space: Option<String>,
+    pub color_transfer: Option<String>,
+    pub color_primaries: Option<String>,
+    pub audio_sample_rate: Option<i64>,
+    pub audio_channels: Option<i64>,
+    pub audio_layout: Option<String>,
+    pub rotation: Option<i64>,
+    pub media_metadata_json: Option<String>,
+    pub metadata_version: Option<i64>,
+    pub metadata_scanned_at: Option<i64>,
+    pub metadata_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -166,7 +186,11 @@ pub(crate) const COLUMNS: &str =
     "id, file_path, file_name, file_ext, file_size, mime_type, width, height, \
                        duration_ms, video_codec, audio_codec, taken_at, created_at, modified_at, \
                        hash, placeholder_path, hd_thumbnail_path, \
-                       camera, lens, iso, aperture, shutter, focal";
+                       camera, lens, iso, aperture, shutter, focal, \
+                       media_kind, container_format, video_profile, pixel_format, bit_depth, frame_rate, \
+                       video_bit_rate, color_range, color_space, color_transfer, color_primaries, \
+                       audio_sample_rate, audio_channels, audio_layout, rotation, \
+                       media_metadata_json, metadata_version, metadata_scanned_at, metadata_error";
 
 pub(crate) fn from_row(row: &Row) -> rusqlite::Result<Asset> {
     Ok(Asset {
@@ -193,6 +217,25 @@ pub(crate) fn from_row(row: &Row) -> rusqlite::Result<Asset> {
         aperture: row.get(20)?,
         shutter: row.get(21)?,
         focal: row.get(22)?,
+        media_kind: row.get(23)?,
+        container_format: row.get(24)?,
+        video_profile: row.get(25)?,
+        pixel_format: row.get(26)?,
+        bit_depth: row.get(27)?,
+        frame_rate: row.get(28)?,
+        video_bit_rate: row.get(29)?,
+        color_range: row.get(30)?,
+        color_space: row.get(31)?,
+        color_transfer: row.get(32)?,
+        color_primaries: row.get(33)?,
+        audio_sample_rate: row.get(34)?,
+        audio_channels: row.get(35)?,
+        audio_layout: row.get(36)?,
+        rotation: row.get(37)?,
+        media_metadata_json: row.get(38)?,
+        metadata_version: row.get(39)?,
+        metadata_scanned_at: row.get(40)?,
+        metadata_error: row.get(41)?,
         tags: Vec::new(),
     })
 }
@@ -884,6 +927,80 @@ pub fn find_by_path(conn: &Connection, file_path: &str) -> AppResult<Option<i64>
     let mut rows = stmt.query([file_path])?;
     Ok(rows.next()?.map(|r| r.get(0)).transpose()?)
 }
+
+/// 媒体探测回写（指导书 §7.4/§7.5）：结构字段 + metadata_scanned_at / metadata_error。
+/// 只回写本次探测结果；error 与 NULL 分属「读取失败」「未读取」，不可混为一谈。
+#[derive(Debug, Default, Clone)]
+pub struct MediaProbeUpdate {
+    pub media_kind: Option<String>,
+    pub width: Option<i64>,
+    pub height: Option<i64>,
+    pub duration_ms: Option<i64>,
+    pub video_codec: Option<String>,
+    pub audio_codec: Option<String>,
+    pub container_format: Option<String>,
+    pub video_profile: Option<String>,
+    pub pixel_format: Option<String>,
+    pub frame_rate: Option<f64>,
+    pub rotation: Option<i64>,
+    pub media_metadata_json: Option<String>,
+    pub metadata_version: Option<i64>,
+    /// 探测失败原因（可辨识）；None = 成功
+    pub error: Option<String>,
+}
+
+/// 把一次探测结果回写到 assets（媒体探测协议版本 V12 之后）。
+pub fn update_media_metadata(conn: &Connection, id: i64, m: &MediaProbeUpdate) -> AppResult<()> {
+    let now = chrono::Utc::now().timestamp_millis();
+    conn.execute(
+        "UPDATE assets SET media_kind=?1, width=?2, height=?3, duration_ms=?4, video_codec=?5, audio_codec=?6,
+            container_format=?7, video_profile=?8, pixel_format=?9, frame_rate=?10, rotation=?11,
+            media_metadata_json=?12, metadata_error=?13, metadata_version=?14, metadata_scanned_at=?15
+         WHERE id=?16",
+        rusqlite::params![
+            m.media_kind,
+            m.width,
+            m.height,
+            m.duration_ms,
+            m.video_codec,
+            m.audio_codec,
+            m.container_format,
+            m.video_profile,
+            m.pixel_format,
+            m.frame_rate,
+            m.rotation,
+            m.media_metadata_json,
+            m.error,
+            m.metadata_version,
+            now,
+            id
+        ],
+    )?;
+    Ok(())
+}
+
+/// 列出缺少媒体元数据的视频（用于「仅缺字段」回填范围）。视频 = MIME video/* 或已有 duration。
+pub fn list_video_ids_needing_metadata(conn: &Connection) -> AppResult<Vec<i64>> {
+    let mut stmt = conn.prepare(
+        "SELECT id FROM assets
+          WHERE deleted_at IS NULL
+            AND (mime_type LIKE 'video/%' OR duration_ms IS NOT NULL)
+            AND (duration_ms IS NULL OR video_codec IS NULL)",
+    )?;
+    let rows = stmt.query_map([], |r| r.get(0))?;
+    Ok(rows.filter_map(|r| r.ok()).collect())
+}
+
+/// 列出全部视频的 id（用于「全部视频」回填范围）。
+pub fn list_video_ids(conn: &Connection) -> AppResult<Vec<i64>> {
+    let mut stmt = conn.prepare(
+        "SELECT id FROM assets
+          WHERE deleted_at IS NULL AND (mime_type LIKE 'video/%' OR duration_ms IS NOT NULL)",
+    )?;
+    let rows = stmt.query_map([], |r| r.get(0))?;
+    Ok(rows.filter_map(|r| r.ok()).collect())
+}
+
 
 pub fn set_hash(conn: &Connection, id: i64, hash: &str) -> AppResult<()> {
     conn.execute(

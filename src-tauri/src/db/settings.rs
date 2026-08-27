@@ -114,6 +114,15 @@ impl AiSettings {
             .find(|p| p.id == self.active_profile)
             .or(self.profiles.first())
     }
+
+    /// 激活档案 id（不回退第一套；供连接迁移/回退判断）
+    pub fn active_profile_opt(&self) -> Option<String> {
+        if self.active_profile.is_empty() {
+            None
+        } else {
+            Some(self.active_profile.clone())
+        }
+    }
 }
 
 fn default_api_mode() -> String {

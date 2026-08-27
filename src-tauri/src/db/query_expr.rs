@@ -14,7 +14,7 @@
 use serde::{Deserialize, Serialize};
 
 use rusqlite::types::Value;
-use rusqlite::Connection;
+use rusqlite::{params_from_iter, Connection, OptionalExtension};
 
 use super::sql_utils::offset_placeholders;
 use crate::error::{AppError, AppResult};
@@ -237,11 +237,16 @@ pub fn compile_leaf(conn: &Connection, cond: &LeafCond) -> AppResult<(String, Ve
             Vec::new(),
         )),
         LeafCond::Tag {
-            facet_key: _f,
+            facet_key,
             tag_ids,
             mode,
             include_descendants,
-        } => compile_tag_leaf(tag_ids, mode.as_deref(), *include_descendants),
+        } => {
+            // §12.5：Tag 叶子不能忽略 facet_key——校验未知分面不被静默折叠成 custom；
+            // 且已存在的标签若其分面与声明不符（跨分面串用），明确报错而非返回错误结果。
+            validate_tag_leaf_facet(conn, facet_key, tag_ids)?;
+            compile_tag_leaf(tag_ids, mode.as_deref(), *include_descendants)
+        }
         LeafCond::ExcludeTag { tag_ids, .. } => {
             let mut sql = String::new();
             let mut params: Vec<Value> = Vec::new();
@@ -263,6 +268,39 @@ pub fn compile_leaf(conn: &Connection, cond: &LeafCond) -> AppResult<(String, Ve
             }
         }
     }
+}
+
+/// §12.5：校验 Tag 叶子的 facet_key。
+///  - 未知 facet：返回明确错误（不静默折叠成 custom）；
+///  - 已存在标签但分面与声明不符（跨分面串用 tag_id）：返回明确错误；
+///  - facet_key 为空（排除标签/历史兼容）跳过校验；tag 不存在（宽容）不报错。
+fn validate_tag_leaf_facet(conn: &Connection, facet_key: &str, tag_ids: &[i64]) -> AppResult<()> {
+    if facet_key.is_empty() {
+        return Ok(());
+    }
+    let exists: Option<i64> = conn
+        .query_row("SELECT 1 FROM tag_facets WHERE key = ?1", [facet_key], |r| r.get(0))
+        .optional()?;
+    if exists.is_none() {
+        return Err(AppError::msg(format!("未知分面：{facet_key}")));
+    }
+    if tag_ids.is_empty() {
+        return Ok(());
+    }
+    let placeholders = tag_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let mut vals: Vec<Value> = vec![Value::Text(facet_key.to_string())];
+    for &t in tag_ids {
+        vals.push(Value::Integer(t));
+    }
+    let mismatched: i64 = conn.query_row(
+        &format!("SELECT COUNT(*) FROM tags WHERE facet_key <> ? AND id IN ({placeholders})"),
+        params_from_iter(vals),
+        |r| r.get(0),
+    )?;
+    if mismatched > 0 {
+        return Err(AppError::msg(format!("标签不属于分面 {facet_key}")));
+    }
+    Ok(())
 }
 
 /// 标签叶子（含后代/any-all），复用 build_where 的 EXISTS 形态。
@@ -477,6 +515,66 @@ mod tests {
         let (sql2, params2) = compile_expr(&conn, &expr).unwrap();
         assert_eq!(sql, sql2);
         assert_eq!(params.len(), params2.len());
+    }
+
+    #[test]
+    fn rejects_unknown_facet_key_not_silent_custom() {
+        // §12.5：未知 facet 不静默折叠成 custom
+        let conn = init_memory().unwrap();
+        let expr = QueryExpr::Leaf {
+            cond: LeafCond::Tag {
+                facet_key: "nonexistent_facet".into(),
+                tag_ids: vec![1],
+                mode: Some("any".into()),
+                include_descendants: true,
+            },
+        };
+        let err = compile_expr(&conn, &expr).unwrap_err();
+        assert!(err.to_string().contains("未知分面"));
+    }
+
+    #[test]
+    fn rejects_tag_belonging_to_wrong_facet() {
+        let conn = init_memory().unwrap();
+        // 造一个在 scene 分面下的标签
+        conn.execute(
+            "INSERT INTO tags (name, normalized_name, canonical_name, facet_key, is_system, status, sort_order)
+             VALUES ('海边', '海边', '海边', 'scene', 0, 'active', 0)",
+            [],
+        )
+        .unwrap();
+        // 声明为 color 分面但 tag 属于 scene → 报错
+        let expr = QueryExpr::Leaf {
+            cond: LeafCond::Tag {
+                facet_key: "color".into(),
+                tag_ids: vec![1],
+                mode: Some("any".into()),
+                include_descendants: false,
+            },
+        };
+        let err = compile_expr(&conn, &expr).unwrap_err();
+        assert!(err.to_string().contains("不属于分面"));
+    }
+
+    #[test]
+    fn accepts_tag_belonging_to_declared_facet() {
+        let conn = init_memory().unwrap();
+        conn.execute(
+            "INSERT INTO tags (name, normalized_name, canonical_name, facet_key, is_system, status, sort_order)
+             VALUES ('海边', '海边', '海边', 'scene', 0, 'active', 0)",
+            [],
+        )
+        .unwrap();
+        let expr = QueryExpr::Leaf {
+            cond: LeafCond::Tag {
+                facet_key: "scene".into(),
+                tag_ids: vec![1],
+                mode: Some("any".into()),
+                include_descendants: false,
+            },
+        };
+        let (sql, _) = compile_expr(&conn, &expr).unwrap();
+        assert!(sql.contains("EXISTS"));
     }
 
     #[test]

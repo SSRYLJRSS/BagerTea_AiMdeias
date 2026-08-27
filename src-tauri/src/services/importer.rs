@@ -276,6 +276,13 @@ struct AssetMeta {
     duration_ms: Option<i64>,
     video_codec: Option<String>,
     audio_codec: Option<String>,
+    // 指导书 §7.3/§7.4：视频结构化字段（V12 迁移新增列）
+    container_format: Option<String>,
+    video_profile: Option<String>,
+    pixel_format: Option<String>,
+    frame_rate: Option<f64>,
+    rotation: Option<i64>,
+    media_metadata_json: Option<String>,
     exif: Option<exif_meta::ExifData>,
 }
 
@@ -295,12 +302,18 @@ fn extract_meta(file: &Path, mime_type: &str) -> Option<AssetMeta> {
             has_any = true;
         }
     } else if mime_type.starts_with("video/") {
-        if let Some(vm) = video::probe(file) {
+        if let Ok(vm) = video::probe(file) {
             meta.width = vm.width;
             meta.height = vm.height;
             meta.duration_ms = vm.duration_ms;
             meta.video_codec = vm.video_codec;
             meta.audio_codec = vm.audio_codec;
+            meta.container_format = vm.container_format;
+            meta.video_profile = vm.video_profile;
+            meta.pixel_format = vm.pixel_format;
+            meta.frame_rate = vm.frame_rate;
+            meta.rotation = vm.rotation;
+            meta.media_metadata_json = vm.raw_json;
             has_any = true;
         }
     }
@@ -345,9 +358,23 @@ fn write_meta(
         }
     } else if mime_type.starts_with("video/") {
         conn.execute(
-            "UPDATE assets SET width=?1, height=?2, duration_ms=?3, video_codec=?4, audio_codec=?5 WHERE id=?6",
+            "UPDATE assets SET width=?1, height=?2, duration_ms=?3, video_codec=?4, audio_codec=?5,
+                            container_format=?6, video_profile=?7, pixel_format=?8, frame_rate=?9,
+                            rotation=?10, media_metadata_json=?11
+             WHERE id=?12",
             rusqlite::params![
-                m.width, m.height, m.duration_ms, m.video_codec, m.audio_codec, id
+                m.width,
+                m.height,
+                m.duration_ms,
+                m.video_codec,
+                m.audio_codec,
+                m.container_format,
+                m.video_profile,
+                m.pixel_format,
+                m.frame_rate,
+                m.rotation,
+                m.media_metadata_json,
+                id
             ],
         )?;
     }

@@ -37,13 +37,20 @@ pub async fn ai_parse_search_query(
                 super_search_ai::MAX_INPUT_LEN
             )));
         }
-        // 3-5. 短锁读取 AI 档案 + 分面 + 标签词典，读取后立即放锁
+        // 3-5. 短锁读取 AI 档案（按用途绑定优先）+ 分面 + 标签词典，读取后立即放锁
         let (cfg, facets, dict) = {
             let conn = lock_db(&db)?;
-            let s = settings::get_settings(&conn)?;
+            let mut s = settings::get_settings(&conn)?;
             if s.ai.active().is_none() {
                 return Err(AppError::msg("请先在设置页添加 API 配置（中转站）"));
             }
+            // §4.4：超级搜索按用途绑定读取连接档案；无绑定时回退默认 active 档案。
+            //         绑定连接含 keyring 密钥解析，共用现有 AI HTTP service。
+            let _ = crate::db::ai_connections::apply_usage_binding(&conn, "super_search", &mut s.ai)
+                .map_err(|e| {
+                    tracing::warn!("超级搜索读取用途绑定失败，回退默认档案: {e}");
+                    e
+                })?;
             let facets = tag_facets::build_prompt_context(&conn, &s.ai_facet_configs)?;
             let dict = super_search_ai::collect_tag_dictionary(&conn, &facets)?;
             (s.ai, facets, dict)

@@ -22,13 +22,16 @@ fn count(conn: &rusqlite::Connection, sql: &str) -> i64 {
 
 // ═══════════════ ① migrations 幂等 ═══════════════
 
+/// 当前迁移链终版 user_version（新迁移追加时同步更新；防止硬编码断言过期）
+const LATEST_VERSION: i64 = 15;
+
 #[test]
 fn migrate_twice_is_idempotent() -> AppResult<()> {
     let conn = setup();
-    // 再次执行 migrate（user_version 已=7，幂等）
+    // 再次执行 migrate（已到终版，幂等）
     migrations::migrate(&conn)?;
     let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    assert_eq!(v, 11);
+    assert_eq!(v, LATEST_VERSION);
     // 表仍存在且可用
     add_asset(&conn, "d:/p/a.jpg", "a.jpg", "jpg", "image/jpeg");
     Ok(())
@@ -794,11 +797,11 @@ fn v3_rebuild_normalizes_fts_content() -> AppResult<()> {
     got.sort();
     assert_eq!(got, vec![id]);
 
-    // user_version 已升到 9（V3 及后续迁移链全部执行）
+    // user_version 已到终版（V3 及后续迁移链全部执行）
     let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    assert_eq!(v, 11);
+    assert_eq!(v, LATEST_VERSION);
 
-    // 幂等：再跑一次 migrate 无副作用（version 已=7，不重跑）
+    // 幂等：再跑一次 migrate 无副作用
     migrations::migrate(&conn)?;
     let fname2: String = conn.query_row(
         "SELECT file_name FROM fts_content WHERE asset_id = ?1",
@@ -807,7 +810,7 @@ fn v3_rebuild_normalizes_fts_content() -> AppResult<()> {
     )?;
     assert_eq!(fname2, "进 度 100%.jpg");
     let v2: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    assert_eq!(v2, 11);
+    assert_eq!(v2, LATEST_VERSION);
     Ok(())
 }
 
@@ -1126,9 +1129,9 @@ fn b37_v2_crash_recovery_all_columns_present() -> AppResult<()> {
     conn.pragma_update(None, "user_version", 1)?;
     // 重新迁移
     migrations::migrate(&conn)?;
-    // version 应升到 11（当前迁移链终版）
+    // version 应到终版
     let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    assert_eq!(v, 11);
+    assert_eq!(v, LATEST_VERSION);
     // 所有 V2 列仍在
     let cols = asset_columns(&conn);
     for c in V2_COLS {
@@ -1172,20 +1175,20 @@ fn b37_v2_partial_columns_recovery() -> AppResult<()> {
         assert!(cols_after.contains(*c), "迁移后列 {c} 应存在");
     }
     let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    assert_eq!(v, 11);
+    assert_eq!(v, LATEST_VERSION);
     Ok(())
 }
 
 #[test]
 fn b37_fresh_install_all_v2_columns() -> AppResult<()> {
-    // 场景：全新安装 → V1→V2（全部 ALTER）→ V3…V6
+    // 场景：全新安装 → V1→V2（全部 ALTER）→ V3…终版
     let conn = db::init_memory()?;
     let cols = asset_columns(&conn);
     for c in V2_COLS {
         assert!(cols.contains(*c), "全新安装后列 {c} 应存在");
     }
     let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    assert_eq!(v, 11);
+    assert_eq!(v, LATEST_VERSION);
     Ok(())
 }
 

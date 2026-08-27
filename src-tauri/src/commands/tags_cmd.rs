@@ -1,6 +1,6 @@
 use tauri::State;
 
-use crate::db::tag_facets::TagFacet;
+use crate::db::tag_facets::{FacetImpact, TagFacet};
 use crate::db::tag_ops::TagOp;
 use crate::db::tags::TagFacetGovernance;
 use crate::db::tags::{Tag, TagNode};
@@ -22,6 +22,95 @@ pub fn list_tags(state: State<AppState>) -> AppResult<Vec<TagNode>> {
 pub fn list_tag_facets(state: State<AppState>) -> AppResult<Vec<TagFacet>> {
     let conn = lock_db(&state)?;
     crate::db::tag_facets::list(&conn)
+}
+
+/// 分面管理：列出全部（含 inactive），供设置页分面生命周期 UI。
+#[tauri::command]
+pub fn list_all_tag_facets(state: State<AppState>) -> AppResult<Vec<TagFacet>> {
+    let conn = lock_db(&state)?;
+    crate::db::tag_facets::list_all(&conn)
+}
+
+/// 分面管理：创建用户分面（is_system=false；key 稳定不可改）。
+#[tauri::command]
+pub fn create_tag_facet(
+    state: State<AppState>,
+    key: String,
+    display_name: String,
+    description: Option<String>,
+    selection_mode: String,
+    max_items: Option<i64>,
+    applies_to: Option<String>,
+) -> AppResult<TagFacet> {
+    let conn = lock_db(&state)?;
+    crate::db::tag_facets::create(
+        &conn,
+        &key,
+        &display_name,
+        description.as_deref().unwrap_or(""),
+        &selection_mode,
+        max_items,
+        applies_to.as_deref().unwrap_or("all"),
+    )
+}
+
+/// 修改显示属性（显示名/描述；key 不可改）。
+#[tauri::command]
+pub fn update_tag_facet_display(
+    state: State<AppState>,
+    key: String,
+    display_name: String,
+    description: Option<String>,
+) -> AppResult<()> {
+    let conn = lock_db(&state)?;
+    crate::db::tag_facets::update_display(&conn, &key, &display_name, description.as_deref().unwrap_or(""))
+}
+
+/// 修改规则（selection_mode / max_items / applies_to）。
+#[tauri::command]
+pub fn update_tag_facet_rules(
+    state: State<AppState>,
+    key: String,
+    selection_mode: String,
+    max_items: Option<i64>,
+    applies_to: Option<String>,
+) -> AppResult<()> {
+    let conn = lock_db(&state)?;
+    crate::db::tag_facets::update_rules(
+        &conn,
+        &key,
+        &selection_mode,
+        max_items,
+        applies_to.as_deref().unwrap_or("all"),
+    )
+}
+
+/// 分面排序（传入完整有序 key 列表）。
+#[tauri::command]
+pub fn reorder_tag_facets(state: State<AppState>, ordered_keys: Vec<String>) -> AppResult<()> {
+    let conn = lock_db(&state)?;
+    crate::db::tag_facets::reorder(&conn, &ordered_keys)
+}
+
+/// 软停用（保留历史引用）；系统分面返回错误。
+#[tauri::command]
+pub fn deactivate_tag_facet(state: State<AppState>, key: String) -> AppResult<()> {
+    let conn = lock_db(&state)?;
+    crate::db::tag_facets::deactivate(&conn, &key)
+}
+
+/// 恢复分面。
+#[tauri::command]
+pub fn restore_tag_facet(state: State<AppState>, key: String) -> AppResult<()> {
+    let conn = lock_db(&state)?;
+    crate::db::tag_facets::restore(&conn, &key)
+}
+
+/// 停用前显示影响范围（标签/素材/AI 配置数量）。
+#[tauri::command]
+pub fn get_tag_facet_impact(state: State<AppState>, key: String) -> AppResult<FacetImpact> {
+    let conn = lock_db(&state)?;
+    crate::db::tag_facets::get_impact(&conn, &key)
 }
 
 #[tauri::command]
