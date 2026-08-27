@@ -1,9 +1,67 @@
 /** 标签相关命令封装（对应 commands/tags_cmd.rs） */
 import { invoke } from "./client";
-import type { Tag, TagFacet, TagFacetGovernance, TagNode } from "@/types/tag";
+import type { Tag, TagFacet, TagFacetGovernance, TagFacetImpact, TagNode } from "@/types/tag";
 
 export function listTagFacets(): Promise<TagFacet[]> {
   return invoke<TagFacet[]>("list_tag_facets");
+}
+
+/** 分面管理：列出全部（含 inactive）。 */
+export function listAllTagFacets(): Promise<TagFacet[]> {
+  return invoke<TagFacet[]>("list_all_tag_facets");
+}
+
+/** 分面管理：创建用户分面（key 稳定不可改）。 */
+export function createTagFacet(input: {
+  key: string;
+  displayName: string;
+  description?: string;
+  selectionMode: "single" | "multi";
+  maxItems?: number | null;
+  appliesTo?: "all" | "image" | "video";
+}): Promise<TagFacet> {
+  return invoke<TagFacet>("create_tag_facet", {
+    key: input.key,
+    displayName: input.displayName,
+    description: input.description ?? "",
+    selectionMode: input.selectionMode,
+    maxItems: input.maxItems ?? null,
+    appliesTo: input.appliesTo ?? "all",
+  });
+}
+
+export function updateTagFacetDisplay(key: string, displayName: string, description?: string): Promise<void> {
+  return invoke<void>("update_tag_facet_display", { key, displayName, description: description ?? "" });
+}
+
+export function updateTagFacetRules(
+  key: string,
+  selectionMode: "single" | "multi",
+  maxItems?: number | null,
+  appliesTo?: "all" | "image" | "video",
+): Promise<void> {
+  return invoke<void>("update_tag_facet_rules", {
+    key,
+    selectionMode,
+    maxItems: maxItems ?? null,
+    appliesTo: appliesTo ?? "all",
+  });
+}
+
+export function reorderTagFacets(orderedKeys: string[]): Promise<void> {
+  return invoke<void>("reorder_tag_facets", { orderedKeys });
+}
+
+export function deactivateTagFacet(key: string): Promise<void> {
+  return invoke<void>("deactivate_tag_facet", { key });
+}
+
+export function restoreTagFacet(key: string): Promise<void> {
+  return invoke<void>("restore_tag_facet", { key });
+}
+
+export function getTagFacetImpact(key: string): Promise<TagFacetImpact> {
+  return invoke<TagFacetImpact>("get_tag_facet_impact", { key });
 }
 
 export function listTagsByFacet(facetKey: string): Promise<TagNode[]> {

@@ -54,3 +54,30 @@ export function getAssetUrls(ids: number[]): Promise<string[]> {
 export function revealInFolder(path: string): Promise<void> {
   return invoke<void>("reveal_in_folder", { path });
 }
+
+// ── 媒体元数据回填（指导书 §7.5）──
+
+export interface RescanResult {
+  total: number;
+  success: number;
+  failed: number;
+  skipped: number;
+}
+
+export interface RefillProgress {
+  done: number;
+  total: number;
+  success: number;
+  failed: number;
+  skipped: number;
+  currentId: number;
+}
+
+/** 回填范围：all=全部视频 | missing=仅缺字段 | ids=选中素材 */
+export function rescanAssetMetadata(ids: number[], scope: "all" | "missing" | "ids"): Promise<RescanResult> {
+  return invoke<RescanResult>("rescan_asset_metadata", { ids, scope });
+}
+
+export function cancelMediaRefill(): Promise<void> {
+  return invoke<void>("cancel_media_refill");
+}

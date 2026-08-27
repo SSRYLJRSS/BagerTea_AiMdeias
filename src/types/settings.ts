@@ -1,4 +1,4 @@
-/** 设置与网盘账号 */
+/** 设置（网盘账号已在指导书 §6.8 移除，云账号类型不再暴露） */
 
 export type ApiMode = "openai" | "anthropic";
 
@@ -75,12 +75,4 @@ export interface Settings {
   customDownloadSources: CustomSource[];
   /** Ollama 模型下载代理（拉起 serve 时注入 HTTPS_PROXY；空 = 不用代理） */
   modelDownloadProxy: string;
-}
-
-export interface CloudAccount {
-  id: number;
-  provider: "baidu" | "quark";
-  name: string;
-  bound: boolean;
-  expiresAt: number | null;
 }

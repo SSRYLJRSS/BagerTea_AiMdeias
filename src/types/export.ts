@@ -1,6 +1,6 @@
-/** 导出任务（本地/网盘统一模型） */
+/** 导出任务（指导书 §6.8：网盘已从正常 UI 移除，仅保留本地文件导出目标）。 */
 
-export type ExportTarget = "local" | "baidu" | "quark";
+export type ExportTarget = "local";
 
 export interface ExportTask {
   id: number;

@@ -25,6 +25,26 @@ export interface Asset {
   aperture: number | null;
   shutter: string | null;
   focal: number | null;
+  // 媒体元数据（指导书 §7.3/§7.4，后端探测为事实源；V12 迁移新增列）
+  mediaKind?: string | null;
+  containerFormat?: string | null;
+  videoProfile?: string | null;
+  pixelFormat?: string | null;
+  bitDepth?: number | null;
+  frameRate?: number | null;
+  videoBitRate?: number | null;
+  colorRange?: string | null;
+  colorSpace?: string | null;
+  colorTransfer?: string | null;
+  colorPrimaries?: string | null;
+  audioSampleRate?: number | null;
+  audioChannels?: number | null;
+  audioLayout?: string | null;
+  rotation?: number | null;
+  mediaMetadataJson?: string | null;
+  metadataVersion?: number | null;
+  metadataScannedAt?: number | null;
+  metadataError?: string | null;
   tags: import("./tag").Tag[];
 }
 

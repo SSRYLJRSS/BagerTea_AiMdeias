@@ -27,7 +27,17 @@ export interface TagFacet {
   maxItems: number | null;
   sortOrder: number;
   isSystem: boolean;
-  status: "active" | "deprecated";
+  status: "active" | "inactive" | "deprecated";
+  appliesTo: "all" | "image" | "video";
+  createdAt: number;
+  updatedAt: number;
+}
+
+/** 分面治理前的影响范围（指导书 §12.3） */
+export interface TagFacetImpact {
+  tagCount: number;
+  assetCount: number;
+  aiConfigCount: number;
 }
 
 /** 打标工作台分面（指导书 §9.2）：tag_facets 唯一决定结构；aiFacetConfigs 只覆盖
