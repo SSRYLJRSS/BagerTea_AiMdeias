@@ -1,17 +1,10 @@
-/** 网格卡片：缩略图 + 选中态 + 视频时长角标 + 格式角标 + 文件名（含 300ms 悬浮预览）
- *  F（指导书）：视频预览改为卡片内 overlay（覆盖原卡片，播放在原位置，离开即停）；
- *  图片预览继续使用固定 MediaPreviewPopover。均通过 useHoverIntent（300ms 进入延迟）驱动。 */
-import { memo, useCallback, useEffect, useState } from "react";
+/** 网格卡片（指导书 §2.2/§6.1）：缩略图 + 角标 + 选中态 + 文件名 + 单击/双击/右键。
+ *  素材库禁止大图/视频 hover 预览：不创建 <video>、不请求 1024px hover 图、
+ *  不渲染 fixed 大图浮层；hover 只允许边框/文件名透明度变化（§3.3）。双击进入 Viewer。 */
+import { memo, useCallback } from "react";
 import clsx from "clsx";
-import { convertFileSrc } from "@tauri-apps/api/core";
 import Thumbnail from "./Thumbnail";
-import MediaPreviewPopover from "@/components/media/MediaPreviewPopover";
-import ImagePreviewContent from "@/components/media/ImagePreviewContent";
-import VideoHoverOverlay from "@/components/media/VideoHoverOverlay";
-import { getImageHoverPreview } from "@/api/mediaPreview";
-import { toFileUrl } from "@/api/thumbnail";
 import { isVideoAsset } from "@/utils/assetKind";
-import { useHoverIntent } from "@/hooks/useHoverIntent";
 import type { Asset } from "@/types/asset";
 
 interface AssetCardProps {
@@ -56,15 +49,12 @@ export default memo(function AssetCard({ asset, index, selected, onSelect, onPre
     [asset, index, onContextMenu],
   );
 
-  // B-4：视频类型优先按 MIME 判断（导入时长读取失败时 durationMs 为 null 也能识别为视频）
+  // B-4：视频类型统一按 MIME 判断（导入时长读取失败时 durationMs 为 null 也能识别为视频）
   const isVideo = isVideoAsset(asset);
-  // F：卡片自身持有 hover intent（300ms 进入），视频 overlay 与图片 popover 共享 active
-  const { active, triggerProps } = useHoverIntent({});
   const badge = formatBadge(asset.fileExt);
-  const cover = asset.placeholderPath ? toFileUrl(asset.placeholderPath) : null;
 
   return (
-    <div {...triggerProps} className="relative">
+    <div className="relative">
       <div
         role="button"
         tabIndex={0}
@@ -101,43 +91,11 @@ export default memo(function AssetCard({ asset, index, selected, onSelect, onPre
           </span>
         )}
 
-        {/* hover 文件名 */}
+        {/* hover 文件名（§3.3：只允许透明度变化，不创建媒体层） */}
         <div className="absolute inset-x-0 bottom-0 truncate bg-gradient-to-t from-black/60 to-transparent px-1.5 pt-4 pb-1 text-[11px] text-white opacity-0 transition-opacity group-hover:opacity-100">
           {asset.fileName}
         </div>
-
-        {/* F：视频卡片内 overlay（hover active 时渲染，覆盖原卡片，播放失败回退封面） */}
-        {isVideo && active && (
-          <VideoHoverOverlay
-            src={convertFileSrc(asset.filePath)}
-            coverUrl={cover}
-            fileName={asset.fileName}
-          />
-        )}
       </div>
-
-      {/* F：图片继续用现有 MediaPreviewPopover（固定浮层） */}
-      {!isVideo && active && (
-        <MediaPreviewPopover>
-          <ImageHoverContent asset={asset} />
-        </MediaPreviewPopover>
-      )}
     </div>
   );
 });
-
-/** 图片悬浮预览内容：按需取 1024px hover 预览（激活时请求，不在 render 中执行 IPC）。 */
-function ImageHoverContent({ asset }: { asset: Asset }) {
-  const [imgUrl, setImgUrl] = useState<string | null>(null);
-  const cover = asset.placeholderPath ? toFileUrl(asset.placeholderPath) : null;
-  useEffect(() => {
-    let cancelled = false;
-    void getImageHoverPreview(asset.id).then((u) => {
-      if (!cancelled) setImgUrl(u);
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, [asset.id]);
-  return <ImagePreviewContent url={imgUrl} placeholderUrl={cover} fileName={asset.fileName} />;
-}

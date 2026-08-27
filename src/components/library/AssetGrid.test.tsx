@@ -23,10 +23,12 @@ vi.mock("@/api/thumbnail", () => ({
 }));
 
 // ── jsdom 补齐：虚拟滚动需要尺寸 + ResizeObserver ──
+let observerInstances: MockResizeObserver[] = [];
 class MockResizeObserver {
   cb: ResizeObserverCallback;
   constructor(cb: ResizeObserverCallback) {
     this.cb = cb;
+    observerInstances.push(this);
   }
   observe() {
     // 立即用固定宽度回报一次，让网格算出列数并渲染首屏卡片
@@ -39,6 +41,16 @@ class MockResizeObserver {
   disconnect() {}
 }
 vi.stubGlobal("ResizeObserver", MockResizeObserver);
+
+/** 手动模拟窗口宽度变化，让虚拟网格重测列数（§13.1 列数变化稳定性测试用） */
+function resizeTo(width: number) {
+  for (const o of observerInstances) {
+    o.cb(
+      [{ contentRect: { width, height: 600 } } as ResizeObserverEntry],
+      o as unknown as ResizeObserver,
+    );
+  }
+}
 
 // Thumbnail 用 IntersectionObserver 触发高清生成；jsdom 缺失，补最小桩
 vi.stubGlobal("IntersectionObserver", class {
@@ -124,6 +136,7 @@ function cardByName(name: string): HTMLElement {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  observerInstances = [];
   // 全选/反选走 fetchAllIds → listAssetIds；给默认返回值（全选 1,2）
   vi.mocked(listAssetIds).mockResolvedValue([1, 2]);
   useLibraryStore.setState({
@@ -264,5 +277,30 @@ describe("AssetGrid 双击预览（F19 语义）", () => {
     fireEvent.click(card);
     fireEvent.click(card); // 再击已选中：取消
     expect(Array.from(useSelectionStore.getState().selected)).toEqual([]);
+  });
+});
+
+describe("AssetGrid §13.1 列数变化稳定性", () => {
+  it("窗口宽度改变（列数变化）后 asset id 与文件名仍对应（不整行 remount 毁状态）", async () => {
+    // 造 6 个素材：宽屏 4 列 → 两行，窄屏 2 列 → 三行
+    const assets = Array.from({ length: 6 }, (_, i) => mkAsset(i + 1));
+    useLibraryStore.setState({ items: assets, total: 6 });
+    renderGrid();
+
+    // 宽屏（800 → 4 列）：a1..a4 可见
+    await waitFor(() => expect(screen.getByAltText("a1.jpg")).toBeInTheDocument());
+    expect(screen.getByAltText("a4.jpg")).toBeInTheDocument();
+
+    // 选中 a2 后改窄屏（2 列）→ 列数变化，卡片重排
+    fireEvent.click(cardByName("a2.jpg"));
+    expect(useSelectionStore.getState().selected.has(2)).toBe(true);
+    resizeTo(340);
+    // 立即显式触发重排后（虚拟器按新列数渲染），文件名仍与 id 对应、选中不丢
+    await new Promise((r) => setTimeout(r, 100));
+    expect(screen.getByAltText("a1.jpg")).toBeInTheDocument();
+    expect(screen.getByAltText("a2.jpg")).toBeInTheDocument();
+    expect(useSelectionStore.getState().selected.has(2)).toBe(true);
+    // a2 的卡片 aria-selected 仍在（卡片未被整行 key 重置）
+    expect(cardByName("a2.jpg").getAttribute("aria-selected")).toBe("true");
   });
 });
