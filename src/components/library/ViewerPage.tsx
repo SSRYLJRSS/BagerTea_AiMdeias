@@ -1,58 +1,43 @@
-/** 全屏查看器（PRD v2.9）：双击进入的不透明新界面
- *  布局：大图区（缩放/平移）→ 信息栏 → 缩略图胶片条
- *  交互：Alt+滚轮以光标为锚缩放、中键拖拽平移、按住右键临时放大松开恢复、←→ 过片、Esc 退出
+/** 查看器（指导书 §4.1）：ViewerPage 只负责当前素材、上一张/下一张、打开/关闭、组合子组件与错误边界。
+ *  布局由 ViewerShell 承载：工具条（固定）→ 左属性栏 + 右媒体舞台 → 底部胶片条。
+ *  标题栏在查看器外层始终可见（不再 fixed inset-0 覆盖标题栏）。
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import clsx from "clsx";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { useShallow } from "zustand/react/shallow";
-import TagChip from "@/components/library/TagChip";
-import VideoPlayer from "@/components/library/VideoPlayer";
+import ViewerShell from "@/components/viewer/ViewerShell";
+import ViewerToolbar from "@/components/viewer/ViewerToolbar";
+import ViewerInfoSidebar from "@/components/viewer/ViewerInfoSidebar";
+import ViewerFilmstrip from "@/components/viewer/ViewerFilmstrip";
+import MediaViewport from "@/components/viewer/MediaViewport";
+import VideoPlayer from "@/components/media/VideoPlayer";
 import TagAssignDialog from "@/components/dialogs/TagAssignDialog";
 import { getThumbnailUrl, toFileUrl } from "@/api/thumbnail";
 import { removeTags } from "@/api/tags";
+import { ensureVideoProxy, cancelVideoProxy, toProxyFileUrl } from "@/api/video";
 import { useLibraryStore } from "@/stores/libraryStore";
 import { useSelectionStore } from "@/stores/selectionStore";
+import { isVideoAsset } from "@/utils/assetKind";
 import type { Asset } from "@/types/asset";
-
-const ZOOM_MIN = 0.2;
-const ZOOM_MAX = 10;
-const RIGHT_HOLD_ZOOM = 2.5;
-
-function formatSize(bytes: number): string {
-  if (bytes >= 1 << 30) return `${(bytes / (1 << 30)).toFixed(1)} GB`;
-  if (bytes >= 1 << 20) return `${(bytes / (1 << 20)).toFixed(1)} MB`;
-  return `${Math.round(bytes / 1024)} KB`;
-}
-
-function formatDuration(ms: number): string {
-  const s = Math.round(ms / 1000);
-  const h = Math.floor(s / 3600);
-  const m = Math.floor((s % 3600) / 60);
-  const sec = s % 60;
-  return h > 0
-    ? `${h}:${String(m).padStart(2, "0")}:${String(sec).padStart(2, "0")}`
-    : `${m}:${String(sec).padStart(2, "0")}`;
-}
-
-function formatTime(ms: number): string {
-  return new Date(ms).toLocaleString();
-}
-
-function exifLine(a: Asset): string {
-  const parts: string[] = [];
-  if (a.camera) parts.push(a.camera);
-  if (a.lens) parts.push(a.lens);
-  if (a.aperture != null) parts.push(`f/${a.aperture}`);
-  if (a.shutter) parts.push(`${a.shutter}s`);
-  if (a.iso != null) parts.push(`ISO${a.iso}`);
-  if (a.focal != null) parts.push(`${a.focal}mm`);
-  return parts.join(" · ");
-}
 
 interface ViewerPageProps {
   asset: Asset;
   onClose: () => void;
+}
+
+/** §4.3 页面键盘白名单：输入框/下拉/文本域/contentEditable 不响应页面级快捷键 */
+function isEditableTarget(t: EventTarget | null): boolean {
+  const el = t as HTMLElement | null;
+  if (!el) return false;
+  if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement || el instanceof HTMLSelectElement) return true;
+  return el.isContentEditable;
+}
+
+/** 焦点是否在播放器根节点或其子节点（§4.3：播放器键盘作用域优先于页面切片） */
+function isInsidePlayer(t: EventTarget | null): boolean {
+  const el = t as HTMLElement | null;
+  return !!el?.closest?.("[data-player-root]");
 }
 
 export default function ViewerPage({ asset: initial, onClose }: ViewerPageProps) {
@@ -66,21 +51,18 @@ export default function ViewerPage({ asset: initial, onClose }: ViewerPageProps)
   );
   const index = useMemo(() => items.findIndex((a) => a.id === currentId), [items, currentId]);
 
-  // 缩放/平移状态
-  const [scale, setScale] = useState(1);
-  const [pan, setPan] = useState({ x: 0, y: 0 });
-  const savedView = useRef<{ scale: number; pan: { x: number; y: number } } | null>(null);
-  const panDrag = useRef<{ x: number; y: number } | null>(null);
-  // 左键双击并按住放大：记录上一次左键按下时间，快速二次按下判定为双击
-  const lastLeftDown = useRef(0);
-  const holdLast = useRef<{ x: number; y: number } | null>(null); // 按住放大期间的拖拽轨迹
-  const stageRef = useRef<HTMLDivElement>(null);
-
+  // 图片高清源（代际保护：切张后旧请求不回写新素材）
   const [src, setSrc] = useState<string | null>(null);
   const [entered, setEntered] = useState(false);
 
-  // 详情抽屉（M3-03 R-18）：标签增删 + 元数据面板，ViewerPage 内部状态切换不新建路由
-  const [drawerOpen, setDrawerOpen] = useState(false);
+  // 视频源 + 代理状态（§8.3：原文件失败 → 按需生成 H.264/AAC MP4）
+  const [videoSrc, setVideoSrc] = useState<string | null>(() => convertFileSrc(initial.filePath));
+  const [proxyError, setProxyError] = useState<string | null>(null);
+  const [proxying, setProxying] = useState(false);
+  const proxyAttempted = useRef(false);
+
+  // 详情开关：左属性栏显隐（§2.3 工具栏「详情开关」）
+  const [detailsOpen, setDetailsOpen] = useState(true);
   const [assignOpen, setAssignOpen] = useState(false);
   const prevSelected = useRef<ReadonlySet<number> | null>(null);
 
@@ -112,10 +94,8 @@ export default function ViewerPage({ asset: initial, onClose }: ViewerPageProps)
     return () => cancelAnimationFrame(raf);
   }, []);
 
-  // 切张：重置视图 + 加载高清（失败退原图）
+  // 切张：重置视图（MediaViewport 内部按 assetId 重置）+ 加载高清（失败退原图）
   useEffect(() => {
-    setScale(1);
-    setPan({ x: 0, y: 0 });
     setSrc(null);
     let cancelled = false;
     getThumbnailUrl(current.id, "hd", 1920)
@@ -137,285 +117,125 @@ export default function ViewerPage({ asset: initial, onClose }: ViewerPageProps)
     [items, total, loadMore],
   );
 
-  // 以光标为锚缩放
-  const zoomAt = useCallback((clientX: number, clientY: number, nextRaw: number) => {
-    const rect = stageRef.current?.getBoundingClientRect();
-    if (!rect) return;
-    const next = Math.max(ZOOM_MIN, Math.min(nextRaw, ZOOM_MAX));
-    const cx = clientX - (rect.left + rect.width / 2);
-    const cy = clientY - (rect.top + rect.height / 2);
-    setPan((p) => {
-      setScale((s) => {
-        const imgX = (cx - p.x) / s;
-        const imgY = (cy - p.y) / s;
-        p = { x: cx - imgX * next, y: cy - imgY * next };
-        return next;
-      });
-      return p;
-    });
-  }, []);
-
-  // 滚轮：React onWheel 拦不住默认行为，必须原生 passive:false
+  // 切张：重置视频源与代理尝试标记（§8.1 播放决策顺序：原文件优先，失败再走代理）
   useEffect(() => {
-    const el = stageRef.current;
-    if (!el) return;
-    const onWheel = (e: WheelEvent) => {
-      if (!e.altKey) return;
-      e.preventDefault();
-      zoomAt(e.clientX, e.clientY, scale * (e.deltaY < 0 ? 1.15 : 1 / 1.15));
-    };
-    el.addEventListener("wheel", onWheel, { passive: false });
-    return () => el.removeEventListener("wheel", onWheel);
-  }, [scale, zoomAt]);
+    proxyAttempted.current = false;
+    setProxyError(null);
+    setProxying(false);
+    setVideoSrc(convertFileSrc(current.filePath));
+  }, [current.id, current.filePath]);
 
-  const onMouseDown = (e: React.MouseEvent) => {
-    if (e.button === 1) {
-      // 中键平移
-      e.preventDefault();
-      panDrag.current = { x: e.clientX, y: e.clientY };
-    } else if (e.button === 0) {
-      // 左键双击并按住：快速二次按下 → 以光标为中心临时放大，松开恢复
-      const now = Date.now();
-      if (now - lastLeftDown.current < 300 && e.detail === 2) {
-        savedView.current = { scale, pan };
-        holdLast.current = { x: e.clientX, y: e.clientY };
-        zoomAt(e.clientX, e.clientY, RIGHT_HOLD_ZOOM);
-      }
-      lastLeftDown.current = now;
-    }
-  };
-
-  const onMouseMove = (e: React.MouseEvent) => {
-    // 按住放大态：左键按下拖动 → 图片跟着移动看细节
-    if (savedView.current) {
-      if (holdLast.current) {
-        const dx = e.clientX - holdLast.current.x;
-        const dy = e.clientY - holdLast.current.y;
-        holdLast.current = { x: e.clientX, y: e.clientY };
-        setPan((p) => ({ x: p.x + dx, y: p.y + dy }));
+  // §8.1：原文件播放失败 → 按需生成兼容代理；代理失败给出可解释原因与操作建议
+  const handleVideoError = useCallback(async () => {
+    if (proxyAttempted.current) return;
+    proxyAttempted.current = true;
+    const id = current.id;
+    setProxying(true);
+    setProxyError(null);
+    try {
+      const proxy = await ensureVideoProxy(id, "h264_mp4");
+      if (proxy.status === "ready" && proxy.path) {
+        setVideoSrc(toProxyFileUrl(proxy.path));
+        setProxyError(null);
       } else {
-        holdLast.current = { x: e.clientX, y: e.clientY };
+        setProxyError(proxy.error ?? "视频编码不兼容，且没有可用的兼容代理");
       }
-      return;
+    } catch (e) {
+      setProxyError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setProxying(false);
     }
-    if (!panDrag.current) return;
-    const dx = e.clientX - panDrag.current.x;
-    const dy = e.clientY - panDrag.current.y;
-    panDrag.current = { x: e.clientX, y: e.clientY };
-    setPan((p) => ({ x: p.x + dx, y: p.y + dy }));
+  }, [current.id]);
+
+  const handleCancelProxy = () => {
+    void cancelVideoProxy(current.id, "h264_mp4").catch(() => undefined);
+    setProxyError("已取消生成代理");
   };
 
-  const onMouseUp = (e: React.MouseEvent) => {
-    if (e.button === 1) {
-      panDrag.current = null;
-    } else if (e.button === 0 && savedView.current) {
-      // 左键松开 → 恢复原视图
-      setScale(savedView.current.scale);
-      setPan(savedView.current.pan);
-      savedView.current = null;
-      holdLast.current = null;
-    }
-  };
-
-  // 键盘：←→ 过片，Esc 退出
+  // 键盘：←→ 过片，Esc 退出。§4.3 忽略输入框/下拉/文本域/contentEditable/播放器根节点与子节点/模态层
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if ((e.target as HTMLElement)?.tagName === "INPUT") return;
+      if (isEditableTarget(e.target) || isInsidePlayer(e.target)) return;
+      if (assignOpen) return; // 模态打开时页面切片不响应
       if (e.key === "Escape") onClose();
       else if (e.key === "ArrowLeft") goto(index - 1);
       else if (e.key === "ArrowRight") goto(index + 1);
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [index, goto, onClose]);
+  }, [index, goto, onClose, assignOpen]);
 
-  const isVideo = current.durationMs != null;
-  const exif = exifLine(current);
+  const isVideo = isVideoAsset(current);
 
   return (
     <div
       className={clsx(
-        "fixed inset-0 z-50 flex flex-col bg-[var(--color-bg)] transition-all duration-200 ease-out",
-        entered ? "scale-100 opacity-100" : "scale-[0.98] opacity-0",
+        "h-full min-h-0 transition-all duration-200 ease-out",
+        entered ? "opacity-100" : "opacity-0",
       )}
     >
-      {/* 顶行：文件名 + 位置 + 关闭 */}
-      <div className="flex h-10 shrink-0 items-center gap-3 border-b border-[var(--color-border)] px-3">
-        <span className="min-w-0 flex-1 truncate text-sm text-[var(--color-text)]">{current.fileName}</span>
-        <span className="shrink-0 text-xs text-[var(--color-text-secondary)]">
-          {index >= 0 ? `${index + 1} / ${total}` : ""}
-        </span>
-        <button
-          onClick={() => setDrawerOpen((v) => !v)}
-          className={clsx(
-            "shrink-0 rounded-md px-2 py-1 text-sm transition-colors hover:bg-[var(--color-surface)]",
-            drawerOpen
-              ? "text-[var(--color-text)]"
-              : "text-[var(--color-text-secondary)] hover:text-[var(--color-text)]",
-          )}
-        >
-          详情
-        </button>
-        <button
-          onClick={onClose}
-          className="shrink-0 rounded-md px-2 py-1 text-sm text-[var(--color-text-secondary)] transition-colors hover:bg-[var(--color-surface)] hover:text-[var(--color-text)]"
-        >
-          关闭（Esc）
-        </button>
-      </div>
-
-      {/* 大图区 */}
-      <div
-        ref={stageRef}
-        onMouseDown={onMouseDown}
-        onMouseMove={onMouseMove}
-        onMouseUp={onMouseUp}
-        onMouseLeave={() => {
-          holdLast.current = null;
-        }}
-        onContextMenu={(e) => e.preventDefault()}
-        className="relative flex min-h-0 flex-1 items-center justify-center overflow-hidden bg-[var(--color-bg)]"
-      >
-        {isVideo ? (
-          <VideoPlayer src={convertFileSrc(current.filePath)} fileName={current.fileName} className="h-full w-full" />
-        ) : src ? (
-          <img
-            key={current.id}
-            src={src}
-            alt={current.fileName}
-            draggable={false}
-            onError={() => {
-              const orig = toFileUrl(current.filePath);
-              if (src !== orig) setSrc(orig);
-            }}
-            className="max-h-full max-w-full object-contain select-none"
-            style={{
-              transform: `translate(${pan.x}px, ${pan.y}px) scale(${scale})`,
-              transition: panDrag.current || savedView.current ? "none" : "transform 120ms ease-out",
-            }}
+      <ViewerShell
+        toolbar={
+          <ViewerToolbar
+            fileName={current.fileName}
+            position={index >= 0 ? `${index + 1} / ${total}` : ""}
+            detailsOpen={detailsOpen}
+            onToggleDetails={() => setDetailsOpen((v) => !v)}
+            onClose={onClose}
           />
-        ) : (
-          <div className="h-32 w-32 animate-pulse rounded bg-[var(--color-border)]" />
-        )}
-        {scale !== 1 && (
-          <span className="absolute top-2 right-3 rounded bg-black/50 px-2 py-0.5 text-xs text-white">
-            {Math.round(scale * 100)}%
-          </span>
-        )}
-      </div>
-
-      {/* 信息栏 */}
-      <div className="flex shrink-0 items-center gap-3 border-t border-[var(--color-border)] px-3 py-1.5">
-        <div className="flex min-w-0 flex-1 flex-wrap items-center gap-1.5">
-          {current.tags.map((t) => (
-            <TagChip key={t.id} label={t.name} />
-          ))}
-          {current.tags.length === 0 && <span className="text-xs text-[var(--color-text-secondary)]">未打标</span>}
-        </div>
-        {exif && <span className="shrink-0 text-[11px] text-[var(--color-text-secondary)]">{exif}</span>}
-        <span className="shrink-0 text-[11px] text-[var(--color-text-secondary)]">
-          {current.width && current.height ? `${current.width}×${current.height} · ` : ""}
-          {formatSize(current.fileSize)} · {current.mimeType}
-        </span>
-      </div>
-
-      {/* 缩略图胶片条 */}
-      <div className="flex shrink-0 gap-1.5 overflow-x-auto border-t border-[var(--color-border)] px-3 py-2">
-        {items.map((a, i) => (
-          <button
-            key={a.id}
-            onClick={() => goto(i)}
-            className={clsx(
-              "h-14 w-14 shrink-0 overflow-hidden rounded border-2 transition-all",
-              a.id === currentId
-                ? "border-[var(--color-accent)]"
-                : "border-transparent opacity-70 hover:opacity-100",
-            )}
-          >
-            {a.placeholderPath ? (
-              <img src={convertFileSrc(a.placeholderPath)} alt="" className="h-full w-full object-cover" />
-            ) : (
-              <div className="flex h-full w-full items-center justify-center bg-[var(--color-surface)] text-[9px] text-[var(--color-text-secondary)]">
-                {a.durationMs != null ? "视频" : "图片"}
-              </div>
-            )}
-          </button>
-        ))}
-      </div>
-
-      {/* 详情抽屉（M3-03）：标签增删 + 元数据面板（信息分组借鉴 Lightroom 检查器：文件/EXIF/标签三段） */}
-      {drawerOpen && (
-        <div className="absolute top-10 right-0 bottom-0 z-10 w-[300px] overflow-y-auto border-l border-[var(--color-border)] bg-[var(--color-bg)] p-3">
-          {/* 标签 */}
-          <section className="mb-4">
-            <h4 className="mb-1.5 text-[10px] font-medium tracking-wide text-[var(--color-text-secondary)] uppercase">标签</h4>
-            <div className="flex flex-wrap items-center gap-1.5">
-              {current.tags.map((t) => (
-                <TagChip key={t.id} label={t.name} onRemove={() => void removeTag(t.id)} />
-              ))}
-              {current.tags.length === 0 && (
-                <span className="text-xs text-[var(--color-text-secondary)]">未打标</span>
-              )}
-            </div>
-            <button
-              onClick={openAssign}
-              className="mt-2 rounded-md border border-dashed border-[var(--color-border)] px-2 py-1 text-xs text-[var(--color-text-secondary)] transition-colors hover:border-[var(--color-accent)] hover:text-[var(--color-text)]"
-            >
-              + 添加标签
-            </button>
-          </section>
-
-          {/* 文件 */}
-          <section className="mb-4">
-            <h4 className="mb-1.5 text-[10px] font-medium tracking-wide text-[var(--color-text-secondary)] uppercase">文件</h4>
-            <dl className="flex flex-col gap-1 text-xs">
-              <MetaRow label="名称" value={current.fileName} />
-              <MetaRow label="路径" value={current.filePath} />
-              <MetaRow label="大小" value={formatSize(current.fileSize)} />
-              <MetaRow label="类型" value={current.mimeType} />
-              {current.width != null && current.height != null && (
-                <MetaRow label="分辨率" value={`${current.width}×${current.height}`} />
-              )}
-              <MetaRow label="入库时间" value={formatTime(current.createdAt)} />
-              {current.durationMs != null && (
-                <>
-                  <MetaRow label="时长" value={formatDuration(current.durationMs)} />
-                  {current.videoCodec && <MetaRow label="视频编码" value={current.videoCodec} />}
-                  {current.audioCodec && <MetaRow label="音频编码" value={current.audioCodec} />}
-                </>
-              )}
-            </dl>
-          </section>
-
-          {/* EXIF（入库时已提取进 assets 表，直读） */}
-          {(current.camera || current.lens || current.aperture != null || current.shutter ||
-            current.iso != null || current.focal != null || current.takenAt != null) && (
-              <section>
-                <h4 className="mb-1.5 text-[10px] font-medium tracking-wide text-[var(--color-text-secondary)] uppercase">EXIF</h4>
-                <dl className="flex flex-col gap-1 text-xs">
-                  {current.takenAt != null && <MetaRow label="拍摄时间" value={formatTime(current.takenAt)} />}
-                  {current.camera && <MetaRow label="机身" value={current.camera} />}
-                  {current.lens && <MetaRow label="镜头" value={current.lens} />}
-                  {current.aperture != null && <MetaRow label="光圈" value={`f/${current.aperture}`} />}
-                  {current.shutter && <MetaRow label="快门" value={`${current.shutter}s`} />}
-                  {current.iso != null && <MetaRow label="ISO" value={String(current.iso)} />}
-                  {current.focal != null && <MetaRow label="焦距" value={`${current.focal}mm`} />}
-                </dl>
-              </section>
-            )}
-        </div>
-      )}
+        }
+        sidebar={
+          detailsOpen ? (
+            <ViewerInfoSidebar
+              asset={current}
+              tags={current.tags}
+              onRemoveTag={(tagId) => void removeTag(tagId)}
+              onAddTag={openAssign}
+              onRefreshed={(a) => patchLocal([a.id], a)}
+            />
+          ) : null
+        }
+        stage={
+          isVideo ? (
+            <MediaViewport assetId={current.id} isVideo fileName={current.fileName} video={
+              <VideoPlayer
+                src={videoSrc ?? ""}
+                fileName={current.fileName}
+                className="h-full w-full"
+                proxying={proxying}
+                proxyError={proxyError}
+                onCancelProxy={handleCancelProxy}
+                onRetryProxy={() => {
+                  proxyAttempted.current = false;
+                  setProxyError(null);
+                  void handleVideoError();
+                }}
+                onError={() => void handleVideoError()}
+              />
+            } />
+          ) : (
+            <MediaViewport
+              assetId={current.id}
+              isVideo={false}
+              imageSrc={src}
+              imageFallbackUrl={toFileUrl(current.filePath)}
+              fileName={current.fileName}
+              onImageError={() => setSrc(toFileUrl(current.filePath))}
+            />
+          )
+        }
+        filmstrip={
+          <ViewerFilmstrip
+            items={items}
+            currentId={currentId}
+            onJump={goto}
+            onPrev={() => goto(index - 1)}
+            onNext={() => goto(index + 1)}
+          />
+        }
+      />
 
       <TagAssignDialog open={assignOpen} onClose={closeAssign} />
-    </div>
-  );
-}
-
-function MetaRow({ label, value }: { label: string; value: string }) {
-  return (
-    <div className="flex gap-2">
-      <dt className="w-14 shrink-0 text-[var(--color-text-secondary)]">{label}</dt>
-      <dd className="min-w-0 flex-1 break-all text-[var(--color-text)]">{value}</dd>
     </div>
   );
 }
