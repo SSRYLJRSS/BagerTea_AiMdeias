@@ -1,4 +1,6 @@
-/** 素材库页：顶栏筛选 + 左侧任务栏 + 虚拟网格 + 上下文操作条 + 弹窗组（PRD 5.2/5.3） */
+/** 素材库页：顶栏筛选 + 左侧任务栏 + 虚拟网格 + 上下文操作条 + 弹窗组（PRD 5.2/5.3）。
+ *  §7.2：Viewer 与库页互斥——preview 非空时整体返回 ViewerPage，
+ *  GridToolbar/SideBar/AssetGrid 完全卸载；关闭后恢复筛选/滚动/选中上下文（store 持有）。 */
 import { useEffect, useState } from "react";
 import GridToolbar from "@/components/library/GridToolbar";
 import SideBar from "@/components/library/SideBar";
@@ -27,6 +29,21 @@ export default function LibraryPage() {
   useEffect(() => {
     void refresh();
   }, [refresh]);
+
+  /** §7.3 方案 A：打开/关闭 Viewer 同步全局 viewerOpen（App 据此隐藏 BottomBar） */
+  const openViewer = (asset: Asset) => {
+    setPreview(asset);
+    useLibraryStore.getState().setViewerOpen(true);
+  };
+  const closeViewer = () => {
+    setPreview(null);
+    useLibraryStore.getState().setViewerOpen(false);
+  };
+
+  // §7.2 互斥：Viewer 打开时整体替换库页内容（库页工具栏/侧栏/网格全部卸载）
+  if (preview) {
+    return <ViewerPage asset={preview} onClose={closeViewer} />;
+  }
 
   // 顶栏与右键菜单共用同一组批量动作（v2.8）
   // v2.10：打标（AI/手动）都跳转打标页，模式随选择带过去
@@ -58,7 +75,7 @@ export default function LibraryPage() {
       <GridToolbar {...actions} />
       <div className="flex min-h-0 flex-1">
         <SideBar />
-        <AssetGrid onPreview={setPreview} {...actions} />
+        <AssetGrid onPreview={openViewer} {...actions} />
       </div>
 
       {error && (
@@ -72,7 +89,6 @@ export default function LibraryPage() {
       <DupDialog open={dialog === "dedup"} onClose={() => setDialog(null)} />
       <ExportDialog open={dialog === "export" && selected.size > 0} initialMode={exportMode} onClose={() => setDialog(null)} />
       <TagAssignDialog open={dialog === "tags"} onClose={() => setDialog(null)} />
-      {preview && <ViewerPage asset={preview} onClose={() => setPreview(null)} />}
     </div>
   );
 }

@@ -113,3 +113,20 @@ button:disabled {
   border-color: var(--color-status);
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-status) 14%, transparent);
 }
+
+/* 启动骨架不定进度条（指导书 §3.2）：左右往复移动，不承诺百分比 */
+.startup-indeterminate {
+  animation: startup-indeterminate 1.2s ease-in-out infinite;
+}
+
+@keyframes startup-indeterminate {
+  0% {
+    transform: translateX(-120%);
+  }
+  50% {
+    transform: translateX(220%);
+  }
+  100% {
+    transform: translateX(-120%);
+  }
+}

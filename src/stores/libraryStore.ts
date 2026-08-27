@@ -2,6 +2,7 @@
 import { create } from "zustand";
 import { listAssets, listAssetIds } from "@/api/assets";
 import { useSelectionStore } from "@/stores/selectionStore";
+import { markStartup } from "@/utils/startupMarks";
 import type { Asset, AssetFilter, AssetType, FacetTagFilter, MetadataFilter } from "@/types/asset";
 
 const PAGE_SIZE = 200;
@@ -71,6 +72,12 @@ interface LibraryState {
   patchLocal: (ids: number[], patch: Partial<Asset>) => void;
   /** 取当前筛选结果的全部 id（全选/反选/批量操作用；一次查询只取 id 数组） */
   fetchAllIds: () => Promise<number[]>;
+  /** Viewer 是否打开（§7.3 方案 A：App 据此隐藏全局 BottomBar，与 Viewer 互斥） */
+  viewerOpen: boolean;
+  setViewerOpen: (open: boolean) => void;
+  /** 网格滚动位置（§7.2：Viewer 关闭后恢复库页滚动上下文；AssetGridView 滚动时写入） */
+  gridScrollTop: number;
+  setGridScrollTop: (top: number) => void;
 }
 
 export const useLibraryStore = create<LibraryState>((set, get) => ({
@@ -127,6 +134,7 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
       // 不写 items/total、不碰 loading（loading 归最新请求管）
       if (seq !== requestSeq) return;
       set({ items: dedupItems(page.items), total: page.total, loading: false });
+      markStartup("library_ready"); // §4.1：素材列表 ready 打点（首次成功刷新即首屏 ready）
     } catch (e) {
       if (seq !== requestSeq) return;
       set({ error: e instanceof Error ? e.message : String(e), loading: false });
@@ -177,4 +185,13 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
     const hit = new Set(ids);
     set((s) => ({ items: s.items.map((a) => (hit.has(a.id) ? { ...a, ...patch } : a)) }));
   },
+
+  viewerOpen: false,
+  setViewerOpen: (open) => {
+    // 关闭 Viewer 时恢复网格滚动（组件写回 gridScrollTop；此处负责清零状态）
+    set({ viewerOpen: open, ...(open ? {} : {}) });
+  },
+
+  gridScrollTop: 0,
+  setGridScrollTop: (top) => set({ gridScrollTop: top }),
 }));

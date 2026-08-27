@@ -32,6 +32,17 @@ vi.mock("@/api/thumbnail", () => ({
   getThumbnailUrl: mocks.getThumbnailUrl,
   toFileUrl: mocks.toFileUrl,
 }));
+vi.mock("@/api/tags", () => ({
+  removeTags: vi.fn().mockResolvedValue(undefined),
+}));
+vi.mock("@/api/video", () => ({
+  ensureVideoProxy: vi.fn(),
+  cancelVideoProxy: vi.fn().mockResolvedValue(undefined),
+  toProxyFileUrl: (p: string) => `asset://proxy/${p}`,
+}));
+vi.mock("@tauri-apps/api/core", () => ({
+  convertFileSrc: (p: string) => `asset://${p}`,
+}));
 
 // ── jsdom 布局/观测器桩（虚拟滚动 + Thumbnail 依赖） ──
 vi.stubGlobal("ResizeObserver", class {
@@ -125,6 +136,7 @@ beforeEach(() => {
     },
   });
   useSelectionStore.setState({ selected: new Set(), anchorIndex: null });
+  useLibraryStore.setState({ viewerOpen: false, gridScrollTop: 0 });
 });
 
 describe("LibraryPage 全页（单击选中不被自动清除）", () => {
@@ -167,5 +179,43 @@ describe("LibraryPage 全页（单击选中不被自动清除）", () => {
     // 切「视频」类型筛选 → B09：筛选变更清空选中（预期行为，非幽灵取消）
     fireEvent.click(screen.getByText("视频"));
     await waitFor(() => expect(useSelectionStore.getState().selected.size).toBe(0));
+  });
+});
+
+describe("LibraryPage §7.2 Viewer 页面级替换（互斥）", () => {
+  it("双击进入 Viewer：库页侧栏/工具栏卸载，Viewer 独占内容区", async () => {
+    render(<LibraryPage />);
+    await waitFor(() => expect(screen.getAllByAltText("a1.jpg").length).toBeGreaterThan(0));
+    // 库页元素存在于渲染树
+    expect(screen.getByText("回收站")).toBeInTheDocument();
+
+    const card = screen.getAllByAltText("a1.jpg")[0].closest('[role="button"]') as HTMLElement;
+    fireEvent.doubleClick(card);
+
+    // Viewer 打开：库页筛选/侧栏/工具栏不在渲染树
+    await waitFor(() => expect(screen.getByRole("button", { name: "返回素材库" })).toBeInTheDocument());
+    expect(screen.queryByText("回收站")).not.toBeInTheDocument();
+    expect(screen.queryByText("全部")).not.toBeInTheDocument();
+    // Viewer 独占：网格卡片（aria-selected 标记）不再渲染；胶片条按钮无此标记
+    expect(document.querySelectorAll("[aria-selected]")).toHaveLength(0);
+    // viewerOpen 同步（App 据此隐藏 BottomBar）
+    expect(useLibraryStore.getState().viewerOpen).toBe(true);
+  });
+
+  it("关闭 Viewer：库页上下文恢复（侧栏/网格回渲染）", async () => {
+    render(<LibraryPage />);
+    await waitFor(() => expect(screen.getAllByAltText("a1.jpg").length).toBeGreaterThan(0));
+    const card = screen.getAllByAltText("a1.jpg")[0].closest('[role="button"]') as HTMLElement;
+    fireEvent.doubleClick(card);
+    await waitFor(() => expect(screen.getByRole("button", { name: "关闭查看器" })).toBeInTheDocument());
+    expect(useLibraryStore.getState().viewerOpen).toBe(true);
+
+    // 关闭 Viewer（Esc 或关闭按钮）
+    fireEvent.click(screen.getByRole("button", { name: "关闭查看器" }));
+    await waitFor(() => expect(screen.queryByRole("button", { name: "关闭查看器" })).not.toBeInTheDocument());
+    expect(useLibraryStore.getState().viewerOpen).toBe(false);
+    // 库页元素恢复
+    expect(screen.getByText("回收站")).toBeInTheDocument();
+    await waitFor(() => expect(screen.getAllByAltText("a1.jpg").length).toBeGreaterThan(0));
   });
 });

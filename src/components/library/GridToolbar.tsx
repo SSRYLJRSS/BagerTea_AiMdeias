@@ -62,14 +62,7 @@ export default function GridToolbar({ onAiTag, onAssignTags, onExport, onMove, o
 
   return (
     <div className="flex h-11 shrink-0 items-center gap-3 border-b border-[var(--color-border)] px-3">
-      {/* 设置入口（库页顶栏左侧，与搜索同行） */}
-      <button
-        onClick={() => window.dispatchEvent(new CustomEvent("app:navigate", { detail: "settings" }))}
-        className="shrink-0 rounded px-2 py-1 text-sm text-[var(--color-text-secondary)] transition-colors hover:bg-[var(--color-surface)] hover:text-[var(--color-text)]"
-      >
-        设置
-      </button>
-
+      {/* 设置入口已移至顶部标题栏（指导书 §10.1），此处移除避免重复入口与导航状态分叉 */}
       <SearchInput onSearch={(kw) => setFilter({ search: kw })} />
       <SelectedFilterTags />
 

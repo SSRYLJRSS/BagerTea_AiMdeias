@@ -1,12 +1,18 @@
+/** 自定义标题栏（无边框窗口）：左侧 logo + 设置按钮，中间拖拽区，右侧窗口控制（最小化/最大化/关闭）。
+ *  指导书 §3.3 施工要求：
+ *   - 左侧不渲染“茶包素材 BagerTea V2”文字，logo 后紧跟设置按钮；
+ *   - 设置按钮与窗口控制按钮都不带 data-tauri-drag-region（点击不触发拖拽）；
+ *   - 窗口控制拆分为独立 WindowControls 组件，只保留最小化/最大化(还原)/关闭三个按钮；
+ *   - 保留现有非 Tauri 环境异常降级逻辑。
+ *   tauri.conf.json 需保持 decorations: false；窗口命令需 core:window:allow-minimize / toggle-maximize / close。
+ */
 import { useEffect, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { Minus, Maximize2, Minimize2, Settings, X } from "lucide-react";
 import appLogo from "@/assets/icon-logo.png";
 
-/** 自定义标题栏（无边框窗口）：左侧应用 logo + 应用名，右侧窗口控制（最小化/最大化/关闭），中间整条可拖拽。
- *  风格对齐 VS Code —— 单行、logo 在最前，窗口控制按钮在右侧。
- *  tauri.conf.json 需保持 decorations: false；窗口命令需 core:window:allow-minimize / toggle-maximize / close / start-dragging。
- */
-export default function TitleBar() {
+/** 窗口控制组：最小化 / 最大化(还原) / 关闭。与拖拽区隔离（按钮无 data-tauri-drag-region）。 */
+export function WindowControls() {
   const [maximized, setMaximized] = useState(false);
 
   // 在 Tauri 环境中监听窗口最大化状态，用于在「最大化/还原」图标之间切换
@@ -60,80 +66,72 @@ export default function TitleBar() {
   };
 
   return (
+    <div className="flex items-stretch">
+      <button
+        type="button"
+        onClick={minimize}
+        aria-label="最小化"
+        title="最小化"
+        className="flex w-11 items-center justify-center text-[var(--color-text-secondary)] transition-colors hover:bg-[var(--color-surface)] hover:text-[var(--color-text)]"
+      >
+        <Minus size={16} strokeWidth={1.75} aria-hidden="true" />
+      </button>
+      <button
+        type="button"
+        onClick={toggleMaximize}
+        aria-label={maximized ? "还原" : "最大化"}
+        title={maximized ? "还原" : "最大化"}
+        className="flex w-11 items-center justify-center text-[var(--color-text-secondary)] transition-colors hover:bg-[var(--color-surface)] hover:text-[var(--color-text)]"
+      >
+        {maximized ? (
+          <Minimize2 size={16} strokeWidth={1.75} aria-hidden="true" />
+        ) : (
+          <Maximize2 size={16} strokeWidth={1.75} aria-hidden="true" />
+        )}
+      </button>
+      <button
+        type="button"
+        onClick={close}
+        aria-label="关闭"
+        title="关闭"
+        className="flex w-11 items-center justify-center text-[var(--color-text-secondary)] transition-colors hover:bg-[#e81123] hover:text-white"
+      >
+        <X size={16} strokeWidth={1.75} aria-hidden="true" />
+      </button>
+    </div>
+  );
+}
+
+export default function TitleBar() {
+  return (
     <header
       data-tauri-drag-region
       className="relative flex h-10 shrink-0 select-none items-stretch border-b border-[var(--color-border)] bg-[var(--color-bg)]"
     >
-      {/* 左侧：logo + 应用名（可拖拽） */}
-      <div data-tauri-drag-region className="flex items-center gap-2 px-3">
-        <img src={appLogo} alt="茶包素材" className="pointer-events-none h-6 w-6 select-none" draggable={false} />
-        <span data-tauri-drag-region className="text-sm font-medium text-[var(--color-text)]">
-          茶包素材 BagerTea V2
-        </span>
+      {/* 左侧：logo + 设置按钮（无文字软件名；设置按钮无 data-tauri-drag-region） */}
+      <div data-tauri-drag-region className="flex items-center gap-1 pl-3 pr-1">
+        <img
+          src={appLogo}
+          alt="茶包素材"
+          className="pointer-events-none h-6 w-6 select-none"
+          draggable={false}
+        />
+        <button
+          type="button"
+          onClick={() => window.dispatchEvent(new CustomEvent("app:navigate", { detail: "settings" }))}
+          aria-label="设置"
+          title="设置"
+          className="flex size-10 items-center justify-center text-[var(--color-text-secondary)] transition-colors hover:bg-[var(--color-surface)] hover:text-[var(--color-text)]"
+        >
+          <Settings size={16} strokeWidth={1.75} aria-hidden="true" />
+        </button>
       </div>
 
       {/* 中间空白拖拽区 */}
       <div data-tauri-drag-region className="min-w-0 flex-1" />
 
-      {/* 右侧：窗口控制 */}
-      <div className="flex items-stretch">
-        <button
-          onClick={minimize}
-          aria-label="最小化"
-          className="flex w-11 items-center justify-center text-[var(--color-text-secondary)] transition-colors hover:bg-[var(--color-surface)] hover:text-[var(--color-text)]"
-        >
-          <MinimizeIcon />
-        </button>
-        <button
-          onClick={toggleMaximize}
-          aria-label={maximized ? "还原" : "最大化"}
-          className="flex w-11 items-center justify-center text-[var(--color-text-secondary)] transition-colors hover:bg-[var(--color-surface)] hover:text-[var(--color-text)]"
-        >
-          {maximized ? <RestoreIcon /> : <MaximizeIcon />}
-        </button>
-        <button
-          onClick={close}
-          aria-label="关闭"
-          className="flex w-11 items-center justify-center text-[var(--color-text-secondary)] transition-colors hover:bg-[#e81123] hover:text-white"
-        >
-          <CloseIcon />
-        </button>
-      </div>
+      {/* 右侧：窗口控制（只保留最小化/最大化/关闭） */}
+      <WindowControls />
     </header>
-  );
-}
-
-function MinimizeIcon() {
-  return (
-    <svg viewBox="0 0 10 10" width="10" height="10" aria-hidden="true">
-      <path d="M0.5 5h9" stroke="currentColor" strokeWidth="1" fill="none" />
-    </svg>
-  );
-}
-
-function MaximizeIcon() {
-  return (
-    <svg viewBox="0 0 10 10" width="10" height="10" aria-hidden="true">
-      <rect x="0.5" y="0.5" width="9" height="9" fill="none" stroke="currentColor" strokeWidth="1" />
-    </svg>
-  );
-}
-
-function RestoreIcon() {
-  return (
-    <svg viewBox="0 0 10 10" width="10" height="10" aria-hidden="true">
-      {/* 背面方块：只画未被正面方块遮住的 上+左+底左 边 */}
-      <path d="M7 3V1H1v6h2" fill="none" stroke="currentColor" strokeWidth="1" />
-      {/* 正面方块 */}
-      <path d="M3 3h6v6H3z" fill="none" stroke="currentColor" strokeWidth="1" />
-    </svg>
-  );
-}
-
-function CloseIcon() {
-  return (
-    <svg viewBox="0 0 10 10" width="10" height="10" aria-hidden="true">
-      <path d="M0.7 0.7 L9.3 9.3 M9.3 0.7 L0.7 9.3" stroke="currentColor" strokeWidth="1" fill="none" />
-    </svg>
   );
 }

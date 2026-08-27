@@ -7,6 +7,7 @@ import AssetCard from "./AssetCard";
 import ContextMenu, { type MenuEntry } from "@/components/common/ContextMenu";
 import { getAssetUrls, revealInFolder } from "@/api/assets";
 import { useElementSize, useEscape } from "@/hooks/hooks";
+import { useLibraryStore } from "@/stores/libraryStore";
 import { useSelectionStore } from "@/stores/selectionStore";
 import type { Asset } from "@/types/asset";
 
@@ -55,6 +56,31 @@ export default function AssetGridView({
     })),
   );
   const { ref, width } = useElementSize<HTMLDivElement>();
+  // §7.2：Viewer 关闭后恢复网格滚动位置（库页上下文保持；store 持有滚动量）
+  useEffect(() => {
+    const el = ref.current;
+    const saved = useLibraryStore.getState().gridScrollTop;
+    if (el && saved > 0) el.scrollTop = saved;
+    // 仅挂载时恢复一次（Virtualizer 接管后续滚动）
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  // 滚动位置写入 store（Viewer 打开前最后值；滚动容器卸载再恢复）
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    let raf = 0;
+    const onScroll = () => {
+      cancelAnimationFrame(raf);
+      raf = requestAnimationFrame(() => {
+        useLibraryStore.getState().setGridScrollTop(el.scrollTop);
+      });
+    };
+    el.addEventListener("scroll", onScroll, { passive: true });
+    return () => {
+      el.removeEventListener("scroll", onScroll);
+      cancelAnimationFrame(raf);
+    };
+  }, []);
 
   const columns = Math.max(2, Math.floor((width + GAP) / (MIN_CARD + GAP)));
   const rowCount = Math.ceil(items.length / columns);
