@@ -13,6 +13,7 @@
  */
 import { useCallback, useEffect, useRef, useState } from "react";
 import clsx from "clsx";
+import StageFrame from "@/components/viewer/StageFrame";
 import { pointerInStage, clampScale, ZOOM_MIN, ZOOM_MAX } from "@/components/viewer/viewportMath";
 
 export { ZOOM_MIN, ZOOM_MAX };
@@ -52,10 +53,6 @@ interface MediaViewportProps {
   /** §7.5 返回素材库 */
   onBackToLibrary?: () => void;
 }
-
-/** 舞台约束（指导书 §4.5）：视频媒体区最大宽 92%、最大高 82%；图片同规格 contain。 */
-export const STAGE_WIDTH_PCT = 92;
-export const STAGE_HEIGHT_PCT = 82;
 
 export default function MediaViewport({
   assetId,
@@ -223,15 +220,10 @@ export default function MediaViewport({
   const errorGen = generation.current;
   const cursor = view.scale > 1 && !isVideo ? (view.mode === "panning" ? "grabbing" : "grab") : undefined;
 
-  // §7.5 致命错误：主图与兜底都失败时的 Viewer 局部错误（沿用现有边界视觉，不新建第二套边界）
+  /* §7.5 致命错误：主图与兜底都失败时的 Viewer 局部错误（沿用现有边界视觉，不新建第二套边界） */
   if (fatal && !isVideo) {
     return (
-      <div
-        ref={stageRef}
-        data-media-stage
-        className="relative flex min-h-0 min-w-0 flex-1 flex-col items-center justify-center gap-3 overflow-hidden bg-[var(--color-bg)] p-6 text-center"
-        data-testid="media-viewport"
-      >
+      <StageFrame className="flex-col gap-3 p-6 text-center">
         <p className="text-base font-medium text-[var(--color-text)]">当前素材暂时无法显示</p>
         <p className="max-w-md text-sm text-[var(--color-text-secondary)]">
           可能是文件损坏、路径不可用或媒体解码失败。
@@ -252,44 +244,28 @@ export default function MediaViewport({
             返回素材库
           </button>
         </div>
-      </div>
+      </StageFrame>
     );
   }
 
-  // 视频：不挂图片平移交互；内部事件由 VideoPlayer 自行 stopPropagation
+  // 视频：不挂图片平移交互；内部事件由 VideoPlayer 自行 stopPropagation。
+  // 直接作为 StageFrame 子节点（VideoPlayer 自带 max-h-full max-w-full + object-contain）。
   if (isVideo) {
-    return (
-      <div
-        ref={stageRef}
-        data-media-stage
-        className={clsx(
-          "relative flex min-h-0 min-w-0 flex-1 items-center justify-center overflow-hidden bg-[var(--color-bg)]",
-        )}
-        data-testid="media-viewport"
-      >
-        {/* 舞台约束：宽 92% / 高 82%，object-contain 不拉伸 */}
-        <div className="flex max-h-[82%] max-w-[92%] items-center justify-center" style={{ maxHeight: `${STAGE_HEIGHT_PCT}%`, maxWidth: `${STAGE_WIDTH_PCT}%` }}>
-          {video}
-        </div>
-      </div>
-    );
+    return <StageFrame stageRef={stageRef}>{video}</StageFrame>;
   }
 
   return (
-    <div
-      ref={stageRef}
-      data-media-stage
-      className={clsx(
-        "relative flex min-h-0 min-w-0 flex-1 select-none items-center justify-center overflow-hidden bg-[var(--color-bg)]",
-        cursor && "cursor-grab active:cursor-grabbing",
-      )}
+    <StageFrame
+      stageRef={stageRef}
+      className={clsx("select-none", cursor && "cursor-grab active:cursor-grabbing")}
       style={cursor ? { cursor } : undefined}
-      data-testid="media-viewport"
-      onPointerDown={onPointerDown}
-      onPointerMove={onPointerMove}
-      onPointerUp={endPan}
-      onPointerCancel={endPan}
-      onContextMenu={(e) => e.preventDefault()}
+      handlers={{
+        onPointerDown,
+        onPointerMove,
+        onPointerUp: endPan,
+        onPointerCancel: endPan,
+        onContextMenu: (e) => e.preventDefault(),
+      }}
     >
       {showSrc ? (
         <img
@@ -317,6 +293,6 @@ export default function MediaViewport({
           {Math.round(view.scale * 100)}%
         </span>
       )}
-    </div>
+    </StageFrame>
   );
 }

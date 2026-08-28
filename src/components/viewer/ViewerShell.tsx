@@ -1,6 +1,6 @@
 /**
  * ViewerShell（指导书 §2.3/§4.1）：查看器布局骨架。
- *  工具条（固定） → 左属性栏 + 右媒体舞台 → 底部胶片条。
+ *  工具条（固定） → 左属性栏 + 右媒体舞台（纵向 flex，舞台 flex-1 min-h-0） → 底部胶片条。
  *  标题栏在查看器外层始终可见（查看器不再 fixed inset-0 覆盖标题栏）。
  */
 import type { ReactNode } from "react";
@@ -25,7 +25,7 @@ export default function ViewerShell({ toolbar, sidebar, stage, filmstrip }: View
             {sidebar}
           </aside>
         )}
-        <div className="min-w-0 flex-1">{stage}</div>
+        <div className="flex min-h-0 min-w-0 flex-1 flex-col">{stage}</div>
       </div>
       {filmstrip}
     </div>

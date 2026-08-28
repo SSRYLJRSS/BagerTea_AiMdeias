@@ -6,7 +6,7 @@
  * 键盘作用域（焦点在播放器根节点）：
  *   ArrowLeft/Right = seek ±5s；Space/K = 播放/暂停；M = 静音；F = 全屏。
  *  事件执行后 stopPropagation()；仅在执行 seek/play 快捷键时 preventDefault()。
- * 视频尺寸：媒体区最大宽 92%、最大高 82%（舞台约束由上层 MediaViewport 提供），object-contain 不拉伸。
+ * 视频尺寸：constrained by StageFrame（FB2-04/05 统一舞台容器），object-contain 不拉伸。
  */
 import { useCallback, useEffect, useRef, useState } from "react";
 import clsx from "clsx";
