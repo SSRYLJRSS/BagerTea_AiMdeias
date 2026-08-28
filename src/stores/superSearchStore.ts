@@ -6,7 +6,7 @@ import { listSuperAssets, listSuperAssetIds, aiParseSearchQuery } from "@/api/su
 import { useSelectionStore } from "@/stores/selectionStore";
 import type { Asset, ResolvedSearchQuery, MetadataFilter } from "@/types/asset";
 import type { QueryExpr } from "@/types/queryExpr";
-import type { AiApplyMode } from "@/types/superSearch";
+import type { AiApplyMode, ResolvedTag } from "@/types/superSearch";
 import { mergeQueryExpr, resolvedQueryToExpr, serializeExpr, syncQueryFromExpr } from "@/utils/queryExprUtils";
 
 const PAGE_SIZE = 200;
@@ -70,6 +70,10 @@ export interface SuperSearchState {
   aiLoading: boolean;
   aiExplanation: string | null;
   warnings: string[];
+  /** §11.6（FB-05）：AI 已解析标签（含 tagId→名称/分面），供 chips 可读展示 */
+  resolvedTags: ResolvedTag[];
+  /** 概念间关系：and | or（chips 头部展示） */
+  relation: "and" | "or";
 
   setQuery: (patch: Partial<ResolvedSearchQuery>) => void;
   /** P4：设置表达式树（并清空扁平查询的对应字段，避免双源） */
@@ -97,6 +101,8 @@ export const useSuperSearchStore = create<SuperSearchState>((set, get) => ({
   aiLoading: false,
   aiExplanation: null,
   warnings: [],
+  resolvedTags: [],
+  relation: "and",
 
   setQuery: (patch) => {
     const prev = get().query;
@@ -104,7 +110,7 @@ export const useSuperSearchStore = create<SuperSearchState>((set, get) => ({
     if (queryEqual(prev, next)) return;
     invalidatePendingRequests();
     // 改扁平查询时清掉表达式树（避免双源）
-    set({ query: next, expr: undefined, warnings: [], aiExplanation: null, aiLoading: false });
+    set({ query: next, expr: undefined, warnings: [], aiExplanation: null, aiLoading: false, resolvedTags: [], relation: "and" });
     useSelectionStore.getState().clear();
     scheduleRefresh(get().refresh);
   },
@@ -114,7 +120,7 @@ export const useSuperSearchStore = create<SuperSearchState>((set, get) => ({
     if ((!expr && !currentExpr) || (expr && currentExpr && serializeExpr(expr) === serializeExpr(currentExpr))) return;
     invalidatePendingRequests();
     const query = syncQueryFromExpr(get().query, expr);
-    set({ query, expr, warnings: [], aiExplanation: null, aiLoading: false });
+    set({ query, expr, warnings: [], aiExplanation: null, aiLoading: false, resolvedTags: [], relation: "and" });
     useSelectionStore.getState().clear();
     scheduleRefresh(get().refresh);
   },
@@ -125,14 +131,14 @@ export const useSuperSearchStore = create<SuperSearchState>((set, get) => ({
     const sameExpr = (!expr && !currentExpr) || (expr && currentExpr && serializeExpr(expr) === serializeExpr(currentExpr));
     if (queryEqual(prev, query) && sameExpr) return;
     invalidatePendingRequests();
-    set({ query, expr, warnings: [], aiExplanation: null, aiLoading: false });
+    set({ query, expr, warnings: [], aiExplanation: null, aiLoading: false, resolvedTags: [], relation: "and" });
     useSelectionStore.getState().clear();
     scheduleRefresh(get().refresh);
   },
 
   setAiInput: (v) => set({ aiInput: v }),
   setAiResult: (explanation, warnings) => set({ aiExplanation: explanation, warnings }),
-  clearAiResult: () => set({ aiExplanation: null, warnings: [] }),
+  clearAiResult: () => set({ aiExplanation: null, warnings: [], resolvedTags: [], relation: "and" }),
 
   applyAiSearch: async (text, mode = "replace") => {
     const aiSeq = ++requestSeq;
@@ -160,6 +166,8 @@ export const useSuperSearchStore = create<SuperSearchState>((set, get) => ({
         expr: nextExpr,
         aiExplanation: result.explanation,
         warnings: result.warnings,
+        resolvedTags: result.resolvedTags ?? [],
+        relation: result.intent?.relation === "or" ? "or" : "and",
         aiLoading: false,
       });
       useSelectionStore.getState().clear();

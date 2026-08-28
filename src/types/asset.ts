@@ -177,7 +177,15 @@ export interface SearchIntentTag {
   includeDescendants?: boolean;
 }
 
-/** SearchIntent：AI 自然语言解析产物（P0 contract-v1 §2） */
+/** §11.2 原子概念：模型拆分的主体/颜色/场景等（role + facetHint + confidence） */
+export interface SearchConcept {
+  text: string;
+  role?: string;
+  facetHint?: string | null;
+  confidence?: number | null;
+}
+
+/** SearchIntent：AI 自然语言解析产物（P0 contract-v1 §2 + §11.2 概念层） */
 export interface SearchIntent {
   search?: string;
   assetType?: AssetType;
@@ -186,6 +194,12 @@ export interface SearchIntent {
   metadata?: MetadataFilter[];
   sortBy?: ResolvedSearchQuery["sortBy"];
   sortDir?: "desc" | "asc";
+  /** §11.2 原子概念（模型输出；前端不消费原有字段的前提下可展示 chips） */
+  concepts?: SearchConcept[];
+  /** 概念间关系：and（默认）| or */
+  relation?: "and" | "or";
+  /** 模型识别不了的具体词（进全文 search 并 warning） */
+  unresolved?: string[];
 }
 
 export interface ImportResult {

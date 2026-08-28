@@ -1,4 +1,7 @@
-/** 超级搜索条件芯片（P2.7）：可单独删除、可清除全部。AI 与手动条件用同一种芯片。 */
+/** 超级搜索条件芯片（P2.7 + §11.6）：可单独删除、可清除全部。AI 与手动条件用同一种芯片。
+ *  §11.6（FB-05）：AI 解析后显示可读 chips——「主体：建筑 × 色彩：红色 × 关系：全部满足」；
+ *  标签名取自后端 resolvedTags（含 tagId→名称/分面），未知退回「标签#id」；
+ *  用户删除 chip 直接改 query（不重新调 AI）。 */
 import { useShallow } from "zustand/react/shallow";
 import { useSuperSearchStore } from "@/stores/superSearchStore";
 import type { MetadataFilter } from "@/types/asset";
@@ -11,6 +14,17 @@ const LABELS: Record<string, string> = {
   aperture: "光圈", shutter: "快门", focal: "焦距", video_codec: "视频编码",
   audio_codec: "音频编码", folder: "文件夹",
 };
+
+/** 分面 key → 显示名（与 tagStore BASE_FACET_DEFAULTS 对齐；未知回退 key） */
+const FACET_NAMES: Record<string, string> = {
+  subject: "主体/对象", scene: "场景/地点", purpose: "用途", style: "风格/氛围",
+  color: "色彩", composition: "构图/视角", lighting: "光线/时间", people: "人物属性",
+  technical: "可用性/技术特征", custom: "自定义", location: "地点", event: "事件",
+};
+
+function facetName(key: string): string {
+  return FACET_NAMES[key] ?? key;
+}
 
 const OP_TEXT: Record<string, string> = { gt: ">", gte: "≥", lt: "<", lte: "≤", eq: "=", contains: "含", between: "", in: "∈" };
 
@@ -25,8 +39,14 @@ function metaLabel(f: MetadataFilter): string {
 }
 
 export default function FilterChips() {
-  const { query, setQuery, replaceQuery } = useSuperSearchStore(
-    useShallow((s) => ({ query: s.query, setQuery: s.setQuery, replaceQuery: s.replaceQuery })),
+  const { query, resolvedTags, relation, setQuery, replaceQuery } = useSuperSearchStore(
+    useShallow((s) => ({
+      query: s.query,
+      resolvedTags: s.resolvedTags,
+      relation: s.relation,
+      setQuery: s.setQuery,
+      replaceQuery: s.replaceQuery,
+    })),
   );
 
   type Chip = { key: string; label: string; onRemove: () => void };
@@ -44,11 +64,16 @@ export default function FilterChips() {
   if (query.untaggedOnly) {
     chips.push({ key: "untagged", label: "未打标", onRemove: () => setQuery({ untaggedOnly: false }) });
   }
+  // §11.6 可读标签：优先 AI resolvedTags（含名称/分面），未知退回「标签#id」
+  const nameById = new Map<number, { facetKey: string; text: string }>();
+  for (const rt of resolvedTags) nameById.set(rt.tagId, { facetKey: rt.facetKey, text: rt.text });
   for (const f of query.facetFilters) {
     for (const tid of f.tagIds) {
+      const info = nameById.get(tid);
+      const fname = facetName(f.facetKey);
       chips.push({
         key: `facet:${f.facetKey}:${tid}`,
-        label: `${f.facetKey} · 标签#${tid}`,
+        label: info ? `${fname}：${info.text}` : `${fname} · 标签#${tid}`,
         onRemove: () =>
           setQuery({
             facetFilters: query.facetFilters
@@ -59,8 +84,10 @@ export default function FilterChips() {
     }
   }
   for (const tid of query.excludeTagIds) {
+    const info = nameById.get(tid);
     chips.push({
-      key: `exclude:${tid}`, label: `排除：标签#${tid}`,
+      key: `exclude:${tid}`,
+      label: info ? `排除：${info.text}` : `排除：标签#${tid}`,
       onRemove: () => setQuery({ excludeTagIds: query.excludeTagIds.filter((x) => x !== tid) }),
     });
   }
@@ -82,7 +109,9 @@ export default function FilterChips() {
 
   return (
     <div className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto py-1" aria-label="筛选条件">
-      <span className="shrink-0 text-[11px] text-[var(--color-text-tertiary)]">条件</span>
+      <span className="shrink-0 text-[11px] text-[var(--color-text-tertiary)]">
+        条件（{relation === "or" ? "任一" : "全部"}）
+      </span>
       {chips.map((chip) => (
         <span
           key={chip.key}
