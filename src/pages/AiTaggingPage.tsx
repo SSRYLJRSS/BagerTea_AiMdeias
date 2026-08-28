@@ -14,7 +14,7 @@ import { useAiStore } from "@/stores/aiStore";
 import { useLibraryStore } from "@/stores/libraryStore";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { useTagStore, buildWorkbenchFacets, normalizeTagKeys } from "@/stores/tagStore";
-import { computeAiStats } from "@/utils/aiStats";
+import { computeAiStats, estimateRequests } from "@/utils/aiStats";
 import type { AiSuggestion, CategorizedTags } from "@/types/ai";
 import type { TagOp } from "@/types/asset";
 
@@ -133,6 +133,33 @@ export default function AiTaggingPage() {
     [suggestions],
   );
   const videoTaggingOn = settings?.ai.videoTagging ?? false;
+  // FB2-07（§13.6）：视频打标子模式与帧数（即时预览，随 settings 同步；批次启动时生效）
+  const [videoMode, setVideoMode] = useState<"cover" | "frames">("cover");
+  const [videoFrameCount, setVideoFrameCount] = useState(3);
+  useEffect(() => {
+    if (!settings) return;
+    setVideoMode(settings.ai.videoTaggingMode === "frames" ? "frames" : "cover");
+    setVideoFrameCount(settings.ai.videoFrameCount);
+  }, [settings]);
+  /** FB2-07：子模式/帧数改动即时落库（后端批次读 DB 配置），保存失败静默。 */
+  const persistVideoMode = useCallback(
+    (mode: "cover" | "frames", frameCount: number) => {
+      if (!settings) return;
+      void save({
+        ...settings,
+        ai: { ...settings.ai, videoTaggingMode: mode, videoFrameCount: frameCount },
+      });
+    },
+    [settings, save],
+  );
+  const onSelectVideoMode = (m: "cover" | "frames") => {
+    setVideoMode(m);
+    persistVideoMode(m, videoFrameCount);
+  };
+  const onSelectVideoFrame = (n: number) => {
+    setVideoFrameCount(n);
+    persistVideoMode(videoMode, n);
+  };
   // FB-03 §9.5：区分「设置未加载」与「真未开启」，避免加载失败误报
   const settingsUnloaded = settings === null;
   // B-1 批次统计语义：待生成 / 待确认 / 已确认 / 失败 分开，不再用「处理中」混淆多种状态。
@@ -264,6 +291,52 @@ export default function AiTaggingPage() {
               </button>
             ))}
           </div>
+          {/* FB2-07（§13.6）：视频子打标模式 —— 仅当批次含视频且为 AI 模式时显示，纯图片批次不出现 */}
+          {mode === "auto" && batchHasVideo && (
+            <div className="mt-3">
+              <div className="grid grid-cols-2 rounded-[var(--radius-control)] bg-[var(--color-surface)] p-1 text-sm">
+                {(
+                  [
+                    ["cover", "封面打标"],
+                    ["frames", "抽帧打标"],
+                  ] as const
+                ).map(([m, label]) => (
+                  <button
+                    key={m}
+                    onClick={() => onSelectVideoMode(m)}
+                    className={clsx(
+                      "rounded-md px-2 py-1.5 text-center text-xs font-medium transition-colors",
+                      videoMode === m
+                        ? "bg-[var(--color-surface-raised)] text-[var(--color-text)] shadow-sm"
+                        : "text-[var(--color-text-secondary)] hover:text-[var(--color-text)]",
+                    )}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+              <p className="mt-2 text-[10px] leading-4 text-[var(--color-text-secondary)]">
+                {videoMode === "cover"
+                  ? "复制入库封面零额外开销，每视频一次请求；未生成高清封面的视频用第一帧，夜景可能偏暗。"
+                  : `抽 ${videoFrameCount} 帧分别识别后取多数标签，召回率更高；需要 ffmpeg，每个视频 ${videoFrameCount} 次请求。`}
+              </p>
+              {videoMode === "frames" && (
+                <div className="mt-2 flex items-center gap-2 text-xs text-[var(--color-text-secondary)]">
+                  <span>帧数</span>
+                  <select
+                    value={videoFrameCount}
+                    onChange={(e) => onSelectVideoFrame(Math.max(2, Math.min(8, Number(e.target.value) || 3)))}
+                    className="ui-control rounded-md bg-[var(--color-surface)] px-2 py-1 text-xs outline-none"
+                  >
+                    {[2, 3, 4, 5, 6, 8].map((n) => (
+                      <option key={n} value={n}>{n}</option>
+                    ))}
+                  </select>
+                  <span>· {videoFrameCount} 次/视频</span>
+                </div>
+              )}
+            </div>
+          )}
           {mode === "auto" && (
               <p className="mt-2 text-[10px] leading-4 text-[var(--color-text-secondary)]">
                 {activeProfile?.kind === "local"
@@ -293,6 +366,11 @@ export default function AiTaggingPage() {
                 />
                 张
               </label>
+              {/* FB2-07（§13.6）：成本前置告知 —— 预估请求次数随批次规模/模式/帧数实时变化 */}
+              <p className="text-[10px] leading-4 text-[var(--color-text-secondary)]">
+                本批次约 {estimateRequests(stats, videoMode, videoFrameCount)} 次请求
+                {stats.videoCount > 0 && `（含 ${stats.videoCount} 个视频 × ${videoMode === "frames" ? videoFrameCount : "封面"}）`}
+              </p>
               <Button
                 variant="primary"
                 className="mt-1 w-full"

@@ -678,14 +678,16 @@ fn pick_image(asset: &assets::Asset) -> PathBuf {
     PathBuf::from(&asset.file_path)
 }
 
-/// P3-02：多帧标签频次合并——同分类同标签命中 ≥2 帧才进建议（单帧时阈值降 1）；
+/// P3-02：多帧标签频次合并——同分类同标签命中 ≥ ceil(ok/2) 帧才进建议；单帧时阈值 1；
 /// 每分类最多保留 5 个（与单帧解析上限一致，防标签体系污染）
 pub fn merge_frame_tags(frames: &[CategorizedTags]) -> CategorizedTags {
     let ok = frames.len();
     if ok == 0 {
         return CategorizedTags::new();
     }
-    let threshold = if ok >= 2 { 2 } else { 1 };
+    // FB2-07（§13.5②）：阈值随帧数自适应 ceil(n/2)。固定 2 在 n=6 时过松（1/3 帧命中就通过），
+    // n=2 时又过严。n=2→1、n=3→2、n=4→2、n=6→3、n=8→4
+    let threshold = (ok + 1) / 2;
     let mut counts: std::collections::BTreeMap<(String, String), usize> =
         std::collections::BTreeMap::new();
     for t in frames {
@@ -707,12 +709,14 @@ pub fn merge_frame_tags(frames: &[CategorizedTags]) -> CategorizedTags {
     out
 }
 
-/// P3-02：视频打标——抽头/中/尾三帧逐帧请求后频次合并；抽帧/识别全失败返回 Err（单条置 rejected）
-fn tag_video(
+/// P3-02 + FB2-07：视频抽帧打标（frames 模式）——抽 n 段中点帧逐帧请求后频次合并；
+/// 抽帧/识别全失败返回 Err（单条置 rejected）。帧数由入参驱动（2~8）。
+fn tag_video_frames(
     client: &reqwest::blocking::Client,
     cfg: &ApiProfile,
     facets: &[FacetPromptContext],
     asset: &assets::Asset,
+    frame_count: usize,
 ) -> AppResult<CategorizedTags> {
     let dir = std::env::temp_dir().join(format!(
         "bagertea_kframes_{}_{}",
@@ -724,7 +728,7 @@ fn tag_video(
         std::path::Path::new(&asset.file_path),
         asset.duration_ms,
         &dir,
-        3,
+        frame_count,
     );
     if frames.is_empty() {
         let _ = std::fs::remove_dir_all(&dir);
@@ -744,7 +748,7 @@ fn tag_video(
     }
     let merged = merge_frame_tags(&results);
     if merged.is_empty() {
-        return Err(AppError::msg("视频帧标签未达命中阈值（需 ≥2 帧共同命中）"));
+        return Err(AppError::msg("视频帧标签未达命中阈值（帧数少时需多数帧共同命中）"));
     }
     Ok(merged)
 }
@@ -837,7 +841,19 @@ pub fn run_cloud_batch<F: Fn(AiProgress)>(
             ));
         }
         if is_video {
-            tag_video(&client, profile, facets, asset)
+            // FB2-07（§13.4/§13.5）：cover 模式走与图片完全相同的 pick_image+request_tags 路径
+            //（零 ffmpeg、零额外解码、1 次请求）；frames 模式抽 N 段中点帧逐帧识别后合并。
+            match cfg.video_tagging_mode.as_str() {
+                "frames" => tag_video_frames(
+                    &client,
+                    profile,
+                    facets,
+                    asset,
+                    (cfg.video_frame_count as usize).clamp(2, 8),
+                ),
+                // cover（默认）：复用入库时生成的视频封面，needs 高清图优先
+                _ => request_tags(&client, profile, facets, &pick_image(asset)),
+            }
         } else {
             // 网络请求（可能耗时数十秒）：不持 DB 锁
             request_tags(&client, profile, facets, &pick_image(asset))

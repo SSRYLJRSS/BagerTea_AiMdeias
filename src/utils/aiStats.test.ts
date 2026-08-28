@@ -2,12 +2,12 @@
  * computeAiStats 测试（指导书 B-1 / B-5）：「全部确认」按钮绑定待确认建议数。
  */
 import { describe, expect, it } from "vitest";
-import { computeAiStats } from "@/utils/aiStats";
+import { computeAiStats, estimateRequests } from "@/utils/aiStats";
 
 describe("computeAiStats", () => {
   it("空建议返回全 0", () => {
     expect(computeAiStats([])).toEqual({
-      total: 0, awaitingGeneration: 0, awaitingConfirmation: 0, confirmed: 0, failed: 0,
+      total: 0, awaitingGeneration: 0, awaitingConfirmation: 0, confirmed: 0, failed: 0, videoCount: 0,
     });
   });
 
@@ -39,5 +39,19 @@ describe("computeAiStats", () => {
       { status: "pending", suggestedTags: { subject: ["狗"] } },
     ]);
     expect(stats.awaitingConfirmation).toBe(2);
+  });
+
+  it("FB2-07：统计 videoCount，estimateRequests 按模式折算请求数", () => {
+    const stats = computeAiStats([
+      { status: "pending", suggestedTags: {}, mimeType: "video/mp4" },
+      { status: "pending", suggestedTags: {}, mimeType: "video/quicktime" },
+      { status: "pending", suggestedTags: {}, mimeType: "image/jpeg" },
+    ]);
+    expect(stats.videoCount).toBe(2);
+    expect(stats.total).toBe(3);
+    // 3 = 1 张图片 + 2 视频 × cover(1)
+    expect(estimateRequests(stats, "cover", 3)).toBe(3);
+    // 7 = 1 + 2 × frames(3)
+    expect(estimateRequests(stats, "frames", 3)).toBe(7);
   });
 });

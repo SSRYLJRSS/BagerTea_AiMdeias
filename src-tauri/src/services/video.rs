@@ -501,8 +501,11 @@ pub fn transcode_to_h264(
     Ok(())
 }
 
-/// P3-02：视频 AI 打标抽帧——取头/中/尾三帧（1280px webp）到指定目录；
-/// 返回实际抽出的帧路径（时长未知时退化为 0s/5s/10s）；ffmpeg 不可用或全部失败返回空
+/// P3-02：视频 AI 打标抽帧——取每段中点帧（1280px webp）到指定目录；
+/// 返回实际抽出的帧路径（时长未知时退化为 2s/7s/12s，跳过第 0 秒）；ffmpeg 不可用或全部失败返回空
+///
+/// FB2-07（§13.5）：帧位取每段中点。原公式 d*i/n 的第一帧恒为第 0ms（相机视频开头常是黑场/自动曝光未稳定），
+/// 取中点避开片头黑场与片尾字幕/淡出 —— n=3 → 16.7% / 50% / 83%。抽帧走全局解码并发闸，避免批量打标拉满 CPU。
 pub fn extract_keyframes(
     path: &Path,
     duration_ms: Option<i64>,
@@ -510,14 +513,20 @@ pub fn extract_keyframes(
     n: usize,
 ) -> Vec<std::path::PathBuf> {
     let n = n.max(1);
+    // FB2-07：帧位取每段中点（n==1 时自然给出 d*0.5，与原 vec![d/2] 分支行为一致，已合并删除）
     let times: Vec<i64> = match duration_ms {
-        Some(d) if d > 0 && n > 1 => (0..n).map(|i| d * i as i64 / (n as i64)).collect(),
-        Some(d) if d > 0 => vec![d / 2],
-        _ => (0..n).map(|i| i as i64 * 5000).collect(),
+        Some(d) if d > 0 => (0..n)
+            .map(|i| ((d as f64) * (i as f64 + 0.5) / (n as f64)) as i64)
+            .collect(),
+        // 时长未知：退化为固定间隔，跳过第 0 秒
+        _ => (0..n).map(|i| 2000 + i as i64 * 5000).collect(),
     };
     let mut out = Vec::new();
     for (i, t) in times.iter().enumerate() {
         let frame = dir.join(format!("kframe_{i}.webp"));
+        // FB2-07：每帧申请一次全局解码/抽帧并发闸 permit（acquire 返回 RAII guard，作用域内持有）。
+        // 绝不能 `let _ = acquire()` —— 那会立即 drop，permit 白拿；也不能提到循环外（会降低整段吞吐）。
+        let _permit = crate::services::imaging::acquire();
         if extract_frame(path, *t, &frame, 1280) {
             out.push(frame);
         }

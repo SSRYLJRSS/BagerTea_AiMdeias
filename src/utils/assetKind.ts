@@ -19,3 +19,13 @@ export function isVideoAsset(asset: Pick<Asset, "mimeType" | "durationMs" | "fil
 export function isImageAsset(asset: Pick<Asset, "mimeType" | "durationMs" | "fileExt">): boolean {
   return !isVideoAsset(asset);
 }
+
+/**
+ * FB2-07：判断 MIME/路径是否为视频（供 suggestion 等没有完整 Asset 对象的场景用）。
+ * 与 isVideoAsset 的判断口径一致（MIME video/* 优先，扩展名兜底），避免两处重复正则。
+ */
+export function isVideoLike(mimeType: string | null | undefined, pathOrName: string): boolean {
+  if (mimeType?.startsWith("video/")) return true;
+  const ext = (pathOrName.split(".").pop() ?? "").toLowerCase();
+  return VIDEO_EXTS.has(ext);
+}

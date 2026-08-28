@@ -686,6 +686,37 @@ function AiPurposePanel({
           </span>
         </Field>
       )}
+      {/* FB2-07（§13.6）：视频打标子模式与帧数 —— 仅当视频打标开启时显示，关闭时无意义避免误导 */}
+      {!isSuperSearch && draft.ai.videoTagging && (
+        <>
+          <Field
+            label="视频打标模式"
+            hint={
+              draft.ai.videoTaggingMode === "frames"
+                ? "抽多帧分别识别后取多数标签，召回率更高；需要 ffmpeg，每个视频多帧解码"
+                : "复用入库封面的低开销 1 次请求；未生成高清封面的视频用第一帧，夜景可能偏暗"
+            }
+          >
+            <select
+              value={draft.ai.videoTaggingMode === "frames" ? "frames" : "cover"}
+              onChange={(e) => patchAi({ videoTaggingMode: e.target.value as Settings["ai"]["videoTaggingMode"] })}
+              className="ui-control rounded-md px-2 py-1.5 text-sm outline-none"
+            >
+              <option value="cover">封面打标（默认，省开销）</option>
+              <option value="frames">抽帧打标（召回率更高）</option>
+            </select>
+          </Field>
+          {draft.ai.videoTaggingMode === "frames" && (
+            <Field label="抽帧数" hint="抽帧模式下每个视频抽取的帧数（2–8），越多召回越高、开销越大">
+              <TextInput
+                type="number"
+                value={String(draft.ai.videoFrameCount)}
+                onChange={(v) => patchAi({ videoFrameCount: Math.max(2, Math.min(8, Number(v) || 3)) })}
+              />
+            </Field>
+          )}
+        </>
+      )}
       {!isSuperSearch && (
         <Field label="执行分块大小" hint="单次请求分块大小：执行层按此内存分块、限流、重试，不截断总批次">
           <TextInput
