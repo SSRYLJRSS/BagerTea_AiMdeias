@@ -210,6 +210,84 @@ pub fn rescan_assets(
     rescan_assets_with(db, asset_ids, cancel, probe_asset, on_progress)
 }
 
+/// FB2-08（§14.6/14.7）：存量色板回算。复用 rescan_assets_with 的骨架（短锁读/写 + 取消 + 进度）。
+/// 取材：placeholder（256px 入库即生成）优先，其次 hd 缩略图，最次原图；全都不行则该行 failed。
+/// 色板为空（如全黑图极端像素丢光）→ 计 skipped、不覆盖；成功写入 palette_json + dominant_*。
+pub fn rescan_assets_palette(
+    db: &Arc<Mutex<Connection>>,
+    asset_ids: &[i64],
+    cancel: &AtomicBool,
+    mut on_progress: impl FnMut(&RefillProgress),
+) -> AppResult<RefillSummary> {
+    const PALETTE_VERSION: i64 = 1;
+    let lock = || db.lock().map_err(|_| crate::error::AppError::msg("数据库锁中毒"));
+    let mut summary = RefillSummary {
+        total: asset_ids.len() as i64,
+        ..Default::default()
+    };
+    for (i, &id) in asset_ids.iter().enumerate() {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        let asset = {
+            let conn = lock()?;
+            assets::get(&conn, id).ok()
+        };
+        let Some(asset) = asset else {
+            summary.skipped += 1;
+            continue;
+        };
+        // 取材路径（§14.6）
+        let src = asset
+            .placeholder_path
+            .as_deref()
+            .map(std::path::PathBuf::from)
+            .or_else(|| asset.hd_thumbnail_path.as_deref().map(std::path::PathBuf::from))
+            .unwrap_or_else(|| std::path::PathBuf::from(&asset.file_path));
+
+        // 锁外计算（解码走 imaging::decode_thumb；acquire 取全局并发闸）
+        let palette = {
+            let _permit = crate::services::imaging::acquire();
+            crate::services::imaging::decode_thumb(&src, 100)
+                .map(|img| crate::services::palette::compute_palette(&img))
+        };
+
+        let ok = match palette {
+            Some(palette) if !palette.is_empty() => {
+                let entries: Vec<serde_json::Value> = palette
+                    .iter()
+                    .map(|e| {
+                        serde_json::json!({
+                            "hex": e.hex, "r": e.r, "g": e.g, "b": e.b, "ratio": e.ratio
+                        })
+                    })
+                    .collect();
+                let json = serde_json::to_string(&entries).unwrap_or_else(|_| "[]".to_string());
+                let p0 = &palette[0];
+                let (hue, sat, lum) = crate::services::palette::dominant_from_rgb(p0.r, p0.g, p0.b);
+                let conn = lock()?;
+                assets::set_palette(&conn, id, &json, PALETTE_VERSION, hue, sat, lum).is_ok()
+            }
+            // 色板为空（全黑/全白被丢光）或解码失败 → 未计算，不覆盖
+            _ => false,
+        };
+        if ok {
+            summary.success += 1;
+        } else {
+            summary.failed += 1;
+        }
+        on_progress(&RefillProgress {
+            done: (i + 1) as i64,
+            total: summary.total,
+            success: summary.success,
+            failed: summary.failed,
+            skipped: summary.skipped,
+            current_id: id,
+        });
+    }
+    Ok(summary)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

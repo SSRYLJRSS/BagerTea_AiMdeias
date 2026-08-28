@@ -166,6 +166,8 @@ pub fn run() {
             // 媒体元数据回填（指导书 §7.5）
             commands::rescan_asset_metadata,
             commands::cancel_media_refill,
+            // FB2-08：算法色板回算（独立的 rescan_*）
+            commands::rescan_asset_palette,
             // 视频兼容代理（指导书 §8.3）
             commands::ensure_video_proxy,
             commands::get_video_proxy_status,

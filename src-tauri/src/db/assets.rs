@@ -1025,6 +1025,41 @@ pub fn set_placeholder_path(conn: &Connection, id: i64, path: &str) -> AppResult
     Ok(())
 }
 
+/// FB2-08：写算法色板 + 主导三维度索引列（「按颜色筛选」走这三列，palette_json 只用于渲染色条）。
+pub fn set_palette(
+    conn: &Connection,
+    id: i64,
+    palette_json: &str,
+    version: i64,
+    hue: i64,
+    sat: i64,
+    lum: i64,
+) -> AppResult<()> {
+    let now = chrono::Utc::now().timestamp_millis();
+    conn.execute(
+        "UPDATE assets SET palette_json=?1, palette_version=?2, palette_scanned_at=?3,
+            dominant_hue=?4, dominant_sat=?5, dominant_lum=?6 WHERE id=?7",
+        rusqlite::params![palette_json, version, now, hue, sat, lum, id],
+    )?;
+    Ok(())
+}
+
+/// FB2-08：列出缺少色板（palette_json 为空）的素材 id（用于「仅缺色板」回填范围）。
+pub fn list_ids_needing_palette(conn: &Connection) -> AppResult<Vec<i64>> {
+    let mut stmt = conn.prepare(
+        "SELECT id FROM assets WHERE deleted_at IS NULL AND palette_json IS NULL",
+    )?;
+    let rows = stmt.query_map([], |r| r.get(0))?;
+    Ok(rows.filter_map(|r| r.ok()).collect())
+}
+
+/// FB2-08：列出全部未删除素材 id（用于「全部」色板回算范围）。
+pub fn list_all_ids(conn: &Connection) -> AppResult<Vec<i64>> {
+    let mut stmt = conn.prepare("SELECT id FROM assets WHERE deleted_at IS NULL")?;
+    let rows = stmt.query_map([], |r| r.get(0))?;
+    Ok(rows.filter_map(|r| r.ok()).collect())
+}
+
 pub fn set_hd_thumbnail_path(conn: &Connection, id: i64, path: &str) -> AppResult<()> {
     conn.execute(
         "UPDATE assets SET hd_thumbnail_path = ?1 WHERE id = ?2",

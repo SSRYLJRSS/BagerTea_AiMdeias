@@ -45,7 +45,21 @@ export interface Asset {
   metadataVersion?: number | null;
   metadataScannedAt?: number | null;
   metadataError?: string | null;
+  // FB2-08：算法主色（§14.8）。palette 为色条分段；dominant_* 供检索索引。
+  palette?: PaletteSegmentDto[] | null;
+  dominantHue?: number | null;
+  dominantSat?: number | null;
+  dominantLum?: number | null;
   tags: import("./tag").Tag[];
+}
+
+/** FB2-08：色板单段（占比例降序）。hex 用于渲染色带；hue/sat/lum 用于中文色名。 */
+export interface PaletteSegmentDto {
+  hex: string;
+  r: number;
+  g: number;
+  b: number;
+  ratio: number;
 }
 
 export type AssetType = "all" | "image" | "video";

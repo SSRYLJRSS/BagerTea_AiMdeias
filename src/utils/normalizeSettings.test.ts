@@ -143,4 +143,15 @@ describe("normalizeSettings", () => {
     expect(s.appearance.grid.importCellStep).toBe(0);
     expect(s.appearance.grid.cellFit).toBe("cover");
   });
+
+  it("FB2-08：colorStrip 默认值（grid 关/viewer 开/count 6），非法 count → 6、mode 回落 ratio", () => {
+    const s = normalizeSettings({});
+    const cs = s.appearance.colorStrip;
+    expect(cs.showInLibraryGrid).toBe(false);
+    expect(cs.showInViewer).toBe(true);
+    expect(cs.count).toBe(6);
+    const s2 = normalizeSettings({ appearance: { colorStrip: { count: 99, mode: "bad" } } });
+    expect(s2.appearance.colorStrip.count).toBe(6);
+    expect(s2.appearance.colorStrip.mode).toBe("ratio");
+  });
 });

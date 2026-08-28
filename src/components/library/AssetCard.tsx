@@ -6,6 +6,7 @@ import { memo, useCallback, useContext } from "react";
 import clsx from "clsx";
 import Thumbnail from "./Thumbnail";
 import AssetCardVideoLayer from "./AssetCardVideoLayer";
+import ColorStrip, { toPaletteSegments } from "@/components/library/ColorStrip";
 import { isVideoAsset } from "@/utils/assetKind";
 import { useAppearance } from "@/hooks/useAppearance";
 import { useHoverIntent } from "@/hooks/useHoverIntent";
@@ -46,7 +47,7 @@ function formatBadge(ext: string): string | null {
 }
 
 export default memo(function AssetCard({ asset, index, selected, thumbSize, onSelect, onPreview, onContextMenu }: AssetCardProps) {
-  const { grid, hoverPreview } = useAppearance();
+  const { grid, hoverPreview, colorStrip } = useAppearance();
   const isScrolling = useContext(GridScrollingContext);
   const handleClick = useCallback(
     (e: React.MouseEvent) => onSelect(asset, index, e),
@@ -131,6 +132,11 @@ export default memo(function AssetCard({ asset, index, selected, thumbSize, onSe
           {asset.fileName}
         </div>
       </div>
+
+      {/* FB2-08（§14.11）：素材库色条 —— 紧贴卡片下沿 thin 6px；默认关（设置→素材框→色条）。 */}
+      {colorStrip.enabled && colorStrip.showInLibraryGrid && asset.palette?.length ? (
+        <ColorStrip palette={toPaletteSegments(asset.palette)} height="thin" />
+      ) : null}
     </div>
   );
 });

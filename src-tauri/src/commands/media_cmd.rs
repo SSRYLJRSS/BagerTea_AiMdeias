@@ -64,6 +64,49 @@ pub async fn rescan_asset_metadata(
     .map_err(|e| AppError::msg(format!("回填线程异常: {e}")))?
 }
 
+/// FB2-08（§14.7）：算法色板回算（scope = all | missing | ids；复用 media_refill 取消标志与骨架）。
+/// 独立命令而非塞进 rescan_asset_metadata：语义与耗时都不同，混在一起用户没法只跑其中一个。
+#[tauri::command]
+pub async fn rescan_asset_palette(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    ids: Option<Vec<i64>>,
+    scope: Option<String>,
+) -> AppResult<RescanResult> {
+    let scope = scope.unwrap_or_else(|| "missing".to_string());
+    if scope != "all" && scope != "missing" && scope != "ids" {
+        return Err(AppError::msg("scope 只允许 all | missing | ids"));
+    }
+    if scope == "ids" && ids.as_ref().map_or(true, |v| v.is_empty()) {
+        return Err(AppError::msg("未选择任何素材"));
+    }
+    let db = Arc::clone(&state.db);
+    let cancel = Arc::clone(&state.media_refill_cancel);
+    cancel.store(false, Ordering::Relaxed);
+
+    tauri::async_runtime::spawn_blocking(move || -> AppResult<RescanResult> {
+        let resolved: Vec<i64> = {
+            let conn = db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
+            match scope.as_str() {
+                "ids" => ids.unwrap_or_default(),
+                "missing" => assets::list_ids_needing_palette(&conn)?,
+                _ => assets::list_all_ids(&conn)?,
+            }
+        };
+        let summary = media_refill::rescan_assets_palette(&db, &resolved, &cancel, |p| {
+            let _ = app.emit("media_refill://progress", p);
+        })?;
+        Ok(RescanResult {
+            total: summary.total,
+            success: summary.success,
+            failed: summary.failed,
+            skipped: summary.skipped,
+        })
+    })
+    .await
+    .map_err(|e| AppError::msg(format!("色板回算线程异常: {e}")))?
+}
+
 /// 取消正在进行的媒体元数据回填。
 #[tauri::command]
 pub fn cancel_media_refill(state: State<AppState>) -> AppResult<()> {

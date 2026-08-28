@@ -145,7 +145,9 @@ function normalizeColorStrip(raw: unknown): ColorStripAppearance {
   const r = isRecord(raw) ? raw : {};
   const height = asEnum(r.height, ["thin", "normal", "thick"] as const, "normal");
   const mode = asEnum(r.mode, ["ratio", "equal"] as const, "ratio");
-  const count = clampInt(r.count, 4, 8, 6);
+  // FB2-08：count 只允许 {4,6,8}；非法值（含越界 99）回落默认 6，不做区间钳制
+  const rc = r.count;
+  const count = rc === 4 || rc === 8 ? rc : 6;
   return {
     enabled: asBool(r.enabled, true),
     showInLibraryGrid: asBool(r.showInLibraryGrid, false),
@@ -153,7 +155,7 @@ function normalizeColorStrip(raw: unknown): ColorStripAppearance {
     showInImportGrid: asBool(r.showInImportGrid, false),
     height,
     mode,
-    count: count === 4 ? 4 : count === 8 ? 8 : 6,
+    count,
   };
 }
 
