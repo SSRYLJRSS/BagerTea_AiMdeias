@@ -63,11 +63,25 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
     set({ saving: true });
     try {
       await saveSettings(s);
-      set({ settings: s, saving: false });
-      applyTheme(s.theme);
+      // FB-03 §9.5：保存后回读 DB 对账（不再只信任本地对象），确保 videoTagging 等字段往返一致
+      let reconciled = s;
+      try {
+        const raw = await getSettings();
+        reconciled = normalizeSettings(raw);
+      } catch {
+        // 回读失败不阻断保存成功（回读是增强对账，非保存前置条件）
+        tracingWarn("保存设置回读对账失败，沿用本地值");
+      }
+      set({ settings: reconciled, saving: false });
+      applyTheme(reconciled.theme);
     } catch (e) {
       set({ saving: false });
       throw e;
     }
   },
 }));
+
+/** 回读失败仅告警（不把后端异常升级为保存失败） */
+function tracingWarn(msg: string) {
+  if (import.meta.env?.DEV) console.warn(`[settingsStore] ${msg}`);
+}

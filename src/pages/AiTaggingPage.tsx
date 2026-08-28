@@ -133,6 +133,8 @@ export default function AiTaggingPage() {
     [suggestions],
   );
   const videoTaggingOn = settings?.ai.videoTagging ?? false;
+  // FB-03 §9.5：区分「设置未加载」与「真未开启」，避免加载失败误报
+  const settingsUnloaded = settings === null;
   // B-1 批次统计语义：待生成 / 待确认 / 已确认 / 失败 分开，不再用「处理中」混淆多种状态。
   // 「全部确认」必须用「待确认建议」数量（computeAiStats.awaitingConfirmation），不能用待生成数。
   const stats = useMemo(() => computeAiStats(suggestions), [suggestions]);
@@ -294,10 +296,12 @@ export default function AiTaggingPage() {
               <Button
                 variant="primary"
                 className="mt-1 w-full"
-                disabled={!scopeAll && (!scopeN || parseInt(scopeN, 10) < 1)}
+                disabled={
+                  !scopeAll && (!scopeN || parseInt(scopeN, 10) < 1) || (batchHasVideo && !videoTaggingOn)
+                }
                 onClick={() => void startBatch(scopeAll ? undefined : parseInt(scopeN, 10))}
               >
-                开始打标
+                {batchHasVideo && !videoTaggingOn ? "先开启视频 AI 打标" : "开始打标"}
               </Button>
             </div>
           )}
@@ -365,11 +369,13 @@ export default function AiTaggingPage() {
               <h3 className="ui-section-title">当前批次</h3>
               <span className="text-[11px] text-[var(--color-text-tertiary)]">#{current.id} · 共 {suggestions.length} 张</span>
             </div>
-            {/* B-3：批次含视频但视频打标未开启——明确提示并提供打开设置入口（后端保留最终校验） */}
+            {/* B-3：批次含视频但视频打标未开启——明确提示并提供打开设置入口（前端预检 §9.3；后端保留最终校验） */}
             {batchHasVideo && !videoTaggingOn && !running && (
               <div className="mb-2 flex items-center gap-2 rounded-md border border-[var(--color-status)] bg-[var(--color-status-soft)] px-2.5 py-2 text-xs">
                 <span className="min-w-0 flex-1 leading-4 text-[var(--color-status)]">
-                  本批次包含视频，但「视频 AI 打标」未开启。请到设置 → 在线打标 → 视频 AI 打标 开启后保存，再重新开始批次。
+                  {settingsUnloaded
+                    ? "设置尚未加载，无法判断「视频 AI 打标」是否开启；请稍后重试或先到设置页保存配置。"
+                    : "视频 AI 打标未开启。请打开\"设置 → AI 设置 → 自动打标 → 视频 AI 打标\"，保存后重新开始批次。"}
                 </span>
                 <button
                   onClick={openSettings}

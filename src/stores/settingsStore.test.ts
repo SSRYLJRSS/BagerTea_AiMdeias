@@ -5,7 +5,7 @@
  *  - 失败不写入默认设置覆盖真实配置（settings 保持 null，loadError 暴露）。
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { getSettings } from "@/api/settings";
+import { getSettings, saveSettings } from "@/api/settings";
 import { useSettingsStore, applyTheme } from "@/stores/settingsStore";
 import type { Settings } from "@/types/settings";
 
@@ -109,5 +109,34 @@ describe("applyTheme", () => {
     expect(document.documentElement.dataset.theme).toBe("dark");
     applyTheme("system");
     expect(document.documentElement.dataset.theme).toBe("system");
+  });
+});
+
+describe("settingsStore save 回读对账（FB-03 §9.5）", () => {
+  it("保存后回读 DB 并采纳回读值（videoTagging 往返一致）", async () => {
+    const base = mkSettings();
+    // 初次 load 返回开关关；保存提交开；回读返回开后（后端事实源）
+    vi.mocked(getSettings)
+      .mockResolvedValueOnce(base)
+      .mockResolvedValueOnce({ ...base, ai: { ...base.ai, videoTagging: true } });
+    await useSettingsStore.getState().load();
+    expect(useSettingsStore.getState().settings?.ai.videoTagging).toBe(false);
+
+    await useSettingsStore.getState().save({ ...base, ai: { ...base.ai, videoTagging: true } });
+    expect(saveSettings).toHaveBeenCalledTimes(1);
+    // 以回读（DB 事实源）为准
+    expect(useSettingsStore.getState().settings?.ai.videoTagging).toBe(true);
+    expect(useSettingsStore.getState().saving).toBe(false);
+  });
+
+  it("回读失败不阻断保存成功（沿用提交值），saving 复位", async () => {
+    const base = mkSettings();
+    vi.mocked(getSettings).mockResolvedValueOnce(base).mockRejectedValueOnce(new Error("回读失败"));
+    await useSettingsStore.getState().load();
+
+    const committed = { ...base, ai: { ...base.ai, videoTagging: true } };
+    await useSettingsStore.getState().save(committed);
+    expect(useSettingsStore.getState().settings?.ai.videoTagging).toBe(true);
+    expect(useSettingsStore.getState().saving).toBe(false);
   });
 });
