@@ -1,6 +1,6 @@
 use std::sync::atomic::Ordering;
 
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::db::assets::ImportResult;
 use crate::db::settings;
@@ -52,11 +52,22 @@ pub async fn import_files(
 
 /// 扫描路径生成待入库清单统计（两段式入库，不落库）
 /// B07：改 async + spawn_blocking，大目录扫描不卡主线程
+/// FB2-03：对清单内每个原文件逐路径放行 asset 协议，使入库页可在卡片内播放视频。
+/// 安全边界与 list_assets 一致——只放行用户主动选择/拖入的路径，只读，不放宽 scope、不用 allow_directory。
 #[tauri::command]
-pub async fn inspect_import(paths: Vec<String>) -> AppResult<importer::ImportPlan> {
-    tauri::async_runtime::spawn_blocking(move || Ok(importer::inspect_paths(&paths)))
+pub async fn inspect_import(app: AppHandle, paths: Vec<String>) -> AppResult<importer::ImportPlan> {
+    let plan = tauri::async_runtime::spawn_blocking(move || importer::inspect_paths(&paths))
         .await
-        .map_err(|e| AppError::msg(format!("扫描线程异常: {e}")))?
+        .map_err(|e| AppError::msg(format!("扫描线程异常: {e}")))?;
+    for item in &plan.items {
+        allow_import_asset(&app, &item.path);
+    }
+    Ok(plan)
+}
+
+/// 与 assets_cmd::allow_asset 同语义的本地放行函数（仅在 inspect_import 内使用）
+fn allow_import_asset(app: &AppHandle, path: &str) {
+    let _ = app.asset_protocol_scope().allow_file(std::path::Path::new(path));
 }
 
 #[tauri::command]
