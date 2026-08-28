@@ -65,6 +65,7 @@ describe("AssetCard §6.1（素材库禁止 hover 媒体预览）", () => {
       <AssetCard
         asset={mkAsset({ mimeType: "image/jpeg", durationMs: null })}
         index={0}
+        thumbSize={512}
         selected={false}
         onSelect={noop}
         onPreview={noop}
@@ -86,6 +87,7 @@ describe("AssetCard §6.1（素材库禁止 hover 媒体预览）", () => {
       <AssetCard
         asset={mkAsset({ mimeType: "video/mp4", durationMs: 5000, fileExt: "mp4" })}
         index={0}
+        thumbSize={512}
         selected={false}
         onSelect={noop}
         onPreview={noop}
@@ -104,6 +106,7 @@ describe("AssetCard §6.1（素材库禁止 hover 媒体预览）", () => {
       <AssetCard
         asset={mkAsset()}
         index={0}
+        thumbSize={512}
         selected={false}
         onSelect={noop}
         onPreview={preview}
@@ -122,6 +125,7 @@ describe("AssetCard §6.1（素材库禁止 hover 媒体预览）", () => {
       <AssetCard
         asset={mkAsset()}
         index={0}
+        thumbSize={512}
         selected={false}
         onSelect={select}
         onPreview={noop}
@@ -140,6 +144,7 @@ describe("AssetCard §6.1（素材库禁止 hover 媒体预览）", () => {
       <AssetCard
         asset={mkAsset()}
         index={0}
+        thumbSize={512}
         selected
         onSelect={noop}
         onPreview={noop}

@@ -11,6 +11,7 @@
   --color-surface-hover: #eeece7;
   --color-border: #e2e0da;
   --color-border-strong: #d2cfc7;
+  --color-hairline: rgb(0 0 0 / 7%);
   --color-text: #292824;
   --color-text-secondary: #716e66;
   --color-text-tertiary: #96928a;
@@ -36,6 +37,7 @@
   --color-surface-hover: #292929;
   --color-border: #2f2f2f;
   --color-border-strong: #3b3b3b;
+  --color-hairline: rgb(255 255 255 / 8%);
   --color-text: #d4d4d2;
   --color-text-secondary: #aaa9a4;
   --color-text-tertiary: #888781;
@@ -58,6 +60,7 @@
     --color-surface-hover: #292929;
     --color-border: #2f2f2f;
     --color-border-strong: #3b3b3b;
+    --color-hairline: rgb(255 255 255 / 8%);
     --color-text: #d4d4d2;
     --color-text-secondary: #aaa9a4;
     --color-text-tertiary: #888781;

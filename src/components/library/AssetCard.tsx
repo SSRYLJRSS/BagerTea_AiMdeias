@@ -1,16 +1,20 @@
 /** 网格卡片（指导书 §2.2/§6.1）：缩略图 + 角标 + 选中态 + 文件名 + 单击/双击/右键。
- *  素材库禁止大图/视频 hover 预览：不创建 <video>、不请求 1024px hover 图、
- *  不渲染 fixed 大图浮层；hover 只允许边框/文件名透明度变化（§3.3）。双击进入 Viewer。 */
+ *  FB2-01/02（§9）：卡格比例由 appearance.grid.cellAspect 决定（决策 4：一个设置管素材库与入库两页），
+ *  缩略图填充方式由 appearance.grid.cellFit 经 resolveFit 解析（cover/contain/smart，绝不拉伸）。
+ *  hover 只允许边框/文件名透明度变化（§3.3）；双击进入 Viewer。 */
 import { memo, useCallback } from "react";
 import clsx from "clsx";
 import Thumbnail from "./Thumbnail";
 import { isVideoAsset } from "@/utils/assetKind";
+import { useAppearance } from "@/hooks/useAppearance";
+import { ASPECT_CSS, ASPECT_RATIO, resolveFit } from "@/utils/cellFit";
 import type { Asset } from "@/types/asset";
 
 interface AssetCardProps {
   asset: Asset;
   index: number;
   selected: boolean;
+  thumbSize: number;
   onSelect: (asset: Asset, index: number, e: React.MouseEvent) => void;
   onPreview: (asset: Asset) => void;
   onContextMenu: (asset: Asset, index: number, e: React.MouseEvent) => void;
@@ -38,7 +42,8 @@ function formatBadge(ext: string): string | null {
   return null;
 }
 
-export default memo(function AssetCard({ asset, index, selected, onSelect, onPreview, onContextMenu }: AssetCardProps) {
+export default memo(function AssetCard({ asset, index, selected, thumbSize, onSelect, onPreview, onContextMenu }: AssetCardProps) {
+  const { grid } = useAppearance();
   const handleClick = useCallback(
     (e: React.MouseEvent) => onSelect(asset, index, e),
     [asset, index, onSelect],
@@ -53,6 +58,19 @@ export default memo(function AssetCard({ asset, index, selected, onSelect, onPre
   const isVideo = isVideoAsset(asset);
   const badge = formatBadge(asset.fileExt);
 
+  // FB2-02：容器比例 + 内容填充（smart 需 contentAspect）
+  const aspectCSS = ASPECT_CSS[grid.cellAspect] ?? ASPECT_CSS["1:1"];
+  const [cw, ch] = ASPECT_RATIO[grid.cellAspect] ?? ASPECT_RATIO["1:1"];
+  const contentAspect =
+    typeof asset.width === "number" &&
+    typeof asset.height === "number" &&
+    asset.height > 0 &&
+    asset.width > 0
+      ? asset.width / asset.height
+      : null;
+  const containerAspect = cw / ch;
+  const fit = resolveFit(grid.cellFit, contentAspect, containerAspect);
+
   return (
     <div className="relative">
       <div
@@ -62,13 +80,15 @@ export default memo(function AssetCard({ asset, index, selected, onSelect, onPre
         onClick={handleClick}
         onDoubleClick={handleDoubleClick}
         onContextMenu={handleContextMenu}
+        style={{ aspectRatio: aspectCSS }}
         className={clsx(
-          "group relative aspect-square cursor-pointer overflow-hidden rounded-md outline-none select-none",
+          "group relative cursor-pointer overflow-hidden rounded-md outline-none select-none",
           "ring-offset-2 ring-offset-[var(--color-bg)] transition-shadow",
-          selected ? "ring-2 ring-[var(--color-accent)]" : "hover:ring-1 hover:ring-[var(--color-border)]",
+          selected ? "ring-2 ring-[var(--color-accent)]"
+                   : "ring-1 ring-inset ring-[var(--color-hairline)] hover:ring-[var(--color-border-strong)]",
         )}
       >
-        <Thumbnail assetId={asset.id} placeholderPath={asset.placeholderPath} alt={asset.fileName} />
+        <Thumbnail assetId={asset.id} placeholderPath={asset.placeholderPath} alt={asset.fileName} size={thumbSize} fit={fit} />
 
         {/* 视频角标（时长缺失时仅按视频识别，不显示时长数字） */}
         {isVideo && asset.durationMs != null && (

@@ -7,8 +7,6 @@ import { toFileUrl } from "@/api/thumbnail";
 import { getCachedThumbnail, requestThumbnail } from "@/utils/thumbnailCache";
 import { markStartup } from "@/utils/startupMarks";
 
-const SIZE = 512;
-
 /** §4.1：首个高清缩略图 ready 标记（模块级，跨组件只打一次） */
 let firstThumbMarked = false;
 
@@ -16,12 +14,16 @@ interface ThumbnailProps {
   assetId: number;
   placeholderPath: string | null;
   alt: string;
+  /** FB2-01 请求尺寸（由格子档位决定；分级为 512/1024 保证缓存命中） */
+  size: number;
+  /** FB2-02 填充方式（已由调用方经 resolveFit 解析为二态） */
+  fit: "cover" | "contain";
 }
 
-export default memo(function Thumbnail({ assetId, placeholderPath, alt }: ThumbnailProps) {
+export default memo(function Thumbnail({ assetId, placeholderPath, alt, size, fit }: ThumbnailProps) {
   const rootRef = useRef<HTMLDivElement>(null);
   // 初始状态直接读缓存：命中 ready → 立即显示（hdReady 为 true，跳过「从 0 到 1」淡入）
-  const cached = getCachedThumbnail(assetId, "hd", SIZE);
+  const cached = getCachedThumbnail(assetId, "hd", size);
   const [hdUrl, setHdUrl] = useState<string | null>(cached?.status === "ready" ? cached.url ?? null : null);
   const [hdReady, setHdReady] = useState<boolean>(cached?.status === "ready");
   const [placeholderUrl, setPlaceholderUrl] = useState<string | null>(
@@ -41,7 +43,7 @@ export default memo(function Thumbnail({ assetId, placeholderPath, alt }: Thumbn
   useEffect(() => {
     if (placeholderFailed && !hdUrl) {
       const my = ++gen.current;
-      requestThumbnail(assetId, "hd", SIZE)
+      requestThumbnail(assetId, "hd", size)
         .then((url) => {
           if (gen.current !== my) return;
           setHdUrl(url);
@@ -49,7 +51,7 @@ export default memo(function Thumbnail({ assetId, placeholderPath, alt }: Thumbn
         })
         .catch(() => undefined);
     }
-  }, [placeholderFailed, hdUrl, assetId]);
+  }, [placeholderFailed, hdUrl, assetId, size]);
 
   // 可见区触发高清生成（IntersectionObserver；requestThumbnail 内部对同一 asset+size 去重）
   useEffect(() => {
@@ -60,7 +62,7 @@ export default memo(function Thumbnail({ assetId, placeholderPath, alt }: Thumbn
       (entries) => {
         if (entries.some((e) => e.isIntersecting)) {
           io.disconnect();
-          requestThumbnail(assetId, "hd", SIZE)
+          requestThumbnail(assetId, "hd", size)
             .then((url) => {
               if (gen.current !== my) return;
               setHdUrl(url);
@@ -76,7 +78,7 @@ export default memo(function Thumbnail({ assetId, placeholderPath, alt }: Thumbn
       io.disconnect();
       gen.current++;
     };
-  }, [assetId, hdUrl]);
+  }, [assetId, hdUrl, size]);
 
   // §4.1：首个高清缩略图 ready 打点（模块级只打一次，首屏性能观测）
   return (
@@ -87,7 +89,7 @@ export default memo(function Thumbnail({ assetId, placeholderPath, alt }: Thumbn
           alt={alt}
           draggable={false}
           onError={() => setPlaceholderFailed(true)} // B27：占位图失败回退到 pulse 占位
-          className="absolute inset-0 h-full w-full object-cover"
+          className={`absolute inset-0 h-full w-full ${fit === "contain" ? "object-contain" : "object-cover"}`}
         />
       ) : (
         <div className="absolute inset-0 animate-pulse bg-[var(--color-border)]" />
@@ -105,7 +107,7 @@ export default memo(function Thumbnail({ assetId, placeholderPath, alt }: Thumbn
               markStartup("first_thumbnail_ready");
             }
           }}
-          className="absolute inset-0 h-full w-full object-cover transition-opacity duration-300"
+          className={`absolute inset-0 h-full w-full ${fit === "contain" ? "object-contain" : "object-cover"} transition-opacity duration-300`}
           style={{ opacity: hdReady ? 1 : 0 }}
         />
       )}

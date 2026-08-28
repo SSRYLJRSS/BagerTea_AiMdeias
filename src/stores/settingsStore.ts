@@ -21,6 +21,10 @@ interface SettingsState {
    *  网格/Viewer 立即消费（等效 applyTheme 语义）；保存成功后由 save() 与已落库值对齐。 */
   previewAppearance: Appearance | null;
   setPreviewAppearance: (a: Appearance | null) => void;
+  /** §9.3 FB2-01：网格档位即时预览 + 800ms 防抖持久化（滚轮连续滚动不高频落库）。
+   *  patch 合并进当前生效 appearance 的深拷贝后：① 立即写 previewAppearance 让网格跟随；
+   *  ② 防抖 save；卸载时 flush 剩余待写。 */
+  commitAppearanceDebounced: (patch: Partial<Appearance> | ((a: Appearance) => Appearance)) => void;
   load: () => Promise<void>;
   save: (s: Settings) => Promise<void>;
 }
@@ -48,6 +52,11 @@ export function currentAppearance(s: Settings | null, preview: Appearance | null
  */
 let loadPromise: Promise<void> | null = null;
 
+/** §9.3 FB2-01：档位/比例即时预览的防抖持久化定时器（组件卸载时 flush）。 */
+let appearanceTimer: ReturnType<typeof setTimeout> | null = null;
+/** 待持久化的完整设置副本（尚未落库，但已写进 previewAppearance 供网格消费）。 */
+let pendingSave: { settings: Settings } | null = null;
+
 export const useSettingsStore = create<SettingsState>((set, get) => ({
   settings: null,
   loaded: false,
@@ -56,6 +65,28 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
   saving: false,
   previewAppearance: null,
   setPreviewAppearance: (a) => set({ previewAppearance: a }),
+
+  commitAppearanceDebounced: (patch) => {
+    const cur = get().settings?.appearance ?? currentAppearance(get().settings, get().previewAppearance);
+    const next = typeof patch === "function" ? patch(cur) : { ...cur, ...patch };
+    // 1) 立即写入 preview → 网格/Viewer 跟随（不动已落库 settings，避免半提交态）
+    set({ previewAppearance: next });
+    // 2) 组装完整 settings 并防抖持久化
+    const base = get().settings;
+    if (!base) return; // 设置尚未就绪（理论不会发生，load 早于任何消费）
+    pendingSave = { settings: { ...base, appearance: next } };
+    if (appearanceTimer) clearTimeout(appearanceTimer);
+    appearanceTimer = setTimeout(() => {
+      appearanceTimer = null;
+      const p = pendingSave;
+      pendingSave = null;
+      if (!p) return;
+      void get().save(p.settings).then(() => {
+        const settled = get().settings;
+        if (settled) set({ previewAppearance: settled.appearance });
+      });
+    }, 800);
+  },
 
   load: () => {
     const s = get();

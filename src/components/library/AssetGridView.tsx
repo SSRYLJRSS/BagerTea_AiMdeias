@@ -1,6 +1,8 @@
 /** 通用素材网格（P2.4）：受控组件，不 import useLibraryStore。
- *  虚拟滚动、选中/批量操作、右键菜单全部在此；AssetGrid 只是普通素材库的薄封装。 */
-import { useCallback, useEffect, useMemo, useState } from "react";
+ *  虚拟滚动、选中/批量操作、右键菜单全部在此；AssetGrid 只是普通素材库的薄封装。
+ *  FB2-01/02（§9）：格子档位由 appearance.grid 驱动 + 统一比例 + 填充方式；Alt/Ctrl/Cmd+滚轮与
+ *  Ctrl/Cmd+± 增减档位；滚动抑制窗下不激活 hover 预览（FB2-03 护栏，经 GridScrollingContext 传递）。 */
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { useShallow } from "zustand/react/shallow";
 import AssetCard from "./AssetCard";
@@ -9,6 +11,12 @@ import { getAssetUrls, revealInFolder } from "@/api/assets";
 import { useElementSize, useEscape } from "@/hooks/hooks";
 import { useLibraryStore } from "@/stores/libraryStore";
 import { useSelectionStore } from "@/stores/selectionStore";
+import { useAppearance } from "@/hooks/useAppearance";
+import { useSettingsStore } from "@/stores/settingsStore";
+import { GridScrollingContext } from "@/components/library/GridScrollContext";
+import { CELL_STEPS } from "@/types/settings";
+import { ASPECT_RATIO } from "@/utils/cellFit";
+import { thumbSizeForCell } from "@/utils/thumbSize";
 import type { Asset } from "@/types/asset";
 
 export interface AssetGridViewProps extends LibraryGridActions {
@@ -36,7 +44,8 @@ export interface LibraryGridActions {
 }
 
 const GAP = 8;
-const MIN_CARD = 160;
+/** FB2-03：滚动停止后多少毫秒视为「静止」，可重新允许 hover 预览 */
+const SCROLL_SUPPRESS_MS = 150;
 
 export default function AssetGridView({
   items,
@@ -64,20 +73,31 @@ export default function AssetGridView({
     })),
   );
   const { ref, width } = useElementSize<HTMLDivElement>();
-  // 内部滚动容器元素（外部容器存在时用外部，否则用自建）
-  const containerEl = scrollElementRef?.current ?? ref.current;
+
+  // FB2-01/02：外观驱动尺寸
+  const { grid } = useAppearance();
+  const cell = CELL_STEPS[grid.libraryCellStep];
+  const columns = Math.max(2, Math.floor((width + GAP) / (cell + GAP)));
+  const rowCount = Math.ceil(items.length / columns);
+  const orderedIds = useMemo(() => items.map((a) => a.id), [items]);
+  const cellWidth = Math.max(1, (width - GAP * (columns - 1)) / columns);
+  const [rw, rh] = ASPECT_RATIO[grid.cellAspect] ?? ASPECT_RATIO["1:1"];
+  const rowHeight = cellWidth * (rh / rw) + GAP;
+  const thumbSize = thumbSizeForCell(cell);
+
   // §7.2 / FB2-06：Viewer 关闭后恢复网格滚动位置（按键隔离，scrollRestoreKey 为空时跳过）
   useEffect(() => {
     if (!scrollRestoreKey) return;
-    const el = containerEl;
+    const el = scrollElementRef?.current ?? ref.current;
     const saved = useLibraryStore.getState().getGridScrollTop(scrollRestoreKey);
     if (el && saved > 0) el.scrollTop = saved;
     // 仅挂载时恢复一次（Virtualizer 接管后续滚动）
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [scrollRestoreKey]);
+
   // 滚动位置写入 store（Viewer 打开前最后值；滚动容器卸载再恢复）
   useEffect(() => {
-    const el = containerEl;
+    const el = scrollElementRef?.current ?? ref.current;
     if (!el || !scrollRestoreKey) return;
     let raf = 0;
     const onScroll = () => {
@@ -91,18 +111,20 @@ export default function AssetGridView({
       el.removeEventListener("scroll", onScroll);
       cancelAnimationFrame(raf);
     };
-  }, [containerEl, scrollRestoreKey]);
-
-  const columns = Math.max(2, Math.floor((width + GAP) / (MIN_CARD + GAP)));
-  const rowCount = Math.ceil(items.length / columns);
-  const orderedIds = useMemo(() => items.map((a) => a.id), [items]);
+  }, [scrollElementRef, ref, scrollRestoreKey]);
 
   const virtualizer = useVirtualizer({
     count: rowCount,
     getScrollElement: () => scrollElementRef?.current ?? ref.current,
-    estimateSize: () => (width - GAP * (columns - 1)) / columns + GAP,
+    estimateSize: () => rowHeight,
     overscan: 3,
   });
+
+  // 比例/格宽变化后必须显式 re-measure（TanStack Virtual 不会因 estimateSize 闭包变化自动重算）
+  useEffect(() => {
+    virtualizer.measure();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [rowHeight]);
 
   useEffect(() => {
     const last = virtualizer.getVirtualItems().at(-1);
@@ -118,7 +140,6 @@ export default function AssetGridView({
         rangeTo(index, orderedIds);
       } else {
         // E-1：普通点击/Ctrl/Command 都交给 store 决定添加或删除（additive toggle）。
-        // 修复「普通点击已选素材不做任何事」的缺陷：已选再点即取消。
         toggle(asset.id, index, true);
       }
     },
@@ -129,6 +150,70 @@ export default function AssetGridView({
 
   const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
 
+  // FB2-03 护栏：滚动中及停止后 SCROLL_SUPPRESS_MS 内，网格不激活 hover 预览。
+  const scrollingRef = useRef(false);
+  useEffect(() => {
+    const el = scrollElementRef?.current ?? ref.current;
+    if (!el) return;
+    let t = 0;
+    const disarm = () => {
+      scrollingRef.current = true;
+      window.clearTimeout(t);
+      t = window.setTimeout(() => {
+        scrollingRef.current = false;
+      }, SCROLL_SUPPRESS_MS);
+    };
+    el.addEventListener("scroll", disarm, { passive: true });
+    return () => {
+      el.removeEventListener("scroll", disarm);
+      window.clearTimeout(t);
+    };
+  }, [ref, scrollElementRef]);
+  const isScrolling = useCallback(() => scrollingRef.current, []);
+
+  // FB2-01：档位步进（滚轮/键盘/工具栏共用）。切换前记录中心锚点，切换后尽量回到同一位置。
+  const stepCell = useCallback(
+    (delta: number) => {
+      const cur = grid.libraryCellStep;
+      const next = Math.max(0, Math.min(CELL_STEPS.length - 1, cur + delta));
+      if (next === cur) return;
+      const el = scrollElementRef?.current ?? ref.current;
+      const centerY = (el?.scrollTop ?? 0) + (el?.clientHeight ?? 0) / 2;
+      const anchorRow = Math.floor(centerY / Math.max(1, rowHeight));
+      const anchorIdx = Math.min(Math.max(0, items.length - 1), anchorRow * columns);
+      useSettingsStore.getState().commitAppearanceDebounced((a) => ({
+        ...a,
+        grid: { ...a.grid, libraryCellStep: next },
+      }));
+      requestAnimationFrame(() => virtualizer.scrollToIndex(anchorIdx, { align: "center" }));
+    },
+    [grid.libraryCellStep, rowHeight, columns, items.length, scrollElementRef, ref, virtualizer],
+  );
+
+  // FB2-01：Alt（用户点名）+ Ctrl/Cmd（行业惯例）滚轮增减档位；阻止 WebView2 页面级缩放。
+  // Ctrl+滚轮是可取消 wheel 事件（passive:false + preventDefault）——Leaflet/Mapbox 标准做法。
+  useEffect(() => {
+    const el = scrollElementRef?.current ?? ref.current;
+    if (!el) return;
+    let raf = 0;
+    let lastStepAt = 0;
+    const onWheel = (e: WheelEvent) => {
+      if (!e.altKey && !e.ctrlKey && !e.metaKey) return;
+      e.preventDefault();
+      const now = performance.now();
+      if (now - lastStepAt < 60) return; // 每档最小间隔，触控板惯性一次几十个 wheel
+      lastStepAt = now;
+      cancelAnimationFrame(raf);
+      raf = requestAnimationFrame(() => stepCell(e.deltaY < 0 ? 1 : -1));
+    };
+    el.addEventListener("wheel", onWheel, { passive: false });
+    return () => {
+      el.removeEventListener("wheel", onWheel);
+      cancelAnimationFrame(raf);
+    };
+  }, [stepCell, scrollElementRef, ref]);
+
+  // FB2-01：Ctrl/Cmd + = / - 增减一档（复用既有 keydown 效果，避开 INPUT 与菜单打开态）
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (menu) return;
@@ -140,11 +225,17 @@ export default function AssetGridView({
       } else if (e.key === "i" || e.key === "I") {
         e.preventDefault();
         void fetchAllIds().then(invert);
+      } else if (e.key === "=" || e.key === "+") {
+        e.preventDefault();
+        stepCell(1);
+      } else if (e.key === "-" || e.key === "_") {
+        e.preventDefault();
+        stepCell(-1);
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [fetchAllIds, setAll, invert, menu]);
+  }, [fetchAllIds, setAll, invert, menu, stepCell]);
 
   const handleContextMenu = useCallback(
     (asset: Asset, _index: number, e: React.MouseEvent) => {
@@ -163,7 +254,7 @@ export default function AssetGridView({
   }, []);
 
   const copyPaths = useCallback(async () => {
-    const paths = await getAssetUrls(Array.from(selected));
+    const paths = await getAssetUrls([...selected]);
     await navigator.clipboard.writeText(paths.join("\n"));
   }, [selected]);
 
@@ -216,54 +307,57 @@ export default function AssetGridView({
   }
 
   return (
-    <div
-      ref={ref}
-      className={
-        scrollElementRef
-          ? "min-w-0 flex-1 p-2"
-          : "h-full min-w-0 flex-1 overflow-y-auto p-2"
-      }
-      onClick={(e) => {
-        if (e.target === e.currentTarget) clear();
-      }}
-      onContextMenu={handleBlankContextMenu}
-    >
-      <div style={{ height: virtualizer.getTotalSize(), position: "relative" }}>
-        {virtualizer.getVirtualItems().map((row) => (
-          <div
-            key={row.key}
-            style={{
-              position: "absolute",
-              top: 0,
-              left: 0,
-              width: "100%",
-              transform: `translateY(${row.start}px)`,
-              display: "grid",
-              gridTemplateColumns: `repeat(${columns}, 1fr)`,
-              gap: GAP,
-              paddingBottom: GAP,
-            }}
-          >
-            {Array.from({ length: columns }, (_, c) => {
-              const idx = row.index * columns + c;
-              const asset = items[idx];
-              if (!asset) return <div key={`ph-${row.index}-${c}`} />;
-              return (
-                <AssetCard
-                  key={asset.id}
-                  asset={asset}
-                  index={idx}
-                  selected={selected.has(asset.id)}
-                  onSelect={handleSelect}
-                  onPreview={handlePreview}
-                  onContextMenu={handleContextMenu}
-                />
-              );
-            })}
-          </div>
-        ))}
+    <GridScrollingContext.Provider value={isScrolling}>
+      <div
+        ref={ref}
+        className={
+          scrollElementRef
+            ? "min-w-0 flex-1 p-2"
+            : "h-full min-w-0 flex-1 overflow-y-auto p-2"
+        }
+        onClick={(e) => {
+          if (e.target === e.currentTarget) clear();
+        }}
+        onContextMenu={handleBlankContextMenu}
+      >
+        <div style={{ height: virtualizer.getTotalSize(), position: "relative" }}>
+          {virtualizer.getVirtualItems().map((row) => (
+            <div
+              key={row.key}
+              style={{
+                position: "absolute",
+                top: 0,
+                left: 0,
+                width: "100%",
+                transform: `translateY(${row.start}px)`,
+                display: "grid",
+                gridTemplateColumns: `repeat(${columns}, 1fr)`,
+                gap: GAP,
+                paddingBottom: GAP,
+              }}
+            >
+              {Array.from({ length: columns }, (_, c) => {
+                const idx = row.index * columns + c;
+                const asset = items[idx];
+                if (!asset) return <div key={`ph-${row.index}-${c}`} />;
+                return (
+                  <AssetCard
+                    key={asset.id}
+                    asset={asset}
+                    index={idx}
+                    selected={selected.has(asset.id)}
+                    thumbSize={thumbSize}
+                    onSelect={handleSelect}
+                    onPreview={handlePreview}
+                    onContextMenu={handleContextMenu}
+                  />
+                );
+              })}
+            </div>
+          ))}
+        </div>
+        {menu && <ContextMenu x={menu.x} y={menu.y} entries={menuEntries} onClose={() => setMenu(null)} />}
       </div>
-      {menu && <ContextMenu x={menu.x} y={menu.y} entries={menuEntries} onClose={() => setMenu(null)} />}
-    </div>
+    </GridScrollingContext.Provider>
   );
 }

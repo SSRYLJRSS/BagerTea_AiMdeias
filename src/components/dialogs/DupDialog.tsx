@@ -134,7 +134,7 @@ export default function DupDialog({ open, onClose }: DupDialogProps) {
                           }
                           title={a.filePath}
                         >
-                          <Thumbnail assetId={a.id} placeholderPath={a.placeholderPath} alt={a.fileName} />
+                          <Thumbnail assetId={a.id} placeholderPath={a.placeholderPath} alt={a.fileName} size={512} fit="cover" />
                           {keep && (
                             <span className="absolute top-1 left-1 rounded bg-[var(--color-accent)] px-1 text-[10px] text-[var(--color-accent-text)]">
                               建议保留
