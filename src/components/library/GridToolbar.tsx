@@ -2,6 +2,8 @@
  *  类型筛选已移入左侧栏「类型」区；回收站模式（R-22）渲染恢复/彻底删除操作条
  */
 import { useState } from "react";
+import clsx from "clsx";
+import { Grid3x3, Grid2x2, Square } from "lucide-react";
 import SearchInput from "@/components/common/SearchInput";
 import Button from "@/components/common/Button";
 import ContextActionBar from "@/components/library/ContextActionBar";
@@ -9,6 +11,8 @@ import SelectedFilterTags from "@/components/library/SelectedFilterTags";
 import { useShallow } from "zustand/react/shallow";
 import { useLibraryStore } from "@/stores/libraryStore";
 import { useSelectionStore } from "@/stores/selectionStore";
+import { useAppearance } from "@/hooks/useAppearance";
+import { useSettingsStore } from "@/stores/settingsStore";
 import { trashRestore } from "@/api/assets";
 
 interface GridToolbarProps {
@@ -33,6 +37,13 @@ const SORT_OPTIONS: { value: "created_at" | "taken_at" | "size" | "resolution" |
   { value: "resolution", label: "分辨率" },
 ];
 
+/** FB2-01 三态大小入口：小/中/大 → 档位 1 / 3 / 5（与滚轮、Ctrl+± 状态同步） */
+const SIZE_STEPS = [
+  { step: 1, label: "小", Icon: Grid3x3, title: "格子小" },
+  { step: 3, label: "中", Icon: Grid2x2, title: "格子中" },
+  { step: 5, label: "大", Icon: Square, title: "格子大" },
+];
+
 export default function GridToolbar({ onAiTag, onAssignTags, onExport, onMove, onDelete, onPurge }: GridToolbarProps) {
   const { setFilter, total, sortBy, sortDir, trashOnly, removeLocal } = useLibraryStore(
     useShallow((s) => ({
@@ -46,6 +57,8 @@ export default function GridToolbar({ onAiTag, onAssignTags, onExport, onMove, o
   );
   const { selected, clear } = useSelectionStore(useShallow((s) => ({ selected: s.selected, clear: s.clear })));
   const [restoring, setRestoring] = useState(false);
+  // FB2-01 可发现入口：素材库顶栏三态大小切换（小/中/大 = 档位 1/3/5）
+  const { grid } = useAppearance();
 
   const restore = async () => {
     const ids = Array.from(selected);
@@ -58,6 +71,15 @@ export default function GridToolbar({ onAiTag, onAssignTags, onExport, onMove, o
     } finally {
       setRestoring(false);
     }
+  };
+
+  // FB2-01：顶栏点击三态大小 → 即时预览 + 防抖持久化（与滚轮档位同一管道路径）
+  const setSizeStep = (step: number) => {
+    if (step === grid.libraryCellStep) return;
+    useSettingsStore.getState().commitAppearanceDebounced((a) => ({
+      ...a,
+      grid: { ...a.grid, libraryCellStep: step },
+    }));
   };
 
   return (
@@ -108,6 +130,29 @@ export default function GridToolbar({ onAiTag, onAssignTags, onExport, onMove, o
           </div>
         </>
       )}
+
+      {/* FB2-01 可发现入口：三态大小（小/中/大） */}
+      <div className="flex shrink-0 items-center overflow-hidden rounded-md border border-[var(--color-border)]">
+        {SIZE_STEPS.map(({ step, label, Icon, title }) => (
+          <button
+            key={step}
+            type="button"
+            onClick={() => setSizeStep(step)}
+            aria-label={label}
+            aria-pressed={grid.libraryCellStep === step}
+            title={title}
+            data-active={grid.libraryCellStep === step}
+            className={clsx(
+              "flex h-6 w-7 items-center justify-center text-[var(--color-text-secondary)] transition-colors",
+              grid.libraryCellStep === step
+                ? "bg-[var(--color-accent)] text-[var(--color-accent-text)]"
+                : "hover:bg-[var(--color-surface-hover)] hover:text-[var(--color-text)]",
+            )}
+          >
+            <Icon className="h-3.5 w-3.5" aria-hidden />
+          </button>
+        ))}
+      </div>
 
       <span className="ml-auto shrink-0 text-xs text-[var(--color-text-secondary)]">{total} 项</span>
     </div>
