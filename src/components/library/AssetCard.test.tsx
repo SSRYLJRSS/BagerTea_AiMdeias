@@ -5,9 +5,11 @@
  *  - 双击仍调用 onPreview；
  *  - 缩略图、格式/时长角标、选中勾选正常显示。
  */
-import { describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen } from "@testing-library/react";
+import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
+import { act, fireEvent, render, screen } from "@testing-library/react";
 import AssetCard from "@/components/library/AssetCard";
+import { useSettingsStore, DEFAULT_APPEARANCE } from "@/stores/settingsStore";
+import type { Settings } from "@/types/settings";
 import type { Asset } from "@/types/asset";
 
 vi.mock("@/api/thumbnail", () => ({
@@ -59,7 +61,54 @@ const mkAsset = (over: Partial<Asset> = {}): Asset => ({
 
 const noop = () => {};
 
-describe("AssetCard §6.1（素材库禁止 hover 媒体预览）", () => {
+/** §12：让 hover 预览处于关闭态（素材库两级开关都关）。构造最小可用 settings，不依赖 store 已加载。 */
+function disableHoverPreview() {
+  const base = useSettingsStore.getState().settings;
+  const appearance = base?.appearance ?? DEFAULT_APPEARANCE;
+  useSettingsStore.setState({
+    settings: {
+      ...(base ?? mkMinimalSettings()),
+      appearance: { ...appearance, hoverPreview: { ...appearance.hoverPreview, enabled: false, inLibraryGrid: false } },
+    },
+  });
+}
+
+/** 最小可用完整 Settings（测试用，字段不全会触发 TS 但仍走 normalize 兜底）。 */
+function mkMinimalSettings(): Settings {
+  return {
+    ai: {
+      profiles: [],
+      activeProfile: "",
+      autoTagging: false,
+      videoTagging: false,
+      videoTaggingMode: "cover",
+      videoFrameCount: 3,
+      localModelTier: "light",
+      batchLimit: 500,
+      ollamaSourceId: "auto",
+    },
+    theme: "system",
+    thumbnailCacheMb: 2048,
+    tagCategories: [],
+    aiFacetConfigs: [],
+    libraryRoot: "",
+    trashRetentionDays: 30,
+    customDownloadSources: [],
+    modelDownloadProxy: "",
+    appearance: DEFAULT_APPEARANCE,
+  };
+}
+
+beforeEach(() => {
+  useSettingsStore.setState({ settings: null, previewAppearance: null });
+  vi.useFakeTimers();
+});
+
+afterEach(() => {
+  vi.useRealTimers();
+});
+
+describe("AssetCard §6.1 + FB2-03（素材库 hover 原位视频预览）", () => {
   it("图片卡片渲染树无 <video>、无 role=dialog popover、无 position:fixed 预览层", () => {
     const { container } = render(
       <AssetCard
@@ -82,7 +131,7 @@ describe("AssetCard §6.1（素材库禁止 hover 媒体预览）", () => {
     expect(container.querySelector("img")).not.toBeNull();
   });
 
-  it("视频卡片渲染树同样无隐藏 <video>、无 overlay 浮层（素材库不承担播放）", () => {
+  it("视频卡片：hover 未触发时无 <video>、无 dialog、无 fixed 浮层（默认）", () => {
     const { container } = render(
       <AssetCard
         asset={mkAsset({ mimeType: "video/mp4", durationMs: 5000, fileExt: "mp4" })}
@@ -98,6 +147,58 @@ describe("AssetCard §6.1（素材库禁止 hover 媒体预览）", () => {
     expect(container.querySelector('[role="dialog"]')).toBeNull();
     // 时长角标仍显示
     expect(screen.getByText("0:05")).toBeInTheDocument();
+  });
+
+  it("视频卡片：hover 300ms 后原位出现 <video>，为 absolute inset-0 而非 fixed；无 fixed 浮层", () => {
+    const { container } = render(
+      <AssetCard
+        asset={mkAsset({ mimeType: "video/mp4", durationMs: 5000, fileExt: "mp4" })}
+        index={0}
+        thumbSize={512}
+        selected={false}
+        onSelect={noop}
+        onPreview={noop}
+        onContextMenu={noop}
+      />,
+    );
+    const card = screen.getByRole("button");
+    fireEvent.mouseEnter(card);
+    // 300ms intent 前不出现
+    act(() => vi.advanceTimersByTime(280));
+    expect(container.querySelector("video")).toBeNull();
+    // 300ms 后出现
+    act(() => vi.advanceTimersByTime(30));
+    const v = container.querySelector("video");
+    expect(v).not.toBeNull();
+    // §12.4 承诺：卡内原位播放，absolute inset-0，绝非 fixed
+    expect(v?.className).toContain("absolute");
+    expect(v?.className).toContain("inset-0");
+    expect(v?.className).not.toContain("fixed");
+    // 不制造 fixed 浮层、无 dialog
+    expect(container.querySelector('[role="dialog"]')).toBeNull();
+    const fixed = Array.from(container.querySelectorAll("*")).filter(
+      (el) => (el as HTMLElement).style?.position === "fixed" || (el as HTMLElement).className?.includes?.("fixed"),
+    );
+    expect(fixed).toHaveLength(0);
+  });
+
+  it("视频卡片：设置关闭 hoverPreview 后，hover 300ms 仍无 <video>", () => {
+    disableHoverPreview();
+    const { container } = render(
+      <AssetCard
+        asset={mkAsset({ mimeType: "video/mp4", durationMs: 5000, fileExt: "mp4" })}
+        index={0}
+        thumbSize={512}
+        selected={false}
+        onSelect={noop}
+        onPreview={noop}
+        onContextMenu={noop}
+      />,
+    );
+    const card = screen.getByRole("button");
+    fireEvent.mouseEnter(card);
+    act(() => vi.advanceTimersByTime(400));
+    expect(container.querySelector("video")).toBeNull();
   });
 
   it("双击仍调用 onPreview（进入 Viewer 的入口保持不变）", () => {

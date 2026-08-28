@@ -12,6 +12,11 @@ import { convertFileSrc } from "@tauri-apps/api/core";
 import { getPreviewUrl } from "@/api/preview";
 import { useHoverIntent } from "@/hooks/useHoverIntent";
 import { useDoubleAction } from "@/hooks/useDoubleAction";
+import { useHoverPreviewPlayback } from "@/hooks/useHoverPreviewPlayback";
+import { acquireVideoSlot } from "@/utils/videoSlot";
+import { useAppearance } from "@/hooks/useAppearance";
+import { CELL_STEPS } from "@/types/settings";
+import { ASPECT_CSS, ASPECT_RATIO, resolveFit } from "@/utils/cellFit";
 import type { ImportPlan, ImportPlanItem } from "@/api/import";
 
 type ViewMode = "list" | "grid";
@@ -26,8 +31,9 @@ function fileName(path: string): string {
   return path.split(/[\\/]/).pop() ?? path;
 }
 
-/** 懒加载缩略图：进入视口才请求，淡入过渡；失败显示类型占位 */
-function LazyThumb({ path, kind, className }: { path: string; kind: string; className?: string }) {
+/** 懒加载缩略图：进入视口才请求，淡入过渡；失败显示类型占位。
+ *  §9.2 类冲突修复：基类不含定位（relative），定位由调用方经 className 给（absolute inset-0）。 */
+function LazyThumb({ path, kind, className, fit = "cover" }: { path: string; kind: string; className?: string; fit?: "cover" | "contain" }) {
   const ref = useRef<HTMLDivElement>(null);
   const [visible, setVisible] = useState(false);
   const [url, setUrl] = useState<string | null>(null);
@@ -64,14 +70,15 @@ function LazyThumb({ path, kind, className }: { path: string; kind: string; clas
   }, [visible, path]);
 
   return (
-    <div ref={ref} className={clsx("relative overflow-hidden bg-[var(--color-surface)]", className)}>
+    <div ref={ref} className={clsx("overflow-hidden bg-[var(--color-surface)]", className)}>
       {url && (
         <img
           src={url}
           alt=""
           onLoad={() => setLoaded(true)}
           className={clsx(
-            "h-full w-full object-cover transition-opacity duration-300",
+            "h-full w-full transition-opacity duration-300",
+            fit === "contain" ? "object-contain" : "object-cover",
             loaded ? "opacity-100" : "opacity-0",
           )}
         />
@@ -85,24 +92,9 @@ function LazyThumb({ path, kind, className }: { path: string; kind: string; clas
   );
 }
 
-// ── §10（FB-04）单实例约束：同时最多 1 个视频播放（模块级注册表） ──
-type VideoHandle = { key: string; pause: () => void };
-let activeVideo: VideoHandle | null = null;
-
-/** 抢占「唯一播放位」：新视频激活时先暂停旧实例；返回释放函数（仅自己仍持位时才清空） */
-function acquireVideo(key: string, pause: () => void): () => void {
-  if (activeVideo && activeVideo.key !== key) {
-    activeVideo.pause();
-    activeVideo = null;
-  }
-  activeVideo = { key, pause };
-  return () => {
-    if (activeVideo?.key === key) activeVideo = null;
-  };
-}
-
 /** §10 卡片内视频层：absolute inset-0 铺满卡片；仅 active 时由父级挂载。
- *  muted/playsInline/preload=metadata；失败退回封面并提示双击打开；离开/卸载清 src。 */
+ *  muted/playsInline/preload=metadata；失败退回封面并提示双击打开；离开/卸载清 src。
+ *  FB2-03：播放语义抽到共用 useHoverPreviewPlayback（播「前几秒」不上结尾）；单实例槽用全局 videoSlot。 */
 function PendingVideoLayer({ item }: { item: ImportPlanItem }) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const [vidError, setVidError] = useState(false);
@@ -119,38 +111,19 @@ function PendingVideoLayer({ item }: { item: ImportPlanItem }) {
     };
   }, [item.path]);
 
+  // 挂载即抢占全局唯一位；卸载让出（模块级视频槽，入库页与素材库共用）
   useEffect(() => {
-    if (vidError) return;
     const v = videoRef.current;
-    if (!v) return;
-    const release = acquireVideo(item.path, () => {
-      v.pause();
-      v.removeAttribute("src");
-      v.load(); // 清 src 后 load 会触发 error——错误回调里对「主动释放」标记跳过
+    return acquireVideoSlot(`pending:${item.path}`, () => {
+      if (v) {
+        v.pause();
+        v.removeAttribute("src");
+        void v.load();
+      }
     });
-    let released = false;
-    const onErr = () => {
-      if (released) return;
-      setVidError(true);
-    };
-    const onLoaded = () => {
-      v.currentTime = 0;
-      void v.play().catch(() => {
-        if (!released) setVidError(true);
-      });
-    };
-    v.addEventListener("error", onErr);
-    v.addEventListener("loadedmetadata", onLoaded);
-    return () => {
-      released = true;
-      v.pause();
-      v.removeEventListener("error", onErr);
-      v.removeEventListener("loadedmetadata", onLoaded);
-      v.removeAttribute("src");
-      v.load();
-      release();
-    };
-  }, [item.path, vidError]);
+  }, [item.path]);
+
+  useHoverPreviewPlayback(videoRef, { previewSeconds: 5, onFailed: () => setVidError(true) });
 
   if (vidError) {
     return (
@@ -175,7 +148,6 @@ function PendingVideoLayer({ item }: { item: ImportPlanItem }) {
         muted
         playsInline
         preload="metadata"
-        autoPlay
         className="h-full w-full object-contain"
       />
     </div>
@@ -192,6 +164,11 @@ interface PendingItemProps {
 /** §10 PendingItem：relative + 封面 absolute inset-0 + 视频层仅 active 挂载 + 角标 + 文件名 */
 function PendingItem({ item, running, onRemove, onOpenItem }: PendingItemProps) {
   const hover = useHoverIntent({ disabled: running });
+  // FB2-02（§9.4）：入库网格卡片比例与填充沿用 appearance.grid（决策 4：一个设置管两页）
+  const { grid } = useAppearance();
+  const aspectCSS = ASPECT_CSS[grid.cellAspect] ?? ASPECT_CSS["1:1"];
+  const [cw, ch] = ASPECT_RATIO[grid.cellAspect] ?? ASPECT_RATIO["1:1"];
+  const fit = resolveFit(grid.cellFit, null, cw / ch); // 未入库无内容宽高 → smart 退 cover
   const { onClick, onDoubleClick } = useDoubleAction(
     () => {
       /* 单击暂不动作（预览已在 hover 内） */
@@ -208,12 +185,13 @@ function PendingItem({ item, running, onRemove, onOpenItem }: PendingItemProps) 
   return (
     <div
       className="group relative overflow-hidden rounded-lg border border-[var(--color-border)] bg-[var(--color-bg)] transition-all duration-200 hover:-translate-y-0.5 hover:shadow-md"
+      style={{ aspectRatio: aspectCSS, background: fit === "contain" ? "var(--color-surface)" : undefined }}
       {...hover.triggerProps}
       onClick={onClick}
       onDoubleClick={onDoubleClick}
     >
-      {/* 封面/占位图 absolute inset-0（§10 结构） */}
-      <LazyThumb path={item.path} kind={item.kind} className="absolute inset-0" />
+      {/* 封面/占位图 absolute inset-0（§10 结构；§9.2 基类不含 relative） */}
+      <LazyThumb path={item.path} kind={item.kind} fit={fit} className="absolute inset-0" />
       {/* 视频层 absolute inset-0，仅 active 时挂载（快速扫过不创建实例） */}
       {isVideo && hover.active && <PendingVideoLayer item={item} />}
       {/* 角标 */}
@@ -287,6 +265,8 @@ export default function PendingList({
 }: PendingListProps) {
   const [view, setView] = useState<ViewMode>("list");
   const totalSize = items.reduce((s, i) => s + i.size, 0);
+  // FB2-01/02：入库网格格宽档位驱动（CELL_STEPS[importCellStep]）
+  const { grid } = useAppearance();
 
   return (
     <div className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-lg border border-[var(--color-border)]">
@@ -378,7 +358,10 @@ export default function PendingList({
             ))}
           </div>
         ) : (
-          <div className="grid grid-cols-[repeat(auto-fill,minmax(110px,1fr))] gap-2 p-2">
+          <div
+            className="grid gap-2 p-2"
+            style={{ gridTemplateColumns: `repeat(auto-fill, minmax(${CELL_STEPS[grid.importCellStep]}px, 1fr))` }}
+          >
             {items.map((i) => (
               <PendingItem
                 key={i.path}

@@ -2,11 +2,14 @@
  *  FB2-01/02（§9）：卡格比例由 appearance.grid.cellAspect 决定（决策 4：一个设置管素材库与入库两页），
  *  缩略图填充方式由 appearance.grid.cellFit 经 resolveFit 解析（cover/contain/smart，绝不拉伸）。
  *  hover 只允许边框/文件名透明度变化（§3.3）；双击进入 Viewer。 */
-import { memo, useCallback } from "react";
+import { memo, useCallback, useContext } from "react";
 import clsx from "clsx";
 import Thumbnail from "./Thumbnail";
+import AssetCardVideoLayer from "./AssetCardVideoLayer";
 import { isVideoAsset } from "@/utils/assetKind";
 import { useAppearance } from "@/hooks/useAppearance";
+import { useHoverIntent } from "@/hooks/useHoverIntent";
+import { GridScrollingContext } from "@/components/library/GridScrollContext";
 import { ASPECT_CSS, ASPECT_RATIO, resolveFit } from "@/utils/cellFit";
 import type { Asset } from "@/types/asset";
 
@@ -43,7 +46,8 @@ function formatBadge(ext: string): string | null {
 }
 
 export default memo(function AssetCard({ asset, index, selected, thumbSize, onSelect, onPreview, onContextMenu }: AssetCardProps) {
-  const { grid } = useAppearance();
+  const { grid, hoverPreview } = useAppearance();
+  const isScrolling = useContext(GridScrollingContext);
   const handleClick = useCallback(
     (e: React.MouseEvent) => onSelect(asset, index, e),
     [asset, index, onSelect],
@@ -71,6 +75,13 @@ export default memo(function AssetCard({ asset, index, selected, thumbSize, onSe
   const containerAspect = cw / ch;
   const fit = resolveFit(grid.cellFit, contentAspect, containerAspect);
 
+  // FB2-03：视频 hover 原位预览。滚动抑制窗内不激活（用函数而非布尔传 context，
+  // 避免 re-render；只在 hover 触发那一刻读一次）。设置可关。
+  const previewEnabled = isVideo && hoverPreview.enabled && hoverPreview.inLibraryGrid && !isScrolling();
+  const { active: hoverActive, triggerProps } = useHoverIntent({ disabled: !previewEnabled });
+  // 只在 intent 激活（enter 300ms 后）出现
+  const showVideoLayer = isVideo && previewEnabled && hoverActive;
+
   return (
     <div className="relative">
       <div
@@ -80,6 +91,7 @@ export default memo(function AssetCard({ asset, index, selected, thumbSize, onSe
         onClick={handleClick}
         onDoubleClick={handleDoubleClick}
         onContextMenu={handleContextMenu}
+        {...triggerProps}
         style={{ aspectRatio: aspectCSS }}
         className={clsx(
           "group relative cursor-pointer overflow-hidden rounded-md outline-none select-none",
@@ -89,6 +101,9 @@ export default memo(function AssetCard({ asset, index, selected, thumbSize, onSe
         )}
       >
         <Thumbnail assetId={asset.id} placeholderPath={asset.placeholderPath} alt={asset.fileName} size={thumbSize} fit={fit} />
+
+        {/* FB2-03：视频 hover 原位播放层（absolute inset-0，不是 fixed；卡片内如此结构） */}
+        {showVideoLayer && <AssetCardVideoLayer asset={asset} previewSeconds={hoverPreview.previewSeconds} />}
 
         {/* 视频角标（时长缺失时仅按视频识别，不显示时长数字） */}
         {isVideo && asset.durationMs != null && (
