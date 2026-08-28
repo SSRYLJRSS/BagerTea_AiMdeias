@@ -16,7 +16,9 @@ import {
     ollamaOpenModelDir,
     ollamaProbeSources,
     ollamaRemoveCustomSource,
+    ollamaRuntimeStatus,
     ollamaStartService,
+    ollamaStopService,
     onOllamaInstallLog,
     onOllamaInstallProgress,
     probeOllamaHardware,
@@ -26,6 +28,7 @@ import {
     type InstallProgress,
     type InstallStatus,
     type LocalModelInfo,
+    type OllamaRuntimeSnapshot,
     type SourceProbe,
 } from "@/api/ollama";
 import { useTauriEvent } from "@/hooks/hooks";
@@ -34,6 +37,9 @@ import type { ApiProfile, CustomSource, Settings } from "@/types/settings";
 
 const DEFAULT_LOCAL_BASE = "http://localhost:11434/v1";
 const PROBE_CACHE_MS = 5 * 60 * 1000; // 测速结果内存缓存 5 分钟
+
+/** §8.5 空闲保留时长展示文案（与后端 KEEP_ALIVE_IDLE=2m 一致） */
+const KEEP_ALIVE_LABEL = "2 分钟";
 
 const fmtMb = (bytes: number) => `${(bytes / 1024 / 1024).toFixed(0)} MB`;
 const fmtSpeed = (bps: number) =>
@@ -91,6 +97,9 @@ export default function LocalModelGroup({ draft, onPatchAi, onPatchSettings, not
     const [confirmingDelete, setConfirmingDelete] = useState<string | null>(null);
     const [deletingModel, setDeletingModel] = useState<string | null>(null);
     const [modelDir, setModelDir] = useState<string | null>(null);
+    // ---- L2 运行态（§8.2/§8.5）：ownership + 停止服务 ----
+    const [runtime, setRuntime] = useState<OllamaRuntimeSnapshot | null>(null);
+    const [stopping, setStopping] = useState(false);
     const customFormRef = useRef<HTMLDivElement>(null);
     // ---- 安装监控（输出框 + 卡死检测） ----
     const [logs, setLogs] = useState<InstallLogLine[]>([]);
@@ -137,6 +146,8 @@ export default function LocalModelGroup({ draft, onPatchAi, onPatchSettings, not
             setStatus(st);
             if (st.running) setHw(await probeOllamaHardware().catch(() => null));
             else setHw(null);
+            // L2：同步运行态（ownership 只在服务运行时有意义；失败不阻塞向导）
+            setRuntime(await ollamaRuntimeStatus().catch(() => null));
         } catch {
             // A-3：检测失败只在「本地打标」分组显示局部错误，不阻塞在线打标/视频开关
             setStatus(null);
@@ -333,6 +344,24 @@ export default function LocalModelGroup({ draft, onPatchAi, onPatchSettings, not
         }
     };
 
+    /** L2（§8.2）：停止服务——仅 AppOwned 可停；External（用户自启）应用永不停止 */
+    const onStopService = async () => {
+        setStopping(true);
+        try {
+            const res = await ollamaStopService();
+            if (!res.stopped) {
+                fail("该服务不是应用启动的（外部服务），应用不会停止它");
+            } else {
+                notify("Ollama 服务已停止（模型已释放）");
+            }
+        } catch (e) {
+            fail(errMsg(e));
+        } finally {
+            setStopping(false);
+            void refresh();
+        }
+    };
+
     /** 确保存在本地档案并写入模型、置为激活（只改 draft，保存设置才生效） */
     const ensureLocalProfile = (model: string) => {
         const existing = draft.ai.profiles.find((p) => p.kind === "local");
@@ -382,7 +411,7 @@ export default function LocalModelGroup({ draft, onPatchAi, onPatchSettings, not
                 <div className="flex flex-col gap-2 p-3">
                     <p className="text-sm text-[var(--color-danger)]">本地环境检测失败</p>
                     <p className="text-xs leading-5 text-[var(--color-text-secondary)]">
-                        无法判断 Ollama 是否已安装。这不影响「在线打标」和视频 AI 打标；可稍后重试，或到「在线打标」分组使用云端 API。
+                        无法判断 Ollama 是否已安装。这不影响「自动打标」和视频 AI 打标；可稍后重试，或到「自动打标」分组使用云端 API。
                     </p>
                     <div>
                         <Button variant="ghost" onClick={() => void refresh()}>
@@ -624,6 +653,38 @@ export default function LocalModelGroup({ draft, onPatchAi, onPatchSettings, not
                     </span>
                 )}
             </p>
+
+            {/* L2 运行态（§8.5 服务管理）：ownership 只读展示 + 停止服务（仅 AppOwned） */}
+            {runtime?.ownership && (
+                <div className="flex items-center gap-2 rounded-md border border-[var(--color-border)] px-2.5 py-2">
+                    <div className="min-w-0 flex-1">
+                        <p className="text-xs text-[var(--color-text)]">
+                            {runtime.ownership.kind === "appOwned" ? (
+                                <>
+                                    运行中（应用启动 · PID {runtime.ownership.detail.pid}）
+                                    <span className="ml-1.5 text-[10px] text-[var(--color-text-secondary)]">
+                                        空闲 {KEEP_ALIVE_LABEL} 后模型自动释放内存
+                                    </span>
+                                </>
+                            ) : (
+                                <>
+                                    运行中（外部服务，非应用启动）
+                                    <span className="ml-1.5 text-[10px] text-[var(--color-text-secondary)]">
+                                        应用不会停止外部服务
+                                    </span>
+                                </>
+                            )}
+                        </p>
+                    </div>
+                    <Button
+                        variant="ghost"
+                        disabled={stopping || runtime.ownership.kind !== "appOwned"}
+                        onClick={() => void onStopService()}
+                    >
+                        {stopping ? "停止中…" : runtime.ownership.kind === "appOwned" ? "停止服务" : "外部服务"}
+                    </Button>
+                </div>
+            )}
 
             {(hw?.recommendations ?? []).map((r) => (
                 <div

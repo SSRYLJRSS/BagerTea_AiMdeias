@@ -121,6 +121,39 @@ export function ollamaStartService(): Promise<void> {
     return invoke<void>("ollama_start_service");
 }
 
+// ---- L2 运行态（§8.2/§8.5）：ownership + 停止服务 ----
+
+/** 服务归属：应用自启（AppOwned，可停）或外部已有（External，应用永不停止） */
+export type OllamaOwnership =
+    | { kind: "external" }
+    | { kind: "appOwned"; detail: { pid: number; startedAt: number } };
+
+export interface OllamaRuntimeSnapshot {
+    ownership: OllamaOwnership | null;
+    lastActivityAt: number;
+}
+
+export interface OllamaStopResult {
+    before: OllamaOwnership | null;
+    stopped: boolean;
+    after: OllamaRuntimeSnapshot;
+}
+
+/** 启动服务（L2：已有服务标记 External；自启保存 AppOwned），返回运行态快照 */
+export function ollamaStartServiceWithStatus(): Promise<OllamaRuntimeSnapshot> {
+    return invoke<OllamaRuntimeSnapshot>("ollama_start_service");
+}
+
+/** 查询本地服务运行态（ownership / 最近活动时间） */
+export function ollamaRuntimeStatus(): Promise<OllamaRuntimeSnapshot> {
+    return invoke<OllamaRuntimeSnapshot>("ollama_runtime_status");
+}
+
+/** 停止服务：仅停止 AppOwned；External 服务应用永不停止（返回 stopped=false 且 before=external） */
+export function ollamaStopService(): Promise<OllamaStopResult> {
+    return invoke<OllamaStopResult>("ollama_stop_service");
+}
+
 /** 删除已缓存的 Ollama 安装包（释放空间；返回是否删除了文件） */
 export function ollamaRemoveInstaller(): Promise<boolean> {
     return invoke<boolean>("ollama_remove_installer");

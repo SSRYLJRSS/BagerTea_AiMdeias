@@ -64,3 +64,8 @@ export function inspectImport(paths: string[]): Promise<ImportPlan> {
 export function onImportProgress(handler: (p: ImportProgress) => void): Promise<UnlistenFn> {
   return on<ImportProgress>("import://progress", handler);
 }
+
+/** 用系统默认应用打开待入库原文件（§10 双击打开；失败静默由调用方处理） */
+export function openFileExternal(path: string): Promise<void> {
+  return invoke<void>("open_file_external", { path });
+}

@@ -8,6 +8,7 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import Button from "@/components/common/Button";
 import PendingList, { formatSize } from "@/components/import/PendingList";
 import RenameBuilder from "@/components/import/RenameBuilder";
+import { openFileExternal } from "@/api/import";
 import {
   cancelImport,
   importFiles,
@@ -281,6 +282,7 @@ export default function ImportPage() {
             onAddFiles={choose}
             onAddFolder={chooseFolder}
             onClear={clearPlan}
+            onOpenItem={(p) => void openFileExternal(p).catch(() => undefined)}
           />
         ) : (
           <div
