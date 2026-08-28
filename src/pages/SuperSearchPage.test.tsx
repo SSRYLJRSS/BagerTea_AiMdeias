@@ -1,8 +1,15 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen } from "@testing-library/react";
 import SuperSearchPage from "@/pages/SuperSearchPage";
 import { useSuperSearchStore } from "@/stores/superSearchStore";
 import { useSelectionStore } from "@/stores/selectionStore";
+
+// 让 rAF 同步执行：滚动方向 hook 依赖它（jsdom 无真实 rAF 时钟）
+vi.spyOn(global, "requestAnimationFrame").mockImplementation((cb) => {
+  cb(0);
+  return 0;
+});
+vi.spyOn(global, "cancelAnimationFrame").mockImplementation(() => {});
 
 vi.mock("@/api/assets", () => ({
   listAssets: vi.fn().mockResolvedValue({ items: [], total: 0, hasMore: false }),
@@ -79,6 +86,37 @@ describe("SuperSearchPage", () => {
     expect(screen.getByText("超级搜索")).toBeInTheDocument();
     expect(screen.getByText("← 返回")).toBeInTheDocument();
     expect(screen.getAllByRole("searchbox")).toHaveLength(1);
+    expect(screen.getByRole("region", { name: "条件公式" })).toBeInTheDocument();
+  });
+
+  function scrollTo(top: number) {
+    const el = screen.getByTestId("super-search-scroll") as HTMLElement;
+    Object.defineProperty(el, "scrollTop", { configurable: true, value: top, writable: true });
+    fireEvent.scroll(el);
+  }
+
+  it("FB-06：下滚收起详细条件，上滚恢复", () => {
+    render(<SuperSearchPage onBack={() => undefined} />);
+    expect(screen.getByRole("region", { name: "条件公式" })).toBeInTheDocument();
+    // 下滚超过阈值 → 条件面板收起
+    scrollTo(40);
+    expect(screen.queryByRole("region", { name: "条件公式" })).not.toBeInTheDocument();
+    // 上滚 → 恢复
+    scrollTo(0);
+    expect(screen.getByRole("region", { name: "条件公式" })).toBeInTheDocument();
+  });
+
+  it("FB-06：底部快速编辑条打开抽屉", () => {
+    render(<SuperSearchPage onBack={() => undefined} />);
+    fireEvent.click(screen.getByRole("button", { name: "快速编辑条件" }));
+    fireEvent.click(screen.getByRole("button", { name: "关闭快速编辑" }));
+  });
+
+  it("FB-06：focus 进入时强制展开（不隐藏焦点）", () => {
+    render(<SuperSearchPage onBack={() => undefined} />);
+    scrollTo(60); // 收起
+    expect(screen.queryByRole("region", { name: "条件公式" })).not.toBeInTheDocument();
+    fireEvent.focus(screen.getByRole("searchbox") as HTMLElement);
     expect(screen.getByRole("region", { name: "条件公式" })).toBeInTheDocument();
   });
 });

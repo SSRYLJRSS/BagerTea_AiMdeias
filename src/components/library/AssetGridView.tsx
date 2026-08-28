@@ -18,6 +18,9 @@ export interface AssetGridViewProps extends LibraryGridActions {
   loadMore: () => void;
   fetchAllIds: () => Promise<number[]>;
   onPreview: (asset: Asset) => void;
+  /** §12（FB-06）：外部主滚动容器。缺省时内部自建可滚容器（普通库页）；
+   *  提供时虚拟滚动使用外部容器，内部不再 overflow 自身。 */
+  scrollElementRef?: React.RefObject<HTMLElement | null>;
 }
 
 /** 批量操作入口（顶栏与右键菜单共用） */
@@ -44,6 +47,7 @@ export default function AssetGridView({
   onExport,
   onMove,
   onDelete,
+  scrollElementRef,
 }: AssetGridViewProps) {
   const { selected, toggle, rangeTo, clear, setAll, invert } = useSelectionStore(
     useShallow((s) => ({
@@ -56,9 +60,11 @@ export default function AssetGridView({
     })),
   );
   const { ref, width } = useElementSize<HTMLDivElement>();
+  // 内部滚动容器元素（外部容器存在时用外部，否则用自建）
+  const containerEl = scrollElementRef?.current ?? ref.current;
   // §7.2：Viewer 关闭后恢复网格滚动位置（库页上下文保持；store 持有滚动量）
   useEffect(() => {
-    const el = ref.current;
+    const el = containerEl;
     const saved = useLibraryStore.getState().gridScrollTop;
     if (el && saved > 0) el.scrollTop = saved;
     // 仅挂载时恢复一次（Virtualizer 接管后续滚动）
@@ -66,7 +72,7 @@ export default function AssetGridView({
   }, []);
   // 滚动位置写入 store（Viewer 打开前最后值；滚动容器卸载再恢复）
   useEffect(() => {
-    const el = ref.current;
+    const el = containerEl;
     if (!el) return;
     let raf = 0;
     const onScroll = () => {
@@ -80,7 +86,7 @@ export default function AssetGridView({
       el.removeEventListener("scroll", onScroll);
       cancelAnimationFrame(raf);
     };
-  }, []);
+  }, [containerEl]);
 
   const columns = Math.max(2, Math.floor((width + GAP) / (MIN_CARD + GAP)));
   const rowCount = Math.ceil(items.length / columns);
@@ -88,7 +94,7 @@ export default function AssetGridView({
 
   const virtualizer = useVirtualizer({
     count: rowCount,
-    getScrollElement: () => ref.current,
+    getScrollElement: () => scrollElementRef?.current ?? ref.current,
     estimateSize: () => (width - GAP * (columns - 1)) / columns + GAP,
     overscan: 3,
   });
@@ -191,7 +197,14 @@ export default function AssetGridView({
 
   if (items.length === 0) {
     return (
-      <div ref={ref} className="flex h-full flex-1 items-center justify-center text-sm text-[var(--color-text-secondary)]">
+      <div
+        ref={ref}
+        className={
+          scrollElementRef
+            ? "flex min-h-0 flex-1 items-center justify-center text-sm text-[var(--color-text-secondary)]"
+            : "flex h-full flex-1 items-center justify-center text-sm text-[var(--color-text-secondary)]"
+        }
+      >
         {loading ? "加载中…" : total === 0 ? "没有符合条件的素材" : "没有匹配的素材"}
       </div>
     );
@@ -200,7 +213,11 @@ export default function AssetGridView({
   return (
     <div
       ref={ref}
-      className="h-full min-w-0 flex-1 overflow-y-auto p-2"
+      className={
+        scrollElementRef
+          ? "min-w-0 flex-1 p-2"
+          : "h-full min-w-0 flex-1 overflow-y-auto p-2"
+      }
       onClick={(e) => {
         if (e.target === e.currentTarget) clear();
       }}
