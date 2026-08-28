@@ -3,11 +3,13 @@
  * （对应 M7 BAT-001~008 / LIB-018；jsdom 下补齐 ResizeObserver 与尺寸 mock 支撑虚拟网格）
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { listAssetIds } from "@/api/assets";
 import AssetGrid from "@/components/library/AssetGrid";
 import { useLibraryStore } from "@/stores/libraryStore";
 import { useSelectionStore } from "@/stores/selectionStore";
+import { useSettingsStore, DEFAULT_APPEARANCE } from "@/stores/settingsStore";
+import type { Settings } from "@/types/settings";
 import type { Asset } from "@/types/asset";
 
 // ── mock API 层 ──
@@ -302,5 +304,59 @@ describe("AssetGrid §13.1 列数变化稳定性", () => {
     expect(useSelectionStore.getState().selected.has(2)).toBe(true);
     // a2 的卡片 aria-selected 仍在（卡片未被整行 key 重置）
     expect(cardByName("a2.jpg").getAttribute("aria-selected")).toBe("true");
+  });
+});
+
+describe("AssetGrid FB2-01 档位缩放（Alt/Ctrl+滚轮）", () => {
+  function mkSettingsAppearance(): Settings {
+    return {
+      ai: {
+        profiles: [],
+        activeProfile: "",
+        autoTagging: false,
+        videoTagging: false,
+        videoTaggingMode: "cover",
+        videoFrameCount: 3,
+        localModelTier: "light",
+        batchLimit: 500,
+        ollamaSourceId: "auto",
+      },
+      theme: "system",
+      thumbnailCacheMb: 2048,
+      tagCategories: [],
+      aiFacetConfigs: [],
+      libraryRoot: "",
+      trashRetentionDays: 30,
+      customDownloadSources: [],
+      modelDownloadProxy: "",
+      appearance: DEFAULT_APPEARANCE,
+    };
+  }
+
+  it("Alt+滚轮上滚 → 档位 +1 且不越界；即时写入 previewAppearance", () => {
+    vi.useFakeTimers();
+    useSettingsStore.setState({ settings: mkSettingsAppearance(), previewAppearance: null });
+    useLibraryStore.setState({ items: [mkAsset(1), mkAsset(2)], total: 2 });
+    const { container } = renderGrid();
+    const scrollEl = container.querySelector(".overflow-y-auto") as HTMLElement;
+    expect(scrollEl).not.toBeNull();
+
+    // 先把时钟推过 60ms 节流窗（performance.now 从 0 起，否则首个 wheel 被节流吞掉）
+    act(() => vi.advanceTimersByTime(100));
+    // 上滚 +1：档位 3 → 4（推进 rAF 让 handler 内 step 落地）
+    fireEvent.wheel(scrollEl, { altKey: true, deltaY: -100 });
+    act(() => vi.advanceTimersByTime(16));
+    expect(useSettingsStore.getState().previewAppearance?.grid.libraryCellStep).toBe(4);
+    vi.useRealTimers();
+  });
+
+  it("不按修饰键的滚轮不触发档位变化（无回归）", () => {
+    useSettingsStore.setState({ settings: mkSettingsAppearance(), previewAppearance: null });
+    useLibraryStore.setState({ items: [mkAsset(1)], total: 1 });
+    const { container } = renderGrid();
+    const scrollEl = container.querySelector(".overflow-y-auto") as HTMLElement;
+    fireEvent.wheel(scrollEl, { deltaY: -100 }); // 无 Alt/Ctrl
+    expect(useSettingsStore.getState().previewAppearance).toBeNull();
+    // 无修饰键 + Alt 关，行为不变
   });
 });
