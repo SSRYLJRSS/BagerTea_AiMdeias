@@ -155,6 +155,8 @@ fn settings_with(profile: ApiProfile) -> AiSettings {
         model: String::new(),
         auto_tagging: false,
         video_tagging: false,
+        video_tagging_mode: "cover".into(),
+        video_frame_count: 3,
         local_model_tier: "light".into(),
         batch_limit: 500,
         ollama_source_id: "auto".into(),

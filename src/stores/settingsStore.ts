@@ -3,7 +3,7 @@ import { create } from "zustand";
 import { getSettings, saveSettings } from "@/api/settings";
 import { normalizeSettings } from "@/utils/normalizeSettings";
 import { markStartup } from "@/utils/startupMarks";
-import type { Settings } from "@/types/settings";
+import type { Appearance, Settings } from "@/types/settings";
 
 /** R-24：主题写入 <html> 的 data-theme（system 时 media query 接管，light/dark 显式生效） */
 export function applyTheme(theme: Settings["theme"]) {
@@ -17,8 +17,28 @@ interface SettingsState {
   loading: boolean;
   loadError: string | null; // B28：新增——加载失败时暴露错误，前端可据此禁用保存防覆盖
   saving: boolean;
+  /** §8.4 FB2-01/02/08：外观设置的即时预览通道。SettingsPage 编辑草稿时写入，
+   *  网格/Viewer 立即消费（等效 applyTheme 语义）；保存成功后由 save() 与已落库值对齐。 */
+  previewAppearance: Appearance | null;
+  setPreviewAppearance: (a: Appearance | null) => void;
   load: () => Promise<void>;
   save: (s: Settings) => Promise<void>;
+}
+
+/** FB2-03 默认外观（与 Rust 端 default_* 对齐）；settings 未加载时用作兜底。 */
+export const DEFAULT_APPEARANCE: Appearance = {
+  grid: { libraryCellStep: 3, importCellStep: 1, cellAspect: "1:1", cellFit: "cover", matchDominantColor: false },
+  hoverPreview: { enabled: true, previewSeconds: 3, inLibraryGrid: true },
+  colorStrip: { enabled: true, showInLibraryGrid: false, showInViewer: true, showInImportGrid: false, height: "normal", mode: "ratio", count: 6 },
+};
+
+/**
+ * 读取当前生效外观：草稿预览优先，其次已落库值，最后编译期默认。
+ * 这样 SettingsPage 拖动滑块时网格立刻跟随，而其他页面读到的是已保存值或默认。
+ */
+export function currentAppearance(s: Settings | null, preview: Appearance | null): Appearance {
+  if (preview) return preview;
+  return s?.appearance ?? DEFAULT_APPEARANCE;
 }
 
 /**
@@ -34,6 +54,8 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
   loading: false,
   loadError: null,
   saving: false,
+  previewAppearance: null,
+  setPreviewAppearance: (a) => set({ previewAppearance: a }),
 
   load: () => {
     const s = get();

@@ -77,6 +77,12 @@ pub struct AiSettings {
     pub auto_tagging: bool,
     #[serde(default)]
     pub video_tagging: bool,
+    /// FB2-07：视频打标模式（cover 复用封面 / frames 抽帧）；默认 cover（决策 5）
+    #[serde(default = "default_video_tagging_mode")]
+    pub video_tagging_mode: String,
+    /// FB2-07：frames 模式抽帧数（2~8），默认 3
+    #[serde(default = "default_video_frame_count")]
+    pub video_frame_count: i64,
     #[serde(default = "default_tier")]
     pub local_model_tier: String,
     #[serde(default = "default_batch_limit")]
@@ -105,6 +111,11 @@ impl AiSettings {
             });
             self.active_profile = "default".into();
         }
+        // FB2-07：视频打标模式与帧数校验
+        if self.video_tagging_mode != "frames" {
+            self.video_tagging_mode = "cover".into();
+        }
+        self.video_frame_count = self.video_frame_count.clamp(2, 8);
     }
 
     /// 当前激活档案（找不到时回退第一套）
@@ -115,7 +126,7 @@ impl AiSettings {
             .or(self.profiles.first())
     }
 
-    /// 激活档案 id（不回退第一套；供连接迁移/回退判断）
+    /// 当前激活档案 id（回退第一套的地址；供连接迁移/回退判断）
     pub fn active_profile_opt(&self) -> Option<String> {
         if self.active_profile.is_empty() {
             None
@@ -142,6 +153,12 @@ fn default_model() -> String {
 }
 fn default_tier() -> String {
     "light".into()
+}
+fn default_video_tagging_mode() -> String {
+    "cover".into()
+}
+fn default_video_frame_count() -> i64 {
+    3
 }
 fn default_batch_limit() -> i64 {
     500 // v2.5：胶片条方案下放宽（老板拍板）
@@ -197,6 +214,8 @@ impl Default for AiSettings {
             model: default_model(),
             auto_tagging: false,
             video_tagging: false,
+            video_tagging_mode: default_video_tagging_mode(),
+            video_frame_count: default_video_frame_count(),
             local_model_tier: default_tier(),
             batch_limit: default_batch_limit(),
             ollama_source_id: default_ollama_source_id(),
@@ -211,6 +230,173 @@ pub struct CustomSource {
     pub id: String,
     pub label: String,
     pub url: String,
+}
+
+/// FB2-01/02：素材网格外观（档位/比例/填充/匹配主色）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GridAppearance {
+    /// 素材库格子档位（CELL_STEPS 下标），默认 3（=190px）
+    #[serde(default = "default_library_cell_step")]
+    pub library_cell_step: i64,
+    /// 入库网格格子档位，默认 1（=120px）
+    #[serde(default = "default_import_cell_step")]
+    pub import_cell_step: i64,
+    /// 统一容器比例（决策 4），默认 "1:1"
+    #[serde(default = "default_cell_aspect")]
+    pub cell_aspect: String,
+    /// 填充方式 cover|contain|smart，默认 "cover"
+    #[serde(default = "default_cell_fit")]
+    pub cell_fit: String,
+    /// contain 留边是否填该素材主色，默认 false
+    #[serde(default)]
+    pub match_dominant_color: bool,
+}
+
+fn default_library_cell_step() -> i64 {
+    3
+}
+fn default_import_cell_step() -> i64 {
+    1
+}
+fn default_cell_aspect() -> String {
+    "1:1".into()
+}
+fn default_cell_fit() -> String {
+    "cover".into()
+}
+
+/// FB2-03：悬停预览（入库页 + 素材库）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HoverPreviewAppearance {
+    /// 总开关，默认 true（bool 需显式 default，避免误为 false）
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// 预览时长（秒）2~10，默认 3
+    #[serde(default = "default_preview_seconds")]
+    pub preview_seconds: i64,
+    /// 素材库网格是否启用，默认 true
+    #[serde(default = "default_true")]
+    pub in_library_grid: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+fn default_preview_seconds() -> i64 {
+    3
+}
+
+/// FB2-08：算法色条显示外观
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ColorStripAppearance {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub show_in_library_grid: bool,
+    #[serde(default = "default_true")]
+    pub show_in_viewer: bool,
+    #[serde(default)]
+    pub show_in_import_grid: bool,
+    #[serde(default = "default_strip_height")]
+    pub height: String,
+    #[serde(default = "default_strip_mode")]
+    pub mode: String,
+    #[serde(default = "default_strip_count")]
+    pub count: i64,
+}
+
+fn default_strip_height() -> String {
+    "normal".into()
+}
+fn default_strip_mode() -> String {
+    "ratio".into()
+}
+fn default_strip_count() -> i64 {
+    6
+}
+
+/// 外观/交互子对象（批次 2 与批次 3/4 共用）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Appearance {
+    #[serde(default)]
+    pub grid: GridAppearance,
+    #[serde(default)]
+    pub hover_preview: HoverPreviewAppearance,
+    #[serde(default)]
+    pub color_strip: ColorStripAppearance,
+}
+
+impl Default for GridAppearance {
+    fn default() -> Self {
+        Self {
+            library_cell_step: default_library_cell_step(),
+            import_cell_step: default_import_cell_step(),
+            cell_aspect: default_cell_aspect(),
+            cell_fit: default_cell_fit(),
+            match_dominant_color: false,
+        }
+    }
+}
+impl Default for HoverPreviewAppearance {
+    fn default() -> Self {
+        Self {
+            enabled: default_true(),
+            preview_seconds: default_preview_seconds(),
+            in_library_grid: default_true(),
+        }
+    }
+}
+impl Default for ColorStripAppearance {
+    fn default() -> Self {
+        Self {
+            enabled: default_true(),
+            show_in_library_grid: false,
+            show_in_viewer: default_true(),
+            show_in_import_grid: false,
+            height: default_strip_height(),
+            mode: default_strip_mode(),
+            count: default_strip_count(),
+        }
+    }
+}
+impl Default for Appearance {
+    fn default() -> Self {
+        Self {
+            grid: GridAppearance::default(),
+            hover_preview: HoverPreviewAppearance::default(),
+            color_strip: ColorStripAppearance::default(),
+        }
+    }
+}
+
+/// 读取侧：校验并修复 appearance 各字段（非法值回退默认）。在 get_settings 返回前调用。
+pub fn normalize_appearance(s: &mut Settings) {
+    let a = &mut s.appearance;
+    let g = &mut a.grid;
+    g.library_cell_step = g.library_cell_step.clamp(0, 7);
+    g.import_cell_step = g.import_cell_step.clamp(0, 7);
+    if !["1:1", "4:3", "3:2", "16:9", "3:4", "2:3", "9:16"].contains(&g.cell_aspect.as_str()) {
+        g.cell_aspect = default_cell_aspect();
+    }
+    if !["cover", "contain", "smart"].contains(&g.cell_fit.as_str()) {
+        g.cell_fit = default_cell_fit();
+    }
+    let h = &mut a.hover_preview;
+    h.preview_seconds = h.preview_seconds.clamp(2, 10);
+    let cs = &mut a.color_strip;
+    if ![4, 6, 8].contains(&cs.count) {
+        cs.count = default_strip_count();
+    }
+    if !["thin", "normal", "thick"].contains(&cs.height.as_str()) {
+        cs.height = default_strip_height();
+    }
+    if !["ratio", "equal"].contains(&cs.mode.as_str()) {
+        cs.mode = default_strip_mode();
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -241,6 +427,9 @@ pub struct Settings {
     /// Ollama 模型下载代理（改造方案·加速项 A：拉起 serve 时注入 HTTPS_PROXY；空 = 不用代理）
     #[serde(default)]
     pub model_download_proxy: String,
+    /// FB2-01/02/03/08：外观与交互设置
+    #[serde(default)]
+    pub appearance: Appearance,
 }
 
 fn default_theme() -> String {
@@ -265,6 +454,7 @@ impl Default for Settings {
             trash_retention_days: default_trash_retention_days(),
             custom_download_sources: default_custom_sources(),
             model_download_proxy: String::new(),
+            appearance: Appearance::default(),
         }
     }
 }
@@ -370,6 +560,7 @@ pub fn get_settings(conn: &Connection) -> AppResult<Settings> {
         migrate_tag_categories_to_facets(&mut s);
         normalize_ai_facet_defaults(&mut s);
         s.ai.normalize();
+        normalize_appearance(&mut s);
         return Ok(s);
     }
     let mut d = Settings::default();
@@ -541,5 +732,60 @@ mod tests {
             !json.contains("tagCategories"),
             "tag_categories 不应再序列化"
         );
+    }
+
+    #[test]
+    fn appearance_missing_fields_default_to_expectations() {
+        // 缺 appearance 字段反序列化 → 全默认；尤其 hover_preview.enabled 默认为 true
+        let s: Settings = serde_json::from_str(r#"{}"#).unwrap();
+        assert_eq!(s.appearance.grid.library_cell_step, default_library_cell_step());
+        assert_eq!(s.appearance.grid.cell_aspect, "1:1");
+        assert_eq!(s.appearance.grid.cell_fit, "cover");
+        assert!(s.appearance.hover_preview.enabled, "hover 默认应开启");
+        assert_eq!(s.appearance.hover_preview.preview_seconds, 3);
+        assert!(s.appearance.hover_preview.in_library_grid);
+        assert_eq!(s.appearance.color_strip.count, 6);
+        assert_eq!(s.appearance.color_strip.height, "normal");
+        assert!(!s.appearance.color_strip.show_in_library_grid);
+        assert!(s.appearance.color_strip.show_in_viewer);
+    }
+
+    #[test]
+    fn normalize_appearance_clamps_and_falls_back() {
+        let mut s: Settings = serde_json::from_str(
+            r#"{"appearance":{"grid":{"libraryCellStep":99,"cellAspect":"oops","cellFit":"stretch"},
+                "hoverPreview":{"previewSeconds":99},"colorStrip":{"count":5,"height":"huge"}}}"#,
+        )
+        .unwrap();
+        normalize_appearance(&mut s);
+        let g = &s.appearance.grid;
+        assert_eq!(g.library_cell_step, 7); // clamp 0..=7
+        assert_eq!(g.cell_aspect, "1:1");
+        assert_eq!(g.cell_fit, "cover");
+        assert_eq!(s.appearance.hover_preview.preview_seconds, 10);
+        assert_eq!(s.appearance.color_strip.count, 6);
+        assert_eq!(s.appearance.color_strip.height, "normal");
+    }
+
+    #[test]
+    fn appearance_roundtrip_json_consistent() {
+        let s = Settings::default();
+        let json = serde_json::to_string(&s).unwrap();
+        let back: Settings = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.appearance.grid.library_cell_step, s.appearance.grid.library_cell_step);
+        assert_eq!(back.appearance.hover_preview.enabled, s.appearance.hover_preview.enabled);
+    }
+
+    #[test]
+    fn ai_video_tagging_mode_defaults_and_clamps() {
+        let s: Settings = serde_json::from_str(r#"{}"#).unwrap();
+        assert_eq!(s.ai.video_tagging_mode, "cover", "默认封面打标（决策 5）");
+        assert_eq!(s.ai.video_frame_count, 3);
+        let mut ai = s.ai;
+        ai.video_tagging_mode = "bad".into();
+        ai.video_frame_count = 99;
+        ai.normalize();
+        assert_eq!(ai.video_tagging_mode, "cover");
+        assert_eq!(ai.video_frame_count, 8);
     }
 }

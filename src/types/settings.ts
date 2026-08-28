@@ -24,6 +24,10 @@ export interface AiSettings {
   activeProfile: string;
   autoTagging: boolean;
   videoTagging: boolean;
+  /** FB2-07：视频打标模式（决策 5：默认首帧/封面） */
+  videoTaggingMode: "cover" | "frames";
+  /** FB2-07：frames 模式抽帧数（2~8） */
+  videoFrameCount: number;
   localModelTier: "light" | "standard";
   batchLimit: number;
   /** 一键安装的下载源偏好（"auto" = 测速选最快；旧数据缺省视为 auto） */
@@ -75,4 +79,53 @@ export interface Settings {
   customDownloadSources: CustomSource[];
   /** Ollama 模型下载代理（拉起 serve 时注入 HTTPS_PROXY；空 = 不用代理） */
   modelDownloadProxy: string;
+  /** FB2-01/02/03/08：外观与交互设置（素材网格档位/比例、悬停预览、色条） */
+  appearance: Appearance;
+}
+
+/** FB2-01 格子尺寸档位表（约 1.25× 等比）。索引存入设置，不存像素值——
+ *  这样以后调整档位表不会让老配置落到非法像素值上。 */
+export const CELL_STEPS = [96, 120, 150, 190, 240, 300, 380, 480] as const;
+
+export type CellAspect = "1:1" | "4:3" | "3:2" | "16:9" | "3:4" | "2:3" | "9:16";
+export type CellFit = "cover" | "contain" | "smart";
+export type StripHeight = "thin" | "normal" | "thick";
+export type StripMode = "ratio" | "equal";
+
+export interface GridAppearance {
+  /** FB2-01 素材库格子档位（CELL_SIZES 下标），默认 3（=190px） */
+  libraryCellStep: number;
+  /** FB2-01 入库网格格子档位，默认 1（=120px） */
+  importCellStep: number;
+  /** FB2-02 统一容器比例（决策 4：一个设置管两页），默认 "1:1" */
+  cellAspect: CellAspect;
+  /** FB2-02 填充方式（不提供拉伸/形变），默认 "cover" */
+  cellFit: CellFit;
+  /** FB2-02 contain 留边是否填该素材主色（依赖 FB2-08 色板），默认 false */
+  matchDominantColor: boolean;
+}
+
+export interface HoverPreviewAppearance {
+  /** FB2-03 悬停自动播放总开关，默认 true */
+  enabled: boolean;
+  /** FB2-03 预览时长（秒），2~10，默认 3 */
+  previewSeconds: number;
+  /** FB2-03 是否在素材库网格也启用（入库页由 enabled 单独控制），默认 true */
+  inLibraryGrid: boolean;
+}
+
+export interface ColorStripAppearance {
+  enabled: boolean; // 默认 true
+  showInLibraryGrid: boolean; // 默认 false
+  showInViewer: boolean; // 默认 true
+  showInImportGrid: boolean; // 默认 false
+  height: StripHeight; // 默认 "normal"
+  mode: StripMode; // 默认 "ratio"
+  count: 4 | 6 | 8; // 默认 6
+}
+
+export interface Appearance {
+  grid: GridAppearance;
+  hoverPreview: HoverPreviewAppearance;
+  colorStrip: ColorStripAppearance;
 }

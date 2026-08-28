@@ -21,6 +21,8 @@ function mkSettings(): Settings {
       activeProfile: "",
       autoTagging: false,
       videoTagging: false,
+      videoTaggingMode: "cover",
+      videoFrameCount: 3,
       localModelTier: "light",
       batchLimit: 500,
       ollamaSourceId: "auto",
@@ -33,6 +35,11 @@ function mkSettings(): Settings {
     trashRetentionDays: 30,
     customDownloadSources: [],
     modelDownloadProxy: "",
+    appearance: {
+      grid: { libraryCellStep: 3, importCellStep: 1, cellAspect: "1:1", cellFit: "cover", matchDominantColor: false },
+      hoverPreview: { enabled: true, previewSeconds: 3, inLibraryGrid: true },
+      colorStrip: { enabled: true, showInLibraryGrid: false, showInViewer: true, showInImportGrid: false, height: "normal", mode: "ratio", count: 6 },
+    },
   };
 }
 

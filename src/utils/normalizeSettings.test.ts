@@ -89,4 +89,46 @@ describe("normalizeSettings", () => {
   it("未知 theme 值回退 system", () => {
     expect(normalizeSettings({ theme: "blue" }).theme).toBe("system");
   });
+
+  it("FB2-01：appearance 完全缺失 → 全默认（hoverEnabled 默认 true）", () => {
+    const s = normalizeSettings(undefined);
+    expect(s.appearance.grid.libraryCellStep).toBe(3);
+    expect(s.appearance.grid.importCellStep).toBe(1);
+    expect(s.appearance.grid.cellAspect).toBe("1:1");
+    expect(s.appearance.grid.cellFit).toBe("cover");
+    expect(s.appearance.grid.matchDominantColor).toBe(false);
+    expect(s.appearance.hoverPreview.enabled).toBe(true);
+    expect(s.appearance.hoverPreview.previewSeconds).toBe(3);
+    expect(s.appearance.hoverPreview.inLibraryGrid).toBe(true);
+    expect(s.appearance.colorStrip.enabled).toBe(true);
+    expect(s.appearance.colorStrip.count).toBe(6);
+  });
+
+  it("FB2-01：非法 cellAspect → 回落 1:1；cellStep 越界 → 钳制", () => {
+    const s = normalizeSettings({
+      appearance: {
+        grid: { libraryCellStep: 99, importCellStep: -3, cellAspect: "oops", cellFit: "stretch" },
+      },
+    });
+    expect(s.appearance.grid.libraryCellStep).toBe(7);
+    expect(s.appearance.grid.importCellStep).toBe(0);
+    expect(s.appearance.grid.cellAspect).toBe("1:1");
+    expect(s.appearance.grid.cellFit).toBe("cover");
+  });
+
+  it("FB2-03：previewSeconds=99 → 钳制 10；hoverPreview.enabled 缺失 → true", () => {
+    const s = normalizeSettings({
+      appearance: { hoverPreview: { previewSeconds: 99 } },
+    });
+    expect(s.appearance.hoverPreview.previewSeconds).toBe(10);
+    expect(s.appearance.hoverPreview.enabled).toBe(true);
+  });
+
+  it("FB2-07：videoTaggingMode 非法 → cover；videoFrameCount 钳制 2..=8", () => {
+    const s = normalizeSettings({
+      ai: { videoTaggingMode: "bad", videoFrameCount: 99, videoTagging: true },
+    });
+    expect(s.ai.videoTaggingMode).toBe("cover");
+    expect(s.ai.videoFrameCount).toBe(8);
+  });
 });

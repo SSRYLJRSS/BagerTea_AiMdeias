@@ -6,7 +6,20 @@
  * 注意：本函数只负责「前端运行时安全」，不取代 Rust 端迁移 —— 迁移仍是单一事实源。
  * 对未知字段尽量保留，不无故丢弃未来配置。
  */
-import type { AiFacetConfig, AiSettings, ApiProfile, CustomSource, Settings, TagCategory } from "@/types/settings";
+import type {
+  AiFacetConfig,
+  AiSettings,
+  ApiProfile,
+  Appearance,
+  CellAspect,
+  ColorStripAppearance,
+  CustomSource,
+  GridAppearance,
+  HoverPreviewAppearance,
+  Settings,
+  TagCategory,
+} from "@/types/settings";
+import { CELL_STEPS } from "@/types/settings";
 
 export const DEFAULT_MODEL = "qwen-vl-plus";
 export const DEFAULT_BATCH_LIMIT = 500;
@@ -58,6 +71,8 @@ function normalizeAi(raw: unknown): AiSettings {
     localModelTier: tier === "standard" ? "standard" : "light",
     batchLimit: Math.max(1, Math.round(asNum(r.batchLimit, DEFAULT_BATCH_LIMIT))),
     ollamaSourceId: asStr(r.ollamaSourceId, "auto"),
+    videoTaggingMode: asEnum(r.videoTaggingMode, ["cover", "frames"] as const, "cover"),
+    videoFrameCount: clampInt(r.videoFrameCount, 2, 8, 3),
   };
 }
 
@@ -93,6 +108,64 @@ function normalizeCustomSource(c: unknown): CustomSource {
   return { id: asStr(r.id, ""), label: asStr(r.label, ""), url: asStr(r.url, "") };
 }
 
+/** FB2-08/§8.3：枚举守卫——值必须在白名单内，否则回落 fallback */
+function asEnum<T extends string>(v: unknown, allowed: readonly T[], fallback: T): T {
+  return typeof v === "string" && (allowed as readonly string[]).includes(v) ? (v as T) : fallback;
+}
+
+/** FB2-01/§8.3：整数钳制守卫 */
+function clampInt(v: unknown, min: number, max: number, fallback: number): number {
+  const n = Math.round(asNum(v, fallback));
+  return Math.max(min, Math.min(max, n));
+}
+
+const CELL_ASPECTS: readonly CellAspect[] = ["1:1", "4:3", "3:2", "16:9", "3:4", "2:3", "9:16"];
+
+function normalizeGrid(raw: unknown): GridAppearance {
+  const r = isRecord(raw) ? raw : {};
+  return {
+    libraryCellStep: clampInt(r.libraryCellStep, 0, CELL_STEPS.length - 1, 3),
+    importCellStep: clampInt(r.importCellStep, 0, CELL_STEPS.length - 1, 1),
+    cellAspect: asEnum(r.cellAspect, CELL_ASPECTS, "1:1"),
+    cellFit: asEnum(r.cellFit, ["cover", "contain", "smart"] as const, "cover"),
+    matchDominantColor: asBool(r.matchDominantColor, false),
+  };
+}
+
+function normalizeHoverPreview(raw: unknown): HoverPreviewAppearance {
+  const r = isRecord(raw) ? raw : {};
+  return {
+    enabled: asBool(r.enabled, true),
+    previewSeconds: clampInt(r.previewSeconds, 2, 10, 3),
+    inLibraryGrid: asBool(r.inLibraryGrid, true),
+  };
+}
+
+function normalizeColorStrip(raw: unknown): ColorStripAppearance {
+  const r = isRecord(raw) ? raw : {};
+  const height = asEnum(r.height, ["thin", "normal", "thick"] as const, "normal");
+  const mode = asEnum(r.mode, ["ratio", "equal"] as const, "ratio");
+  const count = clampInt(r.count, 4, 8, 6);
+  return {
+    enabled: asBool(r.enabled, true),
+    showInLibraryGrid: asBool(r.showInLibraryGrid, false),
+    showInViewer: asBool(r.showInViewer, true),
+    showInImportGrid: asBool(r.showInImportGrid, false),
+    height,
+    mode,
+    count: count === 4 ? 4 : count === 8 ? 8 : 6,
+  };
+}
+
+function normalizeAppearance(raw: unknown): Appearance {
+  const r = isRecord(raw) ? raw : {};
+  return {
+    grid: normalizeGrid(r.grid),
+    hoverPreview: normalizeHoverPreview(r.hoverPreview),
+    colorStrip: normalizeColorStrip(r.colorStrip),
+  };
+}
+
 /** 对一份 `unknown` 设置做运行时归一化，返回可安全渲染的完整 Settings。 */
 export function normalizeSettings(raw: unknown): Settings {
   const r = isRecord(raw) ? raw : {};
@@ -117,5 +190,6 @@ export function normalizeSettings(raw: unknown): Settings {
       ? r.customDownloadSources.map(normalizeCustomSource).filter((s) => s.id !== "")
       : [],
     modelDownloadProxy: asStr(r.modelDownloadProxy, ""),
+    appearance: normalizeAppearance(r.appearance),
   };
 }
