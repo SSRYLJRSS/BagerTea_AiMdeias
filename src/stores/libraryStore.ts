@@ -75,9 +75,11 @@ interface LibraryState {
   /** Viewer 是否打开（§7.3 方案 A：App 据此隐藏全局 BottomBar，与 Viewer 互斥） */
   viewerOpen: boolean;
   setViewerOpen: (open: boolean) => void;
-  /** 网格滚动位置（§7.2：Viewer 关闭后恢复库页滚动上下文；AssetGridView 滚动时写入） */
-  gridScrollTop: number;
-  setGridScrollTop: (top: number) => void;
+  /** 网格滚动位置（FB2-06 §7.4 方案 D：按键存储，防止素材库与超级搜索互相污染；
+   *  Viewer 关闭后恢复对应页面的滚动上下文；AssetGridView 滚动时写入） */
+  gridScrollTops: Record<string, number>;
+  setGridScrollTop: (key: string, top: number) => void;
+  getGridScrollTop: (key: string) => number;
 }
 
 export const useLibraryStore = create<LibraryState>((set, get) => ({
@@ -192,6 +194,7 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
     set({ viewerOpen: open, ...(open ? {} : {}) });
   },
 
-  gridScrollTop: 0,
-  setGridScrollTop: (top) => set({ gridScrollTop: top }),
+  gridScrollTops: {},
+  setGridScrollTop: (key, top) => set((s) => ({ gridScrollTops: { ...s.gridScrollTops, [key]: top } })),
+  getGridScrollTop: (key) => get().gridScrollTops[key] ?? 0,
 }));

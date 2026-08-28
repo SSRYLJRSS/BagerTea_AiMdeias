@@ -37,6 +37,7 @@ export default function AssetGrid({ onPreview, onAiTag, onAssignTags, onExport, 
       onExport={onExport}
       onMove={onMove}
       onDelete={onDelete}
+      scrollRestoreKey="library"
     />
   );
 }

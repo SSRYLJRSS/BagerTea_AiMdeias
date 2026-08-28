@@ -21,6 +21,9 @@ export interface AssetGridViewProps extends LibraryGridActions {
   /** §12（FB-06）：外部主滚动容器。缺省时内部自建可滚容器（普通库页）；
    *  提供时虚拟滚动使用外部容器，内部不再 overflow 自身。 */
   scrollElementRef?: React.RefObject<HTMLElement | null>;
+  /** FB2-06（§7.4 方案 D）：滚动位置隔离键。素材库传 "library"、超级搜索传 "superSearch"；
+   *  null / 省略 = 不保存不恢复。修复两页滚动位置互相污染。 */
+  scrollRestoreKey?: string | null;
 }
 
 /** 批量操作入口（顶栏与右键菜单共用） */
@@ -48,6 +51,7 @@ export default function AssetGridView({
   onMove,
   onDelete,
   scrollElementRef,
+  scrollRestoreKey,
 }: AssetGridViewProps) {
   const { selected, toggle, rangeTo, clear, setAll, invert } = useSelectionStore(
     useShallow((s) => ({
@@ -62,23 +66,24 @@ export default function AssetGridView({
   const { ref, width } = useElementSize<HTMLDivElement>();
   // 内部滚动容器元素（外部容器存在时用外部，否则用自建）
   const containerEl = scrollElementRef?.current ?? ref.current;
-  // §7.2：Viewer 关闭后恢复网格滚动位置（库页上下文保持；store 持有滚动量）
+  // §7.2 / FB2-06：Viewer 关闭后恢复网格滚动位置（按键隔离，scrollRestoreKey 为空时跳过）
   useEffect(() => {
+    if (!scrollRestoreKey) return;
     const el = containerEl;
-    const saved = useLibraryStore.getState().gridScrollTop;
+    const saved = useLibraryStore.getState().getGridScrollTop(scrollRestoreKey);
     if (el && saved > 0) el.scrollTop = saved;
     // 仅挂载时恢复一次（Virtualizer 接管后续滚动）
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [scrollRestoreKey]);
   // 滚动位置写入 store（Viewer 打开前最后值；滚动容器卸载再恢复）
   useEffect(() => {
     const el = containerEl;
-    if (!el) return;
+    if (!el || !scrollRestoreKey) return;
     let raf = 0;
     const onScroll = () => {
       cancelAnimationFrame(raf);
       raf = requestAnimationFrame(() => {
-        useLibraryStore.getState().setGridScrollTop(el.scrollTop);
+        useLibraryStore.getState().setGridScrollTop(scrollRestoreKey, el.scrollTop);
       });
     };
     el.addEventListener("scroll", onScroll, { passive: true });
@@ -86,7 +91,7 @@ export default function AssetGridView({
       el.removeEventListener("scroll", onScroll);
       cancelAnimationFrame(raf);
     };
-  }, [containerEl]);
+  }, [containerEl, scrollRestoreKey]);
 
   const columns = Math.max(2, Math.floor((width + GAP) / (MIN_CARD + GAP)));
   const rowCount = Math.ceil(items.length / columns);

@@ -136,7 +136,7 @@ beforeEach(() => {
     },
   });
   useSelectionStore.setState({ selected: new Set(), anchorIndex: null });
-  useLibraryStore.setState({ viewerOpen: false, gridScrollTop: 0 });
+  useLibraryStore.setState({ viewerOpen: false, gridScrollTops: {} });
 });
 
 describe("LibraryPage 全页（单击选中不被自动清除）", () => {

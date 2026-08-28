@@ -95,28 +95,36 @@ describe("SuperSearchPage", () => {
     fireEvent.scroll(el);
   }
 
-  it("FB-06：下滚收起详细条件，上滚恢复", () => {
+  it("FB-06：下滚收起详细条件，上滚恢复（FB2-06 改为 grid-template-rows 折叠，面板常驻 DOM）", () => {
     render(<SuperSearchPage onBack={() => undefined} />);
-    expect(screen.getByRole("region", { name: "条件公式" })).toBeInTheDocument();
-    // 下滚超过阈值 → 条件面板收起
-    scrollTo(40);
-    expect(screen.queryByRole("region", { name: "条件公式" })).not.toBeInTheDocument();
-    // 上滚 → 恢复
+    const panel = document.getElementById("super-search-filters") as HTMLElement;
+    expect(panel).toBeInTheDocument();
+    expect(panel.style.gridTemplateRows).toBe("1fr"); // 初始展开
+    expect(panel.getAttribute("aria-hidden")).toBe("false");
+    // 下滚超过阈值（scrollTop>=48 且累计>=24）→ 收起
+    scrollTo(100);
+    expect(panel.style.gridTemplateRows).toBe("0fr");
+    expect(panel.getAttribute("aria-hidden")).toBe("true");
+    // 上滚（回到顶部区 minScrollTop）→ 恢复展开
     scrollTo(0);
-    expect(screen.getByRole("region", { name: "条件公式" })).toBeInTheDocument();
+    expect(panel.style.gridTemplateRows).toBe("1fr");
+    expect(panel.getAttribute("aria-hidden")).toBe("false");
   });
 
-  it("FB-06：底部快速编辑条打开抽屉", () => {
+  it("FB2-06：顶部区（scrollTop < 48）恒为展开态", () => {
     render(<SuperSearchPage onBack={() => undefined} />);
-    fireEvent.click(screen.getByRole("button", { name: "快速编辑条件" }));
-    fireEvent.click(screen.getByRole("button", { name: "关闭快速编辑" }));
+    scrollTo(30); // 低于 minScrollTop，即使下滚也保持展开
+    const panel = document.getElementById("super-search-filters") as HTMLElement;
+    expect(panel.style.gridTemplateRows).toBe("1fr");
   });
 
-  it("FB-06：focus 进入时强制展开（不隐藏焦点）", () => {
+  it("FB2-06：focus 搜索框强制展开、focus 结果卡片不展开", () => {
     render(<SuperSearchPage onBack={() => undefined} />);
-    scrollTo(60); // 收起
-    expect(screen.queryByRole("region", { name: "条件公式" })).not.toBeInTheDocument();
+    scrollTo(100); // 收起
+    const panel = document.getElementById("super-search-filters") as HTMLElement;
+    expect(panel.style.gridTemplateRows).toBe("0fr");
+    // focus 搜索框（在 header data-filter-zone 内）→ 强制展开
     fireEvent.focus(screen.getByRole("searchbox") as HTMLElement);
-    expect(screen.getByRole("region", { name: "条件公式" })).toBeInTheDocument();
+    expect(panel.style.gridTemplateRows).toBe("1fr");
   });
 });
