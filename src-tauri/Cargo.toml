@@ -48,6 +48,8 @@ rawler = "=0.7.2"
 heif-rs = "26.7"
 # 指导书 §6.3：API Key 系统凭据存储（Windows Credential Manager 后端；service/username 见 credentials.rs）
 keyring = { version = "3", features = ["windows-native"] }
+kmeans_colors = "=0.6"
+palette = "=0.7"
 
 [dev-dependencies]
 tempfile = "3"
@@ -65,4 +67,9 @@ opt-level = 3
 [profile.dev.package.rayon]
 opt-level = 3
 [profile.dev.package.rawler]
+opt-level = 3
+# FB2-08：k-means 提色 + Lab 色空间转换（新增图像相关 crate，按铁律 3.3 加 O3）
+[profile.dev.package.kmeans_colors]
+opt-level = 3
+[profile.dev.package.palette]
 opt-level = 3

@@ -54,10 +54,22 @@ fn build_prompt(facets: &[FacetPromptContext]) -> String {
             }
         ));
     }
-    lines.push_str(
-        "示例：{\"subject\":[\"人\"],\"scene\":[\"海边\"],\"color\":[\"青橙\"]}。\
-         颜色类标签只归 color，不归 style；时间/光线只归 lighting；构图归 composition；人物归 people。",
-    );
+    // FB2-08（§14.3①）：示例 JSON 与规则句由 facets 参数实际内容生成，不再硬编码任何 key。
+    // 原「颜色只归 color」这类跨分面消歧指令已删除——该类信息写进各分面的 hint（数据里改，不在此硬编码）。
+    let example: String = {
+        let pairs: Vec<String> = facets
+            .iter()
+            .take(3)
+            .map(|c| format!("\"{}\":[\"…\"]", c.key))
+            .collect();
+        if pairs.is_empty() {
+            "{}".to_string()
+        } else {
+            format!("{{{}}}", pairs.join(","))
+        }
+    };
+    lines.push_str(&format!("示例：{example}。\n"));
+    lines.push_str("每个标签只能归入一个分面；不确定归属时留空，不要猜。");
     lines
 }
 
@@ -117,18 +129,18 @@ pub fn parse_categorized_checked(
     for (k, list) in &raw {
         let trimmed = k.trim();
         let mapped = crate::db::tag_facets::key_for_legacy_name(trimmed);
-        let known = valid_keys.contains(&mapped)
-            || valid_keys.contains(&trimmed)
-            || trimmed.eq_ignore_ascii_case("custom");
-        if !known {
-            warnings.push(format!("未知分面 key「{trimmed}」已归入自定义，建议改用稳定 facetKey"));
-        }
+        // FB2-08（§14.3②）：已知稳定 key 但该分面已停用（如 color）→ 丢弃，比归 custom 更符合「停用」语义，
+        // 也避免 custom 分面被停用分面的标签污染。完全未知 key 仍归 custom（key_for_legacy_name 已映射为 custom）。
         let target = if valid_keys.contains(&mapped) {
             mapped.to_string()
+        } else if valid_keys.contains(&trimmed) {
+            trimmed.to_string()
         } else if mapped == "custom" {
+            warnings.push(format!("未知分面 key「{trimmed}」已归入自定义，建议改用稳定 facetKey"));
             "custom".to_string()
         } else {
-            mapped.to_string()
+            warnings.push(format!("分面「{trimmed}」已停用，本次返回的标签已丢弃"));
+            continue;
         };
         out.entry(target).or_default().extend(list.iter().cloned());
     }

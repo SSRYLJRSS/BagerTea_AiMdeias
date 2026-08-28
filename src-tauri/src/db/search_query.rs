@@ -62,7 +62,8 @@ fn key_spec(key: &str) -> Option<KeySpec> {
             kind: ValueKind::String,
             null_guard: None,
         },
-        "iso" | "aperture" | "focal" | "width" | "height" | "file_size" | "duration_ms" => {
+        "iso" | "aperture" | "focal" | "width" | "height" | "file_size" | "duration_ms"
+        | "dominant_hue" | "dominant_sat" | "dominant_lum" => {
             KeySpec {
                 kind: ValueKind::Number,
                 null_guard: Some("IS NOT NULL"),
@@ -92,7 +93,7 @@ fn allowed_ops(key: &str) -> &'static [&'static str] {
         // P0-2：数值字段允许 `in`，以兼容普通素材库分面把多个离散值以字符串/数值数组传入。
         // 见 contract-v1 §4 及《入库标签与素材库改造开发指导书》阶段 0 P0-2。
         "iso" | "aperture" | "focal" | "width" | "height" | "resolution" | "aspect_ratio"
-        | "file_size" | "duration_ms" => &["eq", "in", "gt", "gte", "lt", "lte", "between"],
+        | "file_size" | "duration_ms" | "dominant_hue" | "dominant_sat" | "dominant_lum" => &["eq", "in", "gt", "gte", "lt", "lte", "between"],
         "taken_at" | "created_at" | "modified_at" => &["gte", "lte", "between"],
         "folder" => &["eq", "in"],
         _ => &[],
@@ -118,6 +119,9 @@ fn value_expr(key: &str) -> String {
         "aspect_ratio" => "(CAST(a.width AS REAL) / a.height)".into(),
         "file_size" => "a.file_size".into(),
         "duration_ms" => "a.duration_ms".into(),
+        "dominant_hue" => "a.dominant_hue".into(),
+        "dominant_sat" => "a.dominant_sat".into(),
+        "dominant_lum" => "a.dominant_lum".into(),
         "taken_at" => "a.taken_at".into(),
         "created_at" => "a.created_at".into(),
         "modified_at" => "a.modified_at".into(),
@@ -354,6 +358,14 @@ fn compile_number(f: &MetadataFilter, spec: &KeySpec) -> AppResult<Option<Compil
                 .ok_or_else(|| AppError::msg(format!("字段 {} 的 between 需要 max", f.key)))?;
             let lo = num(min)?;
             let hi = num(max)?;
+            // FB2-08（§14.9③）：色相是环形量。min > max 表示区间跨越 0°（如红色 345~15），
+            // 必须编译为双区间 OR，否则 BETWEEN 345 AND 15 恒为空集，"搜红色素材"静默返回 0 条。
+            if f.key == "dominant_hue" && lo > hi {
+                return Ok(Some(CompiledMetadata {
+                    sql: format!("({expr} >= ?1 OR {expr} <= ?2){guard}", guard = null_guard),
+                    params: vec![bind_num(lo), bind_num(hi)],
+                }));
+            }
             if hi < lo {
                 return Err(AppError::msg(format!("字段 {} 的 between 区间倒置", f.key)));
             }

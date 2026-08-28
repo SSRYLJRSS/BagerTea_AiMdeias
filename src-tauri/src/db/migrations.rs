@@ -901,6 +901,89 @@ fn migrate_v15(conn: &Connection) -> AppResult<()> {
     Ok(())
 }
 
+/// FB2-08（§14.8）V16：颜色从 AI 分面改为算法主色属性。
+///
+///  - `assets` 加 6 列（palette_json / palette_version / palette_scanned_at / dominant_hue|sat|lum）+ 3 索引；
+///  - color 分面停用：`tag_facets.status = 'inactive'`、`ai_facet_configs` 里 color 的 `enabledForAi = false`、
+///    `visibleInWorkbench = false`（存量 color 标签保留可搜索，只是不再由 AI 生成、工作台默认收起）。
+///  - 幂等：add_column_if_missing + IF NOT EXISTS + UPDATE 无条件（重复执行无副作用）。
+const V16_COLUMNS: &[(&str, &str)] = &[
+    ("palette_json", "TEXT"),
+    ("palette_version", "INTEGER"),
+    ("palette_scanned_at", "INTEGER"),
+    ("dominant_hue", "INTEGER"),
+    ("dominant_sat", "INTEGER"),
+    ("dominant_lum", "INTEGER"),
+];
+
+const V16_INDEXES: &str = r#"
+CREATE INDEX IF NOT EXISTS idx_assets_dominant_hue ON assets(dominant_hue);
+CREATE INDEX IF NOT EXISTS idx_assets_dominant_sat ON assets(dominant_sat);
+CREATE INDEX IF NOT EXISTS idx_assets_dominant_lum ON assets(dominant_lum);
+"#;
+
+/// V16 迁移：加色板列 + 索引 + color 分面停用（AI 侧摘除，见 §14.3）。
+fn migrate_v16(conn: &Connection) -> AppResult<()> {
+    // 1. 只增列模式（沿用 V12）
+    for (col, ty) in V16_COLUMNS {
+        add_column_if_missing(conn, "assets", col, ty)?;
+    }
+    conn.execute_batch(V16_INDEXES)?;
+
+    let now = chrono::Utc::now().timestamp_millis();
+
+    // 2. color 分面停用：`deprecated` 语义已收敛到 `inactive`（V13 统一），此处用 inactive。
+    conn.execute(
+        "UPDATE tag_facets SET status = 'inactive', updated_at = ?1 WHERE key = 'color'",
+        rusqlite::params![now],
+    )?;
+
+    // 2b. §14.3：`style` 分面 hint 追加「不包含颜色描述」，作为删除 cross-facet 规则后的消歧补偿（数据里改，不硬编码）。
+    conn.execute(
+        "UPDATE tag_facets SET hint = hint || '。风格描述不包含颜色（颜色由算法主色呈现）', updated_at = ?1 WHERE key = 'style' AND instr(hint, '不包含颜色') = 0",
+        rusqlite::params![now],
+    )?;
+
+    // 3. ai_facet_configs（settings JSON，camelCase）：color 的 enabledForAi=false + visibleInWorkbench=false。
+    if let Ok(raw) = conn.query_row(
+        "SELECT value FROM settings WHERE key = 'app_settings'",
+        [],
+        |r| r.get::<_, Option<String>>(0),
+    ) {
+        if let Some(raw) = raw {
+            if let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&raw) {
+                let changed = {
+                    let arr = v
+                        .get_mut("aiFacetConfigs")
+                        .and_then(|c| c.as_array_mut());
+                    let mut changed = false;
+                    if let Some(arr) = arr {
+                        for cfg in arr.iter_mut() {
+                            if cfg.get("facetKey").and_then(|k| k.as_str()) == Some("color") {
+                                if let Some(o) = cfg.as_object_mut() {
+                                    o.insert("enabledForAi".into(), serde_json::Value::Bool(false));
+                                    o.insert("visibleInWorkbench".into(), serde_json::Value::Bool(false));
+                                }
+                                changed = true;
+                            }
+                        }
+                    }
+                    changed
+                };
+                if changed {
+                    if let Ok(s) = serde_json::to_string(&v) {
+                        let _ = conn.execute(
+                            "UPDATE settings SET value = ?1 WHERE key = 'app_settings'",
+                            [&s],
+                        );
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn migrate(conn: &Connection) -> AppResult<()> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     if version < 1 {
@@ -971,6 +1054,11 @@ pub fn migrate(conn: &Connection) -> AppResult<()> {
         // V15：AI 连接档案 + 用途绑定（keyring 凭据迁移；§6.3/§7.3）
         migrate_v15(conn)?;
         conn.pragma_update(None, "user_version", 15)?;
+    }
+    if version < 16 {
+        // FB2-08（§14.8）：颜色改为算法主色属性 + color 分面停用（AI 侧摘除）
+        migrate_v16(conn)?;
+        conn.pragma_update(None, "user_version", 16)?;
     }
     Ok(())
 }

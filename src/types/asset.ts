@@ -102,7 +102,11 @@ export type MetadataFilterKey =
   | "created_at"
   | "modified_at"
   | "video_codec"
-  | "audio_codec";
+  | "audio_codec"
+  // FB2-08：算法主色（dominant_color）可检索维度
+  | "dominant_hue"
+  | "dominant_sat"
+  | "dominant_lum";
 
 export type MetadataOp =
   | "eq"
