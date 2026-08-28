@@ -54,6 +54,9 @@ export default function ViewerPage({ asset: initial, onClose }: ViewerPageProps)
   // 图片高清源（代际保护：切张后旧请求不回写新素材）
   const [src, setSrc] = useState<string | null>(null);
   const [entered, setEntered] = useState(false);
+  // §7.5 致命错误：主图与兜底都失败时显示「当前素材暂时无法显示」，重试需重新获取 URL/高清图
+  const [mediaFatal, setMediaFatal] = useState(false);
+  const [reloadNonce, setReloadNonce] = useState(0);
 
   // 视频源 + 代理状态（§8.3：原文件失败 → 按需生成 H.264/AAC MP4）
   const [videoSrc, setVideoSrc] = useState<string | null>(() => convertFileSrc(initial.filePath));
@@ -94,9 +97,10 @@ export default function ViewerPage({ asset: initial, onClose }: ViewerPageProps)
     return () => cancelAnimationFrame(raf);
   }, []);
 
-  // 切张：重置视图（MediaViewport 内部按 assetId 重置）+ 加载高清（失败退原图）
+  // 切张/重试：重置视图（MediaViewport 内部按 assetId 重置）+ 加载高清（失败退原图）
   useEffect(() => {
     setSrc(null);
+    setMediaFatal(false);
     let cancelled = false;
     getThumbnailUrl(current.id, "hd", 1920)
       .then((u) => !cancelled && setSrc(u))
@@ -104,7 +108,7 @@ export default function ViewerPage({ asset: initial, onClose }: ViewerPageProps)
     return () => {
       cancelled = true;
     };
-  }, [current.id, current.filePath]);
+  }, [current.id, current.filePath, reloadNonce]);
 
   // 过片（近尾部自动翻页加载）
   const goto = useCallback(
@@ -220,7 +224,17 @@ export default function ViewerPage({ asset: initial, onClose }: ViewerPageProps)
               imageSrc={src}
               imageFallbackUrl={toFileUrl(current.filePath)}
               fileName={current.fileName}
-              onImageError={() => setSrc(toFileUrl(current.filePath))}
+              onImageError={() => {
+                // §7.5：高清图失败→回落原文件；兜底也失败→致命错误（重新加载需重新获取 URL/高清图）
+                if (src && src === toFileUrl(current.filePath)) {
+                  setMediaFatal(true);
+                } else {
+                  setSrc(toFileUrl(current.filePath));
+                }
+              }}
+              fatal={mediaFatal}
+              onRetryCurrent={() => setReloadNonce((n) => n + 1)}
+              onBackToLibrary={onClose}
             />
           )
         }
