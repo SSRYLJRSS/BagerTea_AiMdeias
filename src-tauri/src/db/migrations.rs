@@ -1204,4 +1204,67 @@ mod tests {
         let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
         assert_eq!(rows.count(), 0, "foreign_key_check 应无错误");
     }
+
+    /// FB2-08（§14.8）：V16 加色板列+索引，color 分面停用、ai_facet_configs.color enabledForAi=false；幂等。
+    #[test]
+    fn v16_adds_palette_columns_and_deactivates_color_facet() {
+        // 最小 fixture：assets + tag_facets + settings
+        let c = mem();
+        c.execute_batch(
+            "CREATE TABLE assets (id INTEGER PRIMARY KEY);
+             CREATE TABLE tag_facets (
+               id INTEGER PRIMARY KEY, key TEXT NOT NULL, display_name TEXT NOT NULL,
+               description TEXT NOT NULL DEFAULT '', min_items INTEGER, max_items INTEGER,
+               status TEXT NOT NULL DEFAULT 'active', updated_at INTEGER NOT NULL);
+             CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO tag_facets (id, key, display_name, status, updated_at) VALUES (1, 'color', '色彩', 'active', 0)",
+            [],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO tag_facets (id, key, display_name, status, updated_at) VALUES (2, 'style', '风格', 'active', 0)",
+            [],
+        )
+        .unwrap();
+        // settings：aiFacetConfigs 里 color 的 enabledForAi=true
+        let jetton = r#"{"aiFacetConfigs":[{"facetKey":"color","enabledForAi":true,"displayName":"色彩"},{"facetKey":"style","enabledForAi":true}]}"#;
+        c.execute("INSERT INTO settings (key, value) VALUES ('app_settings', ?1)", [jetton]).unwrap();
+
+        migrate_v16(&c).unwrap();
+
+        // 6 列 + 3 索引存在
+        for col in ["palette_json", "palette_version", "palette_scanned_at", "dominant_hue", "dominant_sat", "dominant_lum"] {
+            let n: i64 = c
+                .query_row(&format!("SELECT COUNT(*) FROM pragma_table_info('assets') WHERE name='{col}'"), [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(n, 1, "列 {col} 应存在");
+        }
+        for idx in ["idx_assets_dominant_hue", "idx_assets_dominant_sat", "idx_assets_dominant_lum"] {
+            let n: i64 = c
+                .query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name=?1", [idx], |r| r.get(0))
+                .unwrap();
+            assert_eq!(n, 1, "索引 {idx} 应存在");
+        }
+
+        // color 分面停用
+        let st: String = c.query_row("SELECT status FROM tag_facets WHERE key='color'", [], |r| r.get(0)).unwrap();
+        assert_eq!(st, "inactive");
+        // style hint 追加「不包含颜色」
+        let hint: String = c.query_row("SELECT hint FROM tag_facets WHERE key='style'", [], |r| r.get(0)).unwrap();
+        assert!(hint.contains("不包含颜色"));
+
+        // ai_facet_configs.color enabledForAi=false
+        let raw: String = c.query_row("SELECT value FROM settings WHERE key='app_settings'", [], |r| r.get(0)).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let color_cfg = v["aiFacetConfigs"].as_array().unwrap().iter().find(|x| x["facetKey"] == "color").unwrap();
+        assert_eq!(color_cfg["enabledForAi"], serde_json::Value::Bool(false));
+
+        // 幂等：重复执行不报错、不丢现状
+        migrate_v16(&c).unwrap();
+        let st2: String = c.query_row("SELECT status FROM tag_facets WHERE key='color'", [], |r| r.get(0)).unwrap();
+        assert_eq!(st2, "inactive");
+    }
 }

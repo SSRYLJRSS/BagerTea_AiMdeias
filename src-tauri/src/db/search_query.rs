@@ -559,3 +559,43 @@ pub fn compile_metadata_all(filters: &[MetadataFilter]) -> AppResult<Option<(Str
         Ok(Some((parts.join(" AND "), params)))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn between(key: &str, min: i64, max: i64) -> MetadataFilter {
+        MetadataFilter {
+            key: key.into(),
+            op: "between".into(),
+            value: None,
+            values: None,
+            min: Some(serde_json::json!(min)),
+            max: Some(serde_json::json!(max)),
+        }
+    }
+
+    /// FB2-08（§14.9③）：色相环形 —— min>max 编译为双区间 OR（搜红色 345~15 同时命中 350 与 10）。
+    #[test]
+    fn dominant_hue_wraps_red_across_zero() {
+        let c = compile_metadata(&between("dominant_hue", 345, 15)).unwrap().unwrap();
+        assert!(c.sql.contains("OR"), "应编译为双区间 OR，实际：{}", c.sql);
+        assert_eq!(c.params.len(), 2);
+    }
+
+    /// FB2-08：dominant_sat 白名单 / between 正向区间正常。
+    #[test]
+    fn dominant_sat_between_compiles() {
+        let c = compile_metadata(&between("dominant_sat", 10, 60)).unwrap().unwrap();
+        assert!(c.sql.contains(">= ?1") && c.sql.contains("<= ?2"));
+    }
+
+    /// FB2-08（§14.14）：未收进白名单的 dominant_xxx 报「未知字段」。
+    #[test]
+    fn unknown_dominant_key_rejected() {
+        let c = compile_metadata(&between("dominant_unknown", 0, 359));
+        assert!(c.is_err());
+        let err = c.unwrap_err().to_string();
+        assert!(err.contains("未知元数据字段"), "实际：{}", err);
+    }
+}

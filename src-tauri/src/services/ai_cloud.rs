@@ -964,7 +964,7 @@ mod tests {
 
     #[test]
     fn strict_valid_object_ok() {
-        let valid = ["scene", "style", "color"];
+        let valid = ["scene", "style"];
         let r = super::parse_tags_strict("{\"场景\": [\"公园\"]}", &valid).unwrap();
         assert_eq!(r.get("scene").unwrap(), &vec!["公园".to_string()]);
     }
@@ -997,7 +997,7 @@ mod tests {
     #[test]
     fn checked_unknown_key_warns_not_silent_custom() {
         // C-4：未知 key 应产生 warning 并归入自定义，不静默丢失
-        let valid = ["subject", "scene", "color"];
+        let valid = ["subject", "scene"];
         let (tags, warnings) = super::parse_categorized_checked(
             "{\"subject\":[\"人\"],\"foobar\":[\"奇怪\"]}",
             &valid,
@@ -1010,16 +1010,30 @@ mod tests {
 
     #[test]
     fn checked_legacy_chinese_maps_to_stable_key() {
-        // C-4：兼容旧中文 key 且不产生 warning
-        let valid = ["subject", "scene", "color", "lighting"];
+        // C-4：兼容旧中文 key 且不产生 warning（color 已从 AI 体系摘除，此处不再含 color）
+        let valid = ["subject", "scene", "lighting"];
         let (tags, warnings) = super::parse_categorized_checked(
-            "{\"色彩\":[\"蓝\"],\"光线/时间\":[\"黄昏\"],\"主体\":[\"树\"]}",
+            "{\"光线/时间\":[\"黄昏\"],\"主体\":[\"树\"]}",
             &valid,
         );
-        assert_eq!(tags.get("color").unwrap(), &vec!["蓝".to_string()]);
         assert_eq!(tags.get("lighting").unwrap(), &vec!["黄昏".to_string()]);
         assert_eq!(tags.get("subject").unwrap(), &vec!["树".to_string()]);
         assert!(warnings.is_empty(), "已知中文 key 不应产生 warning");
+    }
+
+    // FB2-08（§14.3② / §14.14）：color 分面停用后，模型返回 color/色彩 key → 丢弃 + warning，不落回 color 分面。
+    #[test]
+    fn checked_deactivated_color_key_is_discarded_with_warning() {
+        let valid = ["subject", "scene"]; // color 不在 valid_keys
+        let (tags, warnings) = super::parse_categorized_checked(
+            "{\"subject\":[\"人\"],\"color\":[\"青橙\"],\"色彩\":[\"蓝\"]}",
+            &valid,
+        );
+        assert!(tags.get("color").is_none(), "停用分面 color 的标签应被丢弃");
+        assert_eq!(tags.get("scene"), None);
+        assert_eq!(tags.get("subject").unwrap(), &vec!["人".to_string()]);
+        assert!(!warnings.is_empty());
+        assert!(warnings.iter().any(|w| w.contains("已停用")), "应有「已停用」warning：{:?}", warnings);
     }
 
     #[test]
