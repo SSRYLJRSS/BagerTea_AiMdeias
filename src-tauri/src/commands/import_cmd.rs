@@ -75,3 +75,20 @@ pub fn preview_rename(
 ) -> String {
     importer::preview_rename(&template, &collection, &orig_stem, seq.unwrap_or(1))
 }
+
+/// 用系统默认应用打开待入库原文件（§10 FB-04：PeningItem 双击打开）。
+/// 校验路径存在；仅允许打开，不做任何文件修改。
+#[tauri::command]
+pub fn open_file_external(app: tauri::AppHandle, path: String) -> AppResult<()> {
+    if path.trim().is_empty() {
+        return Err(AppError::msg("路径为空"));
+    }
+    let p = std::path::Path::new(&path);
+    if !p.exists() {
+        return Err(AppError::msg(format!("文件不存在: {path}")));
+    }
+    use tauri_plugin_opener::OpenerExt;
+    app.opener()
+        .open_path(&path, None::<&str>)
+        .map_err(|e| AppError::msg(format!("系统打开文件失败: {e}")))
+}

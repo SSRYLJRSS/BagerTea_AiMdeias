@@ -9,6 +9,8 @@ use std::sync::{Arc, Mutex};
 
 use rusqlite::Connection;
 
+use crate::services::ollama_runtime::OllamaRuntimeState;
+
 pub struct AppState {
     pub db: Arc<Mutex<Connection>>,
     /// 应用数据目录（$APP_DATA_DIR/bagertea_ai_media_v2）
@@ -23,6 +25,8 @@ pub struct AppState {
     pub media_refill_cancel: Arc<AtomicBool>,
     /// 视频兼容代理取消标志注册表（"asset_id:variant" → flag）
     pub video_proxy_cancel: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
+    /// Ollama 本地服务运行态（L2 ownership，§8.2）：External 永不停 / AppOwned 可停
+    pub ollama_runtime: Arc<Mutex<OllamaRuntimeState>>,
 }
 
 impl AppState {
@@ -35,6 +39,7 @@ impl AppState {
             ai_cancel: Arc::new(Mutex::new(HashMap::new())),
             media_refill_cancel: Arc::new(AtomicBool::new(false)),
             video_proxy_cancel: Arc::new(Mutex::new(HashMap::new())),
+            ollama_runtime: Arc::new(Mutex::new(OllamaRuntimeState::new())),
         }
     }
 }

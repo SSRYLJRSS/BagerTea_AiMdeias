@@ -161,6 +161,7 @@ fn is_degenerate(content: &str) -> bool {
 
 /// 本地（Ollama）档案：触发一次模型卸载（keep_alive=0）。
 /// 长驻 runner 状态损坏后"卸载重载"即恢复（#8235 作者验证）；失败静默，由上层重试兜底。
+/// §8.4：读取响应并记录 done_reason（期望 unload），不再纯 fire-and-forget。
 fn unload_ollama_model(cfg: &ApiProfile) {
     // 本地档案 base_url 形如 http://localhost:11434/v1 → 原生端点剥掉 /v1
     let base = cfg.base_url.trim_end_matches('/');
@@ -177,10 +178,67 @@ fn unload_ollama_model(cfg: &ApiProfile) {
         Ok(c) => c,
         Err(_) => return,
     };
-    let _ = client
+    match client
         .post(format!("{native}/api/generate"))
         .json(&body)
-        .send();
+        .send()
+    {
+        Ok(resp) => {
+            if let Ok(v) = resp.json::<serde_json::Value>() {
+                let done = v
+                    .get("done_reason")
+                    .and_then(|d| d.as_str())
+                    .unwrap_or("?");
+                if done == "unload" {
+                    tracing::info!("Ollama 模型已卸载（done_reason=unload）：{}", cfg.model);
+                } else {
+                    tracing::warn!("Ollama 卸载响应 done_reason={done}（期望 unload）");
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!("Ollama 卸载请求失败（签名自愈路径不阻塞）：{e}");
+        }
+    }
+}
+
+/// §8.4：本地（Ollama 原生兼容）请求体统一注入 keep_alive，不依赖服务器默认值。
+/// - 仅本地档案注入（云端服务商不接受未知字段）；
+/// - 值默认 2m（与服务级 OLLAMA_KEEP_ALIVE 一致；连续批次由 lease 延长是 L3 目标态）。
+/// - /v1 兼容端点不保证支持该字段 → 这里注入但不依赖其生效；卸载走原生根地址（见 unload_ollama_model）。
+fn apply_keep_alive(body: &mut serde_json::Value, is_local: bool) {
+    if is_local {
+        body["keep_alive"] = serde_json::json!(KEEP_ALIVE_IDLE);
+    }
+}
+
+/// 本地服务空闲保留时长常量（§8.1 L1 服务级默认；与 ollama_installer::KEEP_ALIVE_IDLE 一致）
+pub const KEEP_ALIVE_IDLE: &str = "2m";
+
+/// 本地模型是否支持视觉/图片输入（启发式短名单；§9.3 视频批次预检用）。
+/// 判定顺序：含视觉标记（vl/vision/llava/moondream/minicpm-v/gemma3 等）→ 支持；
+/// 命中已知纯文本模型段 → 不支持；未知一律按支持处理（避免误拦自定义视觉模型）。
+pub fn model_supports_vision(model: &str) -> bool {
+    let m = model.trim().to_ascii_lowercase();
+    if m.is_empty() {
+        return true;
+    }
+    let vision_markers = [
+        "vl", "vision", "llava", "moondream", "minicpm-v", "minicpmv", "gemma3", "internvl",
+        "intern-vl", "qwen2.5-vl", "qwen2-vl", "glm-4v", "cogvlm", "bunny", "llava-phi",
+    ];
+    if vision_markers.iter().any(|x| m.contains(x)) {
+        return true;
+    }
+    let text_only_markers = [
+        "llama3", "llama-3", "llama2", "llama-2", "deepseek", "mistral", "phi-4", "phi4",
+        "phi-3", "phi3", "gemma2", "gemma-2", "qwen3", "qwen-3", "qwen2.5", "qwen2", "qwen-2.5",
+        "qwen-2", "kimi", "glm-4-", "gemma-1", "gpt-oss",
+    ];
+    if text_only_markers.iter().any(|x| m.contains(x)) {
+        return false;
+    }
+    true
 }
 
 /// 解析模型回复并要求非空（v2.12）：空结果视为失败——通常意味着模型不支持图片输入或未遵循提示词。
@@ -270,7 +328,7 @@ fn request_tags(
     } else {
         // OpenAI 兼容（默认）：Bearer 鉴权 + data:image base64
         Box::new(move || {
-            let body = serde_json::json!({
+            let mut body = serde_json::json!({
                 "model": cfg.model,
                 "messages": [{
                     "role": "user",
@@ -281,6 +339,8 @@ fn request_tags(
                 }],
                 "max_tokens": 500
             });
+            // §8.4：本地请求显式传 keep_alive（不依赖默认值）
+            apply_keep_alive(&mut body, cfg.is_local());
 
             let resp: serde_json::Value = client
                 .post(format!("{base}/chat/completions"))
@@ -449,6 +509,8 @@ fn request_text_raw(
             } else if tier == TextJsonTier::JsonObject {
                 body["response_format"] = serde_json::json!({ "type": "json_object" });
             }
+            // §8.4：本地请求显式传 keep_alive（不依赖默认值）
+            apply_keep_alive(&mut body, cfg.is_local());
             let resp: serde_json::Value = if cfg.api_key.trim().is_empty() {
                 client
                     .post(format!("{base}/chat/completions"))
@@ -758,7 +820,8 @@ pub fn run_cloud_batch<F: Fn(AiProgress)>(
     let total = todo.len() as i64;
     // F15b（2026-08-22）：无待打标项（全部已处理/已确认/已拒绝）不再空转 done——
     // 明确报错；并先把批次状态复位，避免留下 processing 僵尸态
-    // （命令层 ai_start_batch 已在预检拦截同场景，此处为直接服务层调用的兜底）
+    // （命令层 ai_start_batch 已预检「无待打标项」；视频批次三检——开关/ffmpeg/本地视觉模型——
+    //   也在命令层预检，此处为直接服务层调用与逐条兜底，见 :833 的 video_tagging 逐条校验）
     if todo.is_empty() {
         let conn = lock()?;
         ai::set_batch_status(&conn, batch_id, "done")?;
@@ -770,7 +833,7 @@ pub fn run_cloud_batch<F: Fn(AiProgress)>(
         let is_video = asset.mime_type.starts_with("video/");
         if is_video && !cfg.video_tagging {
             return Err(AppError::msg(
-                "视频 AI 打标未开启。请打开设置 → 在线打标 → 视频 AI 打标，保存后重新开始批次。",
+                "视频 AI 打标未开启。请打开\"设置 → AI 设置 → 自动打标 → 视频 AI 打标\"，保存后重新开始批次。",
             ));
         }
         if is_video {
@@ -832,7 +895,9 @@ pub fn run_cloud_batch<F: Fn(AiProgress)>(
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_anthropic_text, parse_categorized, parse_model_ids};
+    use super::{
+        apply_keep_alive, extract_anthropic_text, parse_categorized, parse_model_ids, KEEP_ALIVE_IDLE,
+    };
 
     #[test]
     fn categorized_clean_object() {
@@ -874,6 +939,31 @@ mod tests {
         let valid = ["scene", "style", "color"];
         let r = super::parse_tags_strict("{\"场景\": [\"公园\"]}", &valid).unwrap();
         assert_eq!(r.get("scene").unwrap(), &vec!["公园".to_string()]);
+    }
+
+    // §8.4：本地请求体注入 keep_alive；云端不注入
+    #[test]
+    fn keep_alive_injected_only_for_local() {
+        let mut local = serde_json::json!({ "model": "qwen2.5vl:7b" });
+        apply_keep_alive(&mut local, true);
+        assert_eq!(local["keep_alive"], KEEP_ALIVE_IDLE);
+
+        let mut cloud = serde_json::json!({ "model": "gpt-4o" });
+        apply_keep_alive(&mut cloud, false);
+        assert!(cloud.get("keep_alive").is_none());
+    }
+
+    // §9.3：本地模型视觉能力启发式（含视觉标记 → 支持；已知纯文本 → 不支持；未知 → 支持防误拦）
+    #[test]
+    fn vision_model_heuristic() {
+        assert!(super::model_supports_vision("qwen2.5vl:7b")); // vl 标记
+        assert!(super::model_supports_vision("llava:13b"));
+        assert!(super::model_supports_vision("moondream:2b"));
+        assert!(super::model_supports_vision("gemma3:4b")); // 多模态
+        assert!(!super::model_supports_vision("qwen2.5:7b-instruct")); // 纯文本
+        assert!(!super::model_supports_vision("deepseek-r1:7b"));
+        assert!(super::model_supports_vision("有些自定义视觉模型")); // 未知按支持，避免误拦
+        assert!(super::model_supports_vision("")); // 空模型不拦
     }
 
     #[test]

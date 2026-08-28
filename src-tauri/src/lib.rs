@@ -180,6 +180,7 @@ pub fn run() {
             commands::inspect_import,
             commands::cancel_import,
             commands::preview_rename,
+            commands::open_file_external,
             // 标签
             commands::list_tags,
             commands::list_tag_facets,
@@ -238,6 +239,8 @@ pub fn run() {
             commands::ollama_install_status,
             commands::ollama_download_install,
             commands::ollama_start_service,
+            commands::ollama_runtime_status,
+            commands::ollama_stop_service,
             commands::ollama_remove_installer,
             // 下载源自选/测速（改造方案）
             commands::ollama_list_sources,
@@ -262,6 +265,20 @@ pub fn run() {
             commands::get_ai_usage_bindings,
             commands::get_legacy_active_profile,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app_handle, event| {
+            // L2（§8.2）：应用退出只停止 AppOwned；External（用户自启）永不杀
+            if let tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit = event {
+                if let Some(state) = app_handle.try_state::<AppState>() {
+                    let rt = std::sync::Arc::clone(&state.ollama_runtime);
+                    {
+                        let mut runtime = rt.lock().ok();
+                        if let Some(r) = runtime.as_mut() {
+                            r.stop_app_owned();
+                        }
+                    }
+                }
+            }
+        });
 }

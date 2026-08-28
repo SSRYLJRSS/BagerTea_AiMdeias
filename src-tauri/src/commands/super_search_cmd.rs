@@ -56,12 +56,16 @@ pub async fn ai_parse_search_query(
             (s.ai, facets, dict)
         };
         // 6. 锁外网络请求 + 解析 + 校验（不持 DB 锁）
-        let intent = super_search_ai::request_intent(&cfg, &text, &facets, &dict)?;
+        let raw_intent = super_search_ai::request_intent(&cfg, &text, &facets, &dict)?;
+        // §11.2 概念编译：模型输出的原子概念（主体/颜色/场景…）→ 现有 SearchIntent（兼容前端协议）；
+        //        unresolved 进全文 search 并产生警告。
+        let (intent, concept_warnings) = super_search_ai::compile_concepts(raw_intent);
         // 7-12. 短锁解析 tagId + 生成 warnings + 组装执行对象（不查回收站）
-        let (query, resolved_tags, warnings) = {
+        let (query, resolved_tags, mut warnings) = {
             let conn = lock_db(&db)?;
             super_search_ai::resolve_query(&conn, &intent)?
         };
+        warnings.extend(concept_warnings);
         let explanation = super_search_ai::build_explanation(&intent);
         let _ = current_query;
         Ok(AiSearchParseResult {

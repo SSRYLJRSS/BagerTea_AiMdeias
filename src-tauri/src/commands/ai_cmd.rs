@@ -117,6 +117,52 @@ pub async fn ai_start_batch(
                     "该批次为本地打标：请在设置页把激活档案切换为本地端点（kind=本地，如 Ollama）后重试",
                 ));
             }
+            // FB-03 §9.3 视频批次预检（前后端一致；后端为最终校验，service 层兜底保留）：
+            // 待打标条目是否含视频 → 开关/ffmpeg/本地视觉模型三项检查，启动前阻断而非逐条启动后失败。
+            {
+                let suggestions = ai::list_suggestions(&conn, batch_id)?;
+                let pending_items: Vec<_> = suggestions
+                    .iter()
+                    .filter(|s| s.status == "pending" && s.suggested_tags.is_empty())
+                    .collect();
+                let has_video = pending_items.iter().any(|s| {
+                    let by_mime = s
+                        .mime_type
+                        .as_deref()
+                        .map(|m| m.starts_with("video/"))
+                        .unwrap_or(false);
+                    let by_ext = {
+                        let lower = s.asset_path.to_ascii_lowercase();
+                        [".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v", ".wmv", ".flv", ".ts"]
+                            .iter()
+                            .any(|ext| lower.ends_with(ext))
+                    };
+                    by_mime || by_ext
+                });
+                if has_video {
+                    if !s.ai.video_tagging {
+                        return Err(AppError::msg(
+                            "视频 AI 打标未开启。请打开「设置 → AI 设置 → 自动打标 → 视频 AI 打标」，保存后重新开始批次。",
+                        ));
+                    }
+                    if !crate::services::video::ffmpeg_available() {
+                        return Err(AppError::msg(
+                            "本批次包含视频，但未检测到 ffmpeg：无法抽帧打标。请安装 ffmpeg 并加入 PATH，或在设置中关闭「视频 AI 打标」后重试。",
+                        ));
+                    }
+                    // 本地模型视觉能力启发式检查（仅本地档案；云端默认支持，不做此检）
+                    if profile_is_local {
+                        if let Some(active) = s.ai.active() {
+                            if !crate::services::ai_cloud::model_supports_vision(&active.model) {
+                                return Err(AppError::msg(format!(
+                                    "本批次包含视频，但当前本地模型「{}」不支持视觉（图片/视频抽帧）输入。请更换支持图片输入的视觉模型（如 qwen2.5vl、llava、moondream），保存后重新开始批次。",
+                                    active.model
+                                )));
+                            }
+                        }
+                    }
+                }
+            }
             s
         };
         let cfg = all.ai;

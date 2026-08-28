@@ -798,20 +798,30 @@ pub fn remove_installer_at(path: &Path) -> AppResult<bool> {
 
 /// 已装但服务未跑：拉起 `ollama serve`（无窗口分离进程，随系统托盘由官方安装包管理后续自启）。
 /// 不做代理设置（纯拉起）。
-pub fn start_service(exe_path: &str) -> AppResult<()> {
+pub fn start_service(exe_path: &str) -> AppResult<std::process::Child> {
     start_service_inner(exe_path, None)
 }
 
 /// 拉起 `ollama serve` 并可注入模型下载代理（改造方案·加速项 A：HTTPS_PROXY/HTTP_PROXY）。
 /// proxy 形如 "http://127.0.0.1:7890"（留空/None 则不注入，行为同 start_service）
-pub fn start_service_with_proxy(exe_path: &str, proxy: &str) -> AppResult<()> {
+pub fn start_service_with_proxy(exe_path: &str, proxy: &str) -> AppResult<std::process::Child> {
     let proxy = proxy.trim();
     start_service_inner(exe_path, if proxy.is_empty() { None } else { Some(proxy) })
 }
 
-fn start_service_inner(exe_path: &str, proxy: Option<&str>) -> AppResult<()> {
+/// L1（§8.1）：应用自启 ollama serve 注入的空闲保留时长常量（建议 2m，常量化）。
+/// Ollama 原生 generate/chat 的默认保留时长；模型空闲到点自动卸载，节省 RAM/VRAM。
+pub const KEEP_ALIVE_IDLE: &str = "2m";
+
+/// 构造 `ollama serve` 命令（纯构造，便于单测断言环境变量；§8.1「增加命令构造测试」）。
+/// - 注入 OLLAMA_KEEP_ALIVE（L1 止血：模型空闲自动卸载）；
+/// - 可选注入模型下载代理 HTTPS_PROXY/HTTP_PROXY（保留代理环境变量）；
+/// - Windows 无窗口标志。
+fn build_serve_command(exe_path: &str, proxy: Option<&str>) -> std::process::Command {
     let mut cmd = std::process::Command::new(exe_path);
     cmd.arg("serve");
+    // L1：空闲保留时长注入（不记录密钥；值固定常量无敏感内容）
+    cmd.env("OLLAMA_KEEP_ALIVE", KEEP_ALIVE_IDLE);
     if let Some(p) = proxy {
         // Ollama 模型拉取走进程内 reqwest，读标准 HTTPS_PROXY/HTTP_PROXY 即可换源
         cmd.env("HTTPS_PROXY", p).env("HTTP_PROXY", p);
@@ -822,9 +832,14 @@ fn start_service_inner(exe_path: &str, proxy: Option<&str>) -> AppResult<()> {
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
-    cmd.spawn()
-        .map_err(|e| AppError::msg(format!("启动 Ollama 服务失败: {e}")))?;
-    Ok(())
+    cmd
+}
+
+fn start_service_inner(exe_path: &str, proxy: Option<&str>) -> AppResult<std::process::Child> {
+    // L2（§8.2）：返回 Child（不再丢弃），由命令层保存 pid/ownership 供停服与防重复启动
+    build_serve_command(exe_path, proxy)
+        .spawn()
+        .map_err(|e| AppError::msg(format!("启动 Ollama 服务失败: {e}")))
 }
 
 #[cfg(test)]
@@ -874,6 +889,37 @@ mod tests {
         assert!(exit_code_ok(1));
         assert!(!exit_code_ok(2));
         assert!(!exit_code_ok(-1));
+    }
+
+    // L1（§8.1）：命令构造测试——注入 OLLAMA_KEEP_ALIVE + 保留代理 + serve 参数
+    #[test]
+    fn build_serve_command_injects_keep_alive_and_proxy() {
+        let cmd = build_serve_command("C:\\ollama\\ollama.exe", Some("http://127.0.0.1:7890"));
+        let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert_eq!(args, vec!["serve"]);
+        let envs: Vec<_> = cmd.get_envs().collect();
+        let keep = envs
+            .iter()
+            .find(|(k, _)| k.to_string_lossy() == "OLLAMA_KEEP_ALIVE")
+            .map(|(_, v)| v.as_ref().map(|v| v.to_string_lossy().into_owned()));
+        assert_eq!(keep, Some(Some(KEEP_ALIVE_IDLE.to_string())));
+        let https = envs
+            .iter()
+            .find(|(k, _)| k.to_string_lossy() == "HTTPS_PROXY")
+            .map(|(_, v)| v.as_ref().map(|v| v.to_string_lossy().into_owned()));
+        assert_eq!(https, Some(Some("http://127.0.0.1:7890".to_string())));
+    }
+
+    #[test]
+    fn build_serve_command_no_proxy_omits_proxy_env() {
+        let cmd = build_serve_command("ollama", None);
+        let envs: Vec<_> = cmd.get_envs().collect();
+        assert!(envs.iter().all(|(k, _)| k.to_string_lossy() != "HTTPS_PROXY"));
+        assert!(envs.iter().all(|(k, _)| k.to_string_lossy() != "HTTP_PROXY"));
+        // keep_alive 仍注入（L1 不依赖是否配置代理）
+        assert!(envs
+            .iter()
+            .any(|(k, v)| k.to_string_lossy() == "OLLAMA_KEEP_ALIVE" && v.is_some()));
     }
 
     #[test]

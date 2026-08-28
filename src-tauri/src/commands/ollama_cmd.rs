@@ -12,6 +12,7 @@ use tauri_plugin_opener::OpenerExt;
 use crate::db::settings as db_settings;
 use crate::error::{AppError, AppResult};
 use crate::services::ollama_installer as installer;
+use crate::services::ollama_runtime::{OllamaRuntimeSnapshot, ServiceOwnership};
 use crate::services::ollama_setup::{self, GpuInfo, ModelRec, OllamaStatus, PullProgress};
 use crate::state::AppState;
 
@@ -356,36 +357,100 @@ pub fn ollama_open_model_dir(app: AppHandle) -> AppResult<()> {
 
 /// 已装但服务未跑：拉起 ollama serve 并复检就绪。
 /// 模型下载代理（Settings.modelDownloadProxy）非空时注入 HTTPS_PROXY/HTTP_PROXY（加速项 A）
+/// L2（§8.2）：启动前 ping——已有服务标记 External（不重启不改环境）；应用自启成功保存
+/// Child/pid 为 AppOwned（防重复启动）；返回运行态快照。
 #[tauri::command]
-pub async fn ollama_start_service(state: State<'_, AppState>) -> AppResult<()> {
+pub async fn ollama_start_service(state: State<'_, AppState>) -> AppResult<OllamaRuntimeSnapshot> {
     // 命令层读设置（拿代理），逻辑仍在 services（拉起+复检）
     let proxy = {
         let conn = state.db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
         db_settings::get_settings(&conn)?.model_download_proxy
     };
+    // 运行态在 spawn_blocking 外借用快照 clone（Child 不可跨线程直接持有但锁内可短操作）
+    let runtime = std::sync::Arc::clone(&state.ollama_runtime);
     tauri::async_runtime::spawn_blocking(move || {
+        // L2：已有服务标记 External，绝不重启/改环境（§8.2）
+        if ollama_setup::ping(installer::LOCAL_BASE_URL).running {
+            {
+                let mut rt = runtime.lock().map_err(|_| AppError::msg("Ollama 运行态锁中毒"))?;
+                rt.mark_external();
+            }
+            tracing::info!("检测到已运行的 Ollama 服务（标记 External，应用不重启）");
+            return Ok(runtime
+                .lock()
+                .map_err(|_| AppError::msg("Ollama 运行态锁中毒"))?
+                .snapshot());
+        }
         let d = installer::detect_installed();
         let exe = d
             .exe_path
             .ok_or_else(|| AppError::msg("未检测到已安装的 Ollama，请先一键安装"))?;
-        // 服务已在跑则直接成功（重复点不报错）
-        if ollama_setup::ping(installer::LOCAL_BASE_URL).running {
-            return Ok(());
-        }
-        if proxy.trim().is_empty() {
-            installer::start_service(&exe)?;
+        let child = if proxy.trim().is_empty() {
+            installer::start_service(&exe)?
         } else {
             tracing::info!("为 Ollama 注入模型下载代理: {}", proxy);
-            installer::start_service_with_proxy(&exe, &proxy)?;
+            installer::start_service_with_proxy(&exe, &proxy)?
+        };
+        // 保存 Child/pid 为 AppOwned（防重复启动）
+        {
+            let mut rt = runtime.lock().map_err(|_| AppError::msg("Ollama 运行态锁中毒"))?;
+            rt.register_app_owned(child);
         }
         if installer::wait_ready(installer::LOCAL_BASE_URL, Duration::from_secs(20)).is_some() {
-            Ok(())
+            Ok(runtime
+                .lock()
+                .map_err(|_| AppError::msg("Ollama 运行态锁中毒"))?
+                .snapshot())
         } else {
+            // 启动但未就绪：保留 AppOwned 供用户明确停止，返回可读错误
             Err(AppError::msg(
-                "Ollama 服务未在预期时间内就绪，请再点一次重试",
+                "Ollama 服务未在预期时间内就绪，请再点一次重试，或在服务管理停止后重新启动",
             ))
         }
     })
     .await
     .map_err(|e| AppError::msg(format!("启动服务任务异常: {e}")))?
+}
+
+/// 当前 Ollama 本地服务运行态（§8.5 高级信息 + L2 观测）
+#[tauri::command]
+pub async fn ollama_runtime_status(state: State<'_, AppState>) -> AppResult<OllamaRuntimeSnapshot> {
+    let runtime = std::sync::Arc::clone(&state.ollama_runtime);
+    tauri::async_runtime::spawn_blocking(move || {
+        runtime
+            .lock()
+            .map_err(|_| AppError::msg("Ollama 运行态锁中毒"))
+            .map(|rt| rt.snapshot())
+    })
+    .await
+    .map_err(|e| AppError::msg(format!("运行态查询任务异常: {e}")))?
+}
+
+/// 停止 Ollama 本地服务（L2 §8.2）：仅停止 AppOwned；External 服务永不停止（§2 非目标第 9 条）。
+/// 返回停止前 ownership 与是否执行了停止动作。
+#[tauri::command]
+pub async fn ollama_stop_service(state: State<'_, AppState>) -> AppResult<OllamaStopResult> {
+    let runtime = std::sync::Arc::clone(&state.ollama_runtime);
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut rt = runtime.lock().map_err(|_| AppError::msg("Ollama 运行态锁中毒"))?;
+        let before = rt.snapshot().ownership;
+        let stopped = rt.stop_app_owned();
+        let after = rt.snapshot();
+        Ok(OllamaStopResult {
+            before,
+            stopped,
+            after,
+        })
+    })
+    .await
+    .map_err(|e| AppError::msg(format!("停止服务任务异常: {e}")))?
+}
+
+/// ollama_stop_service 的返回（before/stopped/after）
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OllamaStopResult {
+    pub before: Option<ServiceOwnership>,
+    pub stopped: bool,
+    pub after: OllamaRuntimeSnapshot,
 }

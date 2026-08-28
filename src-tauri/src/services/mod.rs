@@ -8,6 +8,7 @@ pub mod imaging;
 pub mod importer;
 pub mod media_refill;
 pub mod ollama_installer;
+pub mod ollama_runtime;
 pub mod ollama_setup;
 pub mod preview;
 pub mod raw_decode;
