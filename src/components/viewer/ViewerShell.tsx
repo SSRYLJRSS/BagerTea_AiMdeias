@@ -11,11 +11,13 @@ interface ViewerShellProps {
   sidebar: ReactNode;
   /** 右侧媒体舞台 */
   stage: ReactNode;
+  /** FB2-04：舞台下方的标签区（固定高，可折叠）。null 时不占位。 */
+  tagBar?: ReactNode;
   /** 底部胶片条 */
   filmstrip: ReactNode;
 }
 
-export default function ViewerShell({ toolbar, sidebar, stage, filmstrip }: ViewerShellProps) {
+export default function ViewerShell({ toolbar, sidebar, stage, tagBar, filmstrip }: ViewerShellProps) {
   return (
     <div className="flex h-full min-h-0 flex-col bg-[var(--color-bg)]">
       {toolbar}
@@ -25,7 +27,10 @@ export default function ViewerShell({ toolbar, sidebar, stage, filmstrip }: View
             {sidebar}
           </aside>
         )}
-        <div className="flex min-h-0 min-w-0 flex-1 flex-col">{stage}</div>
+        <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+          {stage}
+          {tagBar}
+        </div>
       </div>
       {filmstrip}
     </div>

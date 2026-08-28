@@ -10,6 +10,7 @@ import ViewerShell from "@/components/viewer/ViewerShell";
 import ViewerToolbar from "@/components/viewer/ViewerToolbar";
 import ViewerInfoSidebar from "@/components/viewer/ViewerInfoSidebar";
 import ViewerFilmstrip from "@/components/viewer/ViewerFilmstrip";
+import ViewerTagBar from "@/components/viewer/ViewerTagBar";
 import MediaViewport from "@/components/viewer/MediaViewport";
 import VideoPlayer from "@/components/media/VideoPlayer";
 import TagAssignDialog from "@/components/dialogs/TagAssignDialog";
@@ -190,15 +191,10 @@ export default function ViewerPage({ asset: initial, onClose }: ViewerPageProps)
         }
         sidebar={
           detailsOpen ? (
-            <ViewerInfoSidebar
-              asset={current}
-              tags={current.tags}
-              onRemoveTag={(tagId) => void removeTag(tagId)}
-              onAddTag={openAssign}
-              onRefreshed={(a) => patchLocal([a.id], a)}
-            />
+            <ViewerInfoSidebar asset={current} onRefreshed={(a) => patchLocal([a.id], a)} />
           ) : null
         }
+        tagBar={<ViewerTagBar assetId={current.id} tags={current.tags} onRemoveTag={(tid) => void removeTag(tid)} onAddTag={openAssign} />}
         stage={
           isVideo ? (
             <MediaViewport assetId={current.id} isVideo fileName={current.fileName} video={
