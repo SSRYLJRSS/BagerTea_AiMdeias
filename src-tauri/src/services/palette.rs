@@ -192,7 +192,7 @@ fn merge_clusters(mut clusters: Vec<Cluster>) -> Vec<Cluster> {
 pub fn dominant_from_rgb(r: u8, g: u8, b: u8) -> (i64, i64, i64) {
     let srgb = palette::Srgb::new(r, g, b).into_format::<f32>();
     let hsv = palette::Hsv::from_color(srgb);
-    let hue = (hsv.hue.to_positive_degrees().round() as i64).rem_euclid(360);
+    let hue = (hsv.hue.into_positive_degrees().round() as i64).rem_euclid(360);
     let sat = (hsv.saturation * 100.0).round() as i64;
     let lum = (hsv.value * 100.0).round() as i64;
     (hue, sat, lum)
