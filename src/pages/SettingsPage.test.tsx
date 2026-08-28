@@ -148,6 +148,21 @@ describe("SettingsPage §6.1 信息架构", () => {
     expect(screen.getByText("服务管理")).toBeInTheDocument();
   });
 
+  it("FB2-02 素材框：切到「通用外观」后存在「素材框」组与 7 项比例选项", async () => {
+    useSettingsStore.setState({ settings: mkSettings(), loaded: true, loading: false, loadError: null });
+    render(<SettingsPage />);
+    await waitFor(() => expect(screen.getByText("保存设置")).toBeInTheDocument());
+    fireEvent.click(screen.getByText("通用外观"));
+    await waitFor(() => expect(screen.getByText("素材框")).toBeInTheDocument());
+    // 7 项比例选项（1:1 / 4:3 / 3:2 / 16:9 / 3:4 / 2:3 / 9:16）
+    const ratioOpts = Array.from(screen.getAllByRole("option") as HTMLOptionElement[]).map((o) => o.value).filter((v) => v.includes(":"));
+    expect(ratioOpts.length).toBe(7);
+    // 填充方式 3 项
+    expect(
+      Array.from(screen.getAllByRole("option") as HTMLOptionElement[]).filter((o) => ["cover", "contain", "smart"].includes(o.value)).length,
+    ).toBe(3);
+  });
+
   it("AI 子页「自动打标」只显示「此功能使用的服务」+ 功能参数，不再重复服务管理列表", async () => {
     useSettingsStore.setState({ settings: mkSettings(), loaded: true, loading: false, loadError: null });
     render(<SettingsPage />);

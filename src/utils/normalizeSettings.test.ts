@@ -4,6 +4,7 @@
 import { describe, expect, it } from "vitest";
 import { normalizeSettings } from "@/utils/normalizeSettings";
 import { DEFAULT_BATCH_LIMIT, DEFAULT_CACHE_MB, DEFAULT_MODEL } from "@/utils/normalizeSettings";
+import { CELL_STEPS } from "@/types/settings";
 
 describe("normalizeSettings", () => {
   it("对完全缺失的输入返回全默认值", () => {
@@ -130,5 +131,16 @@ describe("normalizeSettings", () => {
     });
     expect(s.ai.videoTaggingMode).toBe("cover");
     expect(s.ai.videoFrameCount).toBe(8);
+  });
+
+  it("FB2-01：cellStep 越界钳制、非法 cellFit 回落 cover", () => {
+    const s = normalizeSettings({
+      appearance: {
+        grid: { libraryCellStep: 99, importCellStep: -5, cellFit: "stretch" },
+      },
+    });
+    expect(s.appearance.grid.libraryCellStep).toBe(CELL_STEPS.length - 1);
+    expect(s.appearance.grid.importCellStep).toBe(0);
+    expect(s.appearance.grid.cellFit).toBe("cover");
   });
 });

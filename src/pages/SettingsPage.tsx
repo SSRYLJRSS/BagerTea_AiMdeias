@@ -16,8 +16,25 @@ import { listAiConnections, getAiUsageBindings, setAiUsageBinding } from "@/api/
 import { videoProxyCacheStats, clearAllVideoProxies } from "@/api/video";
 import FacetManagePanel from "@/components/settings/FacetManagePanel";
 import ServiceManagement from "@/components/settings/ServiceManagement";
-import { applyTheme, useSettingsStore } from "@/stores/settingsStore";
-import type { Settings } from "@/types/settings";
+import { applyTheme, useSettingsStore, DEFAULT_APPEARANCE } from "@/stores/settingsStore";
+import { CELL_STEPS } from "@/types/settings";
+import type { CellAspect, CellFit, Settings } from "@/types/settings";
+
+/** FB2-01/02：素材框比例与填充可选项（顺序即展示顺序） */
+const CELL_ASPECTS: { value: CellAspect; label: string }[] = [
+  { value: "1:1", label: "1:1（方形）" },
+  { value: "4:3", label: "4:3" },
+  { value: "3:2", label: "3:2" },
+  { value: "16:9", label: "16:9" },
+  { value: "3:4", label: "3:4" },
+  { value: "2:3", label: "2:3" },
+  { value: "9:16", label: "9:16" },
+];
+const CELL_FITS: { value: CellFit; label: string }[] = [
+  { value: "cover", label: "裁切填满（cover）" },
+  { value: "contain", label: "完整显示（contain）" },
+  { value: "smart", label: "智能（smart）" },
+];
 
 /** §6.1 路由状态：必须能表达 AI 的三个子页面（超级搜索 / 自动打标 / 服务管理） */
 type SettingsRoute = "library" | "ai.superSearch" | "ai.tagging" | "ai.services" | "tags" | "general" | "data" | "about";
@@ -196,6 +213,17 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
   const patchFacet = (i: number, patch: Partial<NonNullable<Settings["aiFacetConfigs"]>[number]>) =>
     dirty({ ...draft, aiFacetConfigs: draft.aiFacetConfigs.map((c, j) => (j === i ? { ...c, ...patch } : c)) });
 
+  // FB2-01/02（§8.4）：素材框外观 —— draft.appearance 兜底默认；改动同时写 draft 与 previewAppearance（即时预览）
+  const draftAppearance = draft.appearance ?? DEFAULT_APPEARANCE;
+  const pushPreview = (appearance: Settings["appearance"]) => {
+    useSettingsStore.getState().commitAppearanceDebounced(appearance);
+  };
+  const patchGrid = (grid: Settings["appearance"]["grid"]) => {
+    const next: Settings = { ...draft, appearance: { ...draftAppearance, grid } };
+    dirty(next);
+    pushPreview(next.appearance);
+  };
+
   const chooseLibraryRoot = async () => {
     const dir = await pickDir({ directory: true });
     if (typeof dir === "string") dirty({ ...draft, libraryRoot: dir });
@@ -348,7 +376,8 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
           )}
 
           {route === "general" && (
-            <Group title="通用外观">
+            <>
+              <Group title="通用外观">
               <Field label="主题" hint="跟随系统 / 浅色 / 深色；切换即时预览，保存后记住">
                 <select
                   value={draft.theme}
@@ -365,6 +394,107 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
                 </select>
               </Field>
             </Group>
+
+            {/* FB2-02（§8.4）：素材框 —— 统一比例 + 填充方式 + 双边格子大小 + 悬停预览。
+                所有外观字段即时生效（写 draft + previewAppearance），保存时随 draft 落库。 */}
+            <Group title="素材框">
+              <Field label="统一比例" hint="素材库与入库网格共用同一比例，任意混排都无锯齿行">
+                <select
+                  value={draft.appearance?.grid.cellAspect ?? "1:1"}
+                  onChange={(e) => {
+                    const next: Settings = {
+                      ...draft,
+                      appearance: { ...draftAppearance, grid: { ...draftAppearance.grid, cellAspect: e.target.value as CellAspect } },
+                    };
+                    dirty(next);
+                    pushPreview(next.appearance);
+                  }}
+                  className="ui-control rounded-md px-2 py-1.5 text-sm outline-none"
+                >
+                  {CELL_ASPECTS.map((a) => (
+                    <option key={a.value} value={a.value}>{a.label}</option>
+                  ))}
+                </select>
+              </Field>
+              <Field label="填充方式" hint="cover 裁切填满 / contain 完整显示 / smart 按内容自动权衡，绝不拉伸">
+                <select
+                  value={draftAppearance.grid.cellFit}
+                  onChange={(e) => {
+                    const next: Settings = {
+                      ...draft,
+                      appearance: { ...draftAppearance, grid: { ...draftAppearance.grid, cellFit: e.target.value as CellFit } },
+                    };
+                    dirty(next);
+                    pushPreview(next.appearance);
+                  }}
+                  className="ui-control rounded-md px-2 py-1.5 text-sm outline-none"
+                >
+                  {CELL_FITS.map((f) => (
+                    <option key={f.value} value={f.value}>{f.label}</option>
+                  ))}
+                </select>
+              </Field>
+              <Field label="contain 留边填主色" hint="将留边底色填成素材主色的低饱和版本（视觉延伸，非缺口）">
+                <Toggle
+                  checked={draft.appearance.grid.matchDominantColor}
+                  onChange={() => {
+                    const next: Settings = {
+                      ...draft,
+                      appearance: { ...draftAppearance, grid: { ...draftAppearance.grid, matchDominantColor: !draftAppearance.grid.matchDominantColor } },
+                    };
+                    dirty(next);
+                    pushPreview(next.appearance);
+                  }}
+                />
+              </Field>
+              <Field label="素材库格子大小" hint="档位化缩放；Alt/Ctrl/Cmd+滚轮或 Ctrl/Cmd+± 也可调整">
+                <RangeSteps value={draftAppearance.grid.libraryCellStep} max={CELL_STEPS.length - 1} labelForStep={(i) => `${CELL_STEPS[i]}px`} onChange={(v) => patchGrid({ ...draftAppearance.grid, libraryCellStep: v })} />
+              </Field>
+              <Field label="入库格子大小" hint="入库页网格的默认档位（两页各存一份）">
+                <RangeSteps value={draftAppearance.grid.importCellStep} max={CELL_STEPS.length - 1} labelForStep={(v) => `${CELL_STEPS[v]}px`} onChange={(v) => patchGrid({ ...draftAppearance.grid, importCellStep: v })} />
+              </Field>
+              <Field label="悬停自动播放" hint="视频卡片悬停 300ms 后原位预览前几秒（可选素材库开启）">
+                <Toggle
+                  checked={draftAppearance.hoverPreview.enabled}
+                  onChange={() => {
+                    const hp = { ...draftAppearance.hoverPreview, enabled: !draftAppearance.hoverPreview.enabled };
+                    const next: Settings = { ...draft, appearance: { ...draftAppearance, hoverPreview: hp } };
+                    dirty(next);
+                    pushPreview(next.appearance);
+                  }}
+                />
+              </Field>
+              {draftAppearance.hoverPreview.enabled && (
+                <Field label="预览时长" hint="预览播放的片段长度（秒），2–10">
+                  <input
+                    type="number"
+                    min={2}
+                    max={10}
+                    className="ui-control w-20 rounded-md px-2 py-1.5 text-sm outline-none"
+                    value={String(draftAppearance.hoverPreview.previewSeconds)}
+                    onChange={(v) => {
+                      const n = Math.max(2, Math.min(10, Number(v.target.value) || 2));
+                      const next: Settings = { ...draft, appearance: { ...draftAppearance, hoverPreview: { ...draftAppearance.hoverPreview, previewSeconds: n } } };
+                      dirty(next);
+                      pushPreview(next.appearance);
+                    }}
+                  />
+                </Field>
+              )}
+              {draftAppearance.hoverPreview.enabled && (
+                <Field label="素材库也启用悬停预览" hint="默认只在查看器/入库页预览；开启后素材库悬停也播放">
+                  <Toggle
+                    checked={draftAppearance.hoverPreview.inLibraryGrid}
+                    onChange={() => {
+                      const next: Settings = { ...draft, appearance: { ...draftAppearance, hoverPreview: { ...draftAppearance.hoverPreview, inLibraryGrid: !draftAppearance.hoverPreview.inLibraryGrid } } };
+                      dirty(next);
+                      pushPreview(next.appearance);
+                    }}
+                  />
+                </Field>
+              )}
+            </Group>
+            </>
           )}
 
           {route === "data" && (
@@ -577,6 +707,35 @@ function Group({ title, children }: { title: string; children: React.ReactNode }
         {children}
       </div>
     </section>
+  );
+}
+
+/** FB2-01：档位化 slider（0..max 离散档）。只值 0..7，步子固定；拖动即时预览。 */
+function RangeSteps({
+  value,
+  max,
+  labelForStep,
+  onChange,
+}: {
+  value: number;
+  max: number;
+  labelForStep: (v: number) => string;
+  onChange: (v: number) => void;
+}) {
+  return (
+    <div className="flex items-center gap-2">
+      <input
+        type="range"
+        min={0}
+        max={max}
+        step={1}
+        value={value}
+        onChange={(e) => onChange(Number(e.target.value))}
+        className="ui-range w-48"
+        aria-label="格子大小档位"
+      />
+      <span className="w-14 shrink-0 text-xs text-[var(--color-text-secondary)]">{labelForStep(value)}</span>
+    </div>
   );
 }
 
