@@ -227,8 +227,8 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
 
   return (
     <div className="flex h-full">
-      {/* 左侧分组导航 */}
-      <aside className="w-[160px] shrink-0 border-r border-[var(--color-border)]">
+      {/* 左侧分组导航（§13 FB-07：220~260px） */}
+      <aside className="w-[224px] shrink-0 border-r border-[var(--color-border)] lg:w-[248px]">
         {onBack && (
           <button
             onClick={onBack}
@@ -278,9 +278,9 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
         </div>
       </aside>
 
-      {/* 右侧分组内容 */}
-      <div className="min-w-0 flex-1 overflow-y-auto p-6">
-        <div className="mx-auto flex max-w-xl flex-col gap-6">
+      {/* 右侧分组内容（§13 FB-07：取消 max-w-xl 小框，宽屏充分利用） */}
+      <div className="relative min-w-0 flex-1 overflow-y-auto">
+        <div className="mx-auto flex max-w-[1040px] flex-col gap-6 px-6 py-6">
           {route === "library" && (
             <Group title="入库与总库">
               <Field label="总库位置" hint="配置后，入库将把文件复制到 总库/分库/ 下统一管理；留空 = 原位索引">
@@ -471,8 +471,8 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
             </Group>
           )}
 
-          {/* 保存按钮统一在最后一项设置之后 */}
-          <div className="flex items-center gap-3">
+          {/* 保存按钮统一在最后一项设置之后（sticky 底部，§13 保存栏清晰状态） */}
+          <div className="sticky bottom-0 -mx-6 -mb-6 flex flex-wrap items-center gap-3 border-t border-[var(--color-border)] bg-[var(--color-bg)]/95 px-6 py-3 backdrop-blur">
             <Button variant="primary" disabled={saving || !isDirty || !!loadError} onClick={onSave}>
               {saving ? "保存中…" : "保存设置"}
             </Button>
@@ -548,7 +548,12 @@ function AiPurposePanel({
       </Field>
       {!isSuperSearch && (
         <Field label="视频 AI 打标" hint="对视频抽帧后打标（耗时更长）">
-          <Toggle checked={draft.ai.videoTagging} onChange={(v) => patchAi({ videoTagging: v })} />
+          <span className="flex items-center gap-2">
+            <Toggle checked={draft.ai.videoTagging} onChange={(v) => patchAi({ videoTagging: v })} />
+            <span className="w-16 text-xs whitespace-nowrap text-[var(--color-text-secondary)]">
+              {draft.ai.videoTagging ? "已开启" : "未开启"}
+            </span>
+          </span>
         </Field>
       )}
       {!isSuperSearch && (
@@ -577,12 +582,13 @@ function Group({ title, children }: { title: string; children: React.ReactNode }
 
 function Field({ label, hint, children }: { label: string; hint?: string; children: React.ReactNode }) {
   return (
-    <div className="flex items-center justify-between gap-4 px-4 py-3">
-      <div className="min-w-0">
+    <div className="flex flex-col gap-2 px-4 py-3 sm:flex-row sm:items-center sm:justify-between sm:gap-6">
+      <div className="min-w-0 sm:max-w-[46%]">
         <p className="text-sm text-[var(--color-text)]">{label}</p>
-        {hint && <p className="text-xs text-[var(--color-text-secondary)]">{hint}</p>}
+        {hint && <p className="mt-0.5 text-xs leading-5 text-[var(--color-text-secondary)]">{hint}</p>}
       </div>
-      <div className="shrink-0">{children}</div>
+      {/* 控件列：窄屏整行、宽屏靠右且可换行，挤压时缩进一行 */}
+      <div className="flex min-w-0 flex-wrap items-center gap-2 sm:justify-end">{children}</div>
     </div>
   );
 }

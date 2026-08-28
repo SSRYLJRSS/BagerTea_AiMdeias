@@ -220,3 +220,27 @@ describe("SettingsPage 加载与 Hook 安全", () => {
     await waitFor(() => expect(screen.getByText(/回填完成：总数 2，成功 2/)).toBeInTheDocument());
   });
 });
+
+describe("SettingsPage §13（FB-07）宽屏布局", () => {
+  it("右侧内容不再用 max-w-xl 小框：存在 1040px 内容容器与加宽侧栏", async () => {
+    useSettingsStore.setState({ settings: mkSettings(), loaded: true, loading: false, loadError: null });
+    const { container } = render(<SettingsPage />);
+    await waitFor(() => expect(screen.getByText("保存设置")).toBeInTheDocument());
+    // 内容容器使用 max-w-[1040px]（替代旧 max-w-xl）
+    expect(container.querySelector(".max-w-\\[1040px\\]")).not.toBeNull();
+    // 侧栏宽度进入 220~260px 范围
+    const aside = container.querySelector("aside");
+    expect(aside).not.toBeNull();
+    expect((aside as HTMLElement).className).toMatch(/w-\[224px\]/);
+  });
+
+  it("保存栏 sticky 底部并提供 未保存/已保存 状态", async () => {
+    useSettingsStore.setState({ settings: mkSettings(), loaded: true, loading: false, loadError: null });
+    const { container } = render(<SettingsPage />);
+    await waitFor(() => expect(screen.getByText("保存设置")).toBeInTheDocument());
+    // sticky 保存栏
+    expect(container.querySelector(".sticky.bottom-0")).not.toBeNull();
+    // 未做任何修改：不显示「有未保存的更改」
+    expect(screen.queryByText("有未保存的更改")).not.toBeInTheDocument();
+  });
+});
