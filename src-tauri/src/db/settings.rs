@@ -116,6 +116,12 @@ impl AiSettings {
             self.video_tagging_mode = "cover".into();
         }
         self.video_frame_count = self.video_frame_count.clamp(2, 8);
+        // FB3-07：云端子批大小收敛到运行时实际范围 [10,50]（ai_cloud 执行层 clamp 同值）。
+        // 历史 500（v2.5 胶片条方案遗留）运行时永远被 clamp 到 50，用户看到的值永不生效——
+        // 读取时归一到 30（新默认），避免「显示 500 实际 50」的假象。
+        if self.batch_limit > 50 || self.batch_limit < 10 {
+            self.batch_limit = default_batch_limit();
+        }
     }
 
     /// 当前激活档案（找不到时回退第一套）
@@ -161,7 +167,7 @@ fn default_video_frame_count() -> i64 {
     3
 }
 fn default_batch_limit() -> i64 {
-    500 // v2.5：胶片条方案下放宽（老板拍板）
+    30 // FB3-07：云端每轮处理数量；运行时 clamp [10,50]，默认 30（旧 500 永不生效已归一）
 }
 
 /// 标签分类（PRD 5.5）：分类=父标签；hint 参与 AI 提示词，single 控制单/多选

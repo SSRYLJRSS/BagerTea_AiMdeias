@@ -75,7 +75,7 @@ describe("normalizeSettings", () => {
     expect(s.aiFacetConfigs[0].enabledForAi).toBe(true);
   });
 
-  it("畸形数字/布尔字段兜底", () => {
+  it("畸形数字/布尔字段兜底；batchLimit 越界归一到 [10,50] 默认 30（FB3-07）", () => {
     const s = normalizeSettings({
       theme: "system",
       thumbnailCacheMb: -5,
@@ -84,7 +84,14 @@ describe("normalizeSettings", () => {
     });
     expect(s.thumbnailCacheMb).toBe(0);
     expect(s.trashRetentionDays).toBe(0);
-    expect(s.ai.batchLimit).toBe(1);
+    // FB3-07：0 越界 → 默认 30（旧语义 Math.max(1,·)→1 会写入运行时必被 clamp 的值）
+    expect(s.ai.batchLimit).toBe(DEFAULT_BATCH_LIMIT);
+    // 历史 500（v2.5 遗留）→ 归一默认 30
+    const s500 = normalizeSettings({ ai: { batchLimit: 500 } });
+    expect(s500.ai.batchLimit).toBe(DEFAULT_BATCH_LIMIT);
+    // 合法区间内保留
+    const s20 = normalizeSettings({ ai: { batchLimit: 20 } });
+    expect(s20.ai.batchLimit).toBe(20);
   });
 
   it("未知 theme 值回退 system", () => {

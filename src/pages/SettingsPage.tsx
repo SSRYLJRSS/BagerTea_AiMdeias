@@ -859,13 +859,32 @@ function AiPurposePanel({
           )}
         </>
       )}
-      {!isSuperSearch && (
-        <Field label="执行分块大小" hint="单次请求分块大小：执行层按此内存分块、限流、重试，不截断总批次">
-          <TextInput
-            type="number"
-            value={String(draft.ai.batchLimit)}
-            onChange={(v) => patchAi({ batchLimit: Math.max(1, Number(v) || 1) })}
-          />
+      {/* FB3-07：批大小设置只在云端模式显示（本地模型固定每轮 15 张，设置不生效） */}
+      {!isSuperSearch && !draft.ai.profiles.some((p) => p.id === draft.ai.activeProfile && p.kind === "local") && (
+        <Field
+          label="每批处理数量（云端）"
+          hint="一次 AI 任务中云端每轮处理的素材数。不会减少选中的总数：选 120 张、设 20，仍会处理 120 张，只是分 6 轮完成。数字越大速度可能更快，但占用内存和失败重试成本也更高（10–50）"
+        >
+          <div className="flex items-center gap-2">
+            <input
+              type="range"
+              min={10}
+              max={50}
+              step={1}
+              value={Math.max(10, Math.min(50, draft.ai.batchLimit))}
+              onChange={(e) => patchAi({ batchLimit: Math.max(10, Math.min(50, Number(e.target.value) || 30)) })}
+              className="ui-range w-40"
+              aria-label="每批处理数量"
+            />
+            <span className="w-10 text-right text-xs tabular-nums text-[var(--color-text-secondary)]">
+              {Math.max(10, Math.min(50, draft.ai.batchLimit))}
+            </span>
+          </div>
+        </Field>
+      )}
+      {!isSuperSearch && draft.ai.profiles.some((p) => p.id === draft.ai.activeProfile && p.kind === "local") && (
+        <Field label="每批处理数量" hint="当前为本地模型：固定每轮 15 张，此设置不生效（切换回在线服务后可调）">
+          <span className="text-xs text-[var(--color-text-secondary)]">本地固定 15 张/轮</span>
         </Field>
       )}
     </Group>

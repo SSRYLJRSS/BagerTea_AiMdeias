@@ -22,7 +22,11 @@ import type {
 import { CELL_STEPS } from "@/types/settings";
 
 export const DEFAULT_MODEL = "qwen-vl-plus";
-export const DEFAULT_BATCH_LIMIT = 500;
+/** FB3-07：云端每批处理数量默认 30（与 Rust default_batch_limit 一致；运行时范围 [10,50]） */
+export const DEFAULT_BATCH_LIMIT = 30;
+/** FB3-07：云端每批处理数量运行时范围（与 ai_cloud.rs 执行层 clamp 一致） */
+export const BATCH_LIMIT_MIN = 10;
+export const BATCH_LIMIT_MAX = 50;
 export const DEFAULT_CACHE_MB = 2048;
 export const DEFAULT_TRASH_RETENTION_DAYS = 30;
 
@@ -69,7 +73,12 @@ function normalizeAi(raw: unknown): AiSettings {
     autoTagging: asBool(r.autoTagging, false),
     videoTagging: asBool(r.videoTagging, false),
     localModelTier: tier === "standard" ? "standard" : "light",
-    batchLimit: Math.max(1, Math.round(asNum(r.batchLimit, DEFAULT_BATCH_LIMIT))),
+    // FB3-07：批大小收敛到 [10,50]（云端执行层实际范围）；越界值（含历史 500/0）归一到默认 30，
+    // 与 Rust 端 AiSettings::normalize 的行为一致（不做区间钳制——0 不应变成 10 这种「看似有效」的值）
+    batchLimit: (() => {
+      const n = Math.round(asNum(r.batchLimit, DEFAULT_BATCH_LIMIT));
+      return n >= BATCH_LIMIT_MIN && n <= BATCH_LIMIT_MAX ? n : DEFAULT_BATCH_LIMIT;
+    })(),
     ollamaSourceId: asStr(r.ollamaSourceId, "auto"),
     videoTaggingMode: asEnum(r.videoTaggingMode, ["cover", "frames"] as const, "cover"),
     videoFrameCount: clampInt(r.videoFrameCount, 2, 8, 3),
