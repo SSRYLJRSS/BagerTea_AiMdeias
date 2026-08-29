@@ -492,7 +492,7 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
               <Field label="入库格子大小" hint="入库页网格的默认档位（两页各存一份）">
                 <RangeSteps value={draftAppearance.grid.importCellStep} max={CELL_STEPS.length - 1} labelForStep={(v) => `${CELL_STEPS[v]}px`} onChange={(v) => patchGrid({ ...draftAppearance.grid, importCellStep: v })} />
               </Field>
-              <Field label="悬停自动播放" hint="视频卡片悬停 300ms 后原位预览前几秒（可选素材库开启）">
+              <Field label="悬停自动播放" hint="鼠标停在视频卡片上约 300 毫秒后，在卡片内部静音播放片段；移开鼠标立即停止，不会打开大浮层">
                 <Toggle
                   checked={draftAppearance.hoverPreview.enabled}
                   onChange={() => {
@@ -521,7 +521,7 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
                 </Field>
               )}
               {draftAppearance.hoverPreview.enabled && (
-                <Field label="素材库也启用悬停预览" hint="默认只在查看器/入库页预览；开启后素材库悬停也播放">
+                <Field label="素材库也启用悬停预览" hint="默认只在素材库悬停播放；关闭后素材库仅显示封面（设置只影响素材库网格，查看器内播放不受此开关控制）">
                   <Toggle
                     checked={draftAppearance.hoverPreview.inLibraryGrid}
                     onChange={() => {
@@ -532,15 +532,15 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
                   />
                 </Field>
               )}
-              {/* FB2-08（§14.11）：色条设置。总开关关闭时下面六行整体不渲染（沿用悬停预览的条件渲染范式） */}
-              <Field label="显示色条" hint="在素材下沿显示算法主色色带；关闭后所有位置都不渲染，也不解析色板数据">
+              {/* FB2-08（§14.11）+ FB3-10（§12.2）：算法主色色条设置。总开关关闭时下面各行整体不渲染 */}
+              <Field label="显示算法主色色条" hint="由本地算法从缩略图/封面估算主色，不调用 AI，也不代表摄影师手工调色；关闭后所有位置都不渲染，也不解析色板数据">
                 <Toggle
                   checked={draftAppearance.colorStrip.enabled}
                   onChange={(v) => patchColorStrip({ enabled: v })}
                 />
               </Field>
               {draftAppearance.colorStrip.enabled && (
-                <Field label="素材库网格显示" hint="小格子上加色带会挤压画面，默认关闭">
+                <Field label="素材库网格显示" hint="已入库素材卡片下方显示主色色条；未计算出色板的素材留空槽位">
                   <Toggle
                     checked={draftAppearance.colorStrip.showInLibraryGrid}
                     onChange={(v) => patchColorStrip({ showInLibraryGrid: v })}
@@ -548,19 +548,10 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
                 </Field>
               )}
               {draftAppearance.colorStrip.enabled && (
-                <Field label="查看器显示" hint="大图浏览时色卡最有价值，默认开启（查看器色条将在后续版本接入）">
+                <Field label="查看器显示" hint="大图浏览时在标签栏上方显示主色色条；全屏浏览时自动隐藏">
                   <Toggle
                     checked={draftAppearance.colorStrip.showInViewer}
                     onChange={(v) => patchColorStrip({ showInViewer: v })}
-                  />
-                </Field>
-              )}
-              {draftAppearance.colorStrip.enabled && (
-                <Field label="入库网格显示" hint="入库前尚未计算色板，暂不支持">
-                  <Toggle
-                    checked={draftAppearance.colorStrip.showInImportGrid}
-                    disabled
-                    onChange={(v) => patchColorStrip({ showInImportGrid: v })}
                   />
                 </Field>
               )}

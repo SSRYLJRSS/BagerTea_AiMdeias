@@ -15,12 +15,14 @@ import ViewerFilmstrip from "@/components/viewer/ViewerFilmstrip";
 import ViewerTagBar from "@/components/viewer/ViewerTagBar";
 import MediaViewport from "@/components/viewer/MediaViewport";
 import VideoPlayer from "@/components/media/VideoPlayer";
+import ColorStrip, { toPaletteSegments } from "@/components/library/ColorStrip";
 import TagAssignDialog from "@/components/dialogs/TagAssignDialog";
 import { getThumbnailUrl, toFileUrl } from "@/api/thumbnail";
 import { removeTags } from "@/api/tags";
 import { ensureVideoProxy, cancelVideoProxy, toProxyFileUrl } from "@/api/video";
 import { useLibraryStore } from "@/stores/libraryStore";
 import { useSelectionStore } from "@/stores/selectionStore";
+import { useAppearance } from "@/hooks/useAppearance";
 import { isEditableTarget, isInsidePlayer, escapeShouldExitFullscreen, requestFullscreenSafe } from "@/utils/shortcuts";
 import { isVideoAsset } from "@/utils/assetKind";
 import type { Asset } from "@/types/asset";
@@ -203,6 +205,14 @@ export default function ViewerPage({ asset: initial, onClose }: ViewerPageProps)
   }, [index, goto, onClose, assignOpen, fsFallback]);
 
   const isVideo = isVideoAsset(current);
+  // FB3-10（§12.2）：查看器接入算法主色色条（showInViewer 开关此前无实现）。
+  // 放标签栏上方；全屏时随 tagBar 一起被 ViewerShell 隐藏（不占布局）。
+  const { colorStrip } = useAppearance();
+  const viewerStripOn = colorStrip.enabled && colorStrip.showInViewer && !!current.palette?.length;
+  const viewerSegments = useMemo(
+    () => (viewerStripOn ? toPaletteSegments(current.palette) : []),
+    [viewerStripOn, current.palette],
+  );
 
   return (
     <div
@@ -232,7 +242,16 @@ export default function ViewerPage({ asset: initial, onClose }: ViewerPageProps)
             <ViewerInfoSidebar asset={current} onRefreshed={(a) => patchLocal([a.id], a)} />
           ) : null
         }
-        tagBar={<ViewerTagBar assetId={current.id} tags={current.tags} onRemoveTag={(tid) => void removeTag(tid)} onAddTag={openAssign} />}
+        tagBar={
+          <>
+            {viewerStripOn && (
+              <div className="shrink-0 px-4 pt-1">
+                <ColorStrip palette={viewerSegments} mode={colorStrip.mode} height={colorStrip.height} count={colorStrip.count} />
+              </div>
+            )}
+            <ViewerTagBar assetId={current.id} tags={current.tags} onRemoveTag={(tid) => void removeTag(tid)} onAddTag={openAssign} />
+          </>
+        }
         stage={
           isVideo ? (
             <MediaViewport assetId={current.id} isVideo fileName={current.fileName} video={

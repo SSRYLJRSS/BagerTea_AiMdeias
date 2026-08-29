@@ -170,43 +170,33 @@ describe("SettingsPage §6.1 信息架构", () => {
     ).toBe(3);
   });
 
-  // FB2-08（FX-07）：色条设置区块
-  it("色条区块：切「显示色条」Toggle 触发即时预览；总开关关闭后六行不渲染", async () => {
+  // FB2-08（FX-07）+ FB3-10：色条设置区块（「入库网格显示」已隐藏——永久 disabled 的噪音控件不保留）
+  it("色条区块：切「显示算法主色色条」Toggle 触发即时预览；总开关关闭后各行不渲染", async () => {
     useSettingsStore.setState({ settings: mkSettings(), loaded: true, loading: false, loadError: null });
     render(<SettingsPage />);
     await waitFor(() => expect(screen.getByText("保存设置")).toBeInTheDocument());
     fireEvent.click(screen.getByText("通用外观"));
     await waitFor(() => expect(screen.getByText("素材框")).toBeInTheDocument());
 
-    // 默认 colorStrip.enabled=true → 七行都在
-    expect(screen.getByText("显示色条")).toBeInTheDocument();
+    // 默认 colorStrip.enabled=true → 各行都在（入库网格显示已按真实能力隐藏，不再渲染）
+    expect(screen.getByText("显示算法主色色条")).toBeInTheDocument();
     expect(screen.getByText("素材库网格显示")).toBeInTheDocument();
     expect(screen.getByText("查看器显示")).toBeInTheDocument();
-    expect(screen.getByText("入库网格显示")).toBeInTheDocument();
+    expect(screen.queryByText("入库网格显示")).toBeNull();
     expect(screen.getByText("色条高度")).toBeInTheDocument();
 
     // 点击总开关 → draft 关闭 + pushPreview（commitAppearanceDebounced）被调用
     const previewSpy = vi.spyOn(useSettingsStore.getState(), "commitAppearanceDebounced");
-    const master = fieldSwitch("显示色条");
+    const master = fieldSwitch("显示算法主色色条");
     fireEvent.click(master);
     await waitFor(() => expect(previewSpy).toHaveBeenCalled());
-    // 关闭后六行整体不渲染（条件渲染，不是 disabled）
+    // 关闭后各行整体不渲染（条件渲染，不是 disabled）
     expect(screen.queryByText("素材库网格显示")).toBeNull();
-    expect(screen.queryByText("入库网格显示")).toBeNull();
+    expect(screen.queryByText("查看器显示")).toBeNull();
     expect(screen.queryByText("色条高度")).toBeNull();
     // 再打开恢复渲染
-    fireEvent.click(fieldSwitch("显示色条"));
+    fireEvent.click(fieldSwitch("显示算法主色色条"));
     await waitFor(() => expect(screen.getByText("素材库网格显示")).toBeInTheDocument());
-  });
-
-  it("色条区块：入库网格显示开关 disabled（入库前尚未计算色板）", async () => {
-    useSettingsStore.setState({ settings: mkSettings(), loaded: true, loading: false, loadError: null });
-    render(<SettingsPage />);
-    await waitFor(() => expect(screen.getByText("保存设置")).toBeInTheDocument());
-    fireEvent.click(screen.getByText("通用外观"));
-    await waitFor(() => expect(screen.getByText("入库网格显示")).toBeInTheDocument());
-    const sw = fieldSwitch("入库网格显示") as HTMLButtonElement;
-    expect(sw.disabled).toBe(true);
   });
 
   it("AI 子页「自动打标」只显示「此功能使用的服务」+ 功能参数，不再重复服务管理列表", async () => {

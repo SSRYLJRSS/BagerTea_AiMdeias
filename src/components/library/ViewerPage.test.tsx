@@ -119,3 +119,38 @@ describe("ViewerPage 视频识别（§7.1）", () => {
     );
   });
 });
+
+describe("ViewerPage 查看器色条（FB3-10 §12.2）", () => {
+  it("showInViewer 开启且有 palette 时在标签栏上方渲染色条；无 palette 不渲染", async () => {
+    const { useSettingsStore: sstore, DEFAULT_APPEARANCE: DA } = await import("@/stores/settingsStore");
+    sstore.setState({
+      settings: {
+        ai: { profiles: [], activeProfile: "", autoTagging: false, videoTagging: false, videoTaggingMode: "cover", videoFrameCount: 3, localModelTier: "light", batchLimit: 30, ollamaSourceId: "auto" },
+        theme: "system",
+        thumbnailCacheMb: 2048,
+        tagCategories: [],
+        aiFacetConfigs: [],
+        libraryRoot: "",
+        trashRetentionDays: 30,
+        customDownloadSources: [],
+        modelDownloadProxy: "",
+        appearance: { ...DA, colorStrip: { ...DA.colorStrip, enabled: true, showInViewer: true } },
+      } as never,
+      previewAppearance: null,
+    });
+    const palette = [{ hex: "#1b6ad2", r: 27, g: 106, b: 210, ratio: 0.7 }];
+    const imgAsset = mkAsset({ id: 9, mimeType: "image/jpeg", fileExt: "jpg", filePath: "d:/lib/i.jpg", fileName: "i.jpg", durationMs: null, palette } as Partial<Asset>);
+    // items 里放同一份资产（current 取自 store；不放会落到 beforeEach 的视频资产上）
+    useLibraryStore.setState({ items: [imgAsset], total: 1 });
+    const { container, rerender } = render(<ViewerPage asset={imgAsset} onClose={vi.fn()} />);
+    await waitFor(() => expect(container.querySelector("img")).not.toBeNull());
+    expect(container.querySelector(".ui-colorstrip")).not.toBeNull();
+
+    // 无 palette → 不渲染（查看器不占位）
+    const noPalette = mkAsset({ id: 9, mimeType: "image/jpeg", fileExt: "jpg", filePath: "d:/lib/i.jpg", fileName: "i.jpg", durationMs: null, palette: null } as Partial<Asset>);
+    useLibraryStore.setState({ items: [noPalette], total: 1 });
+    rerender(<ViewerPage asset={noPalette} onClose={vi.fn()} />);
+    await waitFor(() => expect(container.querySelector(".ui-colorstrip")).toBeNull());
+    sstore.setState({ settings: null, previewAppearance: null });
+  });
+});
