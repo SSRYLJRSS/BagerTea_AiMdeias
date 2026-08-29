@@ -86,6 +86,18 @@ pub fn run() {
             let opt_db = std::sync::Arc::clone(&state.db);
             spawn_maintenance("sqlite-optimize", move || {
                 if let Ok(c) = opt_db.lock().map_err(|_| AppError::msg("数据库锁中毒")) {
+                    // PRAGMA optimize 只统计"本连接使用过的表"：启动瞬间没有任何查询跑过时
+                    // optimize 是 no-op（实测 sqlite_stat1 未生成）。先跑一组代表性查询
+                    // 把 assets 纳入本连接的使用集合，optimize 才会为它生成统计。
+                    let _ = c.execute_batch(
+                        "SELECT COUNT(*) FROM assets WHERE deleted_at IS NULL;
+
+                         SELECT id FROM assets WHERE dominant_hue BETWEEN 200 AND 250 AND dominant_hue IS NOT NULL LIMIT 1;
+
+                         SELECT id FROM assets WHERE dominant_sat <= 10 LIMIT 1;
+
+                         SELECT id FROM assets WHERE dominant_lum BETWEEN 10 AND 90 LIMIT 1;",
+                    );
                     if let Err(e) = c.execute_batch("PRAGMA optimize;") {
                         tracing::warn!("PRAGMA optimize 失败（不影响功能，仅查询计划可能次优）: {e}");
                     }
