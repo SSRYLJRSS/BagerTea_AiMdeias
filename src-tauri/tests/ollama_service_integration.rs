@@ -71,7 +71,7 @@ fn pull_sink() -> (Arc<Mutex<Vec<PullProgress>>>, impl Fn(PullProgress)) {
 
 // ───────────────────────── 用例 ─────────────────────────
 
-/// ping：/api/tags 正常 → running=true、is_ollama=true、模型列表解析
+// ping：/api/tags 正常 → running=true、is_ollama=true、模型列表解析
 conn_retry_test!(ping_detects_ollama_with_models, {
     let _g = common::net_lock_guard();
     let srv = MockServer::start(|req| {
@@ -87,7 +87,7 @@ conn_retry_test!(ping_detects_ollama_with_models, {
     );
 });
 
-/// ping：tags 404 但 version 200 → 兼容服务（LM Studio 等），running=true、is_ollama=false
+// ping：tags 404 但 version 200 → 兼容服务（LM Studio 等），running=true、is_ollama=false
 conn_retry_test!(ping_falls_back_to_version_heuristic, {
     let _g = common::net_lock_guard();
     let srv = MockServer::start(|req| match req.path.as_str() {
@@ -110,8 +110,8 @@ fn ping_connection_refused_returns_not_running() {
     assert!(!st.is_ollama);
 }
 
-/// pull：NDJSON 流式进度 → 状态序列完整、最终 done，请求体带模型名 + stream:true，
-/// 且 base_url 带 /v1 时请求打到 api_root 剥离后的 /api/pull
+// pull：NDJSON 流式进度 → 状态序列完整、最终 done，请求体带模型名 + stream:true，
+// 且 base_url 带 /v1 时请求打到 api_root 剥离后的 /api/pull
 conn_retry_test!(pull_streams_progress_until_success, {
     let run = || -> AppResult<()> {
     let _g = common::net_lock_guard();
@@ -158,7 +158,7 @@ conn_retry_test!(pull_streams_progress_until_success, {
     run().unwrap();
 });
 
-/// pull：模型不存在 → error 行 → Err 带服务端错误文案
+// pull：模型不存在 → error 行 → Err 带服务端错误文案
 conn_retry_test!(pull_error_line_fails_with_server_message, {
     let _g = common::net_lock_guard();
     let srv = MockServer::start(|_| {
@@ -179,7 +179,7 @@ conn_retry_test!(pull_error_line_fails_with_server_message, {
     );
 });
 
-/// pull：流提前结束（只有 downloading 无 success）→ Err「拉取流提前结束」
+// pull：流提前结束（只有 downloading 无 success）→ Err「拉取流提前结束」
 conn_retry_test!(pull_stream_ends_without_success_fails, {
     let _g = common::net_lock_guard();
     let srv = MockServer::start(|_| {
@@ -200,7 +200,7 @@ conn_retry_test!(pull_stream_ends_without_success_fails, {
     );
 });
 
-/// pull：取消 → Err「拉取已取消」，不 panic
+// pull：取消 → Err「拉取已取消」，不 panic
 conn_retry_test!(pull_cancelled_fails_with_message, {
     let _g = common::net_lock_guard();
     let srv = MockServer::start(|_| {
@@ -218,7 +218,7 @@ conn_retry_test!(pull_cancelled_fails_with_message, {
     assert!(err.contains("已取消"), "错误应含取消提示: {err}");
 });
 
-/// pull：非 200 → Err「拉取请求失败（状态码）」
+// pull：非 200 → Err「拉取请求失败（状态码）」
 conn_retry_test!(pull_non_200_status_fails, {
     let _g = common::net_lock_guard();
     let srv = MockServer::start(|_| HttpResponse::status_only(404));
@@ -232,7 +232,7 @@ conn_retry_test!(pull_non_200_status_fails, {
     assert!(err.contains("404"), "错误应含状态码: {err}");
 });
 
-/// list_models：/api/tags 返回 name+size → 结构化列表；base_url 带 /v1 剥离到根路径
+// list_models：/api/tags 返回 name+size → 结构化列表；base_url 带 /v1 剥离到根路径
 conn_retry_test!(list_models_returns_name_and_size, {
     let run = || -> AppResult<()> {
     let _g = common::net_lock_guard();
@@ -259,7 +259,7 @@ conn_retry_test!(list_models_returns_name_and_size, {
     run().unwrap();
 });
 
-/// list_models：非 200 → Err 透传状态码
+// list_models：非 200 → Err 透传状态码
 conn_retry_test!(list_models_non_200_fails, {
     let _g = common::net_lock_guard();
     let srv = MockServer::start(|_| HttpResponse::status_only(500));
@@ -269,8 +269,8 @@ conn_retry_test!(list_models_non_200_fails, {
     assert!(err.contains("500"), "错误应含状态码: {err}");
 });
 
-/// delete_model：DELETE /api/delete 带模型名 → 成功；base_url 带 /v1 剥离到根路径
-/// handler 内不 assert（panic 会重置连接表现为 send error），统一在测试体查请求日志
+// delete_model：DELETE /api/delete 带模型名 → 成功；base_url 带 /v1 剥离到根路径
+// handler 内不 assert（panic 会重置连接表现为 send error），统一在测试体查请求日志
 conn_retry_test!(delete_model_sends_delete_with_name, {
     let run = || -> AppResult<()> {
     let _g = common::net_lock_guard();
@@ -297,7 +297,7 @@ conn_retry_test!(delete_model_sends_delete_with_name, {
     run().unwrap();
 });
 
-/// delete_model：非 200 → Err 透传状态码与服务端文案（如模型不存在）
+// delete_model：非 200 → Err 透传状态码与服务端文案（如模型不存在）
 conn_retry_test!(delete_model_non_200_fails_with_server_message, {
     let _g = common::net_lock_guard();
     let srv = MockServer::start(|_| HttpResponse {
