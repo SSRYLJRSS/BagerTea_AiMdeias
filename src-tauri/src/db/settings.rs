@@ -473,6 +473,14 @@ pub fn remove_custom_source(s: &mut Settings, id: &str) -> bool {
 
 const KEY: &str = "app_settings";
 
+/// FB2-08（§14.3）：新播种的分面默认是否参与 AI 打标。
+/// color 恒为 false —— 颜色由 `services::palette` 算法给出（可精确计算、快 3~4 个数量级），
+/// 让 AI 再猜一遍颜色只会产出与算法主色矛盾的标签。V16 迁移已把存量库的 color 关掉，
+/// 这里管的是"之后新播种的配置"（全新库 / 缺 color 的老库），两条路径必须给同一个答案。
+fn seeded_ai_enabled(facet_key: &str) -> bool {
+    facet_key != "color"
+}
+
 /// 把旧的 tag_categories（中文分类名）映射为 ai_facet_configs（稳定 facet_key）。
 /// 这是唯一一次迁移：此后业务只读 ai_facet_configs。
 fn migrate_tag_categories_to_facets(s: &mut Settings) {
@@ -497,9 +505,9 @@ fn migrate_tag_categories_to_facets(s: &mut Settings) {
         }
         existing.insert(facet.clone());
         s.ai_facet_configs.push(AiFacetConfig {
-            facet_key: facet,
+            facet_key: facet.clone(),
             hint: cat.hint.clone(),
-            enabled_for_ai: true,
+            enabled_for_ai: seeded_ai_enabled(&facet),
             display_name: None,
             visible_in_workbench: None,
         });
@@ -516,9 +524,9 @@ fn normalize_ai_facet_defaults(s: &mut Settings) {
                 continue;
             }
             s.ai_facet_configs.push(AiFacetConfig {
-                facet_key: facet,
+                facet_key: facet.clone(),
                 hint: cat.hint,
-                enabled_for_ai: true,
+                enabled_for_ai: seeded_ai_enabled(&facet),
                 display_name: None,
                 visible_in_workbench: None,
             });
@@ -542,7 +550,7 @@ pub fn ensure_color_facet_config(conn: &Connection) -> AppResult<()> {
     s.ai_facet_configs.push(AiFacetConfig {
         facet_key: "color".into(),
         hint: "主色、色调与色彩关系，如青橙/暗调/冷调".into(),
-        enabled_for_ai: true,
+        enabled_for_ai: seeded_ai_enabled("color"),
         display_name: None,
         visible_in_workbench: None,
     });
@@ -698,6 +706,27 @@ mod tests {
             .find(|c| c.facet_key == "custom")
             .expect("未知分类应归 custom");
         assert_eq!(custom.hint, "hint-x");
+    }
+
+    /// FB2-08（§14.3）：新播种的 color 分面不参与 AI 打标。
+    /// V16 只改了存量库的 settings JSON；全新库与"缺 color 的老库"走播种路径，
+    /// 两边必须一致，否则设置页显示 color 开着而 AI 实际不产出 color 标签。
+    #[test]
+    fn seeded_color_facet_is_not_ai_enabled() {
+        let mut s = Settings::default();
+        super::normalize_ai_facet_defaults(&mut s);
+        let color = s
+            .ai_facet_configs
+            .iter()
+            .find(|c| c.facet_key == "color")
+            .expect("默认清单应含 color 分面");
+        assert!(
+            !color.enabled_for_ai,
+            "color 由算法主色负责，不得播种成参与 AI 打标"
+        );
+        // 其他分面不受影响
+        let scene = s.ai_facet_configs.iter().find(|c| c.facet_key == "scene").unwrap();
+        assert!(scene.enabled_for_ai);
     }
 
     #[test]

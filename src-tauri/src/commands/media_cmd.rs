@@ -20,6 +20,17 @@ fn acquire_refill_gate(gate: &Arc<AtomicBool>) -> AppResult<media_refill::Refill
     })
 }
 
+/// 开一轮回填：先抢闸，成功后才重置取消标志（FX-12）。
+/// 顺序不能反：抢不到闸的调用方若已经复位了标志，正在跑的那一批就丢掉了用户点过的"取消"。
+fn begin_refill(
+    gate: &Arc<AtomicBool>,
+    cancel: &AtomicBool,
+) -> AppResult<media_refill::RefillGateGuard> {
+    let guard = acquire_refill_gate(gate)?;
+    cancel.store(false, Ordering::Relaxed);
+    Ok(guard)
+}
+
 /// 回填结果 JSON（camelCase 序列化）。
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -46,9 +57,9 @@ pub async fn rescan_asset_metadata(
     }
     let db = Arc::clone(&state.db);
     let cancel = Arc::clone(&state.media_refill_cancel);
-    cancel.store(false, Ordering::Relaxed); // 新一轮重置取消标志
-    // FX-12：抢闸失败时明确报错；guard move 进闭包，覆盖所有退出路径
-    let _gate = acquire_refill_gate(&state.refill_running)?;
+    // FX-12：抢闸失败时明确报错；guard move 进闭包，覆盖所有退出路径。
+    // 顺序要紧：先抢闸再重置取消标志（见 begin_refill）。
+    let _gate = begin_refill(&state.refill_running, &cancel)?;
 
     tauri::async_runtime::spawn_blocking(move || -> AppResult<RescanResult> {
         let _gate = _gate;
@@ -93,9 +104,8 @@ pub async fn rescan_asset_palette(
     }
     let db = Arc::clone(&state.db);
     let cancel = Arc::clone(&state.media_refill_cancel);
-    cancel.store(false, Ordering::Relaxed);
-    // FX-12：与元数据回填互斥（抢闸失败时明确报错）
-    let _gate = acquire_refill_gate(&state.refill_running)?;
+    // FX-12：与元数据回填互斥（抢闸失败时明确报错），先抢闸再重置取消标志。
+    let _gate = begin_refill(&state.refill_running, &cancel)?;
 
     tauri::async_runtime::spawn_blocking(move || -> AppResult<RescanResult> {
         let _gate = _gate;
@@ -145,5 +155,33 @@ mod tests {
             assert!(gate.load(Ordering::Acquire), "抢闸失败不得复位闸");
         }
         assert!(!gate.load(Ordering::Acquire), "guard drop 后闸应释放");
+    }
+
+    /// FX-12 回归：抢不到闸的调用方不得复位取消标志。
+    /// 反例（旧顺序）：用户点"取消"→ 另一处（如 Viewer 单张重算）发起回填 →
+    /// 它先 store(false) 再抢闸失败，正在跑的批次就丢掉了取消请求。
+    #[test]
+    fn losing_gate_does_not_clear_cancel_flag() {
+        let gate = Arc::new(AtomicBool::new(false));
+        let cancel = AtomicBool::new(false);
+
+        let _running = begin_refill(&gate, &cancel).expect("首轮应抢到闸");
+        cancel.store(true, Ordering::Relaxed); // 用户点了取消
+
+        assert!(begin_refill(&gate, &cancel).is_err(), "第二轮必须抢不到闸");
+        assert!(
+            cancel.load(Ordering::Relaxed),
+            "抢闸失败不得复位取消标志，否则正在跑的批次停不下来"
+        );
+    }
+
+    /// begin_refill 抢到闸时必须重置取消标志：上一轮被取消过时标志仍为 true，
+    /// 不重置会让新一轮在第一个素材前就 break。
+    #[test]
+    fn winning_gate_resets_cancel_flag() {
+        let gate = Arc::new(AtomicBool::new(false));
+        let cancel = AtomicBool::new(true); // 上一轮被取消后的残留状态
+        let _g = begin_refill(&gate, &cancel).expect("应抢到闸");
+        assert!(!cancel.load(Ordering::Relaxed), "新一轮应重置取消标志");
     }
 }

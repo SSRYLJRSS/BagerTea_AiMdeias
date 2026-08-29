@@ -20,6 +20,12 @@ use crate::error::{AppError, AppResult};
 pub const PLACEHOLDER_SIZE: u32 = 256;
 pub const HD_SIZE: u32 = 512;
 
+/// 通用占位图的三个颜色（`write_generic`）。暖灰底 + 中央色块（视频强调色 / 图片灰）。
+/// 公开是给 FX-13 的取材校验用：色板回算必须能认出"这张图是 UI 占位图而不是素材"。
+pub const GENERIC_BG: image::Rgba<u8> = image::Rgba([233, 233, 231, 255]);
+pub const GENERIC_BLOCK_VIDEO: image::Rgba<u8> = image::Rgba([35, 131, 226, 255]);
+pub const GENERIC_BLOCK_IMAGE: image::Rgba<u8> = image::Rgba([120, 119, 116, 255]);
+
 /// B05：hd 缩略图生成计数器，每 LRU_CHECK_INTERVAL 次触发一次 LRU 清理
 static HD_GEN_COUNT: AtomicU64 = AtomicU64::new(0);
 const LRU_CHECK_INTERVAL: u64 = 100;
@@ -266,13 +272,13 @@ impl ThumbnailService {
     // ── 内部 ──
 
     /// 通用类型占位图：纯色底 + 深色色块区分图片/视频
-    fn write_generic(out: &Path, is_video: bool) {
+    pub(crate) fn write_generic(out: &Path, is_video: bool) {
         let (w, h) = (PLACEHOLDER_SIZE, PLACEHOLDER_SIZE);
-        let mut img = image::RgbaImage::from_pixel(w, h, image::Rgba([233, 233, 231, 255]));
+        let mut img = image::RgbaImage::from_pixel(w, h, GENERIC_BG);
         let block = if is_video {
-            image::Rgba([35, 131, 226, 255]) // 视频：强调色块
+            GENERIC_BLOCK_VIDEO
         } else {
-            image::Rgba([120, 119, 116, 255]) // 图片：灰色块
+            GENERIC_BLOCK_IMAGE
         };
         let (bw, bh) = (w / 2, h / 2);
         let (x0, y0) = ((w - bw) / 2, (h - bh) / 2);
@@ -292,10 +298,77 @@ impl ThumbnailService {
     }
 }
 
+/// FX-13：这张解码结果是不是 `write_generic` 写的 UI 占位图？
+///
+/// 色板回算取材优先用 placeholder，而 `extract_placeholder` 永不失败 —— HEIC/RAW/损坏图片
+/// 都会落到通用占位图（暖灰底 + 中央色块）。拿它算主色会写进一个与素材无关的
+/// `dominant_hue`（实测灰白 75% + 品牌色 25%），污染按颜色检索，且因 palette_json 非空
+/// 而永远不会被 `missing` scope 重算。仅按 mime 过滤挡不住这条路径。
+///
+/// 判据：四角是背景色 + 正中是两种色块之一。缩放/编码会在边界引入插值，
+/// 但纯色区域内部不受影响，所以只采样这五点并留 ±4 容差。
+pub fn looks_like_generic_placeholder(img: &image::DynamicImage) -> bool {
+    use image::GenericImageView;
+
+    let (w, h) = img.dimensions();
+    if w < 8 || h < 8 {
+        return false;
+    }
+    let near = |p: image::Rgba<u8>, q: image::Rgba<u8>| {
+        (0..3).all(|i| p[i].abs_diff(q[i]) <= 4)
+    };
+    let rgba = img.to_rgba8();
+    let corners = [
+        rgba.get_pixel(0, 0),
+        rgba.get_pixel(w - 1, 0),
+        rgba.get_pixel(0, h - 1),
+        rgba.get_pixel(w - 1, h - 1),
+    ];
+    if !corners.iter().all(|p| near(**p, GENERIC_BG)) {
+        return false;
+    }
+    let center = *rgba.get_pixel(w / 2, h / 2);
+    near(center, GENERIC_BLOCK_VIDEO) || near(center, GENERIC_BLOCK_IMAGE)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicBool;
+
+    /// FX-13：write_generic 写出的占位图必须被认出来（无论图片还是视频变体），
+    /// 而真实素材（含正好用了近似暖灰的图）不得被误判。
+    #[test]
+    fn generic_placeholder_is_recognized_but_real_images_are_not() {
+        let dir = std::env::temp_dir().join(format!("bg_generic_{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+
+        for is_video in [true, false] {
+            let out = dir.join(format!("generic_{is_video}.webp"));
+            ThumbnailService::write_generic(&out, is_video);
+            let img = image::open(&out).expect("占位图应可解码");
+            assert!(
+                looks_like_generic_placeholder(&img),
+                "write_generic 的产物必须被认出（is_video={is_video}）"
+            );
+            // 回算实际拿到的是缩到 100px 的版本，缩放后同样要认出来
+            assert!(
+                looks_like_generic_placeholder(&img.thumbnail(100, 100)),
+                "缩放后仍应被认出（is_video={is_video}）"
+            );
+        }
+
+        // 纯色暖灰图：四角是背景色但正中不是色块 → 是真实素材，不得误判
+        let solid = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(64, 64, GENERIC_BG));
+        assert!(!looks_like_generic_placeholder(&solid), "纯色图不是占位图");
+        // 普通照片
+        let photo = image::DynamicImage::ImageRgba8(image::RgbaImage::from_fn(64, 64, |x, y| {
+            image::Rgba([(x * 3) as u8, (y * 3) as u8, 90, 255])
+        }));
+        assert!(!looks_like_generic_placeholder(&photo), "渐变图不是占位图");
+
+        fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn temp_path_preserves_extension_and_parent() {

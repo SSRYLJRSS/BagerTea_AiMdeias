@@ -10,6 +10,7 @@ import AiSearchBar from "@/components/supersearch/AiSearchBar";
 import QueryBuilder from "@/components/supersearch/QueryBuilder";
 import FilterChips from "@/components/supersearch/FilterChips";
 import AssetGridView from "@/components/library/AssetGridView";
+import type { PaletteSegment } from "@/components/library/ColorStrip";
 import DeleteDialog from "@/components/dialogs/DeleteDialog";
 import ExportDialog from "@/components/dialogs/ExportDialog";
 import TagAssignDialog from "@/components/dialogs/TagAssignDialog";
@@ -19,11 +20,12 @@ import { useSuperSearchStore } from "@/stores/superSearchStore";
 import { useSelectionStore } from "@/stores/selectionStore";
 import { useAiStore } from "@/stores/aiStore";
 import type { Asset } from "@/types/asset";
+import { dominantFiltersFor } from "@/utils/dominantFilter";
 
 type DialogKey = "delete" | "export" | "tags" | null;
 
 export default function SuperSearchPage({ onBack }: { onBack: () => void }) {
-  const { refresh, error, total, loading, items, loadMore, fetchAllIds, applyAiSearch } = useSuperSearchStore(
+  const { refresh, error, total, loading, items, loadMore, fetchAllIds, applyAiSearch, query, setQuery } = useSuperSearchStore(
     useShallow((s) => ({
       refresh: s.refresh,
       error: s.error,
@@ -33,6 +35,8 @@ export default function SuperSearchPage({ onBack }: { onBack: () => void }) {
       loadMore: s.loadMore,
       fetchAllIds: s.fetchAllIds,
       applyAiSearch: s.applyAiSearch,
+      query: s.query,
+      setQuery: s.setQuery,
     })),
   );
   const selected = useSelectionStore((s) => s.selected);
@@ -90,6 +94,21 @@ export default function SuperSearchPage({ onBack }: { onBack: () => void }) {
     },
     onDelete: () => setDialog("delete"),
   };
+
+  // FB2-08（§14.9 / FX-09）：点结果卡片的主色段 → 同色系条件写进查询并刷新。
+  // 语义与素材库一致（AssetGrid）：同 key 的旧条件替换而不叠加 ——
+  // 两个不相交的 hue 区间 AND 起来恒为空集。
+  const onSearchDominant = useCallback(
+    (seg: PaletteSegment) => {
+      const next = dominantFiltersFor(seg);
+      const keys = new Set(next.map((f) => f.key));
+      setQuery({
+        metadataFilters: [...query.metadataFilters.filter((f) => !keys.has(f.key)), ...next],
+        untaggedOnly: false,
+      });
+    },
+    [query.metadataFilters, setQuery],
+  );
 
   return (
     <div className="relative flex h-full flex-col">
@@ -159,6 +178,7 @@ export default function SuperSearchPage({ onBack }: { onBack: () => void }) {
           loadMore={loadMore}
           fetchAllIds={fetchAllIds}
           onPreview={setPreview}
+          onSearchDominant={onSearchDominant}
           scrollElementRef={scrollRef}
           scrollRestoreKey="superSearch"
           {...actions}

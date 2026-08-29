@@ -38,6 +38,9 @@ pub fn try_rescan_palette_exclusive(
     on_progress: impl FnMut(&RefillProgress),
 ) -> Option<AppResult<RefillSummary>> {
     let _guard = try_acquire_gate(gate)?;
+    // 持闸后才重置取消标志：上一轮被用户取消过时标志仍为 true，
+    // 不重置会让本轮在第一个素材前就 break（表现为"入库后色板一个都没算"）。
+    cancel.store(false, Ordering::Relaxed);
     Some(rescan_assets_palette(db, ids, cancel, on_progress))
 }
 
@@ -298,8 +301,25 @@ pub fn rescan_assets_palette(
 
         // 锁外计算。WHY 不 acquire：decode_thumb 内部已取全局解码并发闸（imaging.rs），
         // 这里再 acquire 是同一线程双持 permit，会把 4 并发闸压成 2（FX-08）。
-        let palette = crate::services::imaging::decode_thumb(&src, 100)
-            .map(|img| crate::services::palette::compute_palette(&img));
+        // FX-13：图片走 placeholder 时还要认一下这张图是不是 write_generic 的 UI 占位图 ——
+        // 按 mime 过滤只挡住了视频，HEIC/RAW/损坏图片的 placeholder 同样是占位图。
+        let decoded = crate::services::imaging::decode_thumb(&src, 100);
+        if decoded
+            .as_ref()
+            .is_some_and(crate::services::thumbnail::looks_like_generic_placeholder)
+        {
+            summary.skipped += 1; // 取材是 UI 占位图 —— 不是错误，等真实缩略图生成后下轮再算
+            on_progress(&RefillProgress {
+                done: (i + 1) as i64,
+                total: summary.total,
+                success: summary.success,
+                failed: summary.failed,
+                skipped: summary.skipped,
+                current_id: id,
+            });
+            continue;
+        }
+        let palette = decoded.map(|img| crate::services::palette::compute_palette(&img));
 
         // FX-10：三分支计数 —— 色板为空是素材本身不适用（skipped，不覆盖已有结果），
         // 解码失败/写库失败才是真错误（failed）。混计会让全库黑白素材显示成大面积失败。
@@ -437,5 +457,37 @@ mod tests {
         // 取消后只探了第一个
         assert_eq!(summary.success, 1);
         assert_eq!(calls, 1);
+    }
+
+    /// FX-13：图片的 placeholder 是 write_generic 的 UI 占位图时必须计 skipped，
+    /// dominant_* 保持 NULL —— 否则按颜色检索会被占位色（灰白 + 品牌色）污染，
+    /// 且 palette_json 一旦非空，missing scope 就永远不会重算这一行。
+    #[test]
+    fn palette_rescan_skips_generic_placeholder_images() {
+        let dir = std::env::temp_dir().join(format!("bg_refill_generic_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ph = dir.join("generic.webp");
+        crate::services::thumbnail::ThumbnailService::write_generic(&ph, false);
+
+        let db = db();
+        let id = {
+            let c = db.lock().unwrap();
+            // HEIC 之类"mime 是图片但解不出来"的素材：placeholder 落到通用占位图
+            let id = insert_asset(&c, "/broken.heic", "image/heic", None);
+            assets::set_placeholder_path(&c, id, &ph.to_string_lossy()).unwrap();
+            id
+        };
+
+        let cancel = AtomicBool::new(false);
+        let summary = rescan_assets_palette(&db, &[id], &cancel, |_| {}).unwrap();
+        assert_eq!(summary.skipped, 1, "占位图取材应计 skipped");
+        assert_eq!(summary.success, 0);
+        assert_eq!(summary.failed, 0);
+
+        let a = assets::get(&db.lock().unwrap(), id).unwrap();
+        assert!(a.palette.is_none(), "不得写入占位图的色板");
+        assert!(a.dominant_hue.is_none(), "dominant_hue 必须保持 NULL");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
