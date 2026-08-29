@@ -1,6 +1,8 @@
-/** 查看器（指导书 §4.1）：ViewerPage 只负责当前素材、上一张/下一张、打开/关闭、组合子组件与错误边界。
+/** 查看器（指导书 §4.1 + FB3-04）：ViewerPage 只负责当前素材、上一张/下一张、打开/关闭、组合子组件与错误边界。
  *  布局由 ViewerShell 承载：工具条（固定）→ 左属性栏 + 右媒体舞台 → 底部胶片条。
- *  标题栏在查看器外层始终可见（不再 fixed inset-0 覆盖标题栏）。
+ *  FB3-04：查看器级全屏（viewerRootRef.requestFullscreen）——全屏时 Shell 只保留工具条与舞台；
+ *  Fullscreen API 不可用时退化为应用内 data-viewer-fullscreen 状态（requestFullscreenSafe）。
+ *  Escape 优先级（§6.2⑥）：任一全屏（查看器级或播放器级）> 关闭查看器。
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import clsx from "clsx";
@@ -19,26 +21,13 @@ import { removeTags } from "@/api/tags";
 import { ensureVideoProxy, cancelVideoProxy, toProxyFileUrl } from "@/api/video";
 import { useLibraryStore } from "@/stores/libraryStore";
 import { useSelectionStore } from "@/stores/selectionStore";
+import { isEditableTarget, isInsidePlayer, escapeShouldExitFullscreen, requestFullscreenSafe } from "@/utils/shortcuts";
 import { isVideoAsset } from "@/utils/assetKind";
 import type { Asset } from "@/types/asset";
 
 interface ViewerPageProps {
   asset: Asset;
   onClose: () => void;
-}
-
-/** §4.3 页面键盘白名单：输入框/下拉/文本域/contentEditable 不响应页面级快捷键 */
-function isEditableTarget(t: EventTarget | null): boolean {
-  const el = t as HTMLElement | null;
-  if (!el) return false;
-  if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement || el instanceof HTMLSelectElement) return true;
-  return el.isContentEditable;
-}
-
-/** 焦点是否在播放器根节点或其子节点（§4.3：播放器键盘作用域优先于页面切片） */
-function isInsidePlayer(t: EventTarget | null): boolean {
-  const el = t as HTMLElement | null;
-  return !!el?.closest?.("[data-player-root]");
 }
 
 export default function ViewerPage({ asset: initial, onClose }: ViewerPageProps) {
@@ -65,10 +54,42 @@ export default function ViewerPage({ asset: initial, onClose }: ViewerPageProps)
   const [proxying, setProxying] = useState(false);
   const proxyAttempted = useRef(false);
 
-  // 详情开关：左属性栏显隐（§2.3 工具栏「详情开关」）
+  // 详情开关：左属性栏显隐（§2.3 工具栏「信息开关」；FB3-04 改名，职责不变）
   const [detailsOpen, setDetailsOpen] = useState(true);
   const [assignOpen, setAssignOpen] = useState(false);
   const prevSelected = useRef<ReadonlySet<number> | null>(null);
+
+  // FB3-04：查看器级全屏。真 Fullscreen API 成功后由 fullscreenchange 同步；
+  // API 不可用/被拒时 fallback=true 走应用内 data-viewer-fullscreen CSS 状态。
+  const viewerRootRef = useRef<HTMLDivElement>(null);
+  const [fsFallback, setFsFallback] = useState(false);
+  const isFullscreen = Boolean(typeof document !== "undefined" && document.fullscreenElement) || fsFallback;
+
+  const toggleFullscreen = useCallback(async () => {
+    if (typeof document !== "undefined" && document.fullscreenElement) {
+      try {
+        await document.exitFullscreen();
+      } catch {
+        /* 拒绝时保持现状 */
+      }
+      return;
+    }
+    if (fsFallback) {
+      setFsFallback(false); // 应用内全屏 → 退出
+      return;
+    }
+    const ok = await requestFullscreenSafe(viewerRootRef.current);
+    if (!ok) setFsFallback(true); // 降级：应用内全屏
+  }, [fsFallback]);
+
+  // 系统级退出全屏（Esc 由浏览器接管）→ 同步状态
+  useEffect(() => {
+    const onFsChange = () => {
+      if (!document.fullscreenElement) setFsFallback(false); // 真全屏退出时清降级位（若有的话）
+    };
+    document.addEventListener("fullscreenchange", onFsChange);
+    return () => document.removeEventListener("fullscreenchange", onFsChange);
+  }, []);
 
   const openAssign = () => {
     // TagAssignDialog 基于选中集工作：暂存原选中，换为当前单张，关闭时恢复
@@ -158,34 +179,51 @@ export default function ViewerPage({ asset: initial, onClose }: ViewerPageProps)
   };
 
   // 键盘：←→ 过片，Esc 退出。§4.3 忽略输入框/下拉/文本域/contentEditable/播放器根节点与子节点/模态层
+  // FB3-04：Escape 优先退任一级全屏（查看器级或播放器级——用 fullscreenElement 统一判断），
+  // 第二次 Esc 才关闭查看器。
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (isEditableTarget(e.target) || isInsidePlayer(e.target)) return;
       if (assignOpen) return; // 模态打开时页面切片不响应
-      if (e.key === "Escape") onClose();
-      else if (e.key === "ArrowLeft") goto(index - 1);
+      if (e.key === "Escape") {
+        if (escapeShouldExitFullscreen()) {
+          // 浏览器全屏：Esc 本身会被浏览器消费退出全屏；此处不关闭查看器
+          return;
+        }
+        if (fsFallback) {
+          setFsFallback(false);
+          return;
+        }
+        onClose();
+      } else if (e.key === "ArrowLeft") goto(index - 1);
       else if (e.key === "ArrowRight") goto(index + 1);
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [index, goto, onClose, assignOpen]);
+  }, [index, goto, onClose, assignOpen, fsFallback]);
 
   const isVideo = isVideoAsset(current);
 
   return (
     <div
+      ref={viewerRootRef}
+      data-viewer-fullscreen={isFullscreen ? "" : undefined}
       className={clsx(
         "h-full min-h-0 transition-all duration-200 ease-out",
+        isFullscreen && "bg-black",
         entered ? "opacity-100" : "opacity-0",
       )}
     >
       <ViewerShell
+        fullscreen={isFullscreen}
         toolbar={
           <ViewerToolbar
             fileName={current.fileName}
             position={index >= 0 ? `${index + 1} / ${total}` : ""}
             detailsOpen={detailsOpen}
             onToggleDetails={() => setDetailsOpen((v) => !v)}
+            fullscreen={isFullscreen}
+            onToggleFullscreen={() => void toggleFullscreen()}
             onClose={onClose}
           />
         }

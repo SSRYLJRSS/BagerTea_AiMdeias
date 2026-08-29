@@ -1,19 +1,25 @@
 /**
- * ViewerToolbar（指导书 §2.3/§4.1）：查看器顶部工具栏。
- * 返回/关闭 · 文件名 · 位置 · 详情开关。图标统一 lucide-react，按钮带 aria-label。
+ * ViewerToolbar（指导书 §2.3/§4.1 + FB3-04 §6.2）：查看器顶部工具栏。
+ *  返回/关闭 · 文件名 · 位置 · 信息开关 · 全屏浏览。
+ *  FB3-04：「详情」改为「信息」（仍控制左侧属性栏）；新「全屏浏览」= 查看器级全屏，
+ *  全屏时隐藏胶片条/标签栏/属性栏/应用底栏。图标统一 lucide-react，按钮带 aria-label。
  */
-import { ArrowLeft, Info, X } from "lucide-react";
+import { ArrowLeft, Info, Maximize2, Minimize2, X } from "lucide-react";
 
 interface ViewerToolbarProps {
   fileName: string;
   /** 当前位置文案，如 "3 / 120" */
   position: string;
+  /** 左侧属性信息栏开关（FB3-04：语义改为「信息」） */
   detailsOpen: boolean;
   onToggleDetails: () => void;
+  /** 查看器级全屏状态 */
+  fullscreen: boolean;
+  onToggleFullscreen: () => void;
   onClose: () => void;
 }
 
-export default function ViewerToolbar({ fileName, position, detailsOpen, onToggleDetails, onClose }: ViewerToolbarProps) {
+export default function ViewerToolbar({ fileName, position, detailsOpen, onToggleDetails, fullscreen, onToggleFullscreen, onClose }: ViewerToolbarProps) {
   return (
     <div className="flex h-10 shrink-0 items-center gap-2 border-b border-[var(--color-border)] px-2">
       <button
@@ -32,12 +38,22 @@ export default function ViewerToolbar({ fileName, position, detailsOpen, onToggl
       <button
         type="button"
         onClick={onToggleDetails}
-        aria-label={detailsOpen ? "隐藏详情" : "显示详情"}
-        title={detailsOpen ? "隐藏详情" : "显示详情"}
+        aria-label={detailsOpen ? "隐藏信息面板" : "显示信息面板"}
+        title={detailsOpen ? "隐藏信息面板" : "显示信息面板"}
         className={clsxBtn(detailsOpen)}
       >
         <Info size={16} strokeWidth={1.75} aria-hidden="true" />
-        <span className="text-xs">详情</span>
+        <span className="text-xs">信息</span>
+      </button>
+      <button
+        type="button"
+        onClick={onToggleFullscreen}
+        aria-label={fullscreen ? "退出全屏浏览" : "全屏浏览"}
+        title={fullscreen ? "退出全屏浏览（Esc）" : "全屏浏览"}
+        className="flex h-9 shrink-0 items-center gap-1 rounded-md px-2 text-[var(--color-text-secondary)] transition-colors hover:bg-[var(--color-surface)] hover:text-[var(--color-text)]"
+      >
+        {fullscreen ? <Minimize2 size={16} strokeWidth={1.75} aria-hidden="true" /> : <Maximize2 size={16} strokeWidth={1.75} aria-hidden="true" />}
+        <span className="text-xs">全屏浏览</span>
       </button>
       <button
         type="button"
