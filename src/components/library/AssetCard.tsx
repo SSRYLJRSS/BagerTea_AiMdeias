@@ -1,12 +1,13 @@
 /** 网格卡片（指导书 §2.2/§6.1）：缩略图 + 角标 + 选中态 + 文件名 + 单击/双击/右键。
  *  FB2-01/02（§9）：卡格比例由 appearance.grid.cellAspect 决定（决策 4：一个设置管素材库与入库两页），
  *  缩略图填充方式由 appearance.grid.cellFit 经 resolveFit 解析（cover/contain/smart，绝不拉伸）。
- *  hover 只允许边框/文件名透明度变化（§3.3）；双击进入 Viewer。 */
+ *  FB3-01（§3.2）：色条恒定槽位——开关打开时卡片永远预留色条高度（与 rowHeight 同用 HEIGHT_PX），
+ *  palette 未到达渲染空槽；hover 只允许边框/文件名透明度变化（§3.3）；双击进入 Viewer。 */
 import { memo, useCallback, useContext, useMemo } from "react";
 import clsx from "clsx";
 import Thumbnail from "./Thumbnail";
 import AssetCardVideoLayer from "./AssetCardVideoLayer";
-import ColorStrip, { toPaletteSegments, type PaletteSegment } from "@/components/library/ColorStrip";
+import ColorStrip, { HEIGHT_PX, toPaletteSegments, type PaletteSegment } from "@/components/library/ColorStrip";
 import { isVideoAsset } from "@/utils/assetKind";
 import { useAppearance } from "@/hooks/useAppearance";
 import { useHoverIntent } from "@/hooks/useHoverIntent";
@@ -87,7 +88,7 @@ export default memo(function AssetCard({ asset, index, selected, thumbSize, onSe
 
   // FB2-08（§5.2）：只在色条确定要渲染时才把 palette 转 segments（不做模块级缓存——
   // 色板随回算变化，模块级缓存会让用户回算后看到旧色）；memo 依赖 asset.palette。
-  const stripOn = colorStrip.enabled && colorStrip.showInLibraryGrid && !!asset.palette?.length;
+  const stripOn = colorStrip.enabled && colorStrip.showInLibraryGrid;
   const paletteSegments = useMemo(
     () => (stripOn ? toPaletteSegments(asset.palette) : []),
     [stripOn, asset.palette],
@@ -143,18 +144,22 @@ export default memo(function AssetCard({ asset, index, selected, thumbSize, onSe
         </div>
       </div>
 
-      {/* FB2-08（§14.11）：素材库色条 —— 紧贴卡片下沿；默认关（设置→通用外观→素材框→显示色条）。
-          条件短路顺序：enabled && 位置开关 && palette 非空；toPaletteSegments 只在条件满足后调用
-          （它对每段做一次 rgbToHsv，在虚拟滚动的可见卡片上是每帧成本，§4.5）。 */}
-      {colorStrip.enabled && colorStrip.showInLibraryGrid && asset.palette?.length ? (
-        <ColorStrip
-          palette={paletteSegments}
-          mode={colorStrip.mode}
-          height={colorStrip.height}
-          count={colorStrip.count}
-          rounded
-          onSearchDominant={onSearchDominant}
-        />
+      {/* FB3-01（§3.2）：色条恒定槽位 —— 开关打开时永远渲染固定高度 wrapper（HEIGHT_PX 与
+          AssetGridView.rowHeight 同一常量），palette 未到达时留空槽不显示假色带。
+          色板异步补齐只更新内容，不改卡片外框几何 → Virtualizer 行高不再累计错位。 */}
+      {stripOn ? (
+        <div style={{ height: HEIGHT_PX[colorStrip.height] }} aria-hidden={!asset.palette?.length}>
+          {asset.palette?.length ? (
+            <ColorStrip
+              palette={paletteSegments}
+              mode={colorStrip.mode}
+              height={colorStrip.height}
+              count={colorStrip.count}
+              rounded
+              onSearchDominant={onSearchDominant}
+            />
+          ) : null}
+        </div>
       ) : null}
     </div>
   );

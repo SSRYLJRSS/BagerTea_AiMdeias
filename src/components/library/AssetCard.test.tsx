@@ -175,7 +175,69 @@ describe("AssetCard §6.1 + FB2-03（素材库 hover 原位视频预览）", () 
         onContextMenu={noop}
       />,
     );
+    // FB3-01：palette 未到达 → 不渲染色条内容，但保留固定高度空槽（恒定几何）
     expect(container.querySelector(".ui-colorstrip")).toBeNull();
+  });
+
+  // FB3-01（§3.3）：恒定槽位——混排卡片（有/无 palette）的色条区高度完全一致
+  it("色条槽位高度恒定：有 palette 与无 palette 的卡片 wrapper 高度相同（HEIGHT_PX）", () => {
+    enableColorStrip();
+    const palette = [{ hex: "#1b2a3c", r: 27, g: 42, b: 60, ratio: 0.6 }];
+    const { container } = render(
+      <div>
+        <AssetCard
+          asset={mkAsset({ mimeType: "image/jpeg", palette } as Partial<Asset>)}
+          index={0}
+          thumbSize={512}
+          selected={false}
+          onSelect={noop}
+          onPreview={noop}
+          onContextMenu={noop}
+        />
+        <AssetCard
+          asset={mkAsset({ id: 2, filePath: "d:/lib/a2.jpg", fileName: "a2.jpg", mimeType: "image/jpeg", palette: null } as Partial<Asset>)}
+          index={1}
+          thumbSize={512}
+          selected={false}
+          onSelect={noop}
+          onPreview={noop}
+          onContextMenu={noop}
+        />
+      </div>,
+    );
+    // 两张卡片的色条槽位 wrapper 都存在且高度一致（AssetCard 根 div 的直接子节点中带 style.height）
+    const slots = Array.from(container.querySelectorAll<HTMLElement>('[aria-hidden]')).filter(
+      (el) => el.style.height,
+    );
+    expect(slots).toHaveLength(2);
+    expect(slots[0].style.height).toBe(slots[1].style.height);
+    expect(slots[0].style.height).toBe("10px"); // HEIGHT_PX.normal
+  });
+
+  // FB3-01：开关关闭 → 不占色条高度（槽位整个不存在）
+  it("色条关闭时不渲染槽位（不占高度）", () => {
+    const base = useSettingsStore.getState().settings;
+    const appearance = base?.appearance ?? DEFAULT_APPEARANCE;
+    useSettingsStore.setState({
+      settings: {
+        ...(base ?? mkMinimalSettings()),
+        appearance: { ...appearance, colorStrip: { ...appearance.colorStrip, enabled: false, showInLibraryGrid: false } },
+      },
+    });
+    const { container } = render(
+      <AssetCard
+        asset={mkAsset({ mimeType: "image/jpeg", palette: [{ hex: "#1b2a3c", r: 27, g: 42, b: 60, ratio: 0.6 }] } as Partial<Asset>)}
+        index={0}
+        thumbSize={512}
+        selected={false}
+        onSelect={noop}
+        onPreview={noop}
+        onContextMenu={noop}
+      />,
+    );
+    expect(container.querySelector(".ui-colorstrip")).toBeNull();
+    const slots = Array.from(container.querySelectorAll<HTMLElement>('[aria-hidden]')).filter((el) => el.style.height);
+    expect(slots).toHaveLength(0);
   });
 
   it("视频卡片：hover 未触发时无 <video>、无 dialog、无 fixed 浮层（默认）", () => {

@@ -1,8 +1,12 @@
 /**
  * FB2-08（§14.10/14.11）：色条组件。紧贴媒体下沿的无缝色带，段宽按占比（或等宽），
  * 只有主色段可点击（§14.9 方案 A）。palette 为空/未计算 → 不渲染（增强信息缺失时安静消失）。
+ * FB3-01（§3.2④）：渲染前经 normalizeSegments 归一化——过滤非有限 ratio、截断到 [0,1]、
+ * 总和为 0 回退等宽、非法 hex 用安全背景色。网格恒定槽位的高度由 HEIGHT_PX 唯一定义，
+ * 本组件只负责内容，不参与卡片几何。
  */
 import { colorNameZh } from "@/utils/colorName";
+import { normalizeSegments, segmentWidth } from "@/utils/palette";
 import type { PaletteSegmentDto } from "@/types/asset";
 
 export interface PaletteSegment {
@@ -69,9 +73,8 @@ export default function ColorStrip({
   /** 点击主色段回调（以该色搜索）；不传则主色段也不可点 */
   onSearchDominant?: (segment: PaletteSegment) => void;
 }) {
-  if (!palette.length) return null; // 空态：不占位
-  const segments = palette.slice(0, Math.max(1, count));
-  const total = segments.reduce((a, s) => a + Math.max(0, s.ratio), 0) || segments.length;
+  if (!palette.length) return null; // 空态：不占位（槽位高度由调用方的恒定 wrapper 负责）
+  const segments = normalizeSegments(palette.slice(0, Math.max(1, count)));
   const label = `主色：${segments
     .map((s) => `${colorNameZh(s.hue, s.sat, s.lum)} ${Math.round(s.ratio * 100)}%`)
     .join("、")}${onSearchDominant ? "（点击主色段可搜索同色系）" : ""}`;
@@ -85,8 +88,7 @@ export default function ColorStrip({
       aria-label={label}
     >
       {segments.map((s, i) => {
-        const width =
-          mode === "ratio" ? `${(Math.max(0, s.ratio) / total) * 100}%` : `${100 / segments.length}%`;
+        const width = `${segmentWidth(segments, i, mode === "ratio" ? "ratio" : "equal")}%`;
         const isDominant = i === 0;
         const style = {
           width,
