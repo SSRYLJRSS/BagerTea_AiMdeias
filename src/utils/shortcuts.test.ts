@@ -17,7 +17,7 @@ describe("isEditableTarget（FB3-05）", () => {
     expect(isEditableTarget(document.createElement("textarea"))).toBe(true);
     expect(isEditableTarget(document.createElement("select"))).toBe(true);
     const editable = document.createElement("div");
-    editable.isContentEditable = true;
+    Object.defineProperty(editable, "isContentEditable", { value: true, configurable: true });
     expect(isEditableTarget(editable)).toBe(true);
     expect(isEditableTarget(document.createElement("button"))).toBe(false);
     expect(isEditableTarget(null)).toBe(false);

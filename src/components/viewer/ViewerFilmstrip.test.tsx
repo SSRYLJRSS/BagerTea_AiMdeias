@@ -78,7 +78,7 @@ describe("ViewerFilmstrip（FB3-02 双排胶片条）", () => {
     const onJump = vi.fn();
     const onPrev = vi.fn();
     const onNext = vi.fn();
-    const { container } = render(
+    render(
       <ViewerFilmstrip items={[mkAsset(1), mkAsset(2), mkAsset(3)]} currentId={1} onJump={onJump} onPrev={onPrev} onNext={onNext} />,
     );
     fireEvent.click(screen.getByRole("button", { name: "第 3 张：a3.jpg" }));

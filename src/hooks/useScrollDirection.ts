@@ -31,7 +31,10 @@ export function useScrollDirection(
 ): [FilterChromeState, (el: HTMLElement | null) => void, (next: FilterChromeState) => void] {
   const { threshold = 15 } = opts;
   const collapseThreshold = useRef(opts.collapseThreshold ?? threshold);
+  // FB3-06：expandThreshold 不再触发自动展开（只有回顶部才展开），保留解析以兼容旧调用方
+  // 的参数形状（传了也不报错），语义见文件头注释。
   const expandThreshold = useRef(opts.expandThreshold ?? threshold);
+  void expandThreshold;
   // minScrollTop 缺省 0：保留 `{ threshold }` 调用方的行为（旧测试依赖 scrollTop<48 也能收起）。
   // SuperSearchPage 显式传 48 启用「顶部区恒展开」。
   const minScrollTop = useRef(opts.minScrollTop ?? 0);
