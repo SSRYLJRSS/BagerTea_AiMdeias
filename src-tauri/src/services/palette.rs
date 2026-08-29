@@ -2,10 +2,11 @@
 //!
 //! 取代"颜色交给视觉大模型输出"的做法——颜色是可精确计算的物理量，算法比 AI 快 3~4 个数量级且确定可复现。
 //!
-//! 流程（§14.5）：取材（§14.6）→ 下采样到 ~100×100 → 丢弃极端像素 → sRGB→Lab →
+//! 流程（§14.5）：丢弃极端像素（不足则回退全样本，FX-04）→ sRGB→Lab →
 //! Hamerly k-means（k=6，3 次取优）→ 合并 ΔE<6 相邻簇 → 按占比降序输出 ≤8 条。
 //!
-//! 解码必须走 `imaging::decode_thumb`（铁律：不另起解码引擎）。
+//! **入参必须是已下采样的图像**（调用方走 `imaging::decode_thumb(src, 100)`）。
+//! compute_palette 自身不下采样：直接喂原图会让 k-means 在数千万样本上跑。
 
 use image::DynamicImage;
 use palette::{FromColor, IntoColor};
@@ -183,26 +184,35 @@ fn delta_(l1: f32, a1: f32, b1: f32, l2: f32, a2: f32, b2: f32) -> f32 {
     ((l1 - l2).powi(2) + (a1 - a2).powi(2) + (b1 - b2).powi(2)).sqrt()
 }
 
-/// 贪心合并：降序处理，与已有簇 ΔE<EPSILON 则把占比叠加进保留代表色（保留 ratio 较大的那个）。
+/// 贪心合并到不动点（FX-15）：每轮把当前 ΔE 最小且 < EPSILON 的一对簇合成一簇
+/// （占比相加，代表色取占比大的那个），直到没有可合并对。
+/// 单轮 break 式合并（旧实现）会漏掉"C 能桥接 A 与 B"的情况，结果色条上留下两块肉眼无差别的分段。
+/// WHY 合并后不更新代表色的 Lab 坐标：代表色应是某个真实簇的中心，而不是两簇的加权中点
+/// （后者可能落在两簇之间"没有像素"的颜色上）。
+/// 舍入只在最终输出做一次（compute_palette 第 7 步）—— 过程中舍入会累积误差，
+/// 让 ratio 总和偏离 1、色条宽度失真。
 fn merge_clusters(mut clusters: Vec<Cluster>) -> Vec<Cluster> {
-    let mut merged: Vec<Cluster> = Vec::new();
-    for c in clusters.drain(..) {
-        let mut absorbed = false;
-        for m in merged.iter_mut() {
-            if delta_(m.l, m.a, m.b_v, c.l, c.a, c.b_v) < EPSILON && m.ratio >= c.ratio {
-                // 保留代表色（占比大的），仅叠占比
-                m.ratio += c.ratio;
-                m.ratio = (m.ratio * 100.0).round() / 100.0;
-                absorbed = true;
-                break;
+    loop {
+        // 找当前最近的一对（ΔE 最小且 < EPSILON）
+        let mut best: Option<(usize, usize, f32)> = None;
+        for i in 0..clusters.len() {
+            for j in (i + 1)..clusters.len() {
+                let d = delta_(
+                    clusters[i].l, clusters[i].a, clusters[i].b_v, clusters[j].l, clusters[j].a,
+                    clusters[j].b_v,
+                );
+                if d < EPSILON && best.map(|(_, _, bd)| d < bd).unwrap_or(true) {
+                    best = Some((i, j, d));
+                }
             }
         }
-        if !absorbed {
-            merged.push(c);
-        }
+        let Some((i, j, _)) = best else { break };
+        // 保留占比大的那个作为代表色：每轮开头都按占比降序排列过，i<j ⇒ ratio[i] ≥ ratio[j]
+        let victim = clusters.remove(j);
+        clusters[i].ratio += victim.ratio;
+        clusters.sort_by(|a, b| b.ratio.partial_cmp(&a.ratio).unwrap_or(std::cmp::Ordering::Equal));
     }
-    merged.sort_by(|a, b| b.ratio.partial_cmp(&a.ratio).unwrap_or(std::cmp::Ordering::Equal));
-    merged
+    clusters
 }
 
 /// 由主色（palette[0]）派生 dominant_hue/sat/lum（供索引列与超级搜索）
@@ -309,6 +319,53 @@ mod tests {
         assert!(p.len() <= 8, "最多 8 条，实际 {}", p.len());
         for w in p.windows(2) {
             assert!(w[0].ratio >= w[1].ratio, "应按占比降序");
+        }
+    }
+
+    /// FX-15：ΔE < 6 的三簇必须全部合并成一簇（旧实现会留下 2 簇）。
+    #[test]
+    fn merges_transitively_close_clusters() {
+        let img = image::RgbaImage::from_fn(60, 1, |x, _| {
+            let c = match x % 3 { 0 => [100, 120, 140], 1 => [102, 122, 142], _ => [104, 124, 144] };
+            image::Rgba([c[0], c[1], c[2], 255])
+        });
+        let p = compute_palette(&DynamicImage::ImageRgba8(img));
+        assert_eq!(p.len(), 1, "肉眼无差别的三色应合成一簇，实际 {:?}", p);
+        assert!(p[0].ratio > 0.95);
+    }
+
+    /// FX-15：ratio 只舍入一次，总和应接近 1。
+    #[test]
+    fn ratios_sum_close_to_one() {
+        let colors: [[u8; 3]; 6] = [
+            [200,0,0],[0,200,0],[0,0,200],[200,200,0],[0,200,200],[200,0,200],
+        ];
+        let img = image::RgbaImage::from_fn(60, 10, |x, _| {
+            let c = colors[(x as usize / 10).min(5)];
+            image::Rgba([c[0], c[1], c[2], 255])
+        });
+        let p = compute_palette(&DynamicImage::ImageRgba8(img));
+        let sum: f32 = p.iter().map(|e| e.ratio).sum();
+        assert!((sum - 1.0).abs() < 0.05, "ratio 总和应≈1（单次舍入），实际 {sum}");
+    }
+
+    /// FX-15 附带：k-means 的 indices 必须为每个被引用的桶都提供至少一个样本
+    /// （否则 compute_palette 第 4 步的 ag.r / ag.count 会整数除零 panic）。
+    /// 用大量随机图压这个不变式 —— 实测 kmeans_colors 0.6 的 Hamerly 实现满足它
+    /// （饿死质心会被重随机，indices 只记录实际最近质心），但这依赖于 crate 内部行为，
+    /// 升级 kmeans_colors 时这条测试会先红。
+    #[test]
+    fn kmeans_buckets_have_no_holes() {
+        let mut state: u32 = 0x5EED;
+        let mut next = || { state ^= state << 13; state ^= state >> 17; state ^= state << 5; state };
+        for _ in 0..200 {
+            let n = 7 + (next() as usize % 40);
+            let img = image::RgbaImage::from_fn(n as u32, 1, |_, _| {
+                let r = next();
+                image::Rgba([(r & 0xff) as u8, ((r >> 8) & 0xff) as u8, ((r >> 16) & 0xff) as u8, 255])
+            });
+            // 不 panic 即通过（内部会走 ag.r / ag.count）
+            let _ = compute_palette(&DynamicImage::ImageRgba8(img));
         }
     }
 

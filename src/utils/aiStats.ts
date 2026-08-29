@@ -20,7 +20,7 @@ export interface AiStats {
 interface StatEntry {
   status: string;
   suggestedTags: Record<string, string[]>;
-  /** PB2-07：若条目能识别出是否视频（suggestion 带 mimeType/path），用于统计 videoCount */
+  /** FB2-07：若条目能识别出是否视频（suggestion 带 mimeType/path），用于统计 videoCount */
   mimeType?: string | null;
   filePath?: string;
 }
@@ -52,7 +52,7 @@ function isVideoPath(p?: string): boolean {
   return !!p && VIDEO_EXT_RE.test(p);
 }
 
-/** FB7-07：预估本批次请求次数 —— 图片 1 次/张；视频按模式（cover=1，frames=N）。 */
+/** FB2-07：预估本批次请求次数 —— 图片 1 次/张；视频按模式（cover=1，frames=N）。 */
 export function estimateRequests(stats: AiStats, mode: "cover" | "frames", frameCount: number): number {
   const images = stats.total - stats.videoCount;
   return images + stats.videoCount * (mode === "frames" ? frameCount : 1);

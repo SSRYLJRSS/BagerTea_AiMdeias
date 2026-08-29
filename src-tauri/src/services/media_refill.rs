@@ -13,6 +13,34 @@ use super::{exif_meta, video};
 use crate::db::assets::{self, Asset, MediaProbeUpdate};
 use crate::error::{AppError, AppResult};
 
+/// 回填互斥闸 RAII（FX-12）：Drop 时释放，保证 panic / 提前 return 都不会永久占闸。
+pub(crate) struct RefillGateGuard(pub Arc<AtomicBool>);
+impl Drop for RefillGateGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+/// 抢互斥闸：已有回填在跑时返回 None（不静默复位对方的取消标志）。
+pub(crate) fn try_acquire_gate(gate: &Arc<AtomicBool>) -> Option<RefillGateGuard> {
+    gate.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .ok()
+        .map(|_| RefillGateGuard(Arc::clone(gate)))
+}
+
+/// FB2-08（FX-11）：抢互斥闸后跑色板回算；闸已被占用时返回 None（调用方决定是否提示用户）。
+/// 导入后置等场景用：失败被包在返回值里，不 panic、不阻塞调用方。
+pub fn try_rescan_palette_exclusive(
+    gate: &Arc<AtomicBool>,
+    db: &Arc<Mutex<Connection>>,
+    ids: &[i64],
+    cancel: &AtomicBool,
+    on_progress: impl FnMut(&RefillProgress),
+) -> Option<AppResult<RefillSummary>> {
+    let _guard = try_acquire_gate(gate)?;
+    Some(rescan_assets_palette(db, ids, cancel, on_progress))
+}
+
 /// 一次探测的归一化结果（图片/视频共用）。error 非空 = 读取失败（可辨识原因）。
 #[derive(Debug, Default, Clone)]
 pub struct MediaMetadata {

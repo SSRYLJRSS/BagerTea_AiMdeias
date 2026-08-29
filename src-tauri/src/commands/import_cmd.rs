@@ -6,7 +6,7 @@ use crate::db::assets::ImportResult;
 use crate::db::settings;
 use crate::error::{AppError, AppResult};
 use crate::services::importer::{self, ImportOptions, ImportProgress};
-use crate::services::thumbnail::ThumbnailService;
+use crate::services::{media_refill, thumbnail::ThumbnailService};
 use crate::state::AppState;
 
 /// 入库：async + spawn_blocking 工作线程（不堵主线程 IPC，取消即时生效）；
@@ -27,7 +27,7 @@ pub async fn import_files(
     let data_dir = state.data_dir.clone();
     let cancel = std::sync::Arc::clone(&state.import_cancel);
 
-    tauri::async_runtime::spawn_blocking(move || {
+    let result = tauri::async_runtime::spawn_blocking(move || {
         let thumbs = ThumbnailService::new(&data_dir)?;
         let library_root = {
             let conn = db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
@@ -47,7 +47,46 @@ pub async fn import_files(
         })
     })
     .await
-    .map_err(|e| AppError::msg(format!("入库线程异常: {e}")))?
+    .map_err(|e| AppError::msg(format!("入库线程异常: {e}")))??;
+
+    // FB2-08（§14.7）：入库完成后自动补算色板。
+    // 不塞进 importer 热路径：placeholder 生成是 par_iter 并行块，图像不驻留内存，
+    // 要在那里取图得改 extract_placeholder 签名（影响 3 个调用点）。走 missing scope
+    // 读 placeholder 文件重算，256px WebP 解码成本可忽略，且天然幂等（FX-11）。
+    // 失败不影响入库结果（色板是增强信息）；闸被占用时跳过（下次手动回算补上）；
+    // on_progress 传空闭包，不与导入进度事件混淆前端状态机。
+    if result.imported > 0 {
+        let gate = std::sync::Arc::clone(&state.refill_running);
+        let pdb = std::sync::Arc::clone(&state.db);
+        let pcancel = std::sync::Arc::clone(&state.media_refill_cancel);
+        tauri::async_runtime::spawn_blocking(move || {
+            let ids = {
+                let conn = match pdb.lock() {
+                    Ok(c) => c,
+                    Err(_) => return,
+                };
+                match crate::db::assets::list_ids_needing_palette(&conn) {
+                    Ok(v) => v,
+                    Err(_) => return,
+                }
+            };
+            if ids.is_empty() {
+                return;
+            }
+            if let Some(Ok(s)) =
+                media_refill::try_rescan_palette_exclusive(&gate, &pdb, &ids, &pcancel, |_| {})
+            {
+                tracing::info!(
+                    "入库后置色板补算完成：总数 {} 成功 {} 跳过 {} 失败 {}",
+                    s.total,
+                    s.success,
+                    s.skipped,
+                    s.failed
+                );
+            }
+        });
+    }
+    Ok(result)
 }
 
 /// 扫描路径生成待入库清单统计（两段式入库，不落库）

@@ -12,21 +12,12 @@ use crate::error::{AppError, AppResult};
 use crate::services::media_refill;
 use crate::state::AppState;
 
-/// 回填闸 RAII：Drop 时释放，保证 panic / 提前 return 都不会永久占闸（FX-12）。
-struct RefillGuard(Arc<AtomicBool>);
-impl Drop for RefillGuard {
-    fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
-    }
-}
-
 /// 抢互斥闸：已有回填在跑时明确拒绝，不静默复位对方的取消标志（FX-12）。
-fn acquire_refill_gate(gate: &Arc<AtomicBool>) -> AppResult<RefillGuard> {
-    gate.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .map(|_| RefillGuard(Arc::clone(gate)))
-        .map_err(|_| {
-            AppError::msg("已有回填任务进行中（媒体元数据回填或色板回算），请等待完成或先取消")
-        })
+/// RAII guard（RefillGateGuard）与抢闸逻辑在 media_refill 内实现，供导入后置（FX-11）复用。
+fn acquire_refill_gate(gate: &Arc<AtomicBool>) -> AppResult<media_refill::RefillGateGuard> {
+    media_refill::try_acquire_gate(gate).ok_or_else(|| {
+        AppError::msg("已有回填任务进行中（媒体元数据回填或色板回算），请等待完成或先取消")
+    })
 }
 
 /// 回填结果 JSON（camelCase 序列化）。
