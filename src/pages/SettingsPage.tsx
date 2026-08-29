@@ -607,7 +607,7 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
                   <Button onClick={() => void openDataDir()}>打开文件夹</Button>
                 </div>
               </Field>
-              <Field label="高清缩略图缓存" hint={`上限 ${draft.thumbnailCacheMb} MB，超出后清理最久未用；手动清除后浏览时重新生成`}>
+              <Field label="高清缩略图缓存" hint="浏览大图时生成的清晰版缩略图。删除后会按需重新生成，不影响原文件；上限超出后自动清理最久未用的">
                 <div className="flex items-center gap-2">
                   <input
                     type="number"
@@ -642,15 +642,15 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
               </Field>
               <Field
                 label="媒体元数据回填"
-                hint="重新读取素材的分辨率/编码/时长/色彩等媒体属性；坏文件记录失败原因，不阻塞批次"
+                hint="重新读取文件本身的技术信息（分辨率、编码、时长、帧率、音频编码、拍摄参数），不改变原文件和标签。适用：旧素材导入时读取失败、程序升级后新增字段、视频时长显示为空。失败会记录原因，不阻塞其他素材"
               >
                 <div className="flex items-center gap-2">
                   {/* 与色板回算互斥（FX-12 后端也会拒绝）；前端 disabled 是为了不让用户点了才知道 */}
                   <Button disabled={refilling || paletteRunning} onClick={() => void onRefill("missing")}>
-                    仅缺字段
+                    只补缺失信息
                   </Button>
                   <Button disabled={refilling || paletteRunning} onClick={() => void onRefill("all")}>
-                    全部视频
+                    重新读取全部视频
                   </Button>
                   {refilling ? (
                     <Button onClick={onCancelRefill}>取消</Button>
@@ -665,17 +665,17 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
               {refillResult && (
                 <p className="px-4 py-2 text-xs text-[var(--color-text-secondary)]">{refillResult}</p>
               )}
-              {/* FB2-08（§14.7）：算法色板回算入口（复用元数据回填的进度/结果行样式） */}
+              {/* FB2-08（§14.7）+ FB3-11（§13.2）：算法色板回算（白话说明 + 危险性写清） */}
               <Field
                 label="算法色板回算"
-                hint="用算法重新计算素材主色（不调用 AI）；仅缺色板＝只补没算过的，全部重算＝覆盖已有结果。视频需要先浏览过（生成封面）才能算色板；未浏览的视频会计入“跳过”"
+                hint="用本地算法从图片或视频封面估算主色，生成色条和按颜色筛选所需的索引。不调用 AI，不会创建标签。只补缺失＝只处理还没有色板的素材（快）；全部重算＝覆盖旧色板（适合算法升级或结果明显不准时）。视频需要先浏览过（生成封面）才能算，没有封面的会计入「跳过」"
               >
                 <div className="flex items-center gap-2">
                   <Button disabled={paletteRunning || refilling} onClick={() => void onRescanPalette("missing")}>
-                    仅缺色板
+                    只补缺失色板
                   </Button>
                   <Button disabled={paletteRunning || refilling} onClick={() => void onRescanPalette("all")}>
-                    全部重算
+                    全部重新计算
                   </Button>
                   {paletteRunning ? (
                     <Button
@@ -701,8 +701,8 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
                 label="视频代理缓存"
                 hint={
                   proxyStats && proxyStats.count > 0
-                    ? `${proxyStats.count} 个代理文件，约 ${(proxyStats.bytes / 1024 / 1024).toFixed(1)} MB；清理不影响原文件`
-                    : "原文件播放不兼容时按需生成 H.264/AAC MP4；暂无可清理的代理（不影响原文件）"
+                    ? `原视频编码不兼容时生成的 H.264/AAC 临时副本（当前 ${proxyStats.count} 个，约 ${(proxyStats.bytes / 1024 / 1024).toFixed(1)} MB）。清理不删除原视频，需要时会重新生成`
+                    : "原视频播放不兼容时按需生成 H.264/AAC MP4 临时副本；清理不删除原视频。暂无可清理的代理"
                 }
               >
                 <Button variant="danger" disabled={clearingProxies} onClick={() => void onClearVideoProxies()}>

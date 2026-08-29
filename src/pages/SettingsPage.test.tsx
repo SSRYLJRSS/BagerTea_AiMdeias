@@ -266,13 +266,13 @@ describe("SettingsPage 加载与 Hook 安全", () => {
     expect(useSettingsStore.getState().settings).not.toBeNull();
   });
 
-  it("「数据与缓存」分组可触发媒体元数据回填（仅缺字段范围）", async () => {
+  it("「数据与缓存」分组可触发媒体元数据回填（只补缺失信息范围；FB3-11 新按钮名）", async () => {
     useSettingsStore.setState({ settings: mkSettings(), loaded: true, loading: false, loadError: null });
     render(<SettingsPage />);
     await waitFor(() => expect(screen.getByText("保存设置")).toBeInTheDocument());
 
     fireEvent.click(screen.getByText("数据与缓存"));
-    fireEvent.click(screen.getByRole("button", { name: "仅缺字段" }));
+    fireEvent.click(screen.getByRole("button", { name: "只补缺失信息" }));
 
     await waitFor(() => expect(rescanAssetMetadata).toHaveBeenCalledWith([], "missing"));
     await waitFor(() => expect(screen.getByText(/回填完成：总数 2，成功 2/)).toBeInTheDocument());
