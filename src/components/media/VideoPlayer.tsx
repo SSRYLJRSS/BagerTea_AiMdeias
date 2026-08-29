@@ -1,12 +1,16 @@
 /**
- * VideoPlayer（指导书 §4.4/§4.5）：统一视频播放器。
+ * VideoPlayer（指导书 §4.4/§4.5 + FB3-03 §5.2）：统一视频播放器。
  *  状态机：loading → ready → playing/paused；autoplayBlocked（自动播放被拒）；
  *          error（解码失败，携带 MediaError.code）；proxying（上层正在生成兼容代理）。
  *  功能：播放/暂停、±5 秒、进度条、当前/总时长、倍速 0.5/1/1.5/2、静音、音量、全屏。
  * 键盘作用域（焦点在播放器根节点）：
  *   ArrowLeft/Right = seek ±5s；Space/K = 播放/暂停；M = 静音；F = 全屏。
  *  事件执行后 stopPropagation()；仅在执行 seek/play 快捷键时 preventDefault()。
- * 视频尺寸：constrained by StageFrame（FB2-04/05 统一舞台容器），object-contain 不拉伸。
+ * FB3-03 高度契约（§5.2，与 Immich VideoNativeViewer 同构）：
+ *  根节点 h-full w-full flex-col → 媒体区 min-h-0 flex-1（video max-h-full object-contain）
+ *  → 控制条 shrink-0。视频固有高度被 flex-1 媒体区约束，控制条永远在可视舞台内，
+ *  不再依赖外层 overflow-hidden 之外的兄弟节点（旧结构 max-h-full 在视频先占满舞台时
+ *  把控制条推到舞台下方被裁掉）。
  */
 import { useCallback, useEffect, useRef, useState } from "react";
 import clsx from "clsx";
@@ -322,20 +326,23 @@ export default function VideoPlayer({
       aria-label="视频播放器"
       data-player-root
       onKeyDown={onRootKeyDown}
-      className={clsx("relative flex max-h-full max-w-full flex-col bg-black/95 outline-none focus-visible:ring-1 focus-visible:ring-[var(--color-status)]", className)}
+      className={clsx("relative flex h-full w-full min-h-0 min-w-0 flex-col bg-black/95 outline-none focus-visible:ring-1 focus-visible:ring-[var(--color-status)]", className)}
     >
-      <video
-        ref={videoRef}
-        src={src}
-        autoPlay
-        muted
-        playsInline
-        onClick={(e) => {
-          e.stopPropagation();
-          togglePlay();
-        }}
-        className="max-h-full max-w-full object-contain"
-      />
+      {/* FB3-03 媒体区：flex-1 min-h-0 约束视频固有高度；object-contain 不拉伸 */}
+      <div className="flex min-h-0 min-w-0 flex-1 items-center justify-center">
+        <video
+          ref={videoRef}
+          src={src}
+          autoPlay
+          muted
+          playsInline
+          onClick={(e) => {
+            e.stopPropagation();
+            togglePlay();
+          }}
+          className="h-full w-full object-contain"
+        />
+      </div>
 
       {/* 加载中 */}
       {status === "loading" && !proxying && (
@@ -441,7 +448,7 @@ export default function VideoPlayer({
         />
       )}
 
-      {/* 无障碍时间信息（duration 未知时提示加载文案） */}
+      {/* 无障碍时间信息（duration 未知时提示加载文案；控制条常驻不因 duration 未知整条隐藏） */}
       {!durationKnown && status !== "loading" && (
         <div className="sr-only">{durationLabel}</div>
       )}

@@ -70,4 +70,48 @@ describe("VideoPlayer（指导书 §4.4）", () => {
     // 不应抛错；控件仍存在
     expect(screen.getByRole("button", { name: /播放|暂停/ })).toBeInTheDocument();
   });
+
+  it("FB3-03 高度契约：根节点 h-full flex-col + 媒体区 flex-1 min-h-0 + 控制条 shrink-0", () => {
+    const { container } = render(<VideoPlayer src="asset://v/mp4" fileName="demo.mp4" />);
+    const root = container.querySelector("[data-player-root]") as HTMLElement;
+    expect(root.className).toContain("h-full");
+    expect(root.className).toContain("flex-col");
+    expect(root.className).toContain("min-h-0");
+    // 媒体区（video 的父节点）必须 min-h-0 flex-1：视频固有高度被约束，控制条不被推出舞台
+    const video = container.querySelector("video") as HTMLVideoElement;
+    const mediaArea = video.parentElement as HTMLElement;
+    expect(mediaArea.className).toContain("flex-1");
+    expect(mediaArea.className).toContain("min-h-0");
+    expect(video.className).toContain("object-contain");
+    // 控制条 shrink-0：永远留在可视区内
+    const controls = root.querySelector(".shrink-0") as HTMLElement | null;
+    expect(controls).not.toBeNull();
+  });
+
+  it("FB3-03 loadedmetadata 后 range 用 duration 作为 max（metadata 前禁用）", () => {
+    const { container } = render(<VideoPlayer src="asset://v/mp4" fileName="demo.mp4" />);
+    const video = container.querySelector("video") as HTMLVideoElement;
+    const range = screen.getByRole("slider", { name: "播放进度" }) as HTMLInputElement;
+    // metadata 前：duration=0 → 禁用
+    expect(range.disabled).toBe(true);
+    // 派发 loadedmetadata + 注入 duration（模拟 WebView2 就绪）
+    Object.defineProperty(video, "duration", { value: 91.5, configurable: true });
+    fireEvent(video, new Event("loadedmetadata"));
+    expect(range.disabled).toBe(false);
+    expect(Number(range.max)).toBeCloseTo(91.5, 5);
+  });
+
+  it("FB3-03 切换 src 重置时间与 duration（旧视频残留不污染新视频）", () => {
+    const { container, rerender } = render(<VideoPlayer src="asset://v/a.mp4" fileName="a.mp4" />);
+    const video = container.querySelector("video") as HTMLVideoElement;
+    Object.defineProperty(video, "duration", { value: 91.5, configurable: true });
+    fireEvent(video, new Event("loadedmetadata"));
+    const range1 = screen.getByRole("slider", { name: "播放进度" }) as HTMLInputElement;
+    expect(Number(range1.max)).toBeCloseTo(91.5, 5);
+
+    rerender(<VideoPlayer src="asset://v/b.mp4" fileName="b.mp4" />);
+    const range2 = screen.getByRole("slider", { name: "播放进度" }) as HTMLInputElement;
+    expect(range2.max).toBe("0");
+    expect(range2.disabled).toBe(true);
+  });
 });

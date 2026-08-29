@@ -201,7 +201,6 @@ export default function ViewerPage({ asset: initial, onClose }: ViewerPageProps)
               <VideoPlayer
                 src={videoSrc ?? ""}
                 fileName={current.fileName}
-                className="max-h-full max-w-full"
                 proxying={proxying}
                 proxyError={proxyError}
                 onCancelProxy={handleCancelProxy}

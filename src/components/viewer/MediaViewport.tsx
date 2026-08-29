@@ -249,7 +249,7 @@ export default function MediaViewport({
   }
 
   // 视频：不挂图片平移交互；内部事件由 VideoPlayer 自行 stopPropagation。
-  // 直接作为 StageFrame 子节点（VideoPlayer 自带 max-h-full max-w-full + object-contain）。
+  // 直接作为 StageFrame 子节点（FB3-03：VideoPlayer 根节点 h-full flex-col，自带高度契约）。
   if (isVideo) {
     return <StageFrame stageRef={stageRef}>{video}</StageFrame>;
   }
