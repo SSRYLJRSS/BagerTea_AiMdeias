@@ -1,9 +1,11 @@
-/** 滚动方向状态（§12.2 FB-06 / FB2-06）：下滚收起、上滚恢复。
- *  - scroll listener passive；
- *  - rAF 合并事件（不在每个 scroll setState）；
- *  - 代码风格：不触发布局重排，只返回两态，由调用方决定动画（transform/opacity）。
- *  FB2-06（§7.3 方案 C）：非对称滞回阈值 + minScrollTop 顶部区恒展开 + suppressMs 手动设定抑制窗，
- *  消除「卸载 ↔ scrollHeight 钳制」的往复闪烁根因与边界抖动。
+/** 滚动方向状态（§12.2 FB-06 / FB2-06 + FB3-06 §8.1）：
+ *  - 下滚超过阈值：收起；
+ *  - 上滑（无论累计多少）：保持收起 —— 只有回到顶部区（scrollTop <= minScrollTop）才自动展开；
+ *  - 用户点击「展开详细条件」立即展开（setExpanded + suppress 窗，不被同段滚动马上收回）；
+ *  - scroll listener passive；rAF 合并事件。
+ *  FB3-06 行为变更（旧→新）：旧语义「上滑累计达 expandThreshold 即展开」改为「仅顶部区自动展开」；
+ *  minScrollTop 语义从「顶部区恒展开的兜底」升级为「唯一的自动展开条件」，expandThreshold 保留给
+ *  非顶部场景的手动展开抑制计算（不再触发自动展开）。
  */
 import { useCallback, useEffect, useRef, useState } from "react";
 
@@ -49,8 +51,8 @@ export function useScrollDirection(
     cancelAnimationFrame(raf.current);
     raf.current = requestAnimationFrame(() => {
       const y = el.scrollTop;
-      // minScrollTop：顶部区恒展开，但 lastY 仍更新，避免从顶部快速滚到中段产生巨大 delta
-      if (y < minScrollTop.current) {
+      // FB3-06：顶部区是唯一自动展开条件（下滚收起后，上滑必须回到顶部才展开）
+      if (y <= minScrollTop.current) {
         lastY.current = y;
         lastDir.current = null;
         moved.current = 0;
@@ -71,10 +73,10 @@ export function useScrollDirection(
         moved.current = 0; // 换向清零
       }
       moved.current += Math.abs(delta);
-      const need = dir === "down" ? collapseThreshold.current : expandThreshold.current;
-      if (moved.current >= need) {
+      // FB3-06：仅下滚收起；非顶部的上滑保持收起（用户点了「展开」才是展开来源）
+      if (dir === "down" && moved.current >= collapseThreshold.current) {
         moved.current = 0;
-        setState(dir === "down" ? "collapsed" : "expanded");
+        setState("collapsed");
       }
     });
   }, []);

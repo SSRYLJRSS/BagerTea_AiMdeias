@@ -39,7 +39,9 @@ describe("useScrollDirection（FB-06）", () => {
     const { el, result } = mountOnContainer();
     scroll(el, 40); // 下滚 → collapsed
     expect(result.current[0]).toBe("collapsed");
-    scroll(el, 0); // 上滚 → expanded
+    scroll(el, 20); // FB3-06：上滑但未回顶部 → 保持收起（旧语义会展开，此为行为变更点）
+    expect(result.current[0]).toBe("collapsed");
+    scroll(el, 0); // 回到顶部 → expanded
     expect(result.current[0]).toBe("expanded");
   });
 
@@ -91,14 +93,17 @@ describe("useScrollDirection（FB2-06 方案 C 新增）", () => {
     });
   }
 
-  it("非对称阈值：下滚 20 不收起、24 才收起；上滚 12 即展开", () => {
+  it("非对称阈值：下滚 20 不收起、24 才收起；非顶部上滑不展开（FB3-06），回顶部才展开", () => {
     const { el, result } = mountOnContainer({ collapseThreshold: 24, expandThreshold: 12, minScrollTop: 0 });
     scroll(el, 20); // < collapseThreshold 24 → 不收起
     expect(result.current[0]).toBe("expanded");
     scroll(el, 45); // 累计 45 ≥ 24 → collapsed
     expect(result.current[0]).toBe("collapsed");
-    // 上滚 12 → expanded
+    // FB3-06：上滑 12（≥ expandThreshold）但在非顶部 → 仍收起
     scroll(el, 33);
+    expect(result.current[0]).toBe("collapsed");
+    // 回到顶部（minScrollTop=0）→ 展开
+    scroll(el, 0);
     expect(result.current[0]).toBe("expanded");
   });
 
@@ -129,5 +134,48 @@ describe("useScrollDirection（FB2-06 方案 C 新增）", () => {
     expect(result.current[0]).toBe("expanded");
     // 模拟抑制窗过后：用新 hook 没直接暴露 suppressUntil，此处验证「窗口内滚动被记录」即可，
     // 通过再次 scroll 到接近值累计不到阈值来佐证 lastY 已同步（无巨大一次越阈）
+  });
+});
+
+describe("useScrollDirection（FB3-06 只在顶部自动展开）", () => {
+  function mountOnContainer(opts: Parameters<typeof useScrollDirection>[0]) {
+    const el = document.createElement("div");
+    document.body.appendChild(el);
+    const { result } = renderHook(() => useScrollDirection(opts));
+    act(() => {
+      result.current[1](el);
+    });
+    return { el, result };
+  }
+
+  function scroll(el: HTMLElement, top: number) {
+    act(() => {
+      el.scrollTop = top;
+      el.dispatchEvent(new Event("scroll"));
+    });
+  }
+
+  /** 指导书 §8.3 验收：scrollTop=300 上滑 20px 不展开；滚到 40 以下展开 */
+  it("scrollTop=300 上滑 20px 保持收起；回到 40 以下（minScrollTop=48 顶区）展开", () => {
+    const { el, result } = mountOnContainer({ collapseThreshold: 24, expandThreshold: 12, minScrollTop: 48, suppressMs: 300 });
+    scroll(el, 320); // 下滚收起
+    expect(result.current[0]).toBe("collapsed");
+    scroll(el, 300); // 上滑 20px（未回顶）→ 不展开
+    expect(result.current[0]).toBe("collapsed");
+    scroll(el, 100); // 大幅上滑仍未回顶 → 不展开
+    expect(result.current[0]).toBe("collapsed");
+    scroll(el, 40); // 回到顶部区（<=48）→ 展开
+    expect(result.current[0]).toBe("expanded");
+  });
+
+  it("点击手动展开后 300ms 内 scroll 不覆盖（suppress 窗）", () => {
+    const { el, result } = mountOnContainer({ collapseThreshold: 24, expandThreshold: 12, minScrollTop: 48, suppressMs: 100000 });
+    scroll(el, 300);
+    expect(result.current[0]).toBe("collapsed");
+    act(() => {
+      result.current[2]("expanded"); // 手动展开（点击「展开详细条件」）
+    });
+    scroll(el, 310); // 抑制窗内下滚 → 不收回
+    expect(result.current[0]).toBe("expanded");
   });
 });
