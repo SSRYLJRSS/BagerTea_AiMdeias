@@ -72,8 +72,6 @@ export default function MediaViewport({
   const dragStart = useRef<{ x: number; y: number; offsetX: number; offsetY: number; gen: number } | null>(null);
   /** 记录按下的 pointerId：卸载时释放 capture */
   const activePointer = useRef<number | null>(null);
-  /** 双击判定：上次 pointerdown 时间 */
-  const lastDown = useRef(0);
   /** temporaryZoom 回落 idle 的定时器 */
   const zoomTimer = useRef<number | null>(null);
   /** 代际保护（§7.3）：assetId/图片源变化、重试、卸载时递增 */
@@ -156,27 +154,30 @@ export default function MediaViewport({
     return () => el.removeEventListener("wheel", onWheel);
   }, [view.scale, isVideo, zoomAt, armTemporaryZoomRevert, assetId]);
 
+  // FB3-05（§7.3）：双击用原生 onDoubleClick（不手工依赖 pointerdown 的 e.detail/时间窗口——
+  // WebView2/触摸板/子节点截获时该判定脆弱）；统一走 zoomAt reducer。
+  const onDoubleClick = useCallback(
+    (e: React.MouseEvent) => {
+      if (isVideo) return;
+      const gen = generation.current;
+      if (view.scale === 1) {
+        zoomAt(e.clientX, e.clientY, DOUBLE_CLICK_ZOOM, gen);
+        armTemporaryZoomRevert();
+      } else {
+        setView(INITIAL_VIEW); // 已放大：回 1x，offset 归零
+      }
+    },
+    [isVideo, view.scale, zoomAt, armTemporaryZoomRevert],
+  );
+
   const onPointerDown = (e: React.PointerEvent) => {
     if (isVideo) return;
     const gen = generation.current; // 按下时捕获代际（§7.3）
-    // 左键：未放大时只做双击判定；放大后拖拽平移
+    // 左键：未放大不拖拽（等待双击）；放大后拖拽平移。中键兼容平移；其他按键忽略。
     if (e.button === 0) {
-      const now = Date.now();
-      const isDbl = now - lastDown.current < 350 && e.detail === 2;
-      lastDown.current = now;
-      if (isDbl) {
-        // 双击切换：1x ↔ 2x（锚点为指针位置）；不再实现「按住才生效」隐藏语义
-        if (view.scale === 1) {
-          zoomAt(e.clientX, e.clientY, DOUBLE_CLICK_ZOOM, gen);
-          armTemporaryZoomRevert();
-        } else {
-          setView(INITIAL_VIEW);
-        }
-        return;
-      }
-      if (view.scale <= 1) return; // 未放大不拖拽
+      if (view.scale <= 1) return;
     } else if (e.button !== 1) {
-      return; // 中键兼容平移；其他按键忽略
+      return;
     }
     e.preventDefault();
     activePointer.current = e.pointerId; // 先记录：capture 不可用（如 jsdom）时 pointerUp 仍能结算
@@ -264,6 +265,7 @@ export default function MediaViewport({
         onPointerMove,
         onPointerUp: endPan,
         onPointerCancel: endPan,
+        onDoubleClick,
         onContextMenu: (e) => e.preventDefault(),
       }}
     >

@@ -65,9 +65,8 @@ describe("MediaViewport 图片交互（§4.2）", () => {
   it("双击从 1x 放大到约 2x，再次双击恢复 1x（连续 20 次不失效）", () => {
     const { stage } = renderImg();
     for (let i = 0; i < 20; i++) {
-      // 双击 = detail 2 的两次 pointerdown（350ms 窗口内）
-      fireEvent.pointerDown(stage, { button: 0, detail: 1, clientX: 100, clientY: 100, pointerId: i });
-      fireEvent.pointerDown(stage, { button: 0, detail: 2, clientX: 100, clientY: 100, pointerId: i });
+      // FB3-05：双击走原生 onDoubleClick（不再依赖 pointerdown 的 e.detail 判定）
+      fireEvent.doubleClick(stage, { clientX: 100, clientY: 100 });
       if (i % 2 === 0) {
         expect(currentStyle(stage)).toContain("scale(2)");
       } else {
@@ -87,8 +86,7 @@ describe("MediaViewport 图片交互（§4.2）", () => {
   it("未放大时左键不拖拽（双击语义优先）；放大后左键拖动平移，松开停止", () => {
     const { stage } = renderImg();
     // 先双击放大
-    fireEvent.pointerDown(stage, { button: 0, detail: 1, clientX: 10, clientY: 10, pointerId: 1 });
-    fireEvent.pointerDown(stage, { button: 0, detail: 2, clientX: 10, clientY: 10, pointerId: 1 });
+    fireEvent.doubleClick(stage, { clientX: 10, clientY: 10 });
     expect(currentStyle(stage)).toContain("scale(2)");
 
     // 左键按下 → 移动 → 平移增量生效（相对双击锚点后的偏移）
@@ -110,8 +108,7 @@ describe("MediaViewport 图片交互（§4.2）", () => {
 
   it("切换素材重置 scale/offset（assetId 变化）", () => {
     const { stage, rerender } = renderImg();
-    fireEvent.pointerDown(stage, { button: 0, detail: 1, clientX: 10, clientY: 10, pointerId: 1 });
-    fireEvent.pointerDown(stage, { button: 0, detail: 2, clientX: 10, clientY: 10, pointerId: 1 });
+    fireEvent.doubleClick(stage, { clientX: 10, clientY: 10 });
     expect(currentStyle(stage)).toContain("scale(2)");
 
     rerender(
@@ -138,8 +135,7 @@ describe("MediaViewport 图片交互（§4.2）", () => {
     expect(Math.abs(imgY - 40)).toBeLessThanOrEqual(1);
 
     // 同一指针位置双击恢复 1x：offset 归零（§7.4）
-    fireEvent.pointerDown(stage, { button: 0, detail: 1, clientX: 260, clientY: 190, pointerId: 9 });
-    fireEvent.pointerDown(stage, { button: 0, detail: 2, clientX: 260, clientY: 190, pointerId: 9 });
+    fireEvent.doubleClick(stage, { clientX: 260, clientY: 190 });
     const restored = parseTransform(stage);
     expect(restored.scale).toBe(1);
     expect(restored.tx).toBeCloseTo(0, 1);
@@ -165,8 +161,7 @@ describe("MediaViewport 图片交互（§4.2）", () => {
   it("快速切图后旧代际回调不改新素材（wheel 捕获旧代际被丢弃）", () => {
     const { stage, rerender } = renderImg();
     // 旧素材上放大
-    fireEvent.pointerDown(stage, { button: 0, detail: 1, clientX: 10, clientY: 10, pointerId: 1 });
-    fireEvent.pointerDown(stage, { button: 0, detail: 2, clientX: 10, clientY: 10, pointerId: 1 });
+    fireEvent.doubleClick(stage, { clientX: 10, clientY: 10 });
     expect(parseTransform(stage).scale).toBe(2);
 
     // 切到新素材（代际 +1，视图归零）
@@ -183,8 +178,7 @@ describe("MediaViewport 图片交互（§4.2）", () => {
 
   it("pointercancel 释放拖拽状态且不抛异常", () => {
     const { stage } = renderImg();
-    fireEvent.pointerDown(stage, { button: 0, detail: 1, clientX: 10, clientY: 10, pointerId: 1 });
-    fireEvent.pointerDown(stage, { button: 0, detail: 2, clientX: 10, clientY: 10, pointerId: 1 });
+    fireEvent.doubleClick(stage, { clientX: 10, clientY: 10 });
     // 放大后拖拽中取消
     expect(() => {
       fireEvent.pointerDown(stage, { button: 0, clientX: 100, clientY: 100, pointerId: 2 });
