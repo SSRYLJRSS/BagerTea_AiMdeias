@@ -217,11 +217,30 @@ function FacetDetail({
 
       {open && (
         <div className="flex flex-col gap-2 border-t border-[var(--color-border)] p-2">
-          {/* ① 基本规则（即时保存） */}
+          {/* ① 分类名称（FB3-09 §11.2：显示名给人和 AI；稳定 key 只读展示为高级信息） */}
+          <div className="flex flex-col gap-1.5">
+            <p className="text-[10px] font-medium tracking-wide text-[var(--color-text-secondary)] uppercase">分类名称</p>
+            <input className="ui-control px-2 py-1 text-sm" value={displayName} onChange={(e) => setDisplayName(e.target.value)} aria-label="分类名称" placeholder="如「物体」" />
+            <p className="text-[10px] text-[var(--color-text-tertiary)]">
+              稳定标识（只读，创建后锁定）：<code>{facet.key}</code>
+            </p>
+          </div>
+
+          {/* ② 给人的说明（FB3-09：description 是给人看的背景说明，如「识别画面中可辨认的主体物件」） */}
+          <div className="flex flex-col gap-1.5">
+            <p className="text-[10px] font-medium tracking-wide text-[var(--color-text-secondary)] uppercase">给人的说明</p>
+            <input
+              className="ui-control px-2 py-1 text-sm"
+              placeholder="这类标签描述什么（给人看的说明，如「识别画面中可辨认的主体物件」）"
+              value={description}
+              onChange={(e) => setDescription(e.target.value)}
+              aria-label="给人的说明"
+            />
+          </div>
+
+          {/* ③ 基本规则（即时保存）：单选/多选、数量上限、适用媒体 */}
           <div className="flex flex-col gap-1.5">
             <p className="text-[10px] font-medium tracking-wide text-[var(--color-text-secondary)] uppercase">基本规则</p>
-            <input className="ui-control px-2 py-1 text-sm" value={displayName} onChange={(e) => setDisplayName(e.target.value)} aria-label="显示名" />
-            <input className="ui-control px-2 py-1 text-sm" placeholder="描述" value={description} onChange={(e) => setDescription(e.target.value)} aria-label="描述" />
             <div className="flex items-center gap-2 text-xs text-[var(--color-text-secondary)]">
               <label className="flex items-center gap-1"><input type="radio" checked={selectionMode === "single"} onChange={() => setSelectionMode("single")} />单选</label>
               <label className="flex items-center gap-1"><input type="radio" checked={selectionMode === "multi"} onChange={() => setSelectionMode("multi")} />多选</label>
@@ -232,6 +251,7 @@ function FacetDetail({
                 {APP_TO_OPTIONS.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
               </select>
             </div>
+            <p className="text-[10px] text-[var(--color-text-tertiary)]">基本规则点击「保存规则」立即生效（历史标签与查询不受影响）。</p>
             <div>
               <Button variant="primary" disabled={saving} onClick={() => void submitStructure()}>
                 {saving ? "保存中…" : "保存规则"}
@@ -239,28 +259,28 @@ function FacetDetail({
             </div>
           </div>
 
-          {/* ② AI 行为（随设置草稿保存，与页面保存按钮同一语义） */}
+          {/* ④ AI 行为（FB3-09：是否参与打标/给 AI 的识别规则/工作台显示；随设置草稿保存） */}
           <div className="flex flex-col gap-1.5">
             <p className="text-[10px] font-medium tracking-wide text-[var(--color-text-secondary)] uppercase">AI 行为</p>
             <label className="flex items-center gap-1.5 text-xs text-[var(--color-text-secondary)]">
               <input type="checkbox" checked={config.enabledForAi} onChange={(e) => onPatchAiConfig({ enabledForAi: e.target.checked })} />
-              参与 AI 打标与搜索
+              参与 AI 打标与搜索（关闭后 AI 不再产出此类标签）
             </label>
             <input
               className="ui-control px-2 py-1 text-xs"
               value={config.hint}
               onChange={(e) => onPatchAiConfig({ hint: e.target.value })}
-              placeholder="给 AI 的分类说明（hint）"
-              aria-label="给 AI 的分类说明"
+              placeholder="给 AI 的识别规则（约束 AI 怎么打标，如「只写可观察到的主要物体，不写推测身份」）"
+              aria-label="给 AI 的识别规则"
             />
             <label className="flex items-center gap-1.5 text-xs text-[var(--color-text-secondary)]">
               <input type="checkbox" checked={config.visibleInWorkbench} onChange={(e) => onPatchAiConfig({ visibleInWorkbench: e.target.checked })} />
               在打标工作台显示
             </label>
-            <p className="text-[10px] text-[var(--color-text-tertiary)]">AI 行为随「保存设置」按钮统一落库。</p>
+            <p className="text-[10px] text-[var(--color-text-tertiary)]">AI 行为随「保存设置」按钮统一落库（与本页其他设置一致）。</p>
           </div>
 
-          {/* ③ 分类词条（二级编辑器，标题体现上下文） */}
+          {/* ⑤ 分类词条（二级编辑器，标题体现上下文） */}
           <div className="flex items-center justify-between">
             <p className="text-[10px] font-medium tracking-wide text-[var(--color-text-secondary)] uppercase">分类词条</p>
             <Button onClick={onOpenTerms}>管理词条</Button>
