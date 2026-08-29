@@ -32,6 +32,7 @@ pub struct MetadataFilter {
 }
 
 /// 编译结果：where 片段 + 位置参数。
+#[derive(Debug)]
 pub struct CompiledMetadata {
     pub sql: String,
     pub params: Vec<Value>,

@@ -1367,12 +1367,11 @@ fn v11_adds_color_facet_to_existing_settings() -> AppResult<()> {
     conn.pragma_update(None, "user_version", 10)?;
     migrations::migrate(&conn)?;
 
-    // tag_facets 补齐 color
-    let facets = db::tag_facets::list(&conn)?;
-    assert!(
-        facets.iter().any(|f| f.key == "color"),
-        "tag_facets 应补齐 color 分面"
-    );
+    // tag_facets 补齐 color（FB2-08/V16 起 color 为 inactive，list() 只回 active，
+    // 改用 list_all() 断言行存在且状态 inactive；旧行为断言 color ∈ list() 已随 V16 失效）
+    let facets = db::tag_facets::list_all(&conn)?;
+    let color = facets.iter().find(|f| f.key == "color").expect("tag_facets 应补齐 color 分面");
+    assert_eq!(color.status, "inactive", "V16 起 color 分面应为 inactive");
     // settings 的 ai_facet_configs 补齐 color（不覆盖已有 scene）
     let s = settings::get_settings(&conn)?;
     let scene = s.ai_facet_configs.iter().find(|c| c.facet_key == "scene").expect("scene 保留");

@@ -276,7 +276,10 @@ conn_retry_test!(anthropic_mode_sends_messages_and_key_header, {
     let srv = MockServer::start(|req| {
         assert_eq!(req.header_x_api_key.as_deref(), Some("test-key"));
         assert_eq!(req.path, "/messages");
-        HttpResponse::ok_json(r#"{"content":[{"type":"text","text":"{\"光线\":[\"逆光\"]}"}]}"#)
+        // 旧用例返回 {"光线":[...]} 并断言 lighting，但 categories() 只注册 scene 分面，
+        // 响应会被 parse_tags_strict 判为不可解析（该缺陷因 lib 测试编译失败长期未暴露）。
+        // 与其余用例对齐：用 场景/scene 验证 anthropic 协议本身（路径 /messages + x-api-key 头）。
+        HttpResponse::ok_json(r#"{"content":[{"type":"text","text":"{\"场景\":[\"逆光\"]}"}]}"#)
     });
     let dbm = Arc::new(Mutex::new(db::init_memory()?));
     let tmp = tempfile::tempdir()?;
@@ -297,7 +300,7 @@ conn_retry_test!(anthropic_mode_sends_messages_and_key_header, {
 
     let sug = suggestion_tags(&dbm.lock().unwrap(), batch.id);
     assert_eq!(
-        sug[0].suggested_tags.get("lighting"),
+        sug[0].suggested_tags.get("scene"),
         Some(&vec!["逆光".to_string()]),
         "status={} last_error={:?}",
         sug[0].status,

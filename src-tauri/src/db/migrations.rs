@@ -1,7 +1,7 @@
 //! 建表迁移：按 PRAGMA user_version 版本推进
 //! v1 = 架构 v1.3 §1.4 全量 schema（含 fts_content 中间表 + 9 个触发器）
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 use crate::error::AppResult;
 
@@ -924,63 +924,78 @@ CREATE INDEX IF NOT EXISTS idx_assets_dominant_lum ON assets(dominant_lum);
 
 /// V16 迁移：加色板列 + 索引 + color 分面停用（AI 侧摘除，见 §14.3）。
 fn migrate_v16(conn: &Connection) -> AppResult<()> {
-    // 1. 只增列模式（沿用 V12）
+    // 1. 只增列 + 索引（ALTER / CREATE INDEX IF NOT EXISTS 天然幂等，放事务外）
     for (col, ty) in V16_COLUMNS {
         add_column_if_missing(conn, "assets", col, ty)?;
     }
     conn.execute_batch(V16_INDEXES)?;
 
     let now = chrono::Utc::now().timestamp_millis();
+    // 数据写操作包事务：否则中途失败会留下"做了一半、版本号未升"的库，
+    // 每次启动都在同一句报错（FX-01 的生产表现）。
+    let tx = conn.unchecked_transaction()?;
 
-    // 2. color 分面停用：`deprecated` 语义已收敛到 `inactive`（V13 统一），此处用 inactive。
-    conn.execute(
+    // 2. color 分面停用（'deprecated' 语义已在 V13 收敛到 'inactive'）
+    tx.execute(
         "UPDATE tag_facets SET status = 'inactive', updated_at = ?1 WHERE key = 'color'",
         rusqlite::params![now],
     )?;
 
-    // 2b. §14.3：`style` 分面 hint 追加「不包含颜色描述」，作为删除 cross-facet 规则后的消歧补偿（数据里改，不硬编码）。
-    conn.execute(
-        "UPDATE tag_facets SET hint = hint || '。风格描述不包含颜色（颜色由算法主色呈现）', updated_at = ?1 WHERE key = 'style' AND instr(hint, '不包含颜色') = 0",
-        rusqlite::params![now],
-    )?;
-
-    // 3. ai_facet_configs（settings JSON，camelCase）：color 的 enabledForAi=false + visibleInWorkbench=false。
-    if let Ok(raw) = conn.query_row(
-        "SELECT value FROM settings WHERE key = 'app_settings'",
-        [],
-        |r| r.get::<_, Option<String>>(0),
-    ) {
-        if let Some(raw) = raw {
-            if let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&raw) {
-                let changed = {
-                    let arr = v
-                        .get_mut("aiFacetConfigs")
-                        .and_then(|c| c.as_array_mut());
-                    let mut changed = false;
-                    if let Some(arr) = arr {
-                        for cfg in arr.iter_mut() {
-                            if cfg.get("facetKey").and_then(|k| k.as_str()) == Some("color") {
-                                if let Some(o) = cfg.as_object_mut() {
-                                    o.insert("enabledForAi".into(), serde_json::Value::Bool(false));
-                                    o.insert("visibleInWorkbench".into(), serde_json::Value::Bool(false));
-                                }
+    // 3. settings JSON（camelCase）一次读-改-写：
+    //    - color: enabledForAi=false + visibleInWorkbench=false；
+    //    - style: hint 追加「不包含颜色」——WHY: hint 是 settings JSON 的字段（settings.rs AiFacetConfig），
+    //      tag_facets 表里从来没有这一列（V8 建表 / V13 重建均无），写表会 no such column（FX-01）。
+    if let Some(raw) = tx
+        .query_row(
+            "SELECT value FROM settings WHERE key = 'app_settings'",
+            [],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten()
+    {
+        if let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&raw) {
+            let mut changed = false;
+            if let Some(arr) = v.get_mut("aiFacetConfigs").and_then(|c| c.as_array_mut()) {
+                for cfg in arr.iter_mut() {
+                    let key = cfg.get("facetKey").and_then(|k| k.as_str()).unwrap_or("");
+                    match key {
+                        "color" => {
+                            if let Some(o) = cfg.as_object_mut() {
+                                o.insert("enabledForAi".into(), serde_json::Value::Bool(false));
+                                o.insert("visibleInWorkbench".into(), serde_json::Value::Bool(false));
                                 changed = true;
                             }
                         }
+                        "style" => {
+                            let old = cfg.get("hint").and_then(|h| h.as_str()).unwrap_or("");
+                            if !old.contains("不包含颜色") {
+                                let next = if old.trim().is_empty() {
+                                    "风格描述不包含颜色（颜色由算法主色呈现）".to_string()
+                                } else {
+                                    format!("{old}。风格描述不包含颜色（颜色由算法主色呈现）")
+                                };
+                                if let Some(o) = cfg.as_object_mut() {
+                                    o.insert("hint".into(), serde_json::Value::String(next));
+                                    changed = true;
+                                }
+                            }
+                        }
+                        _ => {}
                     }
-                    changed
-                };
-                if changed {
-                    if let Ok(s) = serde_json::to_string(&v) {
-                        let _ = conn.execute(
-                            "UPDATE settings SET value = ?1 WHERE key = 'app_settings'",
-                            [&s],
-                        );
-                    }
+                }
+            }
+            if changed {
+                if let Ok(s) = serde_json::to_string(&v) {
+                    tx.execute(
+                        "UPDATE settings SET value = ?1 WHERE key = 'app_settings'",
+                        [&s],
+                    )?;
                 }
             }
         }
     }
+    tx.commit()?;
     Ok(())
 }
 
@@ -1205,66 +1220,95 @@ mod tests {
         assert_eq!(rows.count(), 0, "foreign_key_check 应无错误");
     }
 
-    /// FB2-08（§14.8）：V16 加色板列+索引，color 分面停用、ai_facet_configs.color enabledForAi=false；幂等。
+    /// FB2-08：V16 —— 6 列 + 3 索引、color 分面停用、settings 里 color 关 AI / style hint 追加；幂等。
+    /// 用 init_memory()（跑完整 migrate 链）而不是手写 fixture：手写 fixture 与真实 schema 漂移，
+    /// 正是 FX-01（migrate_v16 写不存在的 tag_facets.hint）逃过测试的原因。
     #[test]
     fn v16_adds_palette_columns_and_deactivates_color_facet() {
-        // 最小 fixture：assets + tag_facets + settings
-        let c = mem();
-        c.execute_batch(
-            "CREATE TABLE assets (id INTEGER PRIMARY KEY);
-             CREATE TABLE tag_facets (
-               id INTEGER PRIMARY KEY, key TEXT NOT NULL, display_name TEXT NOT NULL,
-               description TEXT NOT NULL DEFAULT '', min_items INTEGER, max_items INTEGER,
-               status TEXT NOT NULL DEFAULT 'active', updated_at INTEGER NOT NULL);
-             CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
-        )
-        .unwrap();
-        c.execute(
-            "INSERT INTO tag_facets (id, key, display_name, status, updated_at) VALUES (1, 'color', '色彩', 'active', 0)",
-            [],
-        )
-        .unwrap();
-        c.execute(
-            "INSERT INTO tag_facets (id, key, display_name, status, updated_at) VALUES (2, 'style', '风格', 'active', 0)",
-            [],
-        )
-        .unwrap();
-        // settings：aiFacetConfigs 里 color 的 enabledForAi=true
-        let jetton = r#"{"aiFacetConfigs":[{"facetKey":"color","enabledForAi":true,"displayName":"色彩"},{"facetKey":"style","enabledForAi":true}]}"#;
-        c.execute("INSERT INTO settings (key, value) VALUES ('app_settings', ?1)", [jetton]).unwrap();
+        let c = crate::db::init_memory().unwrap(); // 已跑到 user_version = 16
+        let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, 16, "全新库应迁移到 V16");
 
-        migrate_v16(&c).unwrap();
-
-        // 6 列 + 3 索引存在
-        for col in ["palette_json", "palette_version", "palette_scanned_at", "dominant_hue", "dominant_sat", "dominant_lum"] {
-            let n: i64 = c
-                .query_row(&format!("SELECT COUNT(*) FROM pragma_table_info('assets') WHERE name='{col}'"), [], |r| r.get(0))
-                .unwrap();
-            assert_eq!(n, 1, "列 {col} 应存在");
+        for col in [
+            "palette_json",
+            "palette_version",
+            "palette_scanned_at",
+            "dominant_hue",
+            "dominant_sat",
+            "dominant_lum",
+        ] {
+            assert!(has_column(&c, "assets", col).unwrap(), "列 {col} 应存在");
         }
-        for idx in ["idx_assets_dominant_hue", "idx_assets_dominant_sat", "idx_assets_dominant_lum"] {
+        for idx in [
+            "idx_assets_dominant_hue",
+            "idx_assets_dominant_sat",
+            "idx_assets_dominant_lum",
+        ] {
             let n: i64 = c
-                .query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name=?1", [idx], |r| r.get(0))
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name=?1",
+                    [idx],
+                    |r| r.get(0),
+                )
                 .unwrap();
             assert_eq!(n, 1, "索引 {idx} 应存在");
         }
-
-        // color 分面停用
-        let st: String = c.query_row("SELECT status FROM tag_facets WHERE key='color'", [], |r| r.get(0)).unwrap();
+        let st: String = c
+            .query_row("SELECT status FROM tag_facets WHERE key='color'", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(st, "inactive");
-        // style hint 追加「不包含颜色」
-        let hint: String = c.query_row("SELECT hint FROM tag_facets WHERE key='style'", [], |r| r.get(0)).unwrap();
-        assert!(hint.contains("不包含颜色"));
 
-        // ai_facet_configs.color enabledForAi=false
-        let raw: String = c.query_row("SELECT value FROM settings WHERE key='app_settings'", [], |r| r.get(0)).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        let color_cfg = v["aiFacetConfigs"].as_array().unwrap().iter().find(|x| x["facetKey"] == "color").unwrap();
-        assert_eq!(color_cfg["enabledForAi"], serde_json::Value::Bool(false));
-
-        // 幂等：重复执行不报错、不丢现状
+        // 幂等：重复执行不报错、不改变现状、hint 不重复追加
         migrate_v16(&c).unwrap();
-        let st2: String = c.query_row("SELECT status FROM tag_facets WHERE key='color'", [], |r| r.get(0)).unwrap();
+        migrate_v16(&c).unwrap();
+        let st2: String = c
+            .query_row("SELECT status FROM tag_facets WHERE key='color'", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(st2, "inactive");
+    }
+
+    /// FX-01 回归：存量库（V15 + 已有 aiFacetConfigs）跑 V16 后，
+    /// settings 里 color 关 AI、style hint 追加一次且仅一次。
+    #[test]
+    fn v16_patches_settings_json_not_tag_facets_table() {
+        let c = crate::db::init_memory().unwrap();
+        let json = r#"{"aiFacetConfigs":[
+            {"facetKey":"color","enabledForAi":true,"hint":"主色"},
+            {"facetKey":"style","enabledForAi":true,"hint":"如胶片感"}]}"#;
+        c.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES ('app_settings', ?1)",
+            [json],
+        )
+        .unwrap();
+
+        migrate_v16(&c).unwrap();
+        migrate_v16(&c).unwrap(); // 跑两次验幂等
+
+        let raw: String = c
+            .query_row("SELECT value FROM settings WHERE key='app_settings'", [], |r| r.get(0))
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let arr = v["aiFacetConfigs"].as_array().unwrap();
+        let color = arr.iter().find(|x| x["facetKey"] == "color").unwrap();
+        assert_eq!(color["enabledForAi"], serde_json::Value::Bool(false));
+        assert_eq!(color["visibleInWorkbench"], serde_json::Value::Bool(false));
+        let style_hint = arr.iter().find(|x| x["facetKey"] == "style").unwrap()["hint"]
+            .as_str()
+            .unwrap();
+        assert!(
+            style_hint.contains("不包含颜色"),
+            "style hint 应追加消歧说明，实际：{style_hint}"
+        );
+        assert_eq!(style_hint.matches("不包含颜色").count(), 1, "重复执行不得重复追加");
+        // tag_facets 表不得因此长出 hint 列
+        assert!(!has_column(&c, "tag_facets", "hint").unwrap(), "hint 属于 settings JSON，不是表列");
+    }
+
+    /// FX-01 回归：无 app_settings 行（全新库尚未存过设置）时 V16 不报错。
+    #[test]
+    fn v16_no_settings_row_is_noop() {
+        let c = crate::db::init_memory().unwrap();
+        c.execute("DELETE FROM settings WHERE key='app_settings'", []).unwrap();
+        migrate_v16(&c).unwrap();
     }
 }

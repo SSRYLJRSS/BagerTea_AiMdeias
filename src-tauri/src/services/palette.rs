@@ -31,13 +31,27 @@ const RUNS: usize = 3;
 /// ΔE < 该值视为"肉眼看不出差别"，合并
 const EPSILON: f32 = 6.0;
 
-/// 由解码后的图计算主色板。纯色图 → 1 簇占~100%；全黑/全白（极端像素被丢弃后样本为空）→ 空 vec 不 panic。
+/// 极端像素预筛的保留下限：过筛后样本少于原样本的这个比例，说明这张图本身
+/// 就以极端亮度为主体（黑白摄影 / 夜景 / 大面积过曝），此时预筛在删主体而不是删边框，
+/// 必须回退用全样本 —— 黑白照片的"主色"就是黑/白/灰，这是正确答案而不是缺陷。
+/// WHY 是 0.5 而不是分析稿的 0.35：过筛保留 40%（60% 过曝天空 + 40% 地面）时
+/// 0.35 不触发回退、天空仍被整体丢掉，指导书自带的 overexposed_sky 用例会失败；
+/// 0.5 的语义也最直白 —— 一半以上是极端亮度，极端亮度就是主体。
+const PRESCREEN_KEEP_MIN: f32 = 0.5;
+
+/// 由解码后的图计算主色板。纯色图 → 1 簇占~100%。
 pub fn compute_palette(img: &DynamicImage) -> Vec<PaletteEntry> {
     let rgba = img.to_rgba8();
+    let total_px = rgba.pixels().len();
+    if total_px == 0 {
+        return Vec::new();
+    }
     // 1. 提取像素样本（RGBA → RGB），丢弃极端像素
-    let mut rgb_samples: Vec<[u8; 3]> = Vec::new();
-    let mut discarded = 0usize;
+    let mut all: Vec<[u8; 3]> = Vec::with_capacity(total_px);
+    let mut kept: Vec<[u8; 3]> = Vec::with_capacity(total_px);
     for px in rgba.pixels() {
+        let rgb = [px[0], px[1], px[2]];
+        all.push(rgb);
         let r = px[0] as f32 / 255.0;
         let g = px[1] as f32 / 255.0;
         let b = px[2] as f32 / 255.0;
@@ -48,15 +62,18 @@ pub fn compute_palette(img: &DynamicImage) -> Vec<PaletteEntry> {
         let sat = if maxc == 0.0 { 0.0 } else { (maxc - minc) / maxc };
         // L* < 4（近纯黑）或 L* > 96（近纯白）且饱和度极低 → 丢
         if (lum < 0.02 && sat < 0.5) || (lum > 0.96 && sat < 0.05) {
-            discarded += 1;
             continue;
         }
-        rgb_samples.push([px[0], px[1], px[2]]);
+        kept.push(rgb);
     }
+    let rgb_samples = if (kept.len() as f32) < (total_px as f32 * PRESCREEN_KEEP_MIN) {
+        all
+    } else {
+        kept
+    };
     if rgb_samples.is_empty() {
-        return Vec::new(); // 全极端像素
+        return Vec::new();
     }
-    let _ = discarded;
 
     // 2. sRGB → Lab
     let lab: Vec<palette::Lab> = rgb_samples
@@ -224,7 +241,7 @@ mod tests {
     #[test]
     fn half_black_half_white_yields_two_clusters() {
         let mut img = image::RgbaImage::new(40, 40);
-        for (x, y, px) in img.enumerate_pixels_mut() {
+        for (x, _, px) in img.enumerate_pixels_mut() {
             *px = if x < 20 {
                 image::Rgba([0, 0, 0, 255])
             } else {
@@ -232,17 +249,46 @@ mod tests {
             };
         }
         let p = compute_palette(&DynamicImage::ImageRgba8(img));
-        assert!(!p.is_empty());
-        // 应有 ≥2 簇（黑/白），且各占比可观
-        assert!(p.len() >= 2, "黑白各半应聚出多簇，实际 {}", p.len());
-        // 主色占比不应超过 ~0.9（两侧各半）
-        assert!(p[0].ratio < 0.95);
+        // 预筛回退（PRESCREEN_KEEP_MIN）后用全样本：黑白各半应聚出黑、白两簇。
+        assert!(p.len() >= 2, "黑白各半应聚出 ≥2 簇，实际 {}", p.len());
+        assert!(p[0].ratio < 0.95, "两侧各半，主色占比不应压倒性，实际 {}", p[0].ratio);
     }
 
     #[test]
-    fn all_black_returns_empty_not_panic() {
+    fn all_black_returns_single_black_not_empty() {
+        // 语义变更（FX-04）：原 all_black_returns_empty_not_panic 断言"全黑 → 空色板"。
+        // 预筛回退后全黑图返回单簇黑色 —— 黑图的主色就是黑，这是正确答案。
         let p = compute_palette(&solid_img(0, 0, 0));
-        assert!(p.is_empty(), "全黑图极端像素被丢光 → 空色板，不 panic");
+        assert_eq!(p.len(), 1, "全黑图应聚出 1 簇，实际 {}", p.len());
+        assert!(p[0].ratio > 0.9);
+        assert_eq!(p[0].hex, "#000000");
+    }
+
+    #[test]
+    fn grayscale_photo_keeps_gray_dominant() {
+        // FX-04 回归：低饱和灰阶图（黑白摄影的抽象）主色应是灰阶，而不是空色板。
+        let img = image::RgbaImage::from_fn(60, 60, |x, _| {
+            let v = (x * 4).min(255) as u8; // 0..240 灰阶
+            image::Rgba([v, v, v, 255])
+        });
+        let p = compute_palette(&DynamicImage::ImageRgba8(img));
+        assert!(!p.is_empty(), "灰阶图不应返回空色板");
+        for e in &p {
+            let spread = e.r.abs_diff(e.g).max(e.g.abs_diff(e.b));
+            assert!(spread <= 8, "灰阶图的簇应仍是灰阶，实际 {:?}", e);
+        }
+    }
+
+    #[test]
+    fn overexposed_sky_does_not_lose_subject() {
+        // FX-04 回归：60% 近白天空 + 40% 深色地面。预筛若无回退，天空会被整体丢掉。
+        let img = image::RgbaImage::from_fn(50, 50, |_, y| {
+            if y < 30 { image::Rgba([252, 252, 253, 255]) } else { image::Rgba([48, 62, 40, 255]) }
+        });
+        let p = compute_palette(&DynamicImage::ImageRgba8(img));
+        assert!(p.len() >= 2, "天空与地面应各成一簇，实际 {}", p.len());
+        let has_bright = p.iter().any(|e| e.r > 230 && e.g > 230);
+        assert!(has_bright, "近白天空不应被整体丢弃：{:?}", p);
     }
 
     #[test]
@@ -254,11 +300,10 @@ mod tests {
         ];
         let mut img = image::RgbaImage::new(48, 16);
         // 12 色 × 4 列 = 48 列，每色 4 列宽
-        for (x, y, px) in img.enumerate_pixels_mut() {
+        for (x, _, px) in img.enumerate_pixels_mut() {
             let block = x as usize / 4;
             let c = colors[block];
             *px = image::Rgba([c[0], c[1], c[2], 255]);
-            let _ = y;
         }
         let p = compute_palette(&DynamicImage::ImageRgba8(img));
         assert!(p.len() <= 8, "最多 8 条，实际 {}", p.len());
