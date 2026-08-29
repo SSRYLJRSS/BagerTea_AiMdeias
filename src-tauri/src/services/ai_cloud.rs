@@ -679,6 +679,175 @@ pub fn list_models(base_url: &str, api_key: &str, api_mode: &str) -> AppResult<V
     Ok(models)
 }
 
+// ── FB3-08（§10.2）：连接测试（按协议分支，密钥只在 Rust 侧从 keyring 读取） ──
+
+/// 连接测试结果（camelCase 给前端；错误信息脱敏——不含密钥与完整 URL query）
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiConnectionTestResult {
+    pub ok: bool,
+    pub status_code: Option<u16>,
+    pub latency_ms: u64,
+    pub protocol: String,
+    pub model: String,
+    pub message: String,
+}
+
+/// 拼测试 URL：base_url 去尾斜杠后接 path（用户已含 /v1 或不含都兼容）
+fn join_url(base_url: &str, path: &str) -> String {
+    format!("{}{}", base_url.trim_end_matches('/'), path)
+}
+
+/// 连接测试主入口（阻塞网络请求，命令层包 spawn_blocking）。
+/// protocol: openai_chat | anthropic_messages；local 部署优先走 openai_chat 的 /models 无鉴权探测。
+pub fn test_connection(
+    base_url: &str,
+    api_key: &str,
+    protocol: &str,
+    model: &str,
+    is_local: bool,
+) -> AiConnectionTestResult {
+    let started = std::time::Instant::now();
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return AiConnectionTestResult {
+                ok: false,
+                status_code: None,
+                latency_ms: started.elapsed().as_millis() as u64,
+                protocol: protocol.to_string(),
+                model: model.to_string(),
+                message: format!("无法初始化网络请求: {e}"),
+            }
+        }
+    };
+
+    let (ok, status_code, message) = match protocol {
+        // Anthropic Messages：不假设 /models 可用，用最小 /messages 请求验证鉴权与路径
+        "anthropic_messages" => {
+            let url = join_url(base_url, "/messages");
+            let body = serde_json::json!({
+                "model": if model.is_empty() { "claude-3-haiku-20240307" } else { model },
+                "max_tokens": 1,
+                "messages": [{"role": "user", "content": "hi"}],
+            });
+            let resp = client
+                .post(&url)
+                .header("x-api-key", api_key)
+                .header("anthropic-version", "2023-06-01")
+                .header("content-type", "application/json")
+                .body(body.to_string())
+                .send();
+            match resp {
+                Ok(r) => {
+                    let code = r.status().as_u16();
+                    let ok = r.status().is_success();
+                    let msg = if ok {
+                        format!("连接成功（Anthropic Messages，HTTP {code}）")
+                    } else {
+                        anthropic_fail_message(code)
+                    };
+                    (ok, Some(code), msg)
+                }
+                Err(e) => (false, None, network_error_message(&e, &url)),
+            }
+        }
+        // OpenAI 兼容 / 本地：GET /models（带 Bearer；本地通常无 Key 不带鉴权头）
+        _ => {
+            let url = join_url(base_url, "/models");
+            let mut req = client.get(&url);
+            if !api_key.trim().is_empty() {
+                req = req.bearer_auth(api_key);
+            }
+            match req.send() {
+                Ok(r) => {
+                    let code = r.status().as_u16();
+                    let ok = r.status().is_success();
+                    let msg = if ok {
+                        // 校验指定模型是否在列表中（有模型名时给出更精确的结论）
+                        let listed = r.json::<serde_json::Value>().ok();
+                        let models = listed.as_ref().map(parse_model_ids).unwrap_or_default();
+                        if !model.is_empty() && !models.is_empty() && !models.iter().any(|m| m == model) {
+                            format!("服务可达（HTTP {code}），但模型列表中没有「{model}」。请核对该服务实际可用的模型名。")
+                        } else if models.is_empty() {
+                            format!("连接成功（HTTP {code}，未返回模型列表）")
+                        } else {
+                            format!("连接成功（HTTP {code}，共 {} 个模型）", models.len())
+                        }
+                    } else {
+                        openai_fail_message(code, is_local)
+                    };
+                    let result_ok = ok && (model.is_empty() || !msg.contains("模型列表中没有"));
+                    return finish(result_ok, Some(code), msg, started, protocol, model);
+                }
+                Err(e) => (false, None, network_error_message(&e, &url)),
+            }
+        }
+    };
+    finish(ok, status_code, message, started, protocol, model)
+}
+
+fn finish(
+    ok: bool,
+    status_code: Option<u16>,
+    message: String,
+    started: std::time::Instant,
+    protocol: &str,
+    model: &str,
+) -> AiConnectionTestResult {
+    AiConnectionTestResult {
+        ok,
+        status_code,
+        latency_ms: started.elapsed().as_millis() as u64,
+        protocol: protocol.to_string(),
+        model: model.to_string(),
+        message,
+    }
+}
+
+/// HTTP 层错误 → 可读建议（脱敏：不回显完整 URL/密钥）
+fn network_error_message(e: &reqwest::Error, url: &str) -> String {
+    if e.is_timeout() {
+        return "请求超时（20 秒）。服务可能未启动、地址/端口错误或被防火墙拦截。".to_string();
+    }
+    if e.is_connect() {
+        // DNS/TCP 连接失败：给出地址核对建议，但只提示 host 而非完整 URL
+        let host = url
+            .trim_start_matches("https://")
+            .trim_start_matches("http://")
+            .split('/')
+            .next()
+            .unwrap_or("");
+        return format!("无法连接到 {host}。请核对服务地址是否正确（在线服务通常以 https:// 开头并以 /v1 结尾）、网络是否可达。")
+    }
+    if e.is_decode() {
+        return "服务响应了，但返回内容不是有效的 JSON。请确认地址指向 API 而不是网页。".to_string();
+    }
+    format!("请求失败: {e}")
+}
+
+fn openai_fail_message(code: u16, is_local: bool) -> String {
+    match code {
+        401 | 403 => "服务可达，但密钥无效或没有权限（401/403）。请检查 API 密钥是否正确、是否过期。".to_string(),
+        404 => "路径不存在（404）。请检查服务地址是否已包含正确的路径（如 /v1），或去掉多余的路径。".to_string(),
+        429 => "请求频率受限（429）。服务可达，稍后重试即可。".to_string(),
+        _ if is_local => format!("本地服务返回 HTTP {code}。请确认引擎已启动且端口正确。"),
+        _ => format!("服务返回 HTTP {code}。请核对该服务是否为 OpenAI 兼容接口。"),
+    }
+}
+
+fn anthropic_fail_message(code: u16) -> String {
+    match code {
+        401 => "密钥无效（401）。请检查 Anthropic API 密钥。".to_string(),
+        403 => "没有权限（403）。密钥可能无权访问该模型。".to_string(),
+        404 => "路径或模型不存在（404）。请检查地址是否以 /v1 结尾、模型名是否可用。".to_string(),
+        _ => format!("Anthropic 服务返回 HTTP {code}。"),
+    }
+}
+
 /// 取用于打标的图片路径：高清缩略图 > 占位图 > 原图
 fn pick_image(asset: &assets::Asset) -> PathBuf {
     if let Some(p) = &asset.hd_thumbnail_path {
@@ -926,6 +1095,7 @@ mod tests {
     use super::{
         apply_keep_alive, extract_anthropic_text, parse_categorized, parse_model_ids, KEEP_ALIVE_IDLE,
     };
+    use super::{join_url, openai_fail_message, anthropic_fail_message};
 
     #[test]
     fn categorized_clean_object() {
@@ -1034,6 +1204,33 @@ mod tests {
         assert_eq!(tags.get("subject").unwrap(), &vec!["人".to_string()]);
         assert!(!warnings.is_empty());
         assert!(warnings.iter().any(|w| w.contains("已停用")), "应有「已停用」warning：{:?}", warnings);
+    }
+
+    // ── FB3-08：连接测试的纯函数部分（网络路径在真机验收） ──
+
+    #[test]
+    fn join_url_trims_trailing_slash() {
+        // 用户地址带不带尾斜杠、带不带 /v1 都拼出正确路径
+        assert_eq!(join_url("https://api.example.com/v1", "/models"), "https://api.example.com/v1/models");
+        assert_eq!(join_url("https://api.example.com/v1/", "/models"), "https://api.example.com/v1/models");
+        assert_eq!(join_url("http://localhost:11434/v1", "/models"), "http://localhost:11434/v1/models");
+        assert_eq!(join_url("https://api.example.com", "/messages"), "https://api.example.com/messages");
+    }
+
+    #[test]
+    fn openai_fail_messages_are_actionable() {
+        let m401 = openai_fail_message(401, false);
+        assert!(m401.contains("密钥"), "401 应指向密钥问题：{m401}");
+        let m404 = openai_fail_message(404, false);
+        assert!(m404.contains("路径"), "404 应指向路径问题：{m404}");
+        let local = openai_fail_message(500, true);
+        assert!(local.contains("本地"), "本地部署的失败信息应指向引擎/端口：{local}");
+    }
+
+    #[test]
+    fn anthropic_fail_messages_are_actionable() {
+        assert!(anthropic_fail_message(401).contains("密钥"));
+        assert!(anthropic_fail_message(404).contains("路径"));
     }
 
     #[test]

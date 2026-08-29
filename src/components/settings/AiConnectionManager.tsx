@@ -12,11 +12,11 @@ import {
   deleteAiConnection,
   listAiConnections,
   saveAiConnection,
+  testAiConnection,
   type AiConnection,
   type AiDeployment,
   type AiProtocol,
 } from "@/api/connections";
-import { aiListModels } from "@/api/ai";
 
 interface Props {
   /** 当前部署模式（在线/本地）：新增连接默认按此部署，列表只显示该部署的连接 */
@@ -126,15 +126,18 @@ export default function AiConnectionManager({ deployment, notify, fail, onChange
     }
   };
 
+  // FB3-08：连接测试走后端（密钥从 keyring 读取；按 OpenAI/Anthropic/本地协议分支测试）。
+  // 前端只传 connection_id，不再自己拼 /models 请求——旧实现传空 key 必然 401。
   const test = async (c: AiConnection) => {
     setTestingId(c.id);
     setTestResult((s) => ({ ...s, [c.id]: null }));
     try {
-      const apiMode = c.protocol === "anthropic_messages" ? "anthropic" : "openai";
-      const list = await aiListModels(c.baseUrl, "", apiMode);
+      const r = await testAiConnection(c.id);
+      const label = r.ok ? "连接成功" : "连接失败";
+      const latency = r.latencyMs > 0 ? `，耗时 ${r.latencyMs}ms` : "";
       setTestResult((s) => ({
         ...s,
-        [c.id]: list.length > 0 ? `连接成功（${list.length} 个模型）` : "连接成功（未返回模型列表）",
+        [c.id]: `${label}：${r.message}${latency}`,
       }));
     } catch (e) {
       setTestResult((s) => ({ ...s, [c.id]: `连接失败：${e instanceof Error ? e.message : String(e)}` }));

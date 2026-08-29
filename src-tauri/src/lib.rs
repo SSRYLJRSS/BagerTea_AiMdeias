@@ -290,6 +290,7 @@ pub fn run() {
             commands::set_ai_usage_binding,
             commands::get_ai_usage_bindings,
             commands::get_legacy_active_profile,
+            commands::test_ai_connection,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

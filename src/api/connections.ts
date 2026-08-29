@@ -55,3 +55,18 @@ export function setAiUsageBinding(usage: AiUsage, connectionId: string | null): 
 export function getAiUsageBindings(): Promise<Record<AiUsage, string | null>> {
   return invoke<Record<AiUsage, string | null>>("get_ai_usage_bindings");
 }
+
+/** FB3-08：连接测试结果（后端从 keyring 取密钥，按协议分支测试；错误信息已脱敏） */
+export interface AiConnectionTestResult {
+  ok: boolean;
+  statusCode: number | null;
+  latencyMs: number;
+  protocol: string;
+  model: string;
+  message: string;
+}
+
+/** FB3-08：测试指定连接（密钥只在 Rust 侧读取，前端只传 connection_id） */
+export function testAiConnection(connectionId: string): Promise<AiConnectionTestResult> {
+  return invoke<AiConnectionTestResult>("test_ai_connection", { connectionId });
+}

@@ -171,3 +171,40 @@ pub fn get_legacy_active_profile(state: State<AppState>) -> AppResult<Option<Str
     let s = settings::get_settings(&conn)?;
     Ok(s.ai.active_profile_opt())
 }
+
+/// FB3-08（§10.2）：连接测试。密钥只在 Rust 侧从 keyring 读取（不经前端回显明文），
+/// 按协议分支测试：OpenAI 兼容 / 本地 → GET /models（Bearer/无鉴权）；
+/// Anthropic Messages → POST /messages（x-api-key，max_tokens=1 最小请求）。
+#[tauri::command]
+pub async fn test_ai_connection(
+    state: State<'_, AppState>,
+    connection_id: String,
+) -> AppResult<crate::services::ai_cloud::AiConnectionTestResult> {
+    // DB 与 keyring 都是阻塞调用：先在当前任务提取需要的数据（短锁），网络测试放 spawn_blocking。
+    // State 不能 move 进 'static 闭包，所以这里克隆 Arc 后释放。
+    let (base_url, protocol, model, api_key, is_local) = {
+        let conn = lock_db(&state)?;
+        let c = ai_connections::get(&conn, &connection_id)?
+            .ok_or_else(|| AppError::msg("连接档案不存在"))?;
+        if c.base_url.trim().is_empty() {
+            return Err(AppError::msg("该服务未填写地址，请先编辑并保存"));
+        }
+        // 从 keyring 读取密钥；未配置时按空串处理（本地服务通常无需密钥）
+        let api_key = match &c.api_key_ref {
+            Some(id) => credentials::get_api_key(id)?.unwrap_or_default(),
+            None => String::new(),
+        };
+        (c.base_url, c.protocol, c.model, api_key, c.deployment == "local")
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        Ok(crate::services::ai_cloud::test_connection(
+            &base_url,
+            &api_key,
+            &protocol,
+            &model,
+            is_local,
+        ))
+    })
+    .await
+    .map_err(|e| AppError::msg(format!("连接测试任务失败: {e}")))?
+}

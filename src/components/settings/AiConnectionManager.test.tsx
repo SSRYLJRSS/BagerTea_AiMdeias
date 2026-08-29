@@ -8,15 +8,13 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import AiConnectionManager from "@/components/settings/AiConnectionManager";
-import { deleteAiConnection, listAiConnections, saveAiConnection } from "@/api/connections";
+import { deleteAiConnection, listAiConnections, saveAiConnection, testAiConnection } from "@/api/connections";
 
 vi.mock("@/api/connections", () => ({
   listAiConnections: vi.fn(),
   deleteAiConnection: vi.fn(),
   saveAiConnection: vi.fn(),
-}));
-vi.mock("@/api/ai", () => ({
-  aiListModels: vi.fn().mockResolvedValue([]),
+  testAiConnection: vi.fn(),
 }));
 
 import type { AiConnection } from "@/api/connections";
@@ -100,5 +98,46 @@ describe("AiConnectionManager（§6.3）", () => {
     fireEvent.click(screen.getByRole("button", { name: "删" }));
     expect(confirmSpy).toHaveBeenCalled();
     await waitFor(() => expect(deleteAiConnection).toHaveBeenCalledWith("c1"));
+  });
+
+  // FB3-08：测试连接走后端 test_ai_connection（keyring 密钥在 Rust 侧读取），
+  // 成功/失败都显示后端结构化信息（脱敏 message + 延迟）
+  it("点击测试连接调用 testAiConnection 并显示后端结果（成功含延迟）", async () => {
+    vi.mocked(listAiConnections).mockResolvedValue(fakeConns);
+    vi.mocked(testAiConnection).mockResolvedValue({
+      ok: true,
+      statusCode: 200,
+      latencyMs: 312,
+      protocol: "openai_chat",
+      model: "qwen-max",
+      message: "连接成功（HTTP 200，共 12 个模型）",
+    });
+    render(<AiConnectionManager deployment="cloud" notify={vi.fn()} fail={vi.fn()} />);
+    await waitFor(() => expect(screen.getByText("通义")).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole("button", { name: "测试连接" }));
+    await waitFor(() => expect(testAiConnection).toHaveBeenCalledWith("c1"));
+    await waitFor(() =>
+      expect(screen.getByText(/连接成功：连接成功（HTTP 200，共 12 个模型），耗时 312ms/)).toBeInTheDocument(),
+    );
+  });
+
+  it("测试失败显示失败信息（红色路径）", async () => {
+    vi.mocked(listAiConnections).mockResolvedValue(fakeConns);
+    vi.mocked(testAiConnection).mockResolvedValue({
+      ok: false,
+      statusCode: 401,
+      latencyMs: 150,
+      protocol: "openai_chat",
+      model: "qwen-max",
+      message: "服务可达，但密钥无效或没有权限（401/403）。请检查 API 密钥是否正确、是否过期。",
+    });
+    render(<AiConnectionManager deployment="cloud" notify={vi.fn()} fail={vi.fn()} />);
+    await waitFor(() => expect(screen.getByText("通义")).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole("button", { name: "测试连接" }));
+    await waitFor(() =>
+      expect(screen.getByText(/连接失败：服务可达，但密钥无效/)).toBeInTheDocument(),
+    );
   });
 });
