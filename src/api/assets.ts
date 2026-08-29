@@ -78,6 +78,14 @@ export function rescanAssetMetadata(ids: number[], scope: "all" | "missing" | "i
   return invoke<RescanResult>("rescan_asset_metadata", { ids, scope });
 }
 
+/** FB2-08：算法色板回算（不调用 AI）。范围：all=全部可算素材 | missing=仅缺色板 | ids=选中素材 */
+export function rescanAssetPalette(
+  ids: number[],
+  scope: "all" | "missing" | "ids",
+): Promise<RescanResult> {
+  return invoke<RescanResult>("rescan_asset_palette", { ids, scope });
+}
+
 export function cancelMediaRefill(): Promise<void> {
   return invoke<void>("cancel_media_refill");
 }

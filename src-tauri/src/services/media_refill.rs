@@ -211,8 +211,9 @@ pub fn rescan_assets(
 }
 
 /// FB2-08（§14.6/14.7）：存量色板回算。复用 rescan_assets_with 的骨架（短锁读/写 + 取消 + 进度）。
-/// 取材：placeholder（256px 入库即生成）优先，其次 hd 缩略图，最次原图；全都不行则该行 failed。
-/// 色板为空（如全黑图极端像素丢光）→ 计 skipped、不覆盖；成功写入 palette_json + dominant_*。
+/// 取材（FX-13）：图片 placeholder（256px 入库即生成）→ hd → 原图；视频只认 hd 封面。
+/// 计数三分（FX-10）：无可信取材/色板为空 → skipped（不是错误）；解码/写库失败 → failed；
+/// 成功写入 palette_json + dominant_* → success。
 pub fn rescan_assets_palette(
     db: &Arc<Mutex<Connection>>,
     asset_ids: &[i64],
@@ -237,22 +238,44 @@ pub fn rescan_assets_palette(
             summary.skipped += 1;
             continue;
         };
-        // 取材路径（§14.6）
-        let src = asset
-            .placeholder_path
-            .as_deref()
-            .map(std::path::PathBuf::from)
-            .or_else(|| asset.hd_thumbnail_path.as_deref().map(std::path::PathBuf::from))
-            .unwrap_or_else(|| std::path::PathBuf::from(&asset.file_path));
-
-        // 锁外计算（解码走 imaging::decode_thumb；acquire 取全局并发闸）
-        let palette = {
-            let _permit = crate::services::imaging::acquire();
-            crate::services::imaging::decode_thumb(&src, 100)
-                .map(|img| crate::services::palette::compute_palette(&img))
+        // FX-13：ids scope 由调用方指定，可能包含视频/不可解码素材。取材必须是"真实的素材像素"：
+        // 图片走 placeholder（入库即生成，256px 足够）→ hd → 原图；
+        // 视频只认 hd 封面（真实抽帧），不用 placeholder —— 后者可能是 write_generic 的 UI 占位图。
+        let is_image = asset.mime_type.starts_with("image/");
+        let is_video = asset.mime_type.starts_with("video/");
+        let src: Option<std::path::PathBuf> = if is_image {
+            asset
+                .placeholder_path
+                .as_deref()
+                .map(std::path::PathBuf::from)
+                .or_else(|| asset.hd_thumbnail_path.as_deref().map(std::path::PathBuf::from))
+                .or_else(|| Some(std::path::PathBuf::from(&asset.file_path)))
+        } else if is_video {
+            asset.hd_thumbnail_path.as_deref().map(std::path::PathBuf::from)
+        } else {
+            None
+        };
+        let Some(src) = src.filter(|p| p.exists()) else {
+            summary.skipped += 1; // 没有可信取材 —— 不是错误
+            on_progress(&RefillProgress {
+                done: (i + 1) as i64,
+                total: summary.total,
+                success: summary.success,
+                failed: summary.failed,
+                skipped: summary.skipped,
+                current_id: id,
+            });
+            continue;
         };
 
-        let ok = match palette {
+        // 锁外计算。WHY 不 acquire：decode_thumb 内部已取全局解码并发闸（imaging.rs），
+        // 这里再 acquire 是同一线程双持 permit，会把 4 并发闸压成 2（FX-08）。
+        let palette = crate::services::imaging::decode_thumb(&src, 100)
+            .map(|img| crate::services::palette::compute_palette(&img));
+
+        // FX-10：三分支计数 —— 色板为空是素材本身不适用（skipped，不覆盖已有结果），
+        // 解码失败/写库失败才是真错误（failed）。混计会让全库黑白素材显示成大面积失败。
+        let outcome = match palette {
             Some(palette) if !palette.is_empty() => {
                 let entries: Vec<serde_json::Value> = palette
                     .iter()
@@ -266,15 +289,31 @@ pub fn rescan_assets_palette(
                 let p0 = &palette[0];
                 let (hue, sat, lum) = crate::services::palette::dominant_from_rgb(p0.r, p0.g, p0.b);
                 let conn = lock()?;
-                assets::set_palette(&conn, id, &json, PALETTE_VERSION, hue, sat, lum).is_ok()
+                if assets::set_palette(&conn, id, &json, PALETTE_VERSION, hue, sat, lum).is_ok() {
+                    Ok(())
+                } else {
+                    Err(()) // 写库失败 = 真错误
+                }
             }
-            // 色板为空（全黑/全白被丢光）或解码失败 → 未计算，不覆盖
-            _ => false,
+            // 色板为空：素材本身无有效彩色（FX-04 回退后极少见，但仍可能：0×0 图）。
+            Some(_) => {
+                summary.skipped += 1;
+                on_progress(&RefillProgress {
+                    done: (i + 1) as i64,
+                    total: summary.total,
+                    success: summary.success,
+                    failed: summary.failed,
+                    skipped: summary.skipped,
+                    current_id: id,
+                });
+                continue;
+            }
+            // 解码失败 = 真错误（文件损坏 / 格式不支持）
+            None => Err(()),
         };
-        if ok {
-            summary.success += 1;
-        } else {
-            summary.failed += 1;
+        match outcome {
+            Ok(()) => summary.success += 1,
+            Err(()) => summary.failed += 1,
         }
         on_progress(&RefillProgress {
             done: (i + 1) as i64,

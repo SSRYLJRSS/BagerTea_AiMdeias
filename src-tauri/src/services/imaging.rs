@@ -397,6 +397,7 @@ fn is_jpeg_like(src: &Path) -> bool {
 
 /// 统一解码入口：目标最长边 max_px
 /// 内嵌图达标（≥max_px）直接用；不达标再按格式选最快的解码路
+/// **内部已取全局并发闸**，调用方不要再 `acquire()`（同线程双持会把 4 并发压成 2，FX-08）。
 pub fn decode_thumb(src: &Path, max_px: u32) -> Option<DynamicImage> {
     let _permit = acquire();
 

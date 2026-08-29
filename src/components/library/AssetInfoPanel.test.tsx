@@ -4,11 +4,13 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { render, screen, waitFor, fireEvent } from "@testing-library/react";
 import AssetInfoPanel from "@/components/library/AssetInfoPanel";
-import { rescanAssetMetadata, getAsset } from "@/api/assets";
+import { rescanAssetMetadata, rescanAssetPalette, getAsset } from "@/api/assets";
 import type { Asset } from "@/types/asset";
 
 vi.mock("@/api/assets", () => ({
   rescanAssetMetadata: vi.fn().mockResolvedValue({ total: 1, success: 1, failed: 0, skipped: 0 }),
+  // FB2-08：单张重读顺带算色板；mock 不补这个函数会让 undefined.catch 直接抛错
+  rescanAssetPalette: vi.fn().mockResolvedValue({ total: 1, success: 1, failed: 0, skipped: 0 }),
   getAsset: vi.fn(),
 }));
 
@@ -61,6 +63,8 @@ describe("AssetInfoPanel 媒体属性重读", () => {
     fireEvent.click(screen.getByRole("button", { name: "重新读取" }));
     await waitFor(() => expect(onRefreshed).toHaveBeenCalled());
     expect(rescanAssetMetadata).toHaveBeenCalledWith([1], "ids");
+    // FB2-08（§14.7）：单张重算顺带算色板
+    expect(rescanAssetPalette).toHaveBeenCalledWith([1], "ids");
     expect(getAsset).toHaveBeenCalledWith(1);
     expect(screen.getByText("已重新读取媒体属性")).toBeInTheDocument();
   });

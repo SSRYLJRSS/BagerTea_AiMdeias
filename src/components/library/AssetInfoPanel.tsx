@@ -14,7 +14,7 @@ import {
   probeState,
 } from "@/utils/mediaMeta";
 import { isVideoAsset } from "@/utils/assetKind";
-import { getAsset, rescanAssetMetadata } from "@/api/assets";
+import { getAsset, rescanAssetMetadata, rescanAssetPalette } from "@/api/assets";
 import type { Asset } from "@/types/asset";
 
 type Tab = "general" | "image" | "video";
@@ -52,6 +52,10 @@ export default function AssetInfoPanel({ asset, onRefreshed }: { asset: Asset; o
     setRescanMsg(null);
     try {
       await rescanAssetMetadata([asset.id], "ids");
+      // FB2-08（§14.7）：单张重算顺带算色板 —— 失败不影响元数据回填结果（色板是增强信息）。
+      // 这里的 catch 是有意的：用户要的状态（媒体属性）已拿到，色板缺失在 UI 上表现为
+      // "没有色条"，是可见的；不该让"重新读取媒体属性"整体报错。
+      await rescanAssetPalette([asset.id], "ids").catch(() => undefined);
       const fresh = await getAsset(asset.id);
       onRefreshed?.(fresh);
       setRescanMsg("已重新读取媒体属性");

@@ -58,6 +58,25 @@ pub struct Asset {
     pub metadata_version: Option<i64>,
     pub metadata_scanned_at: Option<i64>,
     pub metadata_error: Option<String>,
+    // FB2-08（§14.8）：算法主色。palette 由 palette_json 解析而来（前端不做 JSON.parse）；
+    // dominant_* 是索引列，供超级搜索按颜色筛选。
+    #[serde(default)]
+    pub palette: Option<Vec<PaletteSegmentDto>>,
+    pub dominant_hue: Option<i64>,
+    pub dominant_sat: Option<i64>,
+    pub dominant_lum: Option<i64>,
+}
+
+/// FB2-08：色板单段（与前端 PaletteSegmentDto 同形）。
+/// palette_json 在 from_row 里解析成这个结构，前端不做 JSON.parse。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PaletteSegmentDto {
+    pub hex: String,
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+    pub ratio: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -190,7 +209,8 @@ pub(crate) const COLUMNS: &str =
                        media_kind, container_format, video_profile, pixel_format, bit_depth, frame_rate, \
                        video_bit_rate, color_range, color_space, color_transfer, color_primaries, \
                        audio_sample_rate, audio_channels, audio_layout, rotation, \
-                       media_metadata_json, metadata_version, metadata_scanned_at, metadata_error";
+                       media_metadata_json, metadata_version, metadata_scanned_at, metadata_error, \
+                       palette_json, dominant_hue, dominant_sat, dominant_lum";
 
 pub(crate) fn from_row(row: &Row) -> rusqlite::Result<Asset> {
     Ok(Asset {
@@ -236,6 +256,14 @@ pub(crate) fn from_row(row: &Row) -> rusqlite::Result<Asset> {
         metadata_version: row.get(39)?,
         metadata_scanned_at: row.get(40)?,
         metadata_error: row.get(41)?,
+        // palette_json（列 42）解析为 DTO；损坏/空 JSON → None（安静降级，不让一行坏数据毁掉整页查询）
+        palette: row
+            .get::<_, Option<String>>(42)?
+            .and_then(|s| serde_json::from_str::<Vec<PaletteSegmentDto>>(&s).ok())
+            .filter(|v| !v.is_empty()),
+        dominant_hue: row.get(43)?,
+        dominant_sat: row.get(44)?,
+        dominant_lum: row.get(45)?,
         tags: Vec::new(),
     })
 }
@@ -1044,18 +1072,27 @@ pub fn set_palette(
     Ok(())
 }
 
+/// FB2-08：色板回算的候选范围。
+/// 只取图片，以及有 hd 封面的视频 —— 视频的 placeholder 可能是 write_generic 写的
+/// 纯 UI 占位图（暖灰底 + 品牌蓝块，thumbnail.rs），拿它算"主色"会写进一个
+/// 与素材无关的 dominant_hue，污染按颜色检索（FX-13）。
+const PALETTE_CANDIDATE_PRED: &str = "deleted_at IS NULL AND (\
+       mime_type LIKE 'image/%' \
+    OR (mime_type LIKE 'video/%' AND hd_thumbnail_path IS NOT NULL))";
+
 /// FB2-08：列出缺少色板（palette_json 为空）的素材 id（用于「仅缺色板」回填范围）。
 pub fn list_ids_needing_palette(conn: &Connection) -> AppResult<Vec<i64>> {
-    let mut stmt = conn.prepare(
-        "SELECT id FROM assets WHERE deleted_at IS NULL AND palette_json IS NULL",
-    )?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT id FROM assets WHERE {PALETTE_CANDIDATE_PRED} AND palette_json IS NULL"
+    ))?;
     let rows = stmt.query_map([], |r| r.get(0))?;
     Ok(rows.filter_map(|r| r.ok()).collect())
 }
 
-/// FB2-08：列出全部未删除素材 id（用于「全部」色板回算范围）。
+/// FB2-08：列出全部可算色板的素材 id（用于「全部」色板回算范围）。
+/// 语义是"全部可算色板的素材"而非"全部素材"：与 list_ids_needing_palette 同谓词（FX-13）。
 pub fn list_all_ids(conn: &Connection) -> AppResult<Vec<i64>> {
-    let mut stmt = conn.prepare("SELECT id FROM assets WHERE deleted_at IS NULL")?;
+    let mut stmt = conn.prepare(&format!("SELECT id FROM assets WHERE {PALETTE_CANDIDATE_PRED}"))?;
     let rows = stmt.query_map([], |r| r.get(0))?;
     Ok(rows.filter_map(|r| r.ok()).collect())
 }
@@ -1092,4 +1129,89 @@ pub fn clear_all_placeholder_paths(conn: &Connection) -> AppResult<()> {
 pub fn clear_all_hd_thumbnail_paths(conn: &Connection) -> AppResult<()> {
     conn.execute("UPDATE assets SET hd_thumbnail_path = NULL", [])?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mem() -> Connection {
+        let c = crate::db::init_memory().unwrap();
+        c
+    }
+
+    fn ins(c: &Connection, path: &str, mime: &str) -> i64 {
+        insert(c, path, "a", "jpg", 100, mime, 1).unwrap()
+    }
+
+    /// FX-13：回算候选不含无封面视频，也不含非图非视频。
+    #[test]
+    fn palette_candidates_exclude_videos_without_cover() {
+        let c = mem();
+        let img = ins(&c, "/a.jpg", "image/jpeg");
+        let vid_no = ins(&c, "/b.mp4", "video/mp4"); // 无 hd
+        let vid_ok = ins(&c, "/c.mp4", "video/mp4");
+        set_hd_thumbnail_path(&c, vid_ok, "/hd/c.jpg").unwrap();
+        let other = ins(&c, "/d.psd", "application/octet-stream");
+
+        let ids = list_ids_needing_palette(&c).unwrap();
+        assert!(ids.contains(&img));
+        assert!(ids.contains(&vid_ok));
+        assert!(
+            !ids.contains(&vid_no),
+            "无封面视频不得进回算队列（会拿到 UI 占位图）"
+        );
+        assert!(!ids.contains(&other), "非图非视频不得进回算队列");
+        // list_all_ids 同谓词
+        let all = list_all_ids(&c).unwrap();
+        assert!(all.contains(&vid_ok));
+        assert!(!all.contains(&vid_no));
+        assert!(!all.contains(&other));
+        // 已算过的不再进 missing
+        set_palette(
+            &c,
+            img,
+            r##"[{"hex":"#000000","r":0,"g":0,"b":0,"ratio":1.0}]"##,
+            1,
+            0,
+            0,
+            0,
+        )
+        .unwrap();
+        assert!(!list_ids_needing_palette(&c).unwrap().contains(&img));
+    }
+
+    /// FX-05：set_palette 写入后，list/get 能把 palette_json 解析成 DTO 数组。
+    #[test]
+    fn list_returns_parsed_palette() {
+        let c = mem();
+        let id = ins(&c, "/a.jpg", "image/jpeg");
+        let json = r##"[{"hex":"#1b2a3c","r":27,"g":42,"b":60,"ratio":0.31},
+                       {"hex":"#e6dfc8","r":230,"g":223,"b":200,"ratio":0.22}]"##;
+        set_palette(&c, id, json, 1, 213, 55, 24).unwrap();
+        let a = get(&c, id).unwrap();
+        let p = a.palette.clone().expect("应解析出色板");
+        assert_eq!(p.len(), 2);
+        assert_eq!(p[0].hex, "#1b2a3c");
+        assert_eq!(a.dominant_hue, Some(213));
+        // 序列化后前端拿到的键名是 palette，不是 paletteJson
+        let v = serde_json::to_value(&a).unwrap();
+        assert!(v.get("palette").is_some());
+        assert!(v.get("paletteJson").is_none(), "palette_json 不得直接暴露");
+    }
+
+    /// FX-05：损坏 JSON 不得让查询失败，只降级为 None。
+    #[test]
+    fn broken_palette_json_degrades_to_none() {
+        let c = mem();
+        let id = ins(&c, "/a.jpg", "image/jpeg");
+        set_palette(&c, id, "{not json", 1, 0, 0, 0).unwrap();
+        let a = get(&c, id).unwrap();
+        assert!(a.palette.is_none());
+        assert_eq!(a.dominant_hue, Some(0), "dominant_* 仍应可读");
+        // 空数组同样归一为 None（Option 语义 = 未计算）
+        set_palette(&c, id, "[]", 1, 0, 0, 0).unwrap();
+        let b = get(&c, id).unwrap();
+        assert!(b.palette.is_none(), "空数组应归一为 None");
+    }
 }

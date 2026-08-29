@@ -11,7 +11,7 @@ import { on } from "@/api/client";
 import Button from "@/components/common/Button";
 import { ollamaInstallStatus, ollamaRemoveInstaller } from "@/api/ollama";
 import { clearThumbnailCache, getDataDir, openDataDir } from "@/api/settings";
-import { rescanAssetMetadata, cancelMediaRefill, type RefillProgress } from "@/api/assets";
+import { rescanAssetMetadata, rescanAssetPalette, cancelMediaRefill, type RefillProgress } from "@/api/assets";
 import { listAiConnections, getAiUsageBindings, setAiUsageBinding } from "@/api/connections";
 import { videoProxyCacheStats, clearAllVideoProxies } from "@/api/video";
 import FacetManagePanel from "@/components/settings/FacetManagePanel";
@@ -122,6 +122,36 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
   const onCancelRefill = () => {
     void cancelMediaRefill().catch(() => undefined);
     setRefillResult("正在取消…");
+  };
+
+  // FB2-08：算法色板回算（与元数据回填互斥，见 FX-12；进度事件同频道，互斥保证不混淆）
+  const [paletteResult, setPaletteResult] = useState<string | null>(null);
+  const [paletteProgress, setPaletteProgress] = useState<RefillProgress | null>(null);
+  const [paletteRunning, setPaletteRunning] = useState(false);
+  const paletteUnsub = useRef<(() => void) | null>(null);
+  useEffect(() => () => paletteUnsub.current?.(), []);
+
+  const onRescanPalette = async (scope: "all" | "missing") => {
+    setPaletteRunning(true);
+    setPaletteResult(null);
+    setPaletteProgress(null);
+    // 独立订阅，不复用 refillUnsub：两个订阅同时活着时复用 ref 会互相覆盖，导致其中一个泄漏
+    on<RefillProgress>("media_refill://progress", (p) => setPaletteProgress(p))
+      .then((unsub) => {
+        paletteUnsub.current = unsub;
+      })
+      .catch(() => undefined);
+    try {
+      const r = await rescanAssetPalette([], scope);
+      setPaletteResult(`回算完成：总数 ${r.total}，成功 ${r.success}，跳过 ${r.skipped}，失败 ${r.failed}`);
+    } catch (e) {
+      setPaletteResult(e instanceof Error ? e.message : String(e));
+    } finally {
+      setPaletteRunning(false);
+      paletteUnsub.current?.();
+      paletteUnsub.current = null;
+      setPaletteProgress(null);
+    }
   };
 
   useEffect(() => {
@@ -545,10 +575,11 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
                 hint="重新读取素材的分辨率/编码/时长/色彩等媒体属性；坏文件记录失败原因，不阻塞批次"
               >
                 <div className="flex items-center gap-2">
-                  <Button disabled={refilling} onClick={() => void onRefill("missing")}>
+                  {/* 与色板回算互斥（FX-12 后端也会拒绝）；前端 disabled 是为了不让用户点了才知道 */}
+                  <Button disabled={refilling || paletteRunning} onClick={() => void onRefill("missing")}>
                     仅缺字段
                   </Button>
-                  <Button disabled={refilling} onClick={() => void onRefill("all")}>
+                  <Button disabled={refilling || paletteRunning} onClick={() => void onRefill("all")}>
                     全部视频
                   </Button>
                   {refilling ? (
@@ -563,6 +594,38 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
               )}
               {refillResult && (
                 <p className="px-4 py-2 text-xs text-[var(--color-text-secondary)]">{refillResult}</p>
+              )}
+              {/* FB2-08（§14.7）：算法色板回算入口（复用元数据回填的进度/结果行样式） */}
+              <Field
+                label="算法色板回算"
+                hint="用算法重新计算素材主色（不调用 AI）；仅缺色板＝只补没算过的，全部重算＝覆盖已有结果。视频需要先浏览过（生成封面）才能算色板；未浏览的视频会计入“跳过”"
+              >
+                <div className="flex items-center gap-2">
+                  <Button disabled={paletteRunning || refilling} onClick={() => void onRescanPalette("missing")}>
+                    仅缺色板
+                  </Button>
+                  <Button disabled={paletteRunning || refilling} onClick={() => void onRescanPalette("all")}>
+                    全部重算
+                  </Button>
+                  {paletteRunning ? (
+                    <Button
+                      onClick={() => {
+                        void cancelMediaRefill().catch(() => undefined);
+                        setPaletteResult("正在取消…");
+                      }}
+                    >
+                      取消
+                    </Button>
+                  ) : null}
+                </div>
+              </Field>
+              {paletteProgress && paletteRunning && (
+                <p className="px-4 py-2 text-xs text-[var(--color-text-secondary)]">
+                  色板回算中 {paletteProgress.done}/{paletteProgress.total}（成功 {paletteProgress.success} · 跳过 {paletteProgress.skipped} · 失败 {paletteProgress.failed}）
+                </p>
+              )}
+              {paletteResult && (
+                <p className="px-4 py-2 text-xs text-[var(--color-text-secondary)]">{paletteResult}</p>
               )}
               <Field
                 label="视频代理缓存"
