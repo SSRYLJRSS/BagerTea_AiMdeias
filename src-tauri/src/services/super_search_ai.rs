@@ -480,6 +480,7 @@ pub fn request_intent(
     let schema = intent_schema();
 
     // 组装 prompt（system + user）
+    // 色相分段与前端 src/utils/colorName.ts 的 HUE_NAMES 同源，改一处必须改另一处（FX-19）
     let system = String::from(
         "你是茶包素材库的搜索条件解析器，不是聊天助手。输入是一句自然语言，输出严格 JSON。\
          只使用给定字段（search/assetType/tags/excludeTags/metadata/sortBy/sortDir/concepts/relation/unresolved）。\
@@ -489,6 +490,11 @@ pub fn request_intent(
          标签只写文字和分面key，不写 id、不写 SQL、不写分页。\
          排除表达（不要/排除/除了）进 excludeTags。横图/竖图用 composition 或 aspect_ratio。\
          相对日期依据当前日期。不确定/词典里没有的概念进 unresolved（不进 tags）。\
+                  颜色用 metadata 的 dominant_hue（0-359 色相）/ dominant_sat（0-100 饱和度）/ \
+                  dominant_lum（0-100 明度），不要写进 tags —— 颜色是算法计算的文件属性，不是标签。\
+                  色相是环形量：红色用 between min=345 max=15（min>max 表示跨 0°）；\
+                  橙约 15-45、黄 45-70、绿 70-155、青 155-225、蓝 225-295、紫 295-345。\
+                  “灰/黑/白”用 dominant_sat lte 10 而不是色相。\
          只生成查询，不创建标签。",
     );
     let mut user = String::from("标签词典（名称(分面key)）\n");
@@ -692,6 +698,29 @@ mod tests {
             max: None,
         });
         assert!(validate_intent(&i, &[]).is_err());
+    }
+
+    /// FX-19：AI 生成的 dominant_hue 跨 0° 表达（min=345 > max=15）必须通过 validate_intent。
+    #[test]
+    fn validates_intent_accepts_dominant_hue_wraparound() {
+        let mut i = SearchIntent::default();
+        i.metadata.push(MetadataFilter {
+            key: "dominant_hue".into(),
+            op: "between".into(),
+            value: None,
+            values: None,
+            min: Some(serde_json::json!(345)),
+            max: Some(serde_json::json!(15)),
+        });
+        i.metadata.push(MetadataFilter {
+            key: "dominant_sat".into(),
+            op: "lte".into(),
+            value: Some(serde_json::json!(10)),
+            values: None,
+            min: None,
+            max: None,
+        });
+        assert!(validate_intent(&i, &[]).is_ok());
     }
 
     #[test]

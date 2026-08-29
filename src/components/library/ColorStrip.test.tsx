@@ -2,7 +2,7 @@
  * FB2-08（§14.14）：ColorStrip 组件测试。
  */
 import { describe, expect, it, vi } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { render, screen, fireEvent } from "@testing-library/react";
 import ColorStrip from "@/components/library/ColorStrip";
 import type { PaletteSegment } from "@/components/library/ColorStrip";
 
@@ -52,5 +52,46 @@ describe("ColorStrip", () => {
     expect((screen.getByRole("img") as HTMLElement).style.height).toBe("10px");
     rerender(<ColorStrip palette={[seg("#000", 1, 0)]} height="thick" />);
     expect((screen.getByRole("img") as HTMLElement).style.height).toBe("16px");
+  });
+
+  // FB2-08（FX-07）：count 接线后新增的用例
+  it("count=4 时 8 段只渲染前 4 段", () => {
+    const palette = [
+      seg("#111111", 0.2, 0), seg("#222222", 0.2, 30), seg("#333333", 0.15, 60), seg("#444444", 0.1, 120),
+      seg("#555555", 0.1, 200), seg("#666666", 0.1, 240), seg("#777777", 0.08, 280), seg("#888888", 0.07, 320),
+    ];
+    render(<ColorStrip palette={palette} count={4} />);
+    const children = screen.getAllByTitle(/·/);
+    expect(children).toHaveLength(4);
+    expect(children[0].getAttribute("title")).toContain("#111111");
+    expect(children[3].getAttribute("title")).toContain("#444444");
+  });
+
+  it("mode=equal 时各段宽度相等", () => {
+    render(
+      <ColorStrip
+        palette={[seg("#ff0000", 0.7, 0), seg("#00ff00", 0.2, 120), seg("#0000ff", 0.1, 240)]}
+        mode="equal"
+      />,
+    );
+    const children = screen.getAllByTitle(/·/);
+    for (const c of children) {
+      expect(c.style.width).toBe(`${100 / 3}%`);
+    }
+  });
+
+  it("有回调时主色段是键盘可达的 button；无回调时是 div", () => {
+    const palette = [seg("#ff0000", 0.5, 0), seg("#00ff00", 0.5, 120)];
+    const onSearch = vi.fn();
+    const { rerender } = render(
+      <ColorStrip palette={palette} onSearchDominant={onSearch} />,
+    );
+    const btn = screen.getByRole("button", { name: /搜索.*系素材/ });
+    expect(btn.tagName).toBe("BUTTON");
+    fireEvent.click(btn);
+    expect(onSearch).toHaveBeenCalledTimes(1);
+    // 无回调：主色段退化为纯展示 div，不可聚焦
+    rerender(<ColorStrip palette={palette} />);
+    expect(screen.queryByRole("button", { name: /搜索/ })).toBeNull();
   });
 });

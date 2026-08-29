@@ -48,6 +48,7 @@ vi.mock("@/api/thumbnail", () => ({
 }));
 vi.mock("@/api/assets", () => ({
   rescanAssetMetadata: vi.fn().mockResolvedValue({ total: 2, success: 2, failed: 0, skipped: 0 }),
+  rescanAssetPalette: vi.fn().mockResolvedValue({ total: 2, success: 2, failed: 0, skipped: 0 }),
   cancelMediaRefill: vi.fn().mockResolvedValue(undefined),
 }));
 vi.mock("@/api/video", () => ({
@@ -99,6 +100,12 @@ function mkSettings(over: Partial<Settings> = {}): Settings {
     },
     ...over,
   };
+}
+
+/** Field 结构：label 文本 → p → label 列 div → Field 根 div（根下才是控件列）。 */
+function fieldSwitch(label: string): Element {
+  const fieldRoot = screen.getByText(label).parentElement!.parentElement!;
+  return fieldRoot.querySelector('[role="switch"]')!;
 }
 
 const emptyStore = {
@@ -161,6 +168,45 @@ describe("SettingsPage §6.1 信息架构", () => {
     expect(
       Array.from(screen.getAllByRole("option") as HTMLOptionElement[]).filter((o) => ["cover", "contain", "smart"].includes(o.value)).length,
     ).toBe(3);
+  });
+
+  // FB2-08（FX-07）：色条设置区块
+  it("色条区块：切「显示色条」Toggle 触发即时预览；总开关关闭后六行不渲染", async () => {
+    useSettingsStore.setState({ settings: mkSettings(), loaded: true, loading: false, loadError: null });
+    render(<SettingsPage />);
+    await waitFor(() => expect(screen.getByText("保存设置")).toBeInTheDocument());
+    fireEvent.click(screen.getByText("通用外观"));
+    await waitFor(() => expect(screen.getByText("素材框")).toBeInTheDocument());
+
+    // 默认 colorStrip.enabled=true → 七行都在
+    expect(screen.getByText("显示色条")).toBeInTheDocument();
+    expect(screen.getByText("素材库网格显示")).toBeInTheDocument();
+    expect(screen.getByText("查看器显示")).toBeInTheDocument();
+    expect(screen.getByText("入库网格显示")).toBeInTheDocument();
+    expect(screen.getByText("色条高度")).toBeInTheDocument();
+
+    // 点击总开关 → draft 关闭 + pushPreview（commitAppearanceDebounced）被调用
+    const previewSpy = vi.spyOn(useSettingsStore.getState(), "commitAppearanceDebounced");
+    const master = fieldSwitch("显示色条");
+    fireEvent.click(master);
+    await waitFor(() => expect(previewSpy).toHaveBeenCalled());
+    // 关闭后六行整体不渲染（条件渲染，不是 disabled）
+    expect(screen.queryByText("素材库网格显示")).toBeNull();
+    expect(screen.queryByText("入库网格显示")).toBeNull();
+    expect(screen.queryByText("色条高度")).toBeNull();
+    // 再打开恢复渲染
+    fireEvent.click(fieldSwitch("显示色条"));
+    await waitFor(() => expect(screen.getByText("素材库网格显示")).toBeInTheDocument());
+  });
+
+  it("色条区块：入库网格显示开关 disabled（入库前尚未计算色板）", async () => {
+    useSettingsStore.setState({ settings: mkSettings(), loaded: true, loading: false, loadError: null });
+    render(<SettingsPage />);
+    await waitFor(() => expect(screen.getByText("保存设置")).toBeInTheDocument());
+    fireEvent.click(screen.getByText("通用外观"));
+    await waitFor(() => expect(screen.getByText("入库网格显示")).toBeInTheDocument());
+    const sw = fieldSwitch("入库网格显示") as HTMLButtonElement;
+    expect(sw.disabled).toBe(true);
   });
 
   it("AI 子页「自动打标」只显示「此功能使用的服务」+ 功能参数，不再重复服务管理列表", async () => {

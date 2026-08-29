@@ -80,6 +80,18 @@ pub fn run() {
             }
             // 关键路径之外的非关键维护：旧预置标签整理（§5.2 移出关键路径）
             let state = app.state::<AppState>();
+            // FX-14：SQLite 无统计信息时不会选用 dominant_* 等窄索引（实测：按主色筛选会退化成
+            // idx_assets_deleted 全扫）。PRAGMA optimize 增量更新 sqlite_stat1，成本与库规模成正比、
+            // 259 项量级是毫秒级。放后台维护线程：它不在启动关键路径上（§5.2）。
+            let opt_db = std::sync::Arc::clone(&state.db);
+            spawn_maintenance("sqlite-optimize", move || {
+                if let Ok(c) = opt_db.lock().map_err(|_| AppError::msg("数据库锁中毒")) {
+                    if let Err(e) = c.execute_batch("PRAGMA optimize;") {
+                        tracing::warn!("PRAGMA optimize 失败（不影响功能，仅查询计划可能次优）: {e}");
+                    }
+                }
+            });
+
             let preset_db = std::sync::Arc::clone(&state.db);
             spawn_maintenance("preset-tags-cleanup", move || {
                 let conn = preset_db.lock().map_err(|_| AppError::msg("数据库锁中毒"));

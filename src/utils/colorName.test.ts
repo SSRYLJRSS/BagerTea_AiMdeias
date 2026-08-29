@@ -34,4 +34,26 @@ describe("colorNameZh", () => {
     expect(colorNameZh(210, 80, 20)).toBe("深青");
     expect(colorNameZh(210, 80, 80)).toBe("浅青");
   });
+
+  it("分段边界一致性：每段中点色名与 super_search_ai.rs prompt 的色相分段吻合（FX-19）", () => {
+    // 该测试锁住 HUE_NAMES 分段：改了 colorName.ts 分段而不同步 AI prompt 时，
+    // 此处人工同步的期望值会红，提醒跨语言两处一起改。
+    const cases: [number, string][] = [
+      [8, "红"], // 0-15
+      [30, "橙"], // 15-45
+      [58, "黄"], // 45-70（prompt：黄 45-70）
+      [80, "黄绿"], // 70-90
+      [120, "绿"], // 90-155（prompt：绿 70-155）
+      [170, "青绿"], // 155-185
+      [205, "青"], // 185-225（prompt：青 155-225）
+      [235, "天蓝"], // 225-255
+      [275, "蓝"], // 255-295（prompt：蓝 225-295）
+      [308, "紫"], // 295-320（prompt：紫 295-345）
+      [330, "品红"], // 320-345
+      [350, "玫红"], // 345-360
+    ];
+    for (const [hue, name] of cases) {
+      expect(colorNameZh(hue, 80, 50)).toBe(name);
+    }
+  });
 });

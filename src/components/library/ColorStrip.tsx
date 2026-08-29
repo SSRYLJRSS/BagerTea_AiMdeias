@@ -48,29 +48,33 @@ export function rgbToHsv(r: number, g: number, b: number): [number, number, numb
 export type ColorStripHeight = "thin" | "normal" | "thick";
 export type ColorStripMode = "ratio" | "equal";
 
-const HEIGHT_PX: Record<ColorStripHeight, number> = { thin: 6, normal: 10, thick: 16 };
+/** 各高度档的像素值（AssetGridView 的 rowHeight 需要补上色条高度，须导出） */
+export const HEIGHT_PX: Record<ColorStripHeight, number> = { thin: 6, normal: 10, thick: 16 };
 
 export default function ColorStrip({
   palette,
   mode = "ratio",
   height = "normal",
+  count = 8,
   rounded = false,
   onSearchDominant,
 }: {
   palette: PaletteSegment[];
   mode?: ColorStripMode;
   height?: ColorStripHeight;
+  /** 最多显示前 N 段（设置项 colorStrip.count，允许 4/6/8） */
+  count?: number;
   /** 底边圆角（网格卡片里用；Viewer 无圆角） */
   rounded?: boolean;
   /** 点击主色段回调（以该色搜索）；不传则主色段也不可点 */
   onSearchDominant?: (segment: PaletteSegment) => void;
 }) {
   if (!palette.length) return null; // 空态：不占位
-  const segments = palette.slice(0, 8);
+  const segments = palette.slice(0, Math.max(1, count));
   const total = segments.reduce((a, s) => a + Math.max(0, s.ratio), 0) || segments.length;
   const label = `主色：${segments
     .map((s) => `${colorNameZh(s.hue, s.sat, s.lum)} ${Math.round(s.ratio * 100)}%`)
-    .join("、")}`;
+    .join("、")}${onSearchDominant ? "（点击主色段可搜索同色系）" : ""}`;
   const h = HEIGHT_PX[height];
 
   return (
@@ -84,21 +88,27 @@ export default function ColorStrip({
         const width =
           mode === "ratio" ? `${(Math.max(0, s.ratio) / total) * 100}%` : `${100 / segments.length}%`;
         const isDominant = i === 0;
-        return (
-          <div
-            key={i}
-            title={`${s.hex} · ${Math.round(s.ratio * 100)}%`}
-            style={{
-              width,
-              background: s.hex,
-              height: "100%",
-              cursor: isDominant && onSearchDominant ? "pointer" : "default",
-            }}
-            onClick={
-              isDominant && onSearchDominant ? () => onSearchDominant(s) : undefined
-            }
-          />
-        );
+        const style = {
+          width,
+          background: s.hex,
+          height: "100%",
+          cursor: isDominant && onSearchDominant ? "pointer" : ("default" as const),
+        };
+        // 无障碍（§4.4）：主色段且有回调 → button（键盘可达）；其余纯展示 → div（不进 tab 序）
+        if (isDominant && onSearchDominant) {
+          return (
+            <button
+              key={i}
+              type="button"
+              title={`${s.hex} · ${Math.round(s.ratio * 100)}%`}
+              aria-label={`搜索${colorNameZh(s.hue, s.sat, s.lum)}系素材`}
+              style={style}
+              onClick={() => onSearchDominant(s)}
+              className="focus-visible:ring-1 focus-visible:ring-[var(--color-status)] focus-visible:outline-none"
+            />
+          );
+        }
+        return <div key={i} title={`${s.hex} · ${Math.round(s.ratio * 100)}%`} style={style} />;
       })}
     </div>
   );

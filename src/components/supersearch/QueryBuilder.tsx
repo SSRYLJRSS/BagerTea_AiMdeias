@@ -11,7 +11,7 @@ type FieldKey = "search" | "tag" | "excludeTag" | "assetType" | "untagged" | Met
 type GroupMode = "and" | "or";
 type FlatTag = { id: number; name: string; facet: string };
 type Row = { id: string; negated: boolean; cond: LeafCond };
-type FieldOption = { key: FieldKey; label: string; group: "关键词" | "标签" | "素材" | "时间" | "拍摄设备" | "视频"; kind?: "number" | "text" | "date" | "size" | "duration" | "resolution"; ops?: MetadataOp[] };
+type FieldOption = { key: FieldKey; label: string; group: "关键词" | "标签" | "素材" | "颜色" | "时间" | "拍摄设备" | "视频"; kind?: "number" | "text" | "date" | "size" | "duration" | "resolution"; ops?: MetadataOp[] };
 
 const NUMERIC_OPS: MetadataOp[] = ["eq", "gt", "gte", "lt", "lte", "between"];
 const TEXT_OPS: MetadataOp[] = ["eq", "contains", "in"];
@@ -24,6 +24,11 @@ const FIELD_OPTIONS: FieldOption[] = [
   { key: "taken_at", label: "拍摄时间", group: "时间", kind: "date", ops: DATE_OPS }, { key: "created_at", label: "入库时间", group: "时间", kind: "date", ops: DATE_OPS }, { key: "modified_at", label: "修改时间", group: "时间", kind: "date", ops: DATE_OPS },
   { key: "camera", label: "相机", group: "拍摄设备", kind: "text", ops: TEXT_OPS }, { key: "lens", label: "镜头", group: "拍摄设备", kind: "text", ops: TEXT_OPS }, { key: "iso", label: "ISO", group: "拍摄设备", kind: "number", ops: NUMERIC_OPS }, { key: "aperture", label: "光圈", group: "拍摄设备", kind: "number", ops: NUMERIC_OPS }, { key: "shutter", label: "快门", group: "拍摄设备", kind: "text", ops: TEXT_OPS }, { key: "focal", label: "焦距", group: "拍摄设备", kind: "number", ops: NUMERIC_OPS },
   { key: "duration_ms", label: "视频时长", group: "视频", kind: "duration", ops: NUMERIC_OPS }, { key: "video_codec", label: "视频编码", group: "视频", kind: "text", ops: TEXT_OPS }, { key: "audio_codec", label: "音频编码", group: "视频", kind: "text", ops: TEXT_OPS },
+  // FB2-08（§14.9）：算法主色检索维度。色相是环形量：介于 345 至 15 表示跨过 0° 的红色区间
+  // （后端编译为双区间 OR，search_query.rs 对 dominant_hue 的 min>max 特判），其他字段的区间倒置仍是错误。
+  { key: "dominant_hue", label: "主色色相（0-359，可跨 0°）", group: "颜色", kind: "number", ops: NUMERIC_OPS },
+  { key: "dominant_sat", label: "主色饱和度（0-100）", group: "颜色", kind: "number", ops: NUMERIC_OPS },
+  { key: "dominant_lum", label: "主色明度（0-100）", group: "颜色", kind: "number", ops: NUMERIC_OPS },
 ];
 const OP_LABELS: Record<MetadataOp, string> = { eq: "等于", in: "属于任一", contains: "包含", gt: "大于", gte: "大于等于", lt: "小于", lte: "小于等于", between: "介于" };
 let rowSeq = 0;
@@ -80,7 +85,7 @@ function ConditionRow({ row, prefix, flatTags, onChange, onRemove }: { row: Row;
   const field = fieldFromCond(row.cond);
   return <div className="grid min-h-11 grid-cols-[48px_minmax(120px,0.8fr)_minmax(108px,0.65fr)_minmax(180px,1.6fr)_32px] items-center gap-2 py-1.5 max-[800px]:grid-cols-[44px_minmax(105px,1fr)_minmax(96px,1fr)_minmax(130px,1.4fr)_30px]"><span className="pl-1 text-[11px] text-[var(--color-text-tertiary)]">{prefix}</span><FieldSelect value={field} onChange={(next) => onChange({ cond: makeCond(next, flatTags), negated: false })} /><ConditionOperator cond={row.cond} negated={row.negated} onChange={onChange} /><ConditionValue cond={row.cond} flatTags={flatTags} onChange={(cond) => onChange({ cond })} /><button type="button" onClick={onRemove} className="flex size-7 items-center justify-center rounded text-base text-[var(--color-text-tertiary)] hover:bg-[var(--color-surface-hover)] hover:text-[var(--color-danger)]" aria-label="删除条件" title="删除条件">×</button></div>;
 }
-function FieldSelect({ value, onChange }: { value: FieldKey; onChange: (value: FieldKey) => void }) { const groups = ["关键词", "标签", "素材", "时间", "拍摄设备", "视频"] as const; return <select aria-label="条件字段" value={value} onChange={(e) => onChange(e.target.value as FieldKey)} className={`${controlClass} w-full`}>{groups.map((group) => <optgroup key={group} label={group}>{FIELD_OPTIONS.filter((item) => item.group === group).map((item) => <option key={item.key} value={item.key}>{item.label}</option>)}</optgroup>)}</select>; }
+function FieldSelect({ value, onChange }: { value: FieldKey; onChange: (value: FieldKey) => void }) { const groups = ["关键词", "标签", "素材", "颜色", "时间", "拍摄设备", "视频"] as const; return <select aria-label="条件字段" value={value} onChange={(e) => onChange(e.target.value as FieldKey)} className={`${controlClass} w-full`}>{groups.map((group) => <optgroup key={group} label={group}>{FIELD_OPTIONS.filter((item) => item.group === group).map((item) => <option key={item.key} value={item.key}>{item.label}</option>)}</optgroup>)}</select>; }
 
 function ConditionOperator({ cond, negated, onChange }: { cond: LeafCond; negated: boolean; onChange: (patch: Partial<Row>) => void }) {
   if (cond.type === "metadata") { const ops = FIELD_OPTIONS.find((item) => item.key === cond.filter.key)?.ops ?? NUMERIC_OPS; return <select aria-label="条件操作符" value={cond.filter.op} onChange={(e) => onChange({ cond: { ...cond, filter: changeMetadataOp(cond.filter, e.target.value as MetadataOp) } })} className={`${controlClass} w-full`}>{ops.map((op) => <option key={op} value={op}>{OP_LABELS[op]}</option>)}</select>; }

@@ -1,6 +1,7 @@
 /**
  * FB2-08：hue/sat/lum → 中文色名。仅用于色条无障碍标签与 hover 文案，不参与任何逻辑判断（§14.10）。
  */
+// hue 分段。与 super_search_ai.rs 的 system prompt 色相分段同源，改一处必须改另一处（FX-19）。
 const HUE_NAMES: [number, string][] = [
   [15, "红"],
   [45, "橙"],

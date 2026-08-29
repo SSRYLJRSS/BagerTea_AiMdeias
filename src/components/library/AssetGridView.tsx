@@ -17,6 +17,7 @@ import { GridScrollingContext } from "@/components/library/GridScrollContext";
 import { CELL_STEPS } from "@/types/settings";
 import { ASPECT_RATIO } from "@/utils/cellFit";
 import { thumbSizeForCell } from "@/utils/thumbSize";
+import { HEIGHT_PX, type PaletteSegment } from "@/components/library/ColorStrip";
 import type { Asset } from "@/types/asset";
 
 export interface AssetGridViewProps extends LibraryGridActions {
@@ -32,6 +33,8 @@ export interface AssetGridViewProps extends LibraryGridActions {
   /** FB2-06（§7.4 方案 D）：滚动位置隔离键。素材库传 "library"、超级搜索传 "superSearch"；
    *  null / 省略 = 不保存不恢复。修复两页滚动位置互相污染。 */
   scrollRestoreKey?: string | null;
+  /** FB2-08（§14.9）：点击卡片色条主色段以同色系搜索（LibraryPage/SuperSearchPage 提供） */
+  onSearchDominant?: (segment: PaletteSegment) => void;
 }
 
 /** 批量操作入口（顶栏与右键菜单共用） */
@@ -61,6 +64,7 @@ export default function AssetGridView({
   onDelete,
   scrollElementRef,
   scrollRestoreKey,
+  onSearchDominant,
 }: AssetGridViewProps) {
   const { selected, toggle, rangeTo, clear, setAll, invert } = useSelectionStore(
     useShallow((s) => ({
@@ -75,14 +79,18 @@ export default function AssetGridView({
   const { ref, width } = useElementSize<HTMLDivElement>();
 
   // FB2-01/02：外观驱动尺寸
-  const { grid } = useAppearance();
+  const { grid, colorStrip } = useAppearance();
   const cell = CELL_STEPS[grid.libraryCellStep];
   const columns = Math.max(2, Math.floor((width + GAP) / (cell + GAP)));
   const rowCount = Math.ceil(items.length / columns);
   const orderedIds = useMemo(() => items.map((a) => a.id), [items]);
   const cellWidth = Math.max(1, (width - GAP * (columns - 1)) / columns);
   const [rw, rh] = ASPECT_RATIO[grid.cellAspect] ?? ASPECT_RATIO["1:1"];
-  const rowHeight = cellWidth * (rh / rw) + GAP;
+  // FB2-08（FX-07 隐藏坑）：色条在媒体容器之外，开启后每张卡片实际高度多出 stripPx，
+  // 不补进 rowHeight 虚拟滚动会逐行累积错位（滚动时卡片重叠/大片空白）。
+  const stripPx =
+    colorStrip.enabled && colorStrip.showInLibraryGrid ? HEIGHT_PX[colorStrip.height] : 0;
+  const rowHeight = cellWidth * (rh / rw) + stripPx + GAP;
   const thumbSize = thumbSizeForCell(cell);
 
   // §7.2 / FB2-06：Viewer 关闭后恢复网格滚动位置（按键隔离，scrollRestoreKey 为空时跳过）
@@ -350,6 +358,7 @@ export default function AssetGridView({
                     onSelect={handleSelect}
                     onPreview={handlePreview}
                     onContextMenu={handleContextMenu}
+                    onSearchDominant={onSearchDominant}
                   />
                 );
               })}

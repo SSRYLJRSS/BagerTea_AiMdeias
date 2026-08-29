@@ -108,6 +108,18 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
+/** FB2-08（§16.5）：开启色条两级开关。 */
+function enableColorStrip() {
+  const base = useSettingsStore.getState().settings;
+  const appearance = base?.appearance ?? DEFAULT_APPEARANCE;
+  useSettingsStore.setState({
+    settings: {
+      ...(base ?? mkMinimalSettings()),
+      appearance: { ...appearance, colorStrip: { ...appearance.colorStrip, enabled: true, showInLibraryGrid: true } },
+    },
+  });
+}
+
 describe("AssetCard §6.1 + FB2-03（素材库 hover 原位视频预览）", () => {
   it("图片卡片渲染树无 <video>、无 role=dialog popover、无 position:fixed 预览层", () => {
     const { container } = render(
@@ -129,6 +141,41 @@ describe("AssetCard §6.1 + FB2-03（素材库 hover 原位视频预览）", () 
     expect(fixed).toHaveLength(0);
     // 缩略图仍在
     expect(container.querySelector("img")).not.toBeNull();
+  });
+
+  // FB2-08（FX-07）：色条渲染与设置联动
+  it("色条开启且有 palette 时渲染 role=img 色条；palette 为 null 时不渲染", () => {
+    enableColorStrip();
+    const palette = [
+      { hex: "#1b2a3c", r: 27, g: 42, b: 60, ratio: 0.6 },
+      { hex: "#e6dfc8", r: 230, g: 223, b: 200, ratio: 0.4 },
+    ];
+    const { container, rerender } = render(
+      <AssetCard
+        asset={mkAsset({ mimeType: "image/jpeg", palette } as Partial<Asset>)}
+        index={0}
+        thumbSize={512}
+        selected={false}
+        onSelect={noop}
+        onPreview={noop}
+        onContextMenu={noop}
+      />,
+    );
+    expect(container.querySelector('[role="img"]')).not.toBeNull();
+    expect(container.querySelector(".ui-colorstrip")).not.toBeNull();
+
+    rerender(
+      <AssetCard
+        asset={mkAsset({ mimeType: "image/jpeg", palette: null } as Partial<Asset>)}
+        index={0}
+        thumbSize={512}
+        selected={false}
+        onSelect={noop}
+        onPreview={noop}
+        onContextMenu={noop}
+      />,
+    );
+    expect(container.querySelector(".ui-colorstrip")).toBeNull();
   });
 
   it("视频卡片：hover 未触发时无 <video>、无 dialog、无 fixed 浮层（默认）", () => {

@@ -253,6 +253,15 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
     dirty(next);
     pushPreview(next.appearance);
   };
+  // FB2-08（§14.11）：色条设置 —— 与 patchGrid 同形；每个 onChange 都 dirty + pushPreview（即时预览纪律）
+  const patchColorStrip = (patch: Partial<Settings["appearance"]["colorStrip"]>) => {
+    const next: Settings = {
+      ...draft,
+      appearance: { ...draftAppearance, colorStrip: { ...draftAppearance.colorStrip, ...patch } },
+    };
+    dirty(next);
+    pushPreview(next.appearance);
+  };
 
   const chooseLibraryRoot = async () => {
     const dir = await pickDir({ directory: true });
@@ -521,6 +530,76 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
                       pushPreview(next.appearance);
                     }}
                   />
+                </Field>
+              )}
+              {/* FB2-08（§14.11）：色条设置。总开关关闭时下面六行整体不渲染（沿用悬停预览的条件渲染范式） */}
+              <Field label="显示色条" hint="在素材下沿显示算法主色色带；关闭后所有位置都不渲染，也不解析色板数据">
+                <Toggle
+                  checked={draftAppearance.colorStrip.enabled}
+                  onChange={(v) => patchColorStrip({ enabled: v })}
+                />
+              </Field>
+              {draftAppearance.colorStrip.enabled && (
+                <Field label="素材库网格显示" hint="小格子上加色带会挤压画面，默认关闭">
+                  <Toggle
+                    checked={draftAppearance.colorStrip.showInLibraryGrid}
+                    onChange={(v) => patchColorStrip({ showInLibraryGrid: v })}
+                  />
+                </Field>
+              )}
+              {draftAppearance.colorStrip.enabled && (
+                <Field label="查看器显示" hint="大图浏览时色卡最有价值，默认开启（查看器色条将在后续版本接入）">
+                  <Toggle
+                    checked={draftAppearance.colorStrip.showInViewer}
+                    onChange={(v) => patchColorStrip({ showInViewer: v })}
+                  />
+                </Field>
+              )}
+              {draftAppearance.colorStrip.enabled && (
+                <Field label="入库网格显示" hint="入库前尚未计算色板，暂不支持">
+                  <Toggle
+                    checked={draftAppearance.colorStrip.showInImportGrid}
+                    disabled
+                    onChange={(v) => patchColorStrip({ showInImportGrid: v })}
+                  />
+                </Field>
+              )}
+              {draftAppearance.colorStrip.enabled && (
+                <Field label="色条高度" hint="网格用细、大图用厚">
+                  <select
+                    value={draftAppearance.colorStrip.height}
+                    onChange={(e) => patchColorStrip({ height: e.target.value as Settings["appearance"]["colorStrip"]["height"] })}
+                    className="ui-control rounded-md px-2 py-1.5 text-sm outline-none"
+                  >
+                    <option value="thin">细 6px</option>
+                    <option value="normal">标准 10px</option>
+                    <option value="thick">厚 16px</option>
+                  </select>
+                </Field>
+              )}
+              {draftAppearance.colorStrip.enabled && (
+                <Field label="分段方式" hint="按占比更能体现调性；等宽接近调色参考站的观感">
+                  <select
+                    value={draftAppearance.colorStrip.mode}
+                    onChange={(e) => patchColorStrip({ mode: e.target.value as Settings["appearance"]["colorStrip"]["mode"] })}
+                    className="ui-control rounded-md px-2 py-1.5 text-sm outline-none"
+                  >
+                    <option value="ratio">按占比</option>
+                    <option value="equal">等宽</option>
+                  </select>
+                </Field>
+              )}
+              {draftAppearance.colorStrip.enabled && (
+                <Field label="显示条数" hint="色条最多显示前 N 个主色">
+                  <select
+                    value={String(draftAppearance.colorStrip.count)}
+                    onChange={(e) => patchColorStrip({ count: Number(e.target.value) as Settings["appearance"]["colorStrip"]["count"] })}
+                    className="ui-control rounded-md px-2 py-1.5 text-sm outline-none"
+                  >
+                    <option value="4">4</option>
+                    <option value="6">6</option>
+                    <option value="8">8</option>
+                  </select>
                 </Field>
               )}
             </Group>
@@ -868,13 +947,22 @@ function TextInput({
   );
 }
 
-function Toggle({ checked, onChange }: { checked: boolean; onChange: (v: boolean) => void }) {
+function Toggle({
+  checked,
+  onChange,
+  disabled = false,
+}: {
+  checked: boolean;
+  onChange: (v: boolean) => void;
+  disabled?: boolean;
+}) {
   return (
     <button
       role="switch"
       aria-checked={checked}
+      disabled={disabled}
       onClick={() => onChange(!checked)}
-      className={`h-5 w-9 rounded-full transition-colors ${checked ? "bg-[var(--color-accent)]" : "bg-[var(--color-border)]"}`}
+      className={`h-5 w-9 rounded-full transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${checked ? "bg-[var(--color-accent)]" : "bg-[var(--color-border)]"}`}
     >
       <span
         className={`block h-4 w-4 translate-x-0.5 rounded-full bg-white transition-transform ${checked ? "translate-x-[18px]" : ""}`}
