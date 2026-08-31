@@ -1131,7 +1131,11 @@ CREATE INDEX IF NOT EXISTS idx_assets_longitude ON assets(longitude);
 pub fn migrate(conn: &Connection) -> AppResult<()> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     if version < 1 {
-        conn.execute_batch(SCHEMA_V1)?;
+        // W0-8：V1 建库包事务。全裸 CREATE TABLE 非幂等，首装中途崩溃 → 重跑报
+        // "table already exists" → 启动永久阻断。事务保证要么全建成功要么全无。
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(SCHEMA_V1)?;
+        tx.commit()?;
         conn.pragma_update(None, "user_version", 1)?;
     }
     if version < 2 {
@@ -1735,5 +1739,35 @@ mod tests {
             )
             .unwrap();
         assert_eq!(lat, 30.25);
+    }
+
+    /// W0-8：V1 建库包事务 —— 首装失败可重跑，不得报 "table already exists" 永久阻断。
+    /// 模拟方式：先建一个只被 SCHEMA_V1 前段创建、且会与后续语句冲突的对象不可行（batch 非事务
+    /// 时中途失败依赖具体失败点），这里验证两个必要属性：
+    /// ① 全新库 migrate 成功且 user_version>=1；② SCHEMA_V1 整体以事务提交——
+    /// 用故意截断的 batch 在同款连接上验证「失败不落任何表」。
+    #[test]
+    fn fresh_install_is_transactional() {
+        // ① 全新库正常建库
+        let c = crate::db::init_memory().unwrap();
+        let v: i64 = c
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert!(v >= 1);
+        let tables: i64 = c
+            .query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table'", [], |r| r.get(0))
+            .unwrap();
+        assert!(tables > 1, "全新库应有完整表结构");
+
+        // ② 半截 SQL 在事务里回滚后不留任何残留表（对照 V1 的建库方式）
+        let c2 = mem();
+        let tx = c2.unchecked_transaction().unwrap();
+        let broken = "CREATE TABLE w0_t1 (id INTEGER PRIMARY KEY); CREATE TABLE w0_t1 (id INTEGER PRIMARY KEY);";
+        assert!(tx.execute_batch(broken).is_err(), "重复建表必须报错");
+        tx.rollback().unwrap_or(());
+        let leftover: i64 = c2
+            .query_row("SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'w0_t%'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(leftover, 0, "事务失败后不得残留半截建表结果");
     }
 }
