@@ -25,6 +25,7 @@ const facet = (over: Partial<TagFacet> = {}): TagFacet => ({
   key: "clothing_color",
   displayName: "衣服颜色",
   description: "描述",
+  inputMode: "ai_and_manual",
   selectionMode: "multi",
   maxItems: 3,
   sortOrder: 1,

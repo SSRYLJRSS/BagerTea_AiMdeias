@@ -94,21 +94,6 @@ function normalizeCategory(c: unknown): TagCategory {
   };
 }
 
-function normalizeFacetConfig(c: unknown): AiFacetConfig | null {
-  const r = isRecord(c) ? c : {};
-  const facetKey = asStr(r.facetKey, "").trim();
-  if (!facetKey) return null;
-  const hint = asStr(r.hint, "");
-  const displayName = asStr(r.displayName, "");
-  const visibleInWorkbench = r.visibleInWorkbench;
-  return {
-    facetKey,
-    hint,
-    enabledForAi: asBool(r.enabledForAi, true),
-    displayName: displayName === "" ? undefined : displayName,
-    visibleInWorkbench: typeof visibleInWorkbench === "boolean" ? visibleInWorkbench : undefined,
-  };
-}
 
 function normalizeCustomSource(c: unknown): CustomSource {
   const r = isRecord(c) ? c : {};
@@ -184,9 +169,8 @@ export function normalizeSettings(raw: unknown): Settings {
   if (ai.activeProfile && ai.profiles.length > 0 && !ai.profiles.some((p) => p.id === ai.activeProfile)) {
     ai.activeProfile = "";
   }
-  const aiFacetConfigs: AiFacetConfig[] = Array.isArray(r.aiFacetConfigs)
-    ? r.aiFacetConfigs.map(normalizeFacetConfig).filter((c): c is AiFacetConfig => c !== null)
-    : [];
+  // W3-1：aiFacetConfigs 已死（V20 合表）——不再归一化重建，直接丢弃（类型可选仅兼容老 JSON）
+  const aiFacetConfigs: AiFacetConfig[] = [];
   return {
     ai,
     theme: theme === "light" || theme === "dark" ? theme : "system",

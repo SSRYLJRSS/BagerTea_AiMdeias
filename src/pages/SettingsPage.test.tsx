@@ -508,11 +508,14 @@ describe("数据与缓存 · 重置数据", () => {
   });
 });
 
-describe("标签与分类 · 无配置条目分面的 AI 行为（回归：勾选被静默丢弃）", () => {
+// W3：旧「aiFacetConfigs 草稿」路径已删（V20 合表后分面 AI 语义在 tag_facets.input_mode，
+// 由 W4 的分面管理面板直接读写库）。此处的两条旧回归测试随通道一起移除。
+describe.skip("标签与分类 · 无配置条目分面的 AI 行为（回归：勾选被静默丢弃）", () => {
   const activeFacet: TagFacet = {
     key: "purpose",
     displayName: "用途",
     description: "",
+    inputMode: "ai_and_manual",
     selectionMode: "multi",
     maxItems: 3,
     sortOrder: 1,

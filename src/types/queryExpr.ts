@@ -12,7 +12,10 @@ export type LeafCond =
   | { type: "assetType"; value: AssetType }
   | { type: "untagged" }
   | { type: "metadata"; filter: MetadataFilter }
-  | { type: "search"; value: string; scope?: SearchScope };
+  | { type: "search"; value: string; scope?: SearchScope }
+  /** W2-7/W3-3d：分面有任意标签 / 没有标签（打标补漏核心场景） */
+  | { type: "facetHasAny"; facetKey: string }
+  | { type: "facetMissing"; facetKey: string };
 
 /** 布尔表达式树 */
 export type QueryExpr =

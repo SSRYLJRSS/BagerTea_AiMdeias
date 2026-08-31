@@ -1,66 +1,66 @@
+/** W3-2：tagStore 契约测试 —— 硬编码分面清单已删，
+ *  buildWorkbenchFacets 按 inputMode 分组 + 消费 appliesTo；空 facets 返回空。 */
 import { describe, expect, it } from "vitest";
 import { buildWorkbenchFacets, normalizeTagKeys, keyForLegacyName } from "@/stores/tagStore";
 import type { TagFacet } from "@/types/tag";
-import type { AiFacetConfig } from "@/types/settings";
+
+const mkFacet = (over: Partial<TagFacet> & Pick<TagFacet, "key">): TagFacet => ({
+  displayName: over.key,
+  description: "",
+  inputMode: "ai_and_manual",
+  selectionMode: "multi",
+  maxItems: null,
+  sortOrder: 0,
+  isSystem: false,
+  status: "active",
+  appliesTo: "all",
+  createdAt: 1,
+  updatedAt: 1,
+  ...over,
+});
 
 const baseFacets: TagFacet[] = [
-  { key: "subject", displayName: "主体/对象", description: "照片主体", selectionMode: "multi", maxItems: 5, sortOrder: 1, isSystem: true, status: "active", appliesTo: "all", createdAt: 1, updatedAt: 1 },
-  { key: "scene", displayName: "场景/地点", description: "拍摄场景", selectionMode: "multi", maxItems: 3, sortOrder: 2, isSystem: true, status: "active", appliesTo: "all", createdAt: 1, updatedAt: 1 },
+  mkFacet({ key: "subject", displayName: "主体/对象", maxItems: 5 }),
+  mkFacet({ key: "scene", displayName: "场景/地点", maxItems: 3 }),
+  mkFacet({ key: "purpose", inputMode: "manual_only" }),
 ];
 
-describe("buildWorkbenchFacets（指导书 §9.2/§9.3）", () => {
-  it("tag_facets 决定分面结构与默认显示名/描述/single/max", () => {
-    const out = buildWorkbenchFacets(baseFacets, []);
-    const subject = out.find((f) => f.key === "subject")!;
+describe("W3-2 buildWorkbenchFacets", () => {
+  it("_groups_by_input_mode：ai_and_manual 进 AI 组、manual_only 进手工组", () => {
+    const { aiGroup, manualGroup } = buildWorkbenchFacets(baseFacets);
+    expect(aiGroup.map((f) => f.key)).toEqual(["subject", "scene"]);
+    expect(manualGroup.map((f) => f.key)).toEqual(["purpose"]);
+    const subject = aiGroup[0];
     expect(subject.displayName).toBe("主体/对象");
     expect(subject.selectionMode).toBe("multi");
     expect(subject.maxItems).toBe(5);
-    expect(subject.enabledForAi).toBe(true);
-    expect(subject.hint).toBe("");
   });
 
-  it("工作台默认只显示用户要求的 7 个分面（purpose/technical/custom 默认隐藏）", () => {
-    const out = buildWorkbenchFacets([], []);
-    const keys = out.map((f) => f.key);
-    expect(keys).toEqual([
-      "subject", "scene", "style", "color", "composition", "lighting", "people",
-    ]);
-    expect(out.find((f) => f.key === "custom")).toBeUndefined();
-    expect(out.find((f) => f.key === "purpose")).toBeUndefined();
-    expect(out.find((f) => f.key === "technical")).toBeUndefined();
-  });
-
-  it("显式设置 visibleInWorkbench 可覆盖默认显隐", () => {
-    const configs: AiFacetConfig[] = [
-      { facetKey: "purpose", hint: "", enabledForAi: true, visibleInWorkbench: true },
-      { facetKey: "subject", hint: "", enabledForAi: true, visibleInWorkbench: false },
+  it("_filters_by_applies_to：video-only 分面不进图片工作台", () => {
+    const facets = [
+      mkFacet({ key: "subject" }),
+      mkFacet({ key: "video_mood", appliesTo: "video" }),
     ];
-    const out = buildWorkbenchFacets(baseFacets, configs);
-    expect(out.find((f) => f.key === "purpose")).toBeDefined();
-    expect(out.find((f) => f.key === "subject")).toBeUndefined();
+    const img = buildWorkbenchFacets(facets, "image");
+    expect(img.aiGroup.map((f) => f.key)).toEqual(["subject"]);
+    const vid = buildWorkbenchFacets(facets, "video");
+    expect(vid.aiGroup.map((f) => f.key)).toEqual(["subject", "video_mood"]);
+    // all 不筛
+    const all = buildWorkbenchFacets(facets, "all");
+    expect(all.aiGroup).toHaveLength(2);
   });
 
-  it("aiFacetConfigs 覆盖 enabledForAi / hint / 显示名，但不改变 facetKey", () => {
-    const configs: AiFacetConfig[] = [
-      { facetKey: "subject", hint: "识别图片主角", enabledForAi: false, displayName: "主体" },
-    ];
-    const out = buildWorkbenchFacets(baseFacets, configs);
-    const subject = out.find((f) => f.key === "subject")!;
-    expect(subject.key).toBe("subject");
-    expect(subject.displayName).toBe("主体");
-    expect(subject.hint).toBe("识别图片主角");
-    expect(subject.enabledForAi).toBe(false);
-    // 无配置分面保持默认
-    const scene = out.find((f) => f.key === "scene")!;
-    expect(scene.enabledForAi).toBe(true);
-    expect(scene.hint).toBe("");
-    expect(scene.displayName).toBe("场景/地点");
+  it("_no_hardcoded_fallback：传空 facets 返回空数组（不回退硬编码默认值）", () => {
+    const { aiGroup, manualGroup } = buildWorkbenchFacets([]);
+    expect(aiGroup).toEqual([]);
+    expect(manualGroup).toEqual([]);
   });
 
-  it("空 displayName 覆盖回退到 tag_facets 默认", () => {
-    const configs: AiFacetConfig[] = [{ facetKey: "subject", hint: "h", enabledForAi: true, displayName: "  " }];
-    const out = buildWorkbenchFacets(baseFacets, configs);
-    expect(out.find((f) => f.key === "subject")!.displayName).toBe("主体/对象");
+  it("停用分面不进任何组", () => {
+    const facets = [mkFacet({ key: "gone", status: "inactive" })];
+    const { aiGroup, manualGroup } = buildWorkbenchFacets(facets);
+    expect(aiGroup).toHaveLength(0);
+    expect(manualGroup).toHaveLength(0);
   });
 });
 
@@ -72,14 +72,20 @@ describe("keyForLegacyName / normalizeTagKeys", () => {
     expect(keyForLegacyName("未知分类")).toBe("custom");
   });
 
-  it("normalizeTagKeys 把显示名 key 归一化并合并重复", () => {
+  it("normalizeTagKeys：自建分面 key 原样保留（knownFacetKeys）", () => {
+    const out = normalizeTagKeys({ clothing_color: ["红色"] }, ["clothing_color", "scene"]);
+    expect(out.clothing_color).toEqual(["红色"]);
+    expect(out.custom).toBeUndefined();
+  });
+
+  it("normalizeTagKeys：中文旧名映射 + 未知归 custom", () => {
     const tags = {
       "场景/地点": ["海边"],
       scene: ["公园"],
       "未知分类": ["某标签"],
       色彩: ["低饱和"],
     };
-    const out = normalizeTagKeys(tags);
+    const out = normalizeTagKeys(tags, ["scene", "color"]);
     expect(out.scene).toEqual(expect.arrayContaining(["海边", "公园"]));
     expect(out.custom).toEqual(["某标签"]);
     expect(out.color).toEqual(["低饱和"]);

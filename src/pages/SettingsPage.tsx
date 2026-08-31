@@ -316,9 +316,8 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
   const isDirty = !!settings && JSON.stringify(draft) !== JSON.stringify(settings);
   const patchAi = (patch: Partial<Settings["ai"]>) => dirty({ ...draft, ai: { ...draft.ai, ...patch } });
 
-  // ---- AI 分面配置（P1B：facet_key 稳定，single/max 以数据库为准） ----
-  const patchFacet = (i: number, patch: Partial<NonNullable<Settings["aiFacetConfigs"]>[number]>) =>
-    dirty({ ...draft, aiFacetConfigs: draft.aiFacetConfigs.map((c, j) => (j === i ? { ...c, ...patch } : c)) });
+  // W3：aiFacetConfigs 草稿路径已删（V20 合表后分面语义在 tag_facets.input_mode，
+  // FacetManagePanel 直接读写库；此处不再维护第二份草稿）
 
   // FB2-01/02（§8.4）：素材框外观 —— draft.appearance 兜底默认；改动同时写 draft 与 previewAppearance（即时预览）
   const draftAppearance = draft.appearance ?? DEFAULT_APPEARANCE;
@@ -475,27 +474,7 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
               {/* §9.2/§9.5：分面结构 + AI 行为 + 分类词条在同一个分面详情内完成；
                    不再并列「AI 行为配置」独立列表与「分类词条」顶层卡片（§9.3） */}
               <div className="p-2">
-                <FacetManagePanel
-                  aiConfigs={draft.aiFacetConfigs.map((c) => ({
-                    facetKey: c.facetKey,
-                    enabledForAi: c.enabledForAi,
-                    hint: c.hint,
-                    visibleInWorkbench: c.visibleInWorkbench ?? true,
-                  }))}
-                  onPatchAiConfig={(facetKey, patch) => {
-                    const idx = draft.aiFacetConfigs.findIndex((c) => c.facetKey === facetKey);
-                    if (idx >= 0) {
-                      patchFacet(idx, patch);
-                      return;
-                    }
-                    // 历史库可能缺条目（迁移只补过 subject/scene/color 等）：补建默认条目再合并，
-                    // 否则勾选/输入会被静默丢弃（无条目 = AI 提示词排除该分面，见 build_prompt_context）
-                    dirty({
-                      ...draft,
-                      aiFacetConfigs: [...draft.aiFacetConfigs, { facetKey, hint: "", enabledForAi: false, ...patch }],
-                    });
-                  }}
-                />
+                <FacetManagePanel />
               </div>
             </Group>
           )}

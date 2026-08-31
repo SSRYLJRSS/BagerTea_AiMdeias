@@ -61,9 +61,10 @@ export default function AiTaggingPage() {
   );
 
   // 阶段 6 §9.2/§9.3：工作台分面 = tag_facets（唯一事实源）+ aiFacetConfigs 覆盖；系统分面恒显
+  // W3-2：分面语义全部来自 tag_facets（inputMode 分组），不再读 settings.aiFacetConfigs
   const workbenchFacets = useMemo(
-    () => buildWorkbenchFacets(tagFacets, settings?.aiFacetConfigs ?? []),
-    [tagFacets, settings?.aiFacetConfigs],
+    () => buildWorkbenchFacets(tagFacets),
+    [tagFacets],
   );
   useEffect(() => {
     if (tagFacets.length === 0) void refreshTags();
@@ -238,7 +239,8 @@ export default function AiTaggingPage() {
         ? currentSuggestion.confirmedTags
         : currentSuggestion.suggestedTags;
     // 阶段 6 §9.4：把 AI 返回的分类显示名 key 归一化为稳定 facetKey（未知 → custom）
-    setDraftTags(normalizeTagKeys(src));
+    // W3-2：knownFacetKeys 来自后端 facets —— 自建分面的 key 原样保留（未知才归 custom）
+    setDraftTags(normalizeTagKeys(src, tagFacets.map((f) => f.key)));
     // 依赖含 suggestedTags 内容：批次跑完回载后 id/status 不变但标签已写入，
     // 若只依赖 [id, status] 当前张会停在旧的空 draft，此时点确认会写入空标签
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -654,7 +656,8 @@ export default function AiTaggingPage() {
           <>
             <Workbench
               suggestion={currentSuggestion}
-              facets={workbenchFacets}
+              aiGroup={workbenchFacets.aiGroup}
+              manualGroup={workbenchFacets.manualGroup}
               tags={draftTags}
               onTagsChange={setDraftTags}
               description={draftDescription}

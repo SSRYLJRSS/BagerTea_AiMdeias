@@ -215,15 +215,17 @@ describe("QueryBuilder", () => {
     expect(Array.from(select.options).some((o) => o.textContent?.startsWith("银杏"))).toBe(true);
   });
 
-  it("expr 中已含未知 tagId：下拉显示「标签 #id」占位而非退回空（§9.8）", () => {
+  it("expr 中已含未知 tagId：下拉显示「标签 #id」占位而非退回空（§9.8；W3-3 多选语义）", () => {
     useSuperSearchStore.setState({
       expr: { op: "leaf", cond: { type: "tag", facetKey: "custom", tagIds: [123], mode: "any", includeDescendants: false } },
       resolvedTags: [],
     });
     render(<QueryBuilder />);
     const select = screen.getByLabelText("条件值") as HTMLSelectElement;
-    expect(select.value).toBe("123");
-    expect(Array.from(select.options).some((o) => o.textContent?.startsWith("标签 #123"))).toBe(true);
+    // 多选 select：选中的 tagIds 反映在 selectedOptions
+    expect(Array.from(select.selectedOptions).some((o) => o.value === "123")).toBe(true);
+    // W3-3：选中项带 ✓ 前缀
+    expect(Array.from(select.options).some((o) => o.textContent?.includes("标签 #123"))).toBe(true);
   });
 });
 
@@ -253,5 +255,81 @@ describe("W0-3 条件公式包含根级标签", () => {
     expect(optionTexts.some((t) => t.includes("海边"))).toBe(true);
     expect(optionTexts.some((t) => t.includes("人像"))).toBe(true);
     expect(optionTexts.some((t) => t.includes("胶片"))).toBe(true);
+  });
+});
+
+/** W3-3：QueryBuilder 三合一改造（定位字段 / optgroup / 多选 / facet_has_any） */
+describe("W3-3 QueryBuilder 三合一", () => {
+  const mkTag = (id: number, name: string, facetKey: string) => ({
+    id, name, canonicalName: name, normalizedName: name, facetKey,
+    parentId: null, status: "active" as const, isSystem: false, isPreset: false,
+    sortOrder: 0, assetCount: 0, totalCount: 0, aliases: [], path: name,
+  });
+
+  it("_includes_root_tags：根级标签出现在下拉（W0-3 回归守护）", () => {
+    useTagStore.setState({
+      tree: [
+        { tag: mkTag(1, "海边", "scene"), children: [] },
+        { tag: mkTag(2, "人像", "subject"), children: [] },
+      ],
+      loading: false, treesByFacet: {}, expanded: new Set(),
+    });
+    render(<QueryBuilder />);
+    fireEvent.click(screen.getByRole("button", { name: "+ 添加第一个条件" }));
+    fireEvent.change(screen.getByLabelText("条件字段"), { target: { value: "tag" } });
+    const select = screen.getByLabelText("条件值") as HTMLSelectElement;
+    const names = Array.from(select.options).map((o) => o.textContent ?? "");
+    expect(names.some((t) => t.includes("海边"))).toBe(true);
+    expect(names.some((t) => t.includes("人像"))).toBe(true);
+  });
+
+  it("_groups_by_facet：optgroup 数 == 出现的分面数", () => {
+    useTagStore.setState({
+      tree: [
+        { tag: mkTag(1, "海边", "scene"), children: [] },
+        { tag: mkTag(2, "公园", "scene"), children: [] },
+        { tag: mkTag(3, "人像", "subject"), children: [] },
+      ],
+      loading: false, treesByFacet: {}, expanded: new Set(),
+    });
+    render(<QueryBuilder />);
+    fireEvent.click(screen.getByRole("button", { name: "+ 添加第一个条件" }));
+    fireEvent.change(screen.getByLabelText("条件字段"), { target: { value: "tag" } });
+    const select = screen.getByLabelText("条件值") as HTMLSelectElement;
+    const groups = Array.from(select.querySelectorAll("optgroup"));
+    expect(groups.map((g) => g.getAttribute("label"))).toEqual(["scene", "subject"]);
+  });
+
+  it("_multi_select_tags：select 为 multiple，可多选并写入 tagIds", () => {
+    useTagStore.setState({
+      tree: [
+        { tag: mkTag(1, "海边", "scene"), children: [] },
+        { tag: mkTag(2, "公园", "scene"), children: [] },
+      ],
+      loading: false, treesByFacet: {}, expanded: new Set(),
+    });
+    render(<QueryBuilder />);
+    fireEvent.click(screen.getByRole("button", { name: "+ 添加第一个条件" }));
+    fireEvent.change(screen.getByLabelText("条件字段"), { target: { value: "tag" } });
+    const select = screen.getByLabelText("条件值") as HTMLSelectElement;
+    expect(select.multiple).toBe(true);
+    // 模拟多选两个
+    select.options[0].selected = true;
+    select.options[1].selected = true;
+    fireEvent.change(select);
+    const expr = useSuperSearchStore.getState().expr;
+    expect(expr).toBeTruthy();
+  });
+
+  it("_has_location_field_present：字段下拉含定位组三个字段", () => {
+    render(<QueryBuilder />);
+    fireEvent.click(screen.getByRole("button", { name: "+ 添加第一个条件" }));
+    const field = screen.getByLabelText("条件字段") as HTMLSelectElement;
+    const texts = Array.from(field.options).map((o) => o.textContent ?? "");
+    expect(texts).toContain("纬度");
+    expect(texts).toContain("经度");
+    expect(texts).toContain("有无定位");
+    const groups = Array.from(field.querySelectorAll("optgroup")).map((g) => g.getAttribute("label"));
+    expect(groups).toContain("定位");
   });
 });

@@ -38,10 +38,21 @@ export default function TagAssignDialog({ open, onClose }: TagAssignDialogProps)
     }
   }, [open, tree.length, refresh]);
 
-  const allTags = useMemo(() => {
+  // W3-5：按分面折叠分组（与 W3-3b optgroup 同构）——标签多了以后平铺不可用。
+  // 分组遍历后端 facets（自建分面自动成组）；系统标签不过滤（分面清单一处事实源）。
+  const groupedTags = useMemo(() => {
     const q = query.trim().toLowerCase();
-    return flatten(tree).filter((tag) => !tag.isSystem && (!q || tag.path.toLowerCase().includes(q) || tag.aliases.some((a) => a.toLowerCase().includes(q))));
-  }, [tree, query]);
+    const all = flatten(tree).filter((tag) => !tag.isSystem && (!q || tag.path.toLowerCase().includes(q) || tag.aliases.some((a) => a.toLowerCase().includes(q))));
+    const groups = new Map<string, Tag[]>();
+    for (const t of all) {
+      const list = groups.get(t.facetKey) ?? [];
+      list.push(t);
+      groups.set(t.facetKey, list);
+    }
+    // 按后端 facets 的 sortOrder 排组；未知 facet（已删除分面残留）排最后
+    const order = new Map(facets.map((f, i) => [f.key, i]));
+    return [...groups.entries()].sort((a, b) => (order.get(a[0]) ?? 999) - (order.get(b[0]) ?? 999));
+  }, [tree, query, facets]);
 
   const toggle = (id: number) =>
     setPicked((s) => {
@@ -110,11 +121,23 @@ export default function TagAssignDialog({ open, onClose }: TagAssignDialogProps)
             {facets.map((facet) => <option key={facet.key} value={facet.key}>{facet.displayName}</option>)}
           </select>
         </div>
-        <div className="flex max-h-48 flex-wrap content-start gap-1.5 overflow-y-auto">
-          {allTags.map((t) => (
-            <TagChip key={t.id} label={t.path || t.name} active={picked.has(t.id)} onClick={() => toggle(t.id)} />
-          ))}
-          {allTags.length === 0 && (
+        <div className="flex max-h-64 flex-col gap-2 overflow-y-auto">
+          {groupedTags.map(([facetKey, tags]) => {
+            const facet = facets.find((f) => f.key === facetKey);
+            return (
+              <div key={facetKey}>
+                <p className="mb-1 text-[11px] font-semibold text-[var(--color-text-tertiary)]">
+                  {facet?.displayName ?? facetKey}
+                </p>
+                <div className="flex flex-wrap content-start gap-1.5">
+                  {tags.map((t) => (
+                    <TagChip key={t.id} label={t.path || t.name} active={picked.has(t.id)} onClick={() => toggle(t.id)} />
+                  ))}
+                </div>
+              </div>
+            );
+          })}
+          {groupedTags.length === 0 && (
             <span className="text-xs text-[var(--color-text-secondary)]">还没有标签，先在下方新建一个</span>
           )}
         </div>

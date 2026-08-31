@@ -12,11 +12,11 @@ import type { AssetType, MetadataFilter, MetadataFilterKey, MetadataOp } from "@
 import type { LeafCond, QueryExpr } from "@/types/queryExpr";
 import { mergeQueryExpr, normalizeExpr, serializeExpr } from "@/utils/queryExprUtils";
 
-type FieldKey = "search" | "tag" | "excludeTag" | "assetType" | "untagged" | MetadataFilterKey;
+type FieldKey = "search" | "tag" | "excludeTag" | "assetType" | "untagged" | "facetHasAny" | "facetMissing" | MetadataFilterKey;
 type GroupMode = "and" | "or";
 type FlatTag = { id: number; name: string; facet: string };
 type Row = { id: string; negated: boolean; cond: LeafCond };
-type FieldOption = { key: FieldKey; label: string; group: "关键词" | "标签" | "素材" | "颜色" | "时间" | "拍摄设备" | "视频"; kind?: "number" | "text" | "date" | "size" | "duration" | "resolution"; ops?: MetadataOp[] };
+type FieldOption = { key: FieldKey; label: string; group: "关键词" | "标签" | "素材" | "颜色" | "定位" | "时间" | "拍摄设备" | "视频"; kind?: "number" | "text" | "date" | "size" | "duration" | "resolution"; ops?: MetadataOp[] };
 
 const NUMERIC_OPS: MetadataOp[] = ["eq", "gt", "gte", "lt", "lte", "between"];
 const TEXT_OPS: MetadataOp[] = ["eq", "contains", "in"];
@@ -25,6 +25,8 @@ const DATE_OPS: MetadataOp[] = ["gte", "lte", "between"];
 const FIELD_OPTIONS: FieldOption[] = [
   { key: "search", label: "关键词", group: "关键词" },
   { key: "tag", label: "包含标签", group: "标签" }, { key: "excludeTag", label: "排除标签", group: "标签" }, { key: "untagged", label: "未打标", group: "标签" },
+  // W3-3d：分面有任意/没有标签（W2-7 对应；「有主体没有场景」类补漏筛选）
+  { key: "facetHasAny", label: "分类有任意标签", group: "标签" }, { key: "facetMissing", label: "分类没有标签", group: "标签" },
   { key: "assetType", label: "素材类型", group: "素材" }, { key: "file_ext", label: "文件格式", group: "素材", kind: "text", ops: ENUM_OPS }, { key: "mime_type", label: "MIME 类型", group: "素材", kind: "text", ops: ENUM_OPS }, { key: "file_size", label: "文件大小", group: "素材", kind: "size", ops: NUMERIC_OPS }, { key: "width", label: "宽度", group: "素材", kind: "number", ops: NUMERIC_OPS }, { key: "height", label: "高度", group: "素材", kind: "number", ops: NUMERIC_OPS }, { key: "resolution", label: "分辨率", group: "素材", kind: "resolution", ops: NUMERIC_OPS }, { key: "aspect_ratio", label: "宽高比", group: "素材", kind: "number", ops: NUMERIC_OPS },
   { key: "taken_at", label: "拍摄时间", group: "时间", kind: "date", ops: DATE_OPS }, { key: "created_at", label: "入库时间", group: "时间", kind: "date", ops: DATE_OPS }, { key: "modified_at", label: "修改时间", group: "时间", kind: "date", ops: DATE_OPS },
   { key: "camera", label: "相机", group: "拍摄设备", kind: "text", ops: TEXT_OPS }, { key: "lens", label: "镜头", group: "拍摄设备", kind: "text", ops: TEXT_OPS }, { key: "iso", label: "ISO", group: "拍摄设备", kind: "number", ops: NUMERIC_OPS }, { key: "aperture", label: "光圈", group: "拍摄设备", kind: "number", ops: NUMERIC_OPS }, { key: "shutter", label: "快门", group: "拍摄设备", kind: "text", ops: TEXT_OPS }, { key: "focal", label: "焦距", group: "拍摄设备", kind: "number", ops: NUMERIC_OPS },
@@ -34,6 +36,10 @@ const FIELD_OPTIONS: FieldOption[] = [
   { key: "dominant_hue", label: "主色色相（0-359，可跨 0°）", group: "颜色", kind: "number", ops: NUMERIC_OPS },
   { key: "dominant_sat", label: "主色饱和度（0-100）", group: "颜色", kind: "number", ops: NUMERIC_OPS },
   { key: "dominant_lum", label: "主色明度（0-100）", group: "颜色", kind: "number", ops: NUMERIC_OPS },
+  // W3-3a：定位字段组（Q4 裁决：地图砍了，筛选留着；后端白名单 V18 已就绪）
+  { key: "latitude", label: "纬度", group: "定位", kind: "number", ops: NUMERIC_OPS },
+  { key: "longitude", label: "经度", group: "定位", kind: "number", ops: NUMERIC_OPS },
+  { key: "has_location", label: "有无定位", group: "定位", kind: "text", ops: ENUM_OPS },
 ];
 const OP_LABELS: Record<MetadataOp, string> = { eq: "等于", in: "属于任一", contains: "包含", gt: "大于", gte: "大于等于", lt: "小于", lte: "小于等于", between: "介于" };
 let rowSeq = 0;
@@ -132,9 +138,10 @@ function ConditionRow({ row, prefix, allTagOptions, onChange, onRemove }: { row:
   const field = fieldFromCond(row.cond);
   return <div className="grid min-h-11 grid-cols-[48px_minmax(120px,0.8fr)_minmax(108px,0.65fr)_minmax(180px,1.6fr)_32px] items-center gap-2 py-1.5 max-[800px]:grid-cols-[44px_minmax(105px,1fr)_minmax(96px,1fr)_minmax(130px,1.4fr)_30px]"><span className="pl-1 text-[11px] text-[var(--color-text-tertiary)]">{prefix}</span><FieldSelect value={field} onChange={(next) => onChange({ cond: makeCond(next, allTagOptions), negated: false })} /><ConditionOperator cond={row.cond} negated={row.negated} onChange={onChange} /><ConditionValue cond={row.cond} allTagOptions={allTagOptions} onChange={(cond) => onChange({ cond })} /><button type="button" onClick={onRemove} className="flex size-7 items-center justify-center rounded text-base text-[var(--color-text-tertiary)] hover:bg-[var(--color-surface-hover)] hover:text-[var(--color-danger)]" aria-label="删除条件" title="删除条件">×</button></div>;
 }
-function FieldSelect({ value, onChange }: { value: FieldKey; onChange: (value: FieldKey) => void }) { const groups = ["关键词", "标签", "素材", "颜色", "时间", "拍摄设备", "视频"] as const; return <select aria-label="条件字段" value={value} onChange={(e) => onChange(e.target.value as FieldKey)} className={`${controlClass} w-full`}>{groups.map((group) => <optgroup key={group} label={group}>{FIELD_OPTIONS.filter((item) => item.group === group).map((item) => <option key={item.key} value={item.key}>{item.label}</option>)}</optgroup>)}</select>; }
+function FieldSelect({ value, onChange }: { value: FieldKey; onChange: (value: FieldKey) => void }) { const groups = ["关键词", "标签", "素材", "颜色", "定位", "时间", "拍摄设备", "视频"] as const; return <select aria-label="条件字段" value={value} onChange={(e) => onChange(e.target.value as FieldKey)} className={`${controlClass} w-full`}>{groups.map((group) => <optgroup key={group} label={group}>{FIELD_OPTIONS.filter((item) => item.group === group).map((item) => <option key={item.key} value={item.key}>{item.label}</option>)}</optgroup>)}</select>; }
 
 function ConditionOperator({ cond, negated, onChange }: { cond: LeafCond; negated: boolean; onChange: (patch: Partial<Row>) => void }) {
+  if (cond.type === "facetHasAny" || cond.type === "facetMissing") return <span className="px-2 text-xs text-[var(--color-text-tertiary)]">{cond.type === "facetHasAny" ? "存在" : "缺失"}</span>;
   if (cond.type === "metadata") { const ops = FIELD_OPTIONS.find((item) => item.key === cond.filter.key)?.ops ?? NUMERIC_OPS; return <select aria-label="条件操作符" value={cond.filter.op} onChange={(e) => onChange({ cond: { ...cond, filter: changeMetadataOp(cond.filter, e.target.value as MetadataOp) } })} className={`${controlClass} w-full`}>{ops.map((op) => <option key={op} value={op}>{OP_LABELS[op]}</option>)}</select>; }
   const excluded = cond.type === "excludeTag" || negated; return <select aria-label="条件操作符" value={excluded ? "not" : "is"} onChange={(e) => onChange({ negated: e.target.value === "not" })} className={`${controlClass} w-full`}><option value="is">是</option><option value="not">不是</option></select>;
 }
@@ -143,15 +150,37 @@ function ConditionValue({ cond, allTagOptions, onChange }: { cond: LeafCond; all
   if (cond.type === "untagged") return <span className="px-2 text-xs text-[var(--color-text-secondary)]">没有任何标签的素材</span>;
   if (cond.type === "assetType") return <select aria-label="条件值" value={cond.value} onChange={(e) => onChange({ ...cond, value: e.target.value as AssetType })} className={`${controlClass} w-full`}><option value="all">全部素材</option><option value="image">图片</option><option value="video">视频</option></select>;
   if (cond.type === "search") return <DraftInput ariaLabel="条件值" placeholder="输入关键词" displayValue={cond.value} onCommit={(v) => onChange({ ...cond, value: v })} className={`${controlClass} w-full`} />;
+  if (cond.type === "facetHasAny" || cond.type === "facetMissing") {
+    // W3-3d：分面选择（从 tagStore facets 派生；无标签树也能用）
+    const facets = [...new Set(allTagOptions.map((t) => t.facet))];
+    const known = facets.includes(cond.facetKey);
+    return <select aria-label="条件值" value={cond.facetKey} onChange={(e) => onChange({ ...cond, facetKey: e.target.value })} className={`${controlClass} w-full`}>{!known && cond.facetKey ? <option value={cond.facetKey}>{cond.facetKey}</option> : null}{facets.map((f) => <option key={f} value={f}>{f}</option>)}</select>;
+  }
   if (cond.type === "tag" || cond.type === "excludeTag") {
-    const selected = cond.tagIds[0] ?? "";
+    // W3-3b：optgroup 按分面分组（新建分面自动成为一组，零代码改动）
+    // W3-3c：多选 + 「同时满足」勾选（协议早就支持 mode:all，此前 UI 只取第一个）
+    const selectedIds = new Set(cond.tagIds.map(String));
     // §9.8：已有非空 tagId 时，两边都找不到 → 显示「标签 #id」，绝不退回「选择标签」
-    const selectedKnown = allTagOptions.find((t) => String(t.id) === String(selected));
     const options = [...allTagOptions];
-    if (selected && !selectedKnown) {
-      options.push({ id: Number(selected), name: `标签 #${selected}`, facet: cond.facetKey || "custom" });
+    for (const id of cond.tagIds) {
+      if (!options.some((t) => t.id === id)) {
+        options.push({ id, name: `标签 #${id}`, facet: cond.facetKey || "custom" });
+      }
     }
-    return <div className="grid grid-cols-[minmax(0,1fr)_92px] gap-2"><select aria-label="条件值" value={selected} onChange={(e) => { const id = Number(e.target.value); const tag = options.find((item) => item.id === id); onChange({ ...cond, tagIds: id ? [id] : [], facetKey: tag?.facet ?? cond.facetKey }); }} className={`${controlClass} w-full`}><option value="">选择标签</option>{options.map((tag) => <option key={tag.id} value={tag.id}>{tag.name} · {tag.facet}</option>)}</select>{cond.type === "tag" ? <select aria-label="标签范围" value={cond.includeDescendants ? "desc" : "self"} onChange={(e) => onChange({ ...cond, includeDescendants: e.target.value === "desc" })} className={`${controlClass} w-full`}><option value="desc">含子标签</option><option value="self">仅当前</option></select> : <span />}</div>;
+    const byFacet = new Map<string, FlatTag[]>();
+    for (const t of options) {
+      const list = byFacet.get(t.facet) ?? [];
+      list.push(t);
+      byFacet.set(t.facet, list);
+    }
+    return <div className="grid grid-cols-[minmax(0,1fr)_92px] gap-2">
+      <select aria-label="条件值" multiple value={cond.tagIds.map(String)} onChange={(e) => { const ids = Array.from(e.target.selectedOptions, (o) => Number(o.value)).filter(Boolean); const facets = new Set(ids.map((id) => options.find((t) => t.id === id)?.facet).filter(Boolean) as string[]); onChange({ ...cond, tagIds: ids, facetKey: [...facets][0] ?? cond.facetKey }); }} className={`${controlClass} h-auto max-h-24 w-full`} size={Math.min(4, Math.max(2, options.length))}>
+        {[...byFacet.entries()].map(([facet, tags]) => <optgroup key={facet} label={facet}>{tags.map((tag) => <option key={tag.id} value={tag.id}>{selectedIds.has(String(tag.id)) ? "✓ " : ""}{tag.name}</option>)}</optgroup>)}
+      </select>
+      {cond.type === "tag"
+        ? <select aria-label="标签范围" value={cond.mode === "all" ? "all" : cond.includeDescendants ? "desc" : "self"} onChange={(e) => { const v = e.target.value; onChange(v === "all" ? { ...cond, mode: "all", includeDescendants: false } : { ...cond, mode: "any", includeDescendants: v === "desc" }); }} className={`${controlClass} w-full`}><option value="desc">含子标签</option><option value="self">仅当前</option><option value="all">同时满足</option></select>
+        : <span />}
+    </div>;
   }
   return <MetadataValue filter={cond.filter} onChange={(filter) => onChange({ ...cond, filter })} />;
 }
@@ -179,7 +208,7 @@ function DraftInput({ ariaLabel = "条件值", displayValue, onCommit, className
   return <div className="relative min-w-0"><input aria-label={ariaLabel} type={type} step={step} value={draft} placeholder={placeholder} className={className} onChange={(e) => { dirty.current = true; setDraft(e.target.value); }} onBlur={commit} onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); commit(); } }} />{suffix && <span className="pointer-events-none absolute inset-y-0 right-2 flex items-center text-[10px] text-[var(--color-text-tertiary)]">{suffix}</span>}</div>;
 }
 
-function makeCond(field: FieldKey, flatTags: FlatTag[]): LeafCond { if (field === "search") return { type: "search", value: "" }; if (field === "tag") return { type: "tag", facetKey: flatTags[0]?.facet ?? "scene", tagIds: [], mode: "any", includeDescendants: true }; if (field === "excludeTag") return { type: "excludeTag", facetKey: flatTags[0]?.facet ?? "", tagIds: [] }; if (field === "assetType") return { type: "assetType", value: "image" }; if (field === "untagged") return { type: "untagged" }; const option = FIELD_OPTIONS.find((item) => item.key === field); const op = option?.ops?.[0] ?? "eq"; return { type: "metadata", filter: changeMetadataOp({ key: field, op }, op) }; }
+function makeCond(field: FieldKey, flatTags: FlatTag[]): LeafCond { if (field === "search") return { type: "search", value: "" }; if (field === "tag") return { type: "tag", facetKey: flatTags[0]?.facet ?? "scene", tagIds: [], mode: "any", includeDescendants: true }; if (field === "excludeTag") return { type: "excludeTag", facetKey: flatTags[0]?.facet ?? "", tagIds: [] }; if (field === "assetType") return { type: "assetType", value: "image" }; if (field === "untagged") return { type: "untagged" }; if (field === "facetHasAny") return { type: "facetHasAny", facetKey: flatTags[0]?.facet ?? "scene" }; if (field === "facetMissing") return { type: "facetMissing", facetKey: flatTags[0]?.facet ?? "scene" }; const option = FIELD_OPTIONS.find((item) => item.key === field); const op = option?.ops?.[0] ?? "eq"; return { type: "metadata", filter: changeMetadataOp({ key: field, op }, op) }; }
 function fieldFromCond(cond: LeafCond): FieldKey { return cond.type === "metadata" ? cond.filter.key : cond.type; }
 function changeMetadataOp(filter: MetadataFilter, op: MetadataOp): MetadataFilter { if (op === "between") return { key: filter.key, op, min: filter.min ?? filter.value, max: filter.max ?? filter.value }; if (op === "in") return { key: filter.key, op, values: filter.values ?? (filter.value === undefined ? [] : [filter.value]) }; return { key: filter.key, op, value: filter.value ?? filter.min }; }
 function isComplete(cond: LeafCond): boolean { if (cond.type === "tag" || cond.type === "excludeTag") return cond.tagIds.length > 0; if (cond.type === "search") return cond.value.trim().length > 0; if (cond.type !== "metadata") return true; if (cond.filter.op === "between") return cond.filter.min !== undefined && cond.filter.max !== undefined; if (cond.filter.op === "in") return Boolean(cond.filter.values?.length); return cond.filter.value !== undefined && cond.filter.value !== ""; }

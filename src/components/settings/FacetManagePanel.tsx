@@ -129,8 +129,8 @@ export default function FacetManagePanel({ aiConfigs = [], onPatchAiConfig }: Pr
               onDeactivate={() =>
                 run(async () => {
                   const impact = await getTagFacetImpact(f.key);
-                  const more = impact.tagCount > 0 || impact.assetCount > 0 || impact.aiConfigCount > 0;
-                  const msg = `该分类下有 ${impact.tagCount} 个标签、被 ${impact.assetCount} 个素材引用、${impact.aiConfigCount} 条 AI 配置。`;
+                  const more = impact.tagCount > 0 || impact.assetCount > 0;
+                  const msg = `该分类下有 ${impact.tagCount} 个标签、被 ${impact.assetCount} 个素材引用。`;
                   if (more && !window.confirm(`停用后保留历史标签与查询。${msg}仍要停用？`)) return;
                   await deactivateTagFacet(f.key);
                 }, "已停用")

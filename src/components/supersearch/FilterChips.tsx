@@ -5,6 +5,7 @@
  *  - 无 expr 时（纯手动条件链路）退回扁平 query 渲染，仍可逐项删除。 */
 import { useShallow } from "zustand/react/shallow";
 import { useSuperSearchStore } from "@/stores/superSearchStore";
+import { useTagStore } from "@/stores/tagStore";
 import type { MetadataFilter } from "@/types/asset";
 import {
   flattenExprForDisplay,
@@ -20,11 +21,12 @@ const LABELS: Record<string, string> = {
   audio_codec: "音频编码", folder: "文件夹",
 };
 
-/** 分面 key → 显示名（与 tagStore BASE_FACET_DEFAULTS 对齐；未知回退 key） */
+/** W3：分面显示名优先读 tagStore.facets（自建分面自动显示中文名）；
+ *  FACET_NAMES 只是系统分面在 store 未加载时的兜底。 */
 const FACET_NAMES: Record<string, string> = {
   subject: "主体/对象", scene: "场景/地点", purpose: "用途", style: "风格/氛围",
   color: "色彩", composition: "构图/视角", lighting: "光线/时间", people: "人物属性",
-  technical: "可用性/技术特征", custom: "自定义", location: "地点", event: "事件",
+  technical: "可用性/技术特征", custom: "自定义",
 };
 
 const OP_TEXT: Record<string, string> = { gt: ">", gte: "≥", lt: "<", lte: "≤", eq: "=", contains: "含", between: "", in: "∈" };
@@ -80,7 +82,7 @@ export default function FilterChips() {
     for (const f of query.facetFilters) {
       for (const tid of f.tagIds) {
         const info = nameById.get(tid);
-        const fname = FACET_NAMES[f.facetKey] ?? f.facetKey;
+        const fname = useTagStore.getState().facets.find((x) => x.key === f.facetKey)?.displayName ?? FACET_NAMES[f.facetKey] ?? f.facetKey;
         chips.push({
           key: `facet:${f.facetKey}:${tid}`,
           label: info ? `${fname}：${info.text}` : `${fname} · 标签#${tid}`,

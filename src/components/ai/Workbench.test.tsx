@@ -32,10 +32,9 @@ const facets: WorkbenchFacet[] = [
     key: "subject",
     displayName: "主体/对象",
     description: "",
+    inputMode: "ai_and_manual",
     selectionMode: "multi",
     maxItems: 5,
-    enabledForAi: true,
-    hint: "",
   },
 ];
 
@@ -46,7 +45,8 @@ function renderWorkbench(over: Partial<AiSuggestion> = {}, description = "夜晚
   const view = render(
     <Workbench
       suggestion={mkSuggestion(over)}
-      facets={facets}
+      aiGroup={facets}
+      manualGroup={[]}
       tags={{ subject: ["猫"] }}
       onTagsChange={onTagsChange}
       description={description}
@@ -75,7 +75,8 @@ describe("Workbench 一句话描述（FB5-05 §7.6）", () => {
     rerender(
       <Workbench
         suggestion={mkSuggestion()}
-        facets={facets}
+        aiGroup={facets}
+      manualGroup={[]}
         tags={{ subject: ["猫"] }}
         onTagsChange={vi.fn()}
         description="海边"
@@ -93,7 +94,8 @@ describe("Workbench 一句话描述（FB5-05 §7.6）", () => {
     rerender(
       <Workbench
         suggestion={mkSuggestion()}
-        facets={facets}
+        aiGroup={facets}
+      manualGroup={[]}
         tags={{ subject: ["猫"] }}
         onTagsChange={vi.fn()}
         description="🌅海边"

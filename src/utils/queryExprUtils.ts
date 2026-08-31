@@ -256,11 +256,11 @@ function notLabel(leaf: QueryExpr, nameById: Map<number, ResolvedTag>): string {
   return `排除：${leafLabel(leaf, nameById)}`;
 }
 
-/** 分面 key → 显示名（与 tagStore BASE_FACET_DEFAULTS 对齐；未知回退 key） */
+/** W3：系统分面显示名兜底（纯函数无法读 store）；自建分面回退显示 key。 */
 const FACET_NAMES: Record<string, string> = {
   subject: "主体/对象", scene: "场景/地点", purpose: "用途", style: "风格/氛围",
   color: "色彩", composition: "构图/视角", lighting: "光线/时间", people: "人物属性",
-  technical: "可用性/技术特征", custom: "自定义", location: "地点", event: "事件",
+  technical: "可用性/技术特征", custom: "自定义",
 };
 
 function leafLabel(leaf: QueryExpr, nameById: Map<number, ResolvedTag>): string {

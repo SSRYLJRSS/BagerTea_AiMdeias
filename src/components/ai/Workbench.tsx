@@ -18,8 +18,9 @@ type ImgStage = "hd" | "ph" | "orig";
 
 interface WorkbenchProps {
   suggestion: AiSuggestion;
-  /** 稳定分面（阶段 6）：来自 tag_facets + aiFacetConfigs 覆盖，不含 tagCategories */
-  facets: WorkbenchFacet[];
+  /** W3-4：稳定分面两组 ——「AI 识别」在前、「需要你填」在后（buildWorkbenchFacets 产物） */
+  aiGroup: WorkbenchFacet[];
+  manualGroup: WorkbenchFacet[];
   tags: CategorizedTags;
   onTagsChange: (t: CategorizedTags) => void;
   /** FB5-05（§7.6）：一句话描述（审核编辑区顶部；最多 20 字符） */
@@ -49,7 +50,8 @@ function exifLine(a: Asset | null): string {
 
 export default function Workbench({
   suggestion: s,
-  facets,
+  aiGroup,
+  manualGroup,
   tags,
   onTagsChange,
   description,
@@ -111,23 +113,12 @@ export default function Workbench({
     };
   }, [s.assetId]);
 
-  // 面板分面 = 稳定分面（系统分面恒显）∪ 标签里出现但不在分面中的 key（归 custom 显示）
-  const panelFacets = useMemo(() => {
-    const keys = facets.map((f) => f.key);
-    const extra = Object.keys(tags).filter((k) => !keys.includes(k));
-    return [
-      ...facets,
-      ...extra.map((key) => ({
-        key,
-        displayName: key,
-        description: "",
-        selectionMode: "multi" as const,
-        maxItems: null,
-        enabledForAi: false,
-        hint: "",
-      })),
-    ];
-  }, [facets, tags]);
+  // W3-4：不再补「假分面」—— V20 后标签 key 应全部命中真实分面。
+  // 真出现未知 key（分面被删后残留的标签）→ 显示 warning 提示，不静默造面板。
+  const orphanKeys = useMemo(() => {
+    const known = new Set([...aiGroup, ...manualGroup].map((f) => f.key));
+    return Object.keys(tags).filter((k) => !known.has(k));
+  }, [aiGroup, manualGroup, tags]);
 
   const setFacetTags = (key: string, list: string[]) => {
     const next = { ...tags };
@@ -148,10 +139,10 @@ export default function Workbench({
       setEditing({ ...editing, [key]: "" });
       return;
     }
-    // 数量上限：单选恒 1，否则 f.maxItems（§9.4 明确反馈）
+    // 数量上限：单选恒 1；multi 时 maxItems 为 null = 不限（W3-4 修复：不再回退硬编码 3）
     const single = f.selectionMode === "single";
-    const cap = single ? 1 : Math.max(1, f.maxItems ?? 3);
-    if (!single && cur.length >= cap) {
+    const cap = single ? 1 : (f.maxItems ?? null);
+    if (!single && cap !== null && cur.length >= cap) {
       setCapHint((m) => ({ ...m, [key]: `已达上限 ${cap} 个` }));
       setTimeout(() => setCapHint((m) => ({ ...m, [key]: "" })), 2500);
       return;
@@ -191,6 +182,43 @@ export default function Workbench({
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [index, onGoto, handleConfirm]); // B33：补依赖数组，避免每次渲染重绑
+
+  // W3-4：单行分面渲染（两组共用；maxItems 为 null = 不限，不回退硬编码 3）
+  const renderFacetRow = (f: WorkbenchFacet) => {
+    const list = tags[f.key] ?? [];
+    const hint = capHint[f.key];
+    const single = f.selectionMode === "single";
+    const cap = single ? 1 : (f.maxItems ?? null);
+    const reached = !single && cap !== null && list.length >= cap;
+    return (
+      <div key={f.key} className="flex min-h-8 items-start gap-3 border-b border-[var(--color-border)]/70 pb-2">
+        <span className="mt-1.5 w-16 shrink-0 truncate text-xs font-medium text-[var(--color-text-secondary)]" title={f.key}>
+          {f.displayName}
+        </span>
+        <div className="min-w-0 flex-1">
+          <div className="flex min-w-0 flex-wrap items-center gap-1">
+            {list.map((t) => (
+              <TagChip key={t} label={t} onRemove={readOnly ? undefined : () => setFacetTags(f.key, list.filter((x) => x !== t))} />
+            ))}
+            {!readOnly && (
+              <FacetTagInput
+                facetKey={f.key}
+                value={editing[f.key] ?? ""}
+                onValueChange={(v) => setEditing({ ...editing, [f.key]: v })}
+                onCommit={(n) => addTag(f, n)}
+              />
+            )}
+          </div>
+          {!single && reached && (
+            <span className="mt-0.5 block text-[10px] text-[var(--color-status)]" data-testid={`max-${f.key}`}>
+              已达上限 {cap} 个
+            </span>
+          )}
+          {hint && <span className="mt-0.5 block text-[10px] text-[var(--color-status)]">{hint}</span>}
+        </div>
+      </div>
+    );
+  };
 
   return (
     <>
@@ -291,43 +319,26 @@ export default function Workbench({
             )}
           </div>
         </div>
+        {/* W3-4：AI 识别组在前（含分隔标题），需要你填组在后（视觉分隔） */}
+        {aiGroup.length > 0 && (
+          <p className="mt-1 mb-1 text-[11px] font-semibold text-[var(--color-text-tertiary)]">AI 识别</p>
+        )}
         <div className="grid grid-cols-1 gap-x-6 gap-y-2 xl:grid-cols-2">
-          {panelFacets.map((f) => {
-            const list = tags[f.key] ?? [];
-            const hint = capHint[f.key];
-            const single = f.selectionMode === "single";
-            const cap = single ? 1 : Math.max(1, f.maxItems ?? 3);
-            const reached = !single && cap > 0 && list.length >= cap;
-            return (
-              <div key={f.key} className="flex min-h-8 items-start gap-3 border-b border-[var(--color-border)]/70 pb-2">
-                <span className="mt-1.5 w-16 shrink-0 truncate text-xs font-medium text-[var(--color-text-secondary)]" title={f.key}>
-                  {f.displayName}
-                </span>
-                <div className="min-w-0 flex-1">
-                  <div className="flex min-w-0 flex-wrap items-center gap-1">
-                    {list.map((t) => (
-                      <TagChip key={t} label={t} onRemove={readOnly ? undefined : () => setFacetTags(f.key, list.filter((x) => x !== t))} />
-                    ))}
-                    {!readOnly && (
-                      <FacetTagInput
-                        facetKey={f.key}
-                        value={editing[f.key] ?? ""}
-                        onValueChange={(v) => setEditing({ ...editing, [f.key]: v })}
-                        onCommit={(n) => addTag(f, n)}
-                      />
-                    )}
-                  </div>
-                  {!single && reached && (
-                    <span className="mt-0.5 block text-[10px] text-[var(--color-status)]" data-testid={`max-${f.key}`}>
-                      已达上限 {cap} 个
-                    </span>
-                  )}
-                  {hint && <span className="mt-0.5 block text-[10px] text-[var(--color-status)]">{hint}</span>}
-                </div>
-              </div>
-            );
-          })}
+          {aiGroup.map((f) => renderFacetRow(f))}
         </div>
+        {manualGroup.length > 0 && (
+          <p className="mt-3 mb-1 border-t border-[var(--color-border)]/70 pt-2 text-[11px] font-semibold text-[var(--color-text-tertiary)]">
+            需要你填（不参与 AI 自动打标）
+          </p>
+        )}
+        <div className="grid grid-cols-1 gap-x-6 gap-y-2 xl:grid-cols-2">
+          {manualGroup.map((f) => renderFacetRow(f))}
+        </div>
+        {orphanKeys.length > 0 && (
+          <p className="mt-2 text-[11px] text-[var(--color-status)]">
+            有 {orphanKeys.length} 个标签属于已删除或未知的分类（{orphanKeys.join("、")}），确认后将归入 custom。
+          </p>
+        )}
         <div className="sticky bottom-0 mt-3 flex items-center gap-2 border-t border-[var(--color-border)] bg-[var(--color-bg)] py-3">
           <span className="text-xs text-[var(--color-text-secondary)]">{readOnly ? "当前结果为只读状态" : "Enter 添加标签，方向键切换图片"}</span>
           <div className="ml-auto flex gap-2">

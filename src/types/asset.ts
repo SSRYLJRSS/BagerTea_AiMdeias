@@ -52,6 +52,15 @@ export interface Asset {
   dominantLum?: number | null;
   // FB5-05（§7.3）：一句话描述（最多 20 字符，素材字段，不进标签树/统计）
   contentDescription?: string;
+  // V19（W3-1）：收藏/评级/手动旋转/phash（可选 + 默认值兼容旧响应）
+  /** 收藏标记（0/1；后端 NOT NULL DEFAULT 0） */
+  favorite?: number;
+  /** 评级 0–5（0 = 未评级） */
+  rating?: number;
+  /** 用户手动旋转（0/90/180/270；与 ffprobe 的 rotation 语义分离） */
+  userRotation?: number;
+  /** 感知哈希 dHash 64 位（W5d 相似去重；未计算为 null） */
+  phash?: number | null;
   tags: import("./tag").Tag[];
 }
 
@@ -125,6 +134,8 @@ export type MetadataFilterKey =
   | "dominant_lum"
   // V18：GPS 定位（带符号十进制度）与定位有无分面（值域 yes/no）
   | "latitude"
+  | "rating"
+  | "favorite"
   | "longitude"
   | "has_location";
 

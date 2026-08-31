@@ -23,6 +23,8 @@ export interface TagFacet {
   key: string;
   displayName: string;
   description: string;
+  /** W3-1：V20 合表后新增——ai_and_manual = 参与 AI 打标；manual_only = 只手工填写 */
+  inputMode: "ai_and_manual" | "manual_only";
   selectionMode: "single" | "multi";
   maxItems: number | null;
   sortOrder: number;
@@ -33,23 +35,22 @@ export interface TagFacet {
   updatedAt: number;
 }
 
-/** 分面治理前的影响范围（指导书 §12.3） */
+/** W2-4：分面影响范围（与后端 FacetImpact 对齐；aiConfigCount 已随 V20 合表删除） */
 export interface TagFacetImpact {
   tagCount: number;
   assetCount: number;
-  aiConfigCount: number;
+  aiSuggestionItemCount: number;
+  tagOpCount: number;
 }
 
-/** 打标工作台分面（指导书 §9.2）：tag_facets 唯一决定结构；aiFacetConfigs 只覆盖
- *  enabledForAi / hint / 可选显示名。tagCategories 不再作为业务渲染数据源。 */
+/** 打标工作台分面：V20 合表后 tag_facets 单一事实源（inputMode 分组取代 enabledForAi）。 */
 export interface WorkbenchFacet {
   key: string;
   displayName: string;
   description: string;
+  inputMode: "ai_and_manual" | "manual_only";
   selectionMode: "single" | "multi";
   maxItems: number | null;
-  enabledForAi: boolean;
-  hint: string;
 }
 
 export interface TagFacetGovernance {

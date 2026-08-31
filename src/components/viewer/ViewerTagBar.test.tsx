@@ -36,6 +36,7 @@ const mkFacet = (key: string, displayName: string): TagFacet => ({
   key,
   displayName,
   description: "",
+  inputMode: "ai_and_manual",
   selectionMode: "multi",
   maxItems: 5,
   sortOrder: 0,

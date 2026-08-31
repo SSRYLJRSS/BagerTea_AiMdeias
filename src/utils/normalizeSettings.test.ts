@@ -14,7 +14,7 @@ describe("normalizeSettings", () => {
     expect(s.ai.videoTagging).toBe(false);
     expect(s.ai.batchLimit).toBe(DEFAULT_BATCH_LIMIT);
     expect(s.ai.activeProfile).toBe("");
-    expect(s.aiFacetConfigs).toEqual([]);
+    expect(s.aiFacetConfigs ?? []).toEqual([]);
     expect(s.tagCategories).toEqual([]);
     expect(s.customDownloadSources).toEqual([]);
     expect(s.libraryRoot).toBe("");
@@ -70,9 +70,8 @@ describe("normalizeSettings", () => {
         null,
       ],
     });
-    expect(s.aiFacetConfigs).toHaveLength(1);
-    expect(s.aiFacetConfigs[0].facetKey).toBe("color");
-    expect(s.aiFacetConfigs[0].enabledForAi).toBe(true);
+    // W3-1：aiFacetConfigs 已可选（V20 合表后后端不再返回；normalize 不再重建）
+    expect(s.aiFacetConfigs ?? []).toHaveLength(0);
   });
 
   it("畸形数字/布尔字段兜底；batchLimit 越界归一到 [10,50] 默认 30（FB3-07）", () => {

@@ -9,7 +9,6 @@ import { memo, useMemo, useState } from "react";
 import { Plus } from "lucide-react";
 import TagChip from "@/components/library/TagChip";
 import { useTagStore, buildWorkbenchFacets } from "@/stores/tagStore";
-import { useSettingsStore } from "@/stores/settingsStore";
 import type { Tag } from "@/types/tag";
 
 interface ViewerTagBarProps {
@@ -23,12 +22,11 @@ interface ViewerTagBarProps {
 
 export default memo(function ViewerTagBar({ tags, contentDescription, onRemoveTag, onAddTag }: ViewerTagBarProps) {
   const [collapsed, setCollapsed] = useState(false);
-  const settings = useSettingsStore((s) => s.settings);
   // 分面唯一事实源 = tag_facets（tagStore.facets），aiFacetConfigs 只覆盖显隐/显示名
   const tagFacets = useTagStore((s) => s.facets);
   const facets = useMemo(
-    () => buildWorkbenchFacets(tagFacets, settings?.aiFacetConfigs ?? []),
-    [tagFacets, settings?.aiFacetConfigs],
+    () => buildWorkbenchFacets(tagFacets).aiGroup,
+    [tagFacets],
   );
   // 分组：固定顺序按 facets 出现顺序；未知 facetKey 归「其他」
   const groups = useMemo(() => {

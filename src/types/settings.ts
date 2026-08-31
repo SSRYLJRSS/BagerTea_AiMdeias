@@ -41,7 +41,7 @@ export interface AiFacetConfig {
   hint: string;
   enabledForAi: boolean;
   displayName?: string;
-  /** 是否显示在人工打标工作台（与 AI 开关独立；缺省按 WORKBENCH_DEFAULT_KEYS 决定） */
+  /** 是否显示在人工打标工作台（W3-2 后已死：分面显隐由 input_mode/status 决定） */
   visibleInWorkbench?: boolean;
 }
 
@@ -66,10 +66,11 @@ export interface Settings {
   ai: AiSettings;
   theme: "system" | "light" | "dark";
   thumbnailCacheMb: number;
-  /** 标签分类（已弃用）：仅作迁移输入，业务已切到 aiFacetConfigs */
+  /** 标签分类（已弃用）：仅作迁移输入，后端不再序列化 */
   tagCategories: TagCategory[];
-  /** AI 分面配置（一条 active 路径，facet_key 稳定） */
-  aiFacetConfigs: AiFacetConfig[];
+  /** W3-1（V20 合表）：已删。分面 AI 参与语义在 tag_facets.input_mode；
+   *  保留类型仅为老 JSON 反序列化兼容，后端不再返回此字段。 */
+  aiFacetConfigs?: AiFacetConfig[];
   /** 总库位置（R-32）；空 = 原位索引模式 */
   libraryRoot: string;
   /** 回收站保留天数（R-22）；0 = 不自动清理 */

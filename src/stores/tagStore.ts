@@ -2,7 +2,6 @@
 import { create } from "zustand";
 import { listTagFacets, listTags, listTagsByFacet, searchTagCandidates } from "@/api/tags";
 import type { Tag, TagFacet, TagNode, WorkbenchFacet } from "@/types/tag";
-import type { AiFacetConfig } from "@/types/settings";
 
 interface TagState {
   tree: TagNode[];
@@ -94,34 +93,10 @@ function collectExpandableIds(nodes: TagNode[]): ReadonlySet<number> {
   return ids;
 }
 
-/** 固定基础分面（指导书 §9.3）：即使当前素材无标签、AI 无建议、手动模式，也必须显示这些系统分面。 */
-const BASE_FACET_DEFAULTS: Record<string, { displayName: string; description: string; selectionMode: "single" | "multi"; maxItems: number | null }> = {
-  subject: { displayName: "主体/对象", description: "画面的主体或对象", selectionMode: "multi", maxItems: 5 },
-  scene: { displayName: "场景/地点", description: "拍摄的场景或地点", selectionMode: "multi", maxItems: 5 },
-  purpose: { displayName: "用途", description: "素材用途/应用场景", selectionMode: "multi", maxItems: 5 },
-  style: { displayName: "风格/氛围", description: "视觉风格/氛围", selectionMode: "multi", maxItems: 5 },
-  color: { displayName: "色彩", description: "色彩基调", selectionMode: "multi", maxItems: 5 },
-  composition: { displayName: "构图/视角", description: "构图或拍摄视角", selectionMode: "multi", maxItems: 5 },
-  lighting: { displayName: "光线/时间", description: "光线条件或拍摄时间", selectionMode: "multi", maxItems: 5 },
-  people: { displayName: "人物属性", description: "人物相关属性", selectionMode: "multi", maxItems: 5 },
-  technical: { displayName: "可用性/技术特征", description: "技术/可用性特征", selectionMode: "multi", maxItems: 5 },
-  custom: { displayName: "自定义", description: "自由标签", selectionMode: "multi", maxItems: null },
-};
-const BASE_FACET_KEYS = Object.keys(BASE_FACET_DEFAULTS);
-
-/** C-1：工作台默认显示的用户要求分面白名单（集中定义，不在多个组件中分别过滤）。
- *  purpose / technical / custom 默认隐藏（只影响工作台显示，不影响历史标签/搜索/数据库）。 */
-export const WORKBENCH_DEFAULT_KEYS = [
-  "subject",
-  "scene",
-  "style",
-  "color",
-  "composition",
-  "lighting",
-  "people",
-] as const;
-
-/** 中文分类显示名 → 稳定 facetKey（与后端 key_for_legacy_name 对齐）。未知归 custom。 */
+/** W3-2：中文分类显示名 → 稳定 facetKey。
+ *  【降级保留】只在解析历史 CategorizedTags JSON 时用（老数据确实存着中文 key）。
+ *  新链路禁止调用——分面 key 路由必须走后端 resolve_facet_key（W2-10），
+ *  它会查 DB 让自建分面生效；这里查不到自建分面。 */
 export function keyForLegacyName(name: string): string {
   const n = name.trim();
   const map: Record<string, string> = {
@@ -140,63 +115,50 @@ export function keyForLegacyName(name: string): string {
   return map[n] ?? "custom";
 }
 
-/** 分面是否显示在工作台：
- *  - 显式设置了 visibleInWorkbench → 以配置为准；
- *  - 未设置 → 基础分面按 WORKBENCH_DEFAULT_KEYS 白名单；非基础分面（用户自建）默认显示。 */
-function isVisibleInWorkbench(key: string, cfg?: AiFacetConfig): boolean {
-  if (cfg?.visibleInWorkbench !== undefined) return cfg.visibleInWorkbench;
-  return BASE_FACET_KEYS.includes(key) ? (WORKBENCH_DEFAULT_KEYS as readonly string[]).includes(key) : true;
-}
-
-/** 组装工作台分面（指导书 §9.2/§9.3 + C-1/C-2）：
- *  - tag_facets 唯一决定结构与默认显示名/描述/single/max；
- *  - aiFacetConfigs 只覆盖 enabledForAi / hint / 可选显示名（displayName）/ 工作台显隐（visibleInWorkbench）；
- *  - 只返回「工作台可见」的分面（purpose/technical/custom 默认隐藏）。 */
-export function buildWorkbenchFacets(facets: TagFacet[], configs: AiFacetConfig[]): WorkbenchFacet[] {
-  const configByKey = new Map(configs.map((c) => [c.facetKey, c]));
-  const byKey = new Map(facets.map((f) => [f.key, f]));
-  const out: WorkbenchFacet[] = [];
-  // 基础分面按白名单顺序在前（§9.3）
-  for (const key of BASE_FACET_KEYS) {
-    if (!isVisibleInWorkbench(key, configByKey.get(key))) continue;
-    const f = byKey.get(key);
-    const cfg = configByKey.get(key);
-    const base = BASE_FACET_DEFAULTS[key];
-    out.push({
-      key,
-      displayName: cfg?.displayName?.trim() || f?.displayName || base.displayName,
-      description: f?.description || base.description,
-      selectionMode: f?.selectionMode ?? base.selectionMode,
-      maxItems: f?.maxItems ?? base.maxItems,
-      enabledForAi: cfg?.enabledForAi ?? true,
-      hint: cfg?.hint ?? "",
-    });
-  }
-  // 额外存在于 DB 但非基础分面的分面也保留（如自定义扩展）
-  for (const key of byKey.keys()) {
-    if (BASE_FACET_KEYS.includes(key)) continue;
-    if (!isVisibleInWorkbench(key, configByKey.get(key))) continue;
-    const f = byKey.get(key)!;
-    const cfg = configByKey.get(key);
-    out.push({
-      key,
-      displayName: cfg?.displayName?.trim() || f.displayName,
+/** W3-2 重写：工作台分面分组 —— 遍历后端 facets（不再是前端常量白名单），
+ *  按 inputMode 分成「AI 识别」与「需要你填」两组，并消费 appliesTo（此前前端完全没用）。
+ *  DB 空时返回空数组（不回退硬编码默认值——用户改了 DB 值前端必须跟随）。 */
+export function buildWorkbenchFacets(
+  facets: TagFacet[],
+  mediaKind: "all" | "image" | "video" = "all",
+): { aiGroup: WorkbenchFacet[]; manualGroup: WorkbenchFacet[] } {
+  const aiGroup: WorkbenchFacet[] = [];
+  const manualGroup: WorkbenchFacet[] = [];
+  for (const f of facets) {
+    if (f.status !== "active") continue;
+    // appliesTo：分面声明只适用于图片/视频时，另一类素材的工作台不显示它
+    if (mediaKind !== "all" && f.appliesTo !== "all" && f.appliesTo !== mediaKind) continue;
+    const item: WorkbenchFacet = {
+      key: f.key,
+      displayName: f.displayName,
       description: f.description,
+      inputMode: f.inputMode,
       selectionMode: f.selectionMode,
       maxItems: f.maxItems,
-      enabledForAi: cfg?.enabledForAi ?? true,
-      hint: cfg?.hint ?? "",
-    });
+    };
+    if (f.inputMode === "ai_and_manual") aiGroup.push(item);
+    else manualGroup.push(item);
   }
-  return out;
+  return { aiGroup, manualGroup };
 }
 
-/** 把 AI/素材返回的分类标签 key 归一化为稳定 facetKey（未知 → custom），
- *  供工作台用稳定 key 渲染与回写（指导书 §9.4/§9.5）。 */
-export function normalizeTagKeys(tags: Record<string, string[]>): Record<string, string[]> {
+/** W3-2/W2-10：把 AI/素材返回的分类标签 key 归一化为稳定 facetKey。
+ *  knownFacetKeys 来自后端 facets（tagStore.facets）—— 自建分面的 key 原样保留；
+ *  未知的先查中文旧名表（历史数据），仍未知才归 custom。 */
+export function normalizeTagKeys(
+  tags: Record<string, string[]>,
+  knownFacetKeys: string[] = [],
+): Record<string, string[]> {
+  const known = new Set(knownFacetKeys);
   const out: Record<string, string[]> = {};
   for (const [name, list] of Object.entries(tags)) {
-    const key = keyForLegacyName(name);
+    const trimmed = name.trim();
+    const key = known.has(trimmed)
+      ? trimmed
+      : (() => {
+          const mapped = keyForLegacyName(trimmed);
+          return known.has(mapped) ? mapped : "custom";
+        })();
     out[key] = [...(out[key] ?? []), ...list];
   }
   return out;
