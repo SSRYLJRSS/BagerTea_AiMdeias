@@ -54,6 +54,8 @@ export interface AiSearchParseResult {
   explanation: string;
   warnings: string[];
   resolvedTags: ResolvedTag[];
+  /** W6-5：完全理解 / 部分理解 / 按关键词搜索 三态 */
+  parseStatus: "full" | "partial" | "keyword";
 }
 
 /** 追加模式：默认替换当前条件；用户明确选择才追加 */

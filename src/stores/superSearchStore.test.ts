@@ -101,6 +101,7 @@ describe("superSearchStore", () => {
       sortDir: "desc",
       explanation: "按关键词搜索",
       warnings: [],
+      parseStatus: "full",
       resolvedTags: [],
     });
     useSuperSearchStore.getState().setExpr({ op: "leaf", cond: { type: "assetType", value: "image" } });
@@ -122,6 +123,7 @@ describe("superSearchStore", () => {
       sortDir: "desc",
       explanation: "",
       warnings: [],
+      parseStatus: "full",
       resolvedTags: [{ facetKey: "subject", text: "树", tagId: 2, path: "" }],
     });
     const base: QueryExpr = { op: "leaf", cond: { type: "tag", facetKey: "subject", tagIds: [1], mode: "any", includeDescendants: true } };

@@ -184,6 +184,7 @@ pub struct ResolvedFacet {
 }
 
 /// FB5-05（§9.5）：AI 解析结果。expr 为唯一执行事实源；排序单独返回。
+/// W6-5（§W6-5）：parseStatus 供前端区分「完全理解 / 部分理解 / 按关键词搜索」三态。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AiSearchParseResult {
@@ -194,6 +195,8 @@ pub struct AiSearchParseResult {
     pub explanation: String,
     pub warnings: Vec<String>,
     pub resolved_tags: Vec<ResolvedTag>,
+    /// "full" = 完全理解（无警告）；"partial" = 部分理解（有警告仍执行）；"keyword" = 关键词兜底
+    pub parse_status: String,
 }
 
 // ═══════════════ 校验（§9.2.2 结构层） ═══════════════
@@ -804,6 +807,10 @@ pub fn parse_intent(content: &str) -> AppResult<SearchIntentV2> {
 
 /// 网络 + 解析 + 校验：由调用方在短锁内收集 facets/dict 后，再在锁外调用本函数。
 /// 不持有 DB 锁；text 已由命令层校验长度。
+///
+/// W6-2（§W6-2）三层降级：① strict 正常解析 → ② lenient 剔除非法项保留其余 + warning
+/// → ③ 关键词兜底（永不失败）。唯一例外：配置类错误（鉴权/连不上/超时）仍真报错
+/// —— 配置问题必须让用户知道，而不是假装搜到了。
 pub fn request_intent(
     cfg: &AiSettings,
     text: &str,
@@ -817,7 +824,7 @@ pub fn request_intent(
         return Err(AppError::msg("当前 API 配置缺少 base_url"));
     }
 
-    let schema = intent_schema();
+    let schema = intent_schema(facets);
     let system = build_system_prompt(facets);
     let mut user = String::from("标签词典（规范名 | aliases: 可搜索别名）\n");
     for t in dict {
@@ -838,23 +845,165 @@ pub fn request_intent(
     user.push_str(text);
     user.push_str("</query>\n请输出解析结果。");
 
-    // 三级降级请求（Structured / JSON Object / Plain 归一化到同一 SearchIntentV2 + 同一守卫）
-    let (tier, raw) = ai_cloud::request_text_json(
+    // ① 网络请求（协议级降级 Structured → JsonObject → Plain 由 request_text_json 内部处理）。
+    // 配置类错误（鉴权/连不上/超时）真报错；其他服务异常降级为关键词搜索（不打扰）。
+    let (_tier, raw) = match ai_cloud::request_text_json(
         profile,
         &system,
         &user,
         Some(schema.clone()),
         TextJsonTier::Structured,
-    )?;
+    ) {
+        Ok(v) => v,
+        Err(e) if is_config_error(&e) => return Err(e),
+        Err(_) => return Ok(keyword_fallback(text)),
+    };
     if ai_cloud::is_degenerate_text(&raw) {
-        return Err(AppError::msg("AI 输出持续异常，请重试或切换存档"));
+        // 持续乱码/复读：属模型能力问题而非配置问题 → 关键词兜底
+        return Ok(keyword_fallback(text));
     }
-    let mut intent = parse_intent(&raw)?;
-    // 容错降级：非法/未知 metadata 条件丢弃 + warning，其余条件继续；结构性错误仍整体报错。
-    let metadata_warnings = sanitize_metadata(&mut intent);
-    validate_intent(&intent, facets)?;
-    let _ = tier;
-    Ok((intent, metadata_warnings))
+    // ②/③/④：解析 + lenient 剔除 + 结构校验，全部失败落第 3 层（永不失败）
+    Ok(degrade_parse(&raw, text, facets))
+}
+
+/// W6-2：解析层三层降级的纯函数（不触网，单测直接打）。
+/// ① strict 解析 → ② lenient 剔除非法项（sanitize_all）→ ③ 关键词兜底。
+pub fn degrade_parse(
+    raw: &str,
+    text: &str,
+    facets: &[FacetPromptContext],
+) -> (SearchIntentV2, Vec<String>) {
+    let mut intent = match parse_intent(raw) {
+        Ok(i) => i,
+        Err(_) => return keyword_fallback(text),
+    };
+    // lenient：部分剔除规则（W6-3），原则「能救一条算一条」
+    let mut warnings = sanitize_all(&mut intent, facets);
+    if intent.groups.is_empty() && intent.exclusions.is_empty() {
+        warnings.push("未能理解搜索条件，已按关键词搜索。".into());
+        return (keyword_intent(text), warnings);
+    }
+    if let Err(e) = validate_intent(&intent, facets) {
+        warnings.push(format!("解析结果不合规（{e}），已按关键词搜索。"));
+        return (keyword_intent(text), warnings);
+    }
+    (intent, warnings)
+}
+
+/// W6-2：配置类错误判定（鉴权 / 连不上 / 超时）—— 这类错误必须真报错，不做降级。
+pub fn is_config_error(e: &AppError) -> bool {
+    let m = e.to_string().to_lowercase();
+    [
+        "401", "403", "api key", "apikey", "unauthorized", "authentication",
+        "鉴权", "无法连接", "连接失败", "error sending request", "timeout",
+        "timed out", "超时", "请求失败",
+    ]
+    .iter()
+    .any(|k| m.contains(k))
+}
+
+/// W6-2 第 3 层：关键词兜底 intent —— 整句进 textTerms(scope=all)，永不失败。
+/// pub：命令层在 validate_expr 失败回退时也会构造兜底 intent 重新生成 expr。
+pub fn keyword_intent(text: &str) -> SearchIntentV2 {
+    SearchIntentV2 {
+        groups: vec![SearchGroupV2 {
+            asset_type: "all".into(),
+            concepts: vec![],
+            text_terms: vec![IntentTextTerm {
+                text: text.trim().to_string(),
+                scope: "all".into(),
+            }],
+            metadata: vec![],
+        }],
+        exclusions: vec![],
+        sort_by: None,
+        sort_dir: None,
+    }
+}
+
+fn keyword_fallback(text: &str) -> (SearchIntentV2, Vec<String>) {
+    (
+        keyword_intent(text),
+        vec!["未能理解搜索条件，已按关键词搜索。".into()],
+    )
+}
+
+/// 判断 intent 是否处于关键词兜底态（命令层据此输出「按关键词搜索」解释文案）。
+pub fn is_keyword_fallback(intent: &SearchIntentV2, text: &str) -> bool {
+    intent.groups.len() == 1
+        && intent.exclusions.is_empty()
+        && intent.groups[0].asset_type == "all"
+        && intent.groups[0].concepts.is_empty()
+        && intent.groups[0].metadata.is_empty()
+        && intent.groups[0].text_terms.len() == 1
+        && intent.groups[0].text_terms[0].scope == "all"
+        && intent.groups[0].text_terms[0].text.trim() == text.trim()
+}
+
+/// W6-3 部分解析剔除规则：能救一条算一条，全部不合法才落第 3 层。
+/// 覆盖：sortBy / sortDir / assetType 非法→默认；单条 metadata 非法→剔除（复用 sanitize_metadata）；
+/// concept.facetHint 未知→降级全分面搜索；空概念剔除；全空 group 剔除。
+pub fn sanitize_all(intent: &mut SearchIntentV2, facets: &[FacetPromptContext]) -> Vec<String> {
+    let mut warnings = Vec::new();
+    // sortBy 非法 → 默认（由命令层 sort_by unwrap_or created_at 兜底）
+    if let Some(sb) = &intent.sort_by {
+        if !is_valid_sort_by(sb) {
+            warnings.push(format!("不支持的排序字段「{sb}」，已用默认排序。"));
+            intent.sort_by = None;
+        }
+    }
+    // sortDir 非法 → 默认 desc
+    if let Some(sd) = &intent.sort_dir {
+        if !matches!(sd.as_str(), "asc" | "desc") {
+            warnings.push(format!("不支持的排序方向「{sd}」，已用默认排序。"));
+            intent.sort_dir = None;
+        }
+    }
+    // 每组的 assetType 非法 → all
+    for g in &mut intent.groups {
+        if !matches!(g.asset_type.as_str(), "all" | "image" | "video") {
+            warnings.push(format!("不认识的类型「{}」，已改为全部。", g.asset_type));
+            g.asset_type = "all".into();
+        }
+        // concept.facetHint 未知 → 清掉（降级全分面搜索），保留 concept 本体
+        let known_keys: Vec<&str> = facets.iter().map(|f| f.key.as_str()).collect();
+        for c in &mut g.concepts {
+            if let Some(h) = &c.facet_hint {
+                if !known_keys.contains(&h.as_str()) {
+                    warnings.push(format!("「{}」的分类提示不在当前分类列表中，已按全部分类搜索。", c.text));
+                    c.facet_hint = None;
+                }
+            }
+        }
+    }
+    // 单条 metadata 非法 → 剔除该条（已有逻辑）
+    warnings.extend(sanitize_metadata(intent));
+    // 空概念 text / 空 textTerm 剔除；清空后的 group（concepts+textTerms+metadata 全空）剔除
+    let before = intent.groups.len();
+    intent.groups.retain(|g| {
+        let has_concept = g.concepts.iter().any(|c| !c.text.trim().is_empty());
+        let has_term = g.text_terms.iter().any(|t| !t.text.trim().is_empty());
+        let has_meta = !g.metadata.is_empty();
+        if !has_concept && !has_term && !has_meta {
+            warnings.push("一组条件为空，已忽略。".into());
+        }
+        has_concept || has_term || has_meta
+    });
+    if intent.groups.len() < before {
+        warnings.push(format!(
+            "已忽略 {} 组无法识别的条件。",
+            before - intent.groups.len()
+        ));
+    }
+    warnings
+}
+
+/// 排序字段白名单（与 db/assets.rs VALID_SORT 对齐，单点声明）
+pub fn is_valid_sort_by(s: &str) -> bool {
+    matches!(
+        s,
+        "created_at" | "taken_at" | "modified_at" | "name" | "size" | "resolution" | "rating"
+    )
 }
 
 /// §9.2 Prompt 硬规则（停用词由 SEARCH_CONCEPT_STOPWORDS 生成，与本地清洗同一集合）。
@@ -899,17 +1048,37 @@ fn build_system_prompt(facets: &[FacetPromptContext]) -> String {
         "示例 3：输入「不要夜景的人像」→ 一个含「人像」的 group + exclusions 含「夜景」。\n",
     );
     p.push_str("示例 4：输入「IMG_1097」→ groups 里 textTerms=[{\"text\":\"IMG_1097\",\"scope\":\"fileName\"}]。\n");
-    let _ = facets;
+    // W6-4（§W6-4）：显式约束句 —— 分面 key 只能从这里选，不要发明新 key。
+    // 分面说明段（user prompt）里同样列出 key；schema 的 facetHint enum 同步收窄。
+    let keys = facets.iter().map(|f| f.key.as_str()).collect::<Vec<_>>();
+    if keys.is_empty() {
+        p.push_str("当前库没有可用分类（facetHint 一律给 null，不要发明分类）。\n");
+    } else {
+        p.push_str(&format!(
+            "分类 key（facetHint 只能填下面这些，不要发明新 key）：{}\n",
+            keys.join("、")
+        ));
+    }
     p
 }
 
 /// §9.2.2 V2 严格 JSON Schema：根与嵌套全部 additionalProperties:false；旧字段必须不存在。
-fn intent_schema() -> serde_json::Value {
+/// W6-1（§W6-1）：facetHint 的 enum = 实时分面 key（新建分面后自动包含），
+/// 支持 json_schema 的服务商在服务端就拒绝非法 key，根本到不了本地校验层。
+fn intent_schema(facets: &[FacetPromptContext]) -> serde_json::Value {
     let nullable_string = serde_json::json!({
         "anyOf": [{"type": "string"}, {"type": "null"}]
     });
     let nullable_number_or_string = serde_json::json!({
         "anyOf": [{"type": "string"}, {"type": "number"}, {"type": "null"}]
+    });
+    // W6-1：facetHint enum = 实时分面 keys + null（无分面时空 enum，模型只能给 null）
+    let facet_key_enum: Vec<serde_json::Value> = facets
+        .iter()
+        .map(|f| serde_json::Value::String(f.key.clone()))
+        .collect();
+    let facet_hint = serde_json::json!({
+        "anyOf": [{"type": "string", "enum": facet_key_enum}, {"type": "null"}]
     });
     let concept = serde_json::json!({
         "type": "object",
@@ -917,7 +1086,7 @@ fn intent_schema() -> serde_json::Value {
         "properties": {
             "text": {"type": "string", "minLength": 1, "maxLength": 12},
             "role": {"type": "string", "maxLength": 40},
-            "facetHint": {"anyOf": [{"type": "string", "maxLength": 60}, {"type": "null"}]},
+            "facetHint": facet_hint,
             "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0}
         },
         "required": ["text", "role", "facetHint", "confidence"]
@@ -1093,7 +1262,7 @@ mod tests {
     #[test]
     fn schema_has_no_legacy_fields() {
         // §9.2.2：schema 必须断言旧字段不存在
-        let s = intent_schema();
+        let s = intent_schema(&[]);
         let props = s["properties"].as_object().unwrap();
         for legacy in [
             "search",
@@ -1122,7 +1291,7 @@ mod tests {
 
     #[test]
     fn schema_requires_v2_fields() {
-        let s = intent_schema();
+        let s = intent_schema(&[]);
         let req: Vec<String> = s["required"]
             .as_array()
             .unwrap()
@@ -1593,7 +1762,7 @@ mod tests {
 
     #[test]
     fn schema_metadata_enums_match_whitelist_contract() {
-        let s = intent_schema();
+        let s = intent_schema(&[]);
         let m = &s["properties"]["groups"]["items"]["properties"]["metadata"]["items"];
         let keys: Vec<&str> = m["properties"]["key"]["enum"]
             .as_array()
@@ -1737,5 +1906,152 @@ mod tests {
                 f.op
             );
         }
+    }
+    // ── W6 搜索健壮化（§W6）──
+
+    /// W6-1：facetHint enum 收窄 —— 实时分面 key 必须出现在 schema enum 中
+    #[test]
+    fn intent_schema_enum_contains_user_facet() {
+        let facets = vec![
+            FacetPromptContext {
+                key: "scene".into(),
+                display_name: "场景".into(),
+                selection_mode: "single".into(),
+                max_items: Some(3),
+                description: String::new(),
+            },
+            FacetPromptContext {
+                key: "mood".into(),
+                display_name: "氛围".into(),
+                selection_mode: "multi".into(),
+                max_items: None,
+                description: String::new(),
+            },
+        ];
+        let schema = intent_schema(&facets);
+        let hint_enum = &schema["properties"]["groups"]["items"]["properties"]["concepts"]["items"]["properties"]["facetHint"]["anyOf"][0]["enum"];
+        let keys: Vec<&str> = hint_enum.as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+        assert!(keys.contains(&"scene"));
+        assert!(keys.contains(&"mood"));
+        assert!(!keys.contains(&"不存在的分面"));
+    }
+
+    /// W6-2：8 种畸形 AI 返回 —— 全部降级为关键词搜索或部分理解，绝不 Err
+    #[test]
+    fn search_never_errors_on_malformed_ai() {
+        let facets: Vec<FacetPromptContext> = vec![];
+        let text = "海边日落";
+        // 1. 空串
+        let (i, w) = degrade_parse("", text, &facets);
+        assert!(is_keyword_fallback(&i, text), "空串应关键词兜底；warnings={w:?}");
+        // 2. 非 JSON
+        let (i, w) = degrade_parse("我觉得你搜不到", text, &facets);
+        assert!(is_keyword_fallback(&i, text), "非 JSON 应关键词兜底；warnings={w:?}");
+        // 3. 未知 facet key → 保留 concept，清掉 hint（lenient）
+        let (i, w) = degrade_parse(
+            r#"{"groups":[{"assetType":"all","concepts":[{"text":"海边","role":"scene","facetHint":"not_a_facet","confidence":0.9}],"textTerms":[],"metadata":[]}],"exclusions":[],"sortBy":null,"sortDir":null}"#,
+            text,
+            &facets,
+        );
+        assert!(!is_keyword_fallback(&i, text), "未知 key 不应兜底");
+        assert!(i.groups[0].concepts[0].facet_hint.is_none(), "未知 hint 应清空");
+        assert!(!w.is_empty(), "应有 warning");
+        // 4. 非法 op → 剔除该条 metadata，保留其余
+        let (i, w) = degrade_parse(
+            r#"{"groups":[{"assetType":"all","concepts":[{"text":"海边","role":"scene","facetHint":null,"confidence":0.9}],"textTerms":[],"metadata":[{"key":"file_size","op":"mega","value":100,"values":null,"min":null,"max":null}]}],"exclusions":[],"sortBy":null,"sortDir":null}"#,
+            text,
+            &facets,
+        );
+        assert!(!is_keyword_fallback(&i, text));
+        assert!(i.groups[0].metadata.is_empty(), "非法 metadata 应被剔除");
+        assert!(!w.is_empty());
+        // 5. 值类型错（字符串当数值）→ 剔除该条 metadata
+        let (i, w) = degrade_parse(
+            r#"{"groups":[{"assetType":"all","concepts":[{"text":"海边","role":"scene","facetHint":null,"confidence":0.9}],"textTerms":[],"metadata":[{"key":"file_size","op":"gt","value":"not-a-number","values":null,"min":null,"max":null}]}],"exclusions":[],"sortBy":null,"sortDir":null}"#,
+            text,
+            &facets,
+        );
+        assert!(i.groups[0].metadata.is_empty());
+        assert!(!w.is_empty());
+        // 6. 空 groups → 关键词兜底
+        let (i, w) = degrade_parse(
+            r#"{"groups":[],"exclusions":[],"sortBy":null,"sortDir":null}"#,
+            text,
+            &facets,
+        );
+        assert!(is_keyword_fallback(&i, text), "空 groups 应兜底；warnings={w:?}");
+        // 7. 超长概念 → 结构校验失败 → 兜底
+        let long = "很".repeat(200);
+        let (i, w) = degrade_parse(
+            &format!(
+                r#"{{"groups":[{{"assetType":"all","concepts":[{{"text":"{long}","role":"scene","facetHint":null,"confidence":0.9}}],"textTerms":[],"metadata":[]}}],"exclusions":[],"sortBy":null,"sortDir":null}}"#
+            ),
+            text,
+            &facets,
+        );
+        assert!(is_keyword_fallback(&i, text), "超长概念应兜底；warnings={w:?}");
+        // 8. 混入 markdown 围栏 → 剥围栏后正常解析（不兜底）
+        let (i, w) = degrade_parse(
+            "```json\n{\"groups\":[{\"assetType\":\"all\",\"concepts\":[{\"text\":\"海边\",\"role\":\"scene\",\"facetHint\":null,\"confidence\":0.9}],\"textTerms\":[],\"metadata\":[]}],\"exclusions\":[],\"sortBy\":null,\"sortDir\":null}\n```",
+            text,
+            &facets,
+        );
+        assert!(!is_keyword_fallback(&i, text), "围栏剥除后应正常解析；warnings={w:?}");
+    }
+
+    /// W6-2 例外：配置类错误（鉴权/连不上/超时）仍应判定为真报错（命令层不降级）
+    #[test]
+    fn search_config_error_still_errors() {
+        for msg in [
+            "云端请求失败: 401 Unauthorized",
+            "云端请求失败: 403 Forbidden",
+            "无法连接本地服务 ...: Connection refused",
+            "请求失败: request timed out",
+            "云端请求失败: error sending request for url ...",
+        ] {
+            let e = AppError::msg(msg);
+            assert!(is_config_error(&e), "应判定为配置错误: {msg}");
+        }
+        for msg in ["AI 未返回可解析的 JSON", "非法排序字段：foo", "分组数量超出上限"] {
+            let e = AppError::msg(msg);
+            assert!(!is_config_error(&e), "不应判定为配置错误: {msg}");
+        }
+    }
+
+    /// W6-3：部分剔除规则 —— 非法 sortBy/sortDir/assetType → 默认；未知 hint → 全分面
+    #[test]
+    fn sanitize_all_corrects_known_keys() {
+        let facets: Vec<FacetPromptContext> = vec![];
+        let mut intent = serde_json::from_str::<SearchIntentV2>(
+            r#"{"groups":[{"assetType":"whatever","concepts":[{"text":"海边","role":"scene","facetHint":"bogus","confidence":0.9}],"textTerms":[],"metadata":[]}],"exclusions":[],"sortBy":"rank","sortDir":"sideways"}"#,
+        )
+        .unwrap();
+        let warnings = sanitize_all(&mut intent, &facets);
+        assert!(intent.sort_by.is_none(), "非法 sortBy 应置默认");
+        assert!(intent.sort_dir.is_none(), "非法 sortDir 应置默认");
+        assert_eq!(intent.groups[0].asset_type, "all", "非法 assetType 应改 all");
+        assert!(intent.groups[0].concepts[0].facet_hint.is_none());
+        assert!(!warnings.is_empty());
+    }
+
+    /// W6-3：全非法 group → 剔除；全部 group 被剔 → 落第 3 层
+    #[test]
+    fn sanitize_all_drops_empty_groups_and_falls_back() {
+        let facets: Vec<FacetPromptContext> = vec![];
+        // 两个 group：一个只有合法概念，一个全空
+        let mut intent = serde_json::from_str::<SearchIntentV2>(
+            r#"{"groups":[{"assetType":"all","concepts":[{"text":"海边","role":"scene","facetHint":null,"confidence":0.9}],"textTerms":[],"metadata":[]},{"assetType":"all","concepts":[],"textTerms":[],"metadata":[]}],"exclusions":[],"sortBy":null,"sortDir":null}"#,
+        )
+        .unwrap();
+        let warnings = sanitize_all(&mut intent, &facets);
+        assert_eq!(intent.groups.len(), 1, "全空 group 应被剔除");
+        assert!(!warnings.is_empty());
+        // 全空 → degrade_parse 落第 3 层
+        let (i, _w) = degrade_parse(
+            r#"{"groups":[{"assetType":"all","concepts":[],"textTerms":[],"metadata":[]}],"exclusions":[],"sortBy":null,"sortDir":null}"#,
+            "海边日落",
+            &facets,
+        );
+        assert!(is_keyword_fallback(&i, "海边日落"));
     }
 }

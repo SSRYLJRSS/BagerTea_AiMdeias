@@ -104,6 +104,8 @@ export interface SuperSearchState {
   aiLoading: boolean;
   aiExplanation: string | null;
   warnings: string[];
+  /** W6-5：AI 解析三态（完全理解 / 部分理解 / 按关键词搜索） */
+  parseStatus: "full" | "partial" | "keyword" | null;
   /** AI 已解析标签（tagId→名称/分面），供 chips 可读展示 */
   resolvedTags: ResolvedTag[];
 
@@ -144,6 +146,7 @@ export const useSuperSearchStore = create<SuperSearchState>()(
   aiLoading: false,
   aiExplanation: null,
   warnings: [],
+  parseStatus: null,
   resolvedTags: [],
 
   setQuery: (patch) => {
@@ -186,8 +189,10 @@ export const useSuperSearchStore = create<SuperSearchState>()(
         ? {}
         : { aiInput: v, aiError: null, aiExplanation: null, warnings: [] },
     ),
-  setAiResult: (explanation, warnings) => set({ aiExplanation: explanation, warnings }),
-  clearAiResult: () => set({ aiExplanation: null, warnings: [], resolvedTags: [], aiError: null }),
+  setAiResult: (explanation, warnings) =>
+    set({ aiExplanation: explanation, warnings, parseStatus: warnings.length > 0 ? "partial" : "full" }),
+  clearAiResult: () =>
+    set({ aiExplanation: null, warnings: [], parseStatus: null, resolvedTags: [], aiError: null }),
 
   applyAiSearch: async (text, mode = "replace") => {
     const aiSeq = ++requestSeq;
@@ -220,6 +225,7 @@ export const useSuperSearchStore = create<SuperSearchState>()(
         expr: nextExpr,
         aiExplanation: result.explanation,
         warnings: result.warnings,
+        parseStatus: result.parseStatus,
         resolvedTags: nextResolvedTags,
         aiLoading: false,
       });

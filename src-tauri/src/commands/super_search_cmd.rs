@@ -55,23 +55,50 @@ pub async fn ai_parse_search_query(
             let dict = super_search_ai::collect_tag_dictionary(&conn, &facets)?;
             (s.ai, facets, dict)
         };
-        // 3. 锁外网络请求 + 解析 + 元数据容错降级 + 结构校验（不持 DB 锁）
-        let (mut intent, metadata_warnings): (SearchIntentV2, Vec<String>) =
+        // 3. 锁外网络请求 + 三层降级（strict → lenient → 关键词兜底；配置错误仍真报错）
+        let (mut intent, ai_warnings): (SearchIntentV2, Vec<String>) =
             super_search_ai::request_intent(&cfg, &text, &facets, &dict)?;
+        // W6-5：是否落在第 3 层（关键词兜底）→ 解释文案与前端三态据此
+        let keyword_mode = super_search_ai::is_keyword_fallback(&intent, &text);
         // 4. 本地确定性守卫（§9.3）：OR/assetType/concept 清洗/去重/confidence 钳制
         let mut warnings = super_search_ai::guard_intent(&text, &mut intent);
-        warnings.extend(metadata_warnings);
+        warnings.extend(ai_warnings);
         // 5. 短锁：标签解析 + QueryExpr 生成 + 校验（AI 结果唯一执行事实源）
         let (expr, resolved_tags, resolve_warnings) = {
             let conn = lock_db(&db)?;
             super_search_ai::build_expr_from_v2(&conn, &intent)?
         };
         warnings.extend(resolve_warnings);
-        // §9.7：AI 结果通过后本地再校验一次；失败视为解析错误，不应用部分条件
-        if let Some(e) = &expr {
-            crate::db::query_expr::validate_expr(e)?;
-        }
-        let explanation = super_search_ai::build_explanation(&intent);
+        // §9.7：AI 结果通过后本地再校验一次；失败视为解析错误，不应用部分条件。
+        // W6-2：此处失败同样降级为关键词搜索（永不红字报错）。
+        let (expr, resolved_tags) = match &expr {
+            Some(e) => match crate::db::query_expr::validate_expr(e) {
+                Ok(()) => (expr, resolved_tags),
+                Err(e) => {
+                    warnings.push(format!("解析结果不合规（{e}），已按关键词搜索。"));
+                    let fallback = super_search_ai::keyword_intent(&text);
+                    let (fe, fr, fw) = {
+                        let conn = lock_db(&db)?;
+                        super_search_ai::build_expr_from_v2(&conn, &fallback)?
+                    };
+                    warnings.extend(fw);
+                    (fe, fr)
+                }
+            },
+            None => (expr, resolved_tags),
+        };
+        let explanation = if keyword_mode {
+            "按关键词搜索".into()
+        } else {
+            super_search_ai::build_explanation(&intent)
+        };
+        let parse_status = if keyword_mode {
+            "keyword".to_string()
+        } else if warnings.is_empty() {
+            "full".to_string()
+        } else {
+            "partial".to_string()
+        };
         let sort_by = intent
             .sort_by
             .clone()
@@ -85,6 +112,7 @@ pub async fn ai_parse_search_query(
             explanation,
             warnings,
             resolved_tags,
+            parse_status,
         })
     })
     .await
