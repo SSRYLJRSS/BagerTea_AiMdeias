@@ -407,6 +407,79 @@ pub fn rescan_assets_geo_taken(
     rescan_assets_geo_taken_with(db, asset_ids, cancel, probe_geo_taken, on_progress)
 }
 
+/// W1-4：图片宽高回填（RAW 存量修复）。复用 rescan 骨架（短锁读/写 + 取消 + 进度）。
+/// 探测在锁外：image_dimensions 优先，RAW 扩展名失败走 rawler probe_dimensions。
+/// 探测不出宽高（损坏文件等）计 failed；写库失败计 failed；成功计 success。
+pub fn rescan_assets_dimensions(
+    db: &Arc<Mutex<Connection>>,
+    asset_ids: &[i64],
+    cancel: &AtomicBool,
+    mut on_progress: impl FnMut(&RefillProgress),
+) -> AppResult<RefillSummary> {
+    let lock = || {
+        db.lock()
+            .map_err(|_| crate::error::AppError::msg("数据库锁中毒"))
+    };
+    let mut summary = RefillSummary {
+        total: asset_ids.len() as i64,
+        ..Default::default()
+    };
+    for (i, &id) in asset_ids.iter().enumerate() {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        let asset = {
+            let conn = lock()?;
+            assets::get(&conn, id).ok()
+        };
+        let Some(asset) = asset else {
+            summary.skipped += 1;
+            emit_progress(&mut on_progress, i + 1, &summary, id);
+            continue;
+        };
+        // 已齐全（只补空语义）：不再解码
+        if asset.width.is_some() && asset.height.is_some() {
+            summary.skipped += 1;
+            emit_progress(&mut on_progress, i + 1, &summary, id);
+            continue;
+        }
+        let path = std::path::PathBuf::from(&asset.file_path);
+        // 锁外探测：先 image_dimensions，RAW 失败走 rawler
+        let dims = image::image_dimensions(&path)
+            .ok()
+            .map(|(w, h)| (w as i64, h as i64))
+            .or_else(|| {
+                let ext = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                if crate::utils::mime::is_raw_ext(&ext) {
+                    crate::services::raw_decode::probe_dimensions(&path)
+                        .map(|(w, h)| (w as i64, h as i64))
+                } else {
+                    None
+                }
+            });
+        let Some((w, h)) = dims else {
+            summary.failed += 1;
+            emit_progress(&mut on_progress, i + 1, &summary, id);
+            continue;
+        };
+        let ok = {
+            let conn = lock()?;
+            assets::set_dimensions(&conn, id, Some(w), Some(h)).is_ok()
+        };
+        if ok {
+            summary.success += 1;
+        } else {
+            summary.failed += 1;
+        }
+        emit_progress(&mut on_progress, i + 1, &summary, id);
+    }
+    Ok(summary)
+}
+
 /// FB2-08（§14.6/14.7）：存量色板回算。复用 rescan_assets_with 的骨架（短锁读/写 + 取消 + 进度）。
 /// 取材（FX-13）：图片 placeholder（256px 入库即生成）→ hd → 原图；视频只认 hd 封面。
 /// 计数三分（FX-10）：无可信取材/色板为空 → skipped（不是错误）；解码/写库失败 → failed；

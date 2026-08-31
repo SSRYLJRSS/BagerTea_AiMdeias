@@ -420,25 +420,23 @@ mod tests {
 
     #[test]
     fn create_seeds_ai_facet_config_entry() {
+        // V20 合表后：新建分面的「参与 AI」语义由 tag_facets.input_mode 承载（列默认
+        // ai_and_manual = 参与），settings JSON 侧 ai_facet_configs 已死（skip_serializing）。
         let c = conn();
-        let before = crate::db::settings::get_settings(&c)
-            .unwrap()
-            .ai_facet_configs
-            .len();
         create(&c, "my_facet", "我的分面", "", "multi", None, "all").unwrap();
-        // 新建分面必须同步补建 AI 配置条目：缺条目 = build_prompt_context 排除 + 设置页无法勾选
-        let s = crate::db::settings::get_settings(&c).unwrap();
-        let cfg = s
-            .ai_facet_configs
-            .iter()
-            .find(|cfg| cfg.facet_key == "my_facet")
-            .expect("新建分面应补建 AI 配置条目");
-        assert!(cfg.enabled_for_ai, "新建用户分面默认参与 AI");
-        // 幂等：不会给已有条目的分面重复补
-        assert_eq!(s.ai_facet_configs.len(), before + 1);
-        create(&c, "another_facet", "另一个", "", "multi", None, "all").unwrap();
-        let s2 = crate::db::settings::get_settings(&c).unwrap();
-        assert_eq!(s2.ai_facet_configs.len(), before + 2);
+        let mode: String = c
+            .query_row(
+                "SELECT input_mode FROM tag_facets WHERE key='my_facet'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(mode, "ai_and_manual", "新建用户分面默认参与 AI");
+        // JSON 侧不得残留（旧语义的 seed_ai_config 已被 V20 取代）
+        let raw: String = c
+            .query_row("SELECT value FROM settings WHERE key='app_settings'", [], |r| r.get(0))
+            .unwrap_or_default();
+        assert!(!raw.contains("my_facet"), "ai_facet_configs 已死，不得再写入");
     }
 
     #[test]

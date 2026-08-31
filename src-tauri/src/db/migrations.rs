@@ -1128,6 +1128,179 @@ CREATE INDEX IF NOT EXISTS idx_assets_longitude ON assets(longitude);
     Ok(())
 }
 
+/// V19：基础版能力补齐的数据列。全部幂等（add_column_if_missing + IF NOT EXISTS）。
+fn migrate_v19(conn: &Connection) -> AppResult<()> {
+    add_column_if_missing(conn, "assets", "favorite", "INTEGER NOT NULL DEFAULT 0")?;
+    add_column_if_missing(conn, "assets", "rating", "INTEGER NOT NULL DEFAULT 0")?;
+    // user_rotation：用户手动旋转（0/90/180/270）。
+    // 严禁复用 assets.rotation —— 那是 V12 的 ffprobe 媒体元数据语义。
+    add_column_if_missing(conn, "assets", "user_rotation", "INTEGER NOT NULL DEFAULT 0")?;
+    add_column_if_missing(conn, "assets", "phash", "INTEGER")?;
+    conn.execute_batch(
+        r#"
+CREATE INDEX IF NOT EXISTS idx_assets_favorite ON assets(favorite)
+  WHERE favorite = 1 AND deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_assets_rating   ON assets(rating)
+  WHERE rating > 0 AND deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_assets_phash    ON assets(phash)
+  WHERE phash IS NOT NULL;
+"#,
+    )?;
+    Ok(())
+}
+
+/// V20：分面单一事实源（低风险段）。settings.aiFacetConfigs 的语义搬进 tag_facets。
+/// 幂等：add_column_if_missing + UPDATE 回填（可重跑）。
+fn migrate_v20(conn: &Connection) -> AppResult<()> {
+    let now = chrono::Utc::now().timestamp_millis();
+
+    // ① 加列。SQLite 的 ALTER ADD COLUMN 不能带 CHECK（tag_facets 已有 3 个 CHECK，
+    //    只能建表时声明）→ input_mode 靠 Rust 层 validate 兜底。
+    add_column_if_missing(conn, "tag_facets", "input_mode",
+                          "TEXT NOT NULL DEFAULT 'ai_and_manual'")?;
+
+    // ② 回填。实测库：6 个 enabledForAi=true → ai_and_manual；color(false) → manual_only。
+    //    hint 并入 description（拼接不覆盖，instr 守卫防重跑重复拼）。
+    let s = crate::db::settings::get_settings(conn)?;
+    for cfg in &s.ai_facet_configs {
+        let mode = if cfg.enabled_for_ai { "ai_and_manual" } else { "manual_only" };
+        conn.execute(
+            "UPDATE tag_facets SET
+                input_mode = ?2,
+                description = CASE
+                    WHEN ?3 = ''                    THEN description
+                    WHEN trim(description) = ''     THEN ?3
+                    WHEN instr(description, ?3) > 0 THEN description
+                    ELSE description || char(10) || ?3
+                END,
+                display_name = COALESCE(NULLIF(trim(?4), ''), display_name),
+                updated_at = ?5
+              WHERE key = ?1",
+            rusqlite::params![cfg.facet_key, mode, cfg.hint.trim(),
+                    cfg.display_name.as_deref().unwrap_or(""), now])?;
+    }
+
+    // ③ 无 aiFacetConfigs 条目的分面（实测库：purpose / technical / custom 三个）
+    //    保持列默认 ai_and_manual。但 purpose / technical 天然是手工类 → 修正。
+    //    守卫：只改「还没有任何标签」的分面，不覆盖已在用的配置。
+    conn.execute(
+        "UPDATE tag_facets SET input_mode='manual_only', updated_at=?1
+          WHERE key IN ('purpose','technical') AND is_system=1
+            AND NOT EXISTS (SELECT 1 FROM tags WHERE facet_key = tag_facets.key)",
+        rusqlite::params![now])?;
+
+    // ④ 清空 JSON 侧（此后 Settings.ai_facet_configs 为 skip_serializing）
+    let mut s2 = crate::db::settings::get_settings(conn)?;
+    s2.ai_facet_configs.clear();
+    crate::db::settings::save_settings(conn, &s2)?;
+    Ok(())
+}
+
+/// V21：FTS 触发器加分面状态联动（高风险段）。独立版本号使其可单独延后。
+///
+/// 当前缺陷：触发器只看 `tags.status`，不看 `tag_facets.status`。停用分面后，
+/// 该分面下的标签仍能被全文搜到 —— 与「停用标签立即消失」语义不一致。
+///
+/// 两处改动：
+/// ① 聚合子查询加分面条件（trg_at_ai / trg_at_ad / trg_tags_au / trg_tag_alias_* 全部）：
+///    `AND EXISTS (SELECT 1 FROM tag_facets f WHERE f.key = t.facet_key AND f.status = 'active')`
+/// ② 新增分面状态触发器 trg_facet_status_au：分面停用/恢复时刷新其下标签关联的全部素材。
+///
+/// 铁律：①复制现有 SQL 再改（V8 语义逐字保留，只加 EXISTS 条件）②改完立即 rebuild
+/// ③先在内存库跑通全部 FTS 测试再上真库。
+fn rebuild_fts_triggers_with_facet_status(conn: &Connection) -> AppResult<()> {
+    // 聚合子查询模板：与 V8 完全一致的分母 + 分面 active 条件（新增）
+    const FACET_COND: &str = "AND EXISTS (SELECT 1 FROM tag_facets f WHERE f.key = t.facet_key AND f.status = 'active')";
+    let tag_terms = format!(
+        r#"SELECT t.name AS term, t.sort_order AS ord, t.id AS tid, 0 AS kind
+        FROM asset_tags at JOIN tags t ON t.id = at.tag_id
+       WHERE at.asset_id = {{ASSET_REF}} AND t.status = 'active' {FACET_COND}
+      UNION ALL
+      SELECT ta.alias AS term, t.sort_order AS ord, t.id AS tid, 1 AS kind
+        FROM asset_tags at JOIN tags t ON t.id = at.tag_id
+        JOIN tag_aliases ta ON ta.tag_id = t.id AND ta.is_searchable = 1
+       WHERE at.asset_id = {{ASSET_REF}} AND t.status = 'active' {FACET_COND}
+      ORDER BY ord, tid, kind, term"#
+    );
+    let agg = |asset_ref: &str| -> String {
+        format!(
+            "SELECT cjk_bigram(COALESCE(group_concat(x.term, ' '), '')) FROM ({}) x",
+            tag_terms.replace("{ASSET_REF}", asset_ref)
+        )
+    };
+
+    conn.execute_batch(
+        r#"
+DROP TRIGGER IF EXISTS trg_at_ai;
+DROP TRIGGER IF EXISTS trg_at_ad;
+DROP TRIGGER IF EXISTS trg_tags_au;
+DROP TRIGGER IF EXISTS trg_tag_alias_ai;
+DROP TRIGGER IF EXISTS trg_tag_alias_au;
+DROP TRIGGER IF EXISTS trg_tag_alias_ad;
+DROP TRIGGER IF EXISTS trg_facet_status_au;
+"#,
+    )?;
+
+    // ① asset_tags INSERT/DELETE：按 new/old.asset_id 刷新
+    conn.execute_batch(&format!(
+        r#"CREATE TRIGGER trg_at_ai AFTER INSERT ON asset_tags BEGIN
+  UPDATE fts_content SET tag_names = ({agg_new}) WHERE asset_id = new.asset_id;
+END;
+CREATE TRIGGER trg_at_ad AFTER DELETE ON asset_tags BEGIN
+  UPDATE fts_content SET tag_names = ({agg_old}) WHERE asset_id = old.asset_id;
+END;"#,
+        agg_new = agg("new.asset_id"),
+        agg_old = agg("old.asset_id"),
+    ))?;
+
+    // ② tags 名字/状态变化：刷新该标签关联的全部素材
+    conn.execute_batch(&format!(
+        r#"CREATE TRIGGER trg_tags_au AFTER UPDATE OF name, status ON tags BEGIN
+  UPDATE fts_content SET tag_names = ({agg_fc})
+   WHERE asset_id IN (SELECT asset_id FROM asset_tags WHERE tag_id = new.id);
+END;"#,
+        agg_fc = agg("fts_content.asset_id"),
+    ))?;
+
+    // ③ 别名三触发器
+    conn.execute_batch(&format!(
+        r#"CREATE TRIGGER trg_tag_alias_ai AFTER INSERT ON tag_aliases BEGIN
+  UPDATE fts_content SET tag_names = ({agg_fc})
+   WHERE asset_id IN (SELECT asset_id FROM asset_tags WHERE tag_id = new.tag_id);
+END;
+CREATE TRIGGER trg_tag_alias_au AFTER UPDATE ON tag_aliases BEGIN
+  UPDATE fts_content SET tag_names = ({agg_fc})
+   WHERE asset_id IN (SELECT asset_id FROM asset_tags WHERE tag_id IN (old.tag_id, new.tag_id));
+END;
+CREATE TRIGGER trg_tag_alias_ad AFTER DELETE ON tag_aliases BEGIN
+  UPDATE fts_content SET tag_names = ({agg_fc})
+   WHERE asset_id IN (SELECT asset_id FROM asset_tags WHERE tag_id = old.tag_id);
+END;"#,
+        agg_fc = agg("fts_content.asset_id"),
+    ))?;
+
+    // ④ 新增：分面状态变化 → 刷新其下标签关联的全部素材
+    conn.execute_batch(&format!(
+        r#"CREATE TRIGGER trg_facet_status_au AFTER UPDATE OF status ON tag_facets BEGIN
+  UPDATE fts_content SET tag_names = ({agg_fc})
+   WHERE asset_id IN (
+     SELECT at.asset_id FROM asset_tags at JOIN tags t ON t.id = at.tag_id
+      WHERE t.facet_key = new.key
+   );
+END;"#,
+        agg_fc = agg("fts_content.asset_id"),
+    ))?;
+
+    Ok(())
+}
+
+/// V21 入口：重建触发器 + 全量 rebuild（FTS 与内容表对齐）。
+fn migrate_v21(conn: &Connection) -> AppResult<()> {
+    rebuild_fts_triggers_with_facet_status(conn)?;
+    conn.execute_batch("INSERT INTO assets_fts(assets_fts) VALUES('rebuild');")?;
+    Ok(())
+}
+
 pub fn migrate(conn: &Connection) -> AppResult<()> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     if version < 1 {
@@ -1217,6 +1390,20 @@ pub fn migrate(conn: &Connection) -> AppResult<()> {
         // GPS 定位属性：latitude/longitude 列 + 索引（只增列，不回填；回填走 media_refill）
         migrate_v18(conn)?;
         conn.pragma_update(None, "user_version", 18)?;
+    }
+    if version < 19 {
+        migrate_v19(conn)?;
+        conn.pragma_update(None, "user_version", 19)?;
+    }
+    if version < 20 {
+        // V20：分面合表（低风险段）。V21 FTS 触发器独立版本号，失败可单独延后。
+        migrate_v20(conn)?;
+        conn.pragma_update(None, "user_version", 20)?;
+    }
+    if version < 21 {
+        // V21 = FTS 触发器（高风险）。独立版本号使其可单独延后。
+        migrate_v21(conn)?;
+        conn.pragma_update(None, "user_version", 21)?;
     }
     Ok(())
 }
@@ -1680,7 +1867,7 @@ mod tests {
         let v: i64 = c
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 18, "全新库应迁移到 V18");
+        assert!(v >= 18, "全新库应至少迁移到 V18（实际 {v}）");
 
         assert!(has_column(&c, "assets", "latitude").unwrap(), "latitude 列应存在");
         assert!(has_column(&c, "assets", "longitude").unwrap(), "longitude 列应存在");
@@ -1770,4 +1957,95 @@ mod tests {
             .unwrap();
         assert_eq!(leftover, 0, "事务失败后不得残留半截建表结果");
     }
+
+    /// W1-1（V19）：四列 + 三索引幂等；新列有默认值不破坏旧行。
+    #[test]
+    fn v19_adds_columns_idempotent() {
+        let c = crate::db::init_memory().unwrap();
+        let v: i64 = c
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert!(v >= 19);
+        // 幂等：重复执行不报错、不重复建列
+        migrate_v19(&c).unwrap();
+        migrate_v19(&c).unwrap();
+        let cols: Vec<String> = c
+            .prepare("SELECT name FROM pragma_table_info('assets')")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        for col in ["favorite", "rating", "user_rotation", "phash"] {
+            assert!(cols.iter().any(|c| c == col), "缺少列 {col}");
+        }
+        // 索引存在
+        let idx: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name IN
+                 ('idx_assets_favorite','idx_assets_rating','idx_assets_phash')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(idx, 3);
+    }
+
+    /// W1-2（V20）：分面合表 —— input_mode 回填按 enabledForAi 映射、
+    /// hint 并入 description、purpose/technical 0 标签修正为 manual_only、JSON 侧清空。幂等。
+    #[test]
+    fn v20_facet_merge_idempotent_and_maps_correctly() {
+        let c = crate::db::init_memory().unwrap();
+        // init_memory 已跑到最新版本（V20 已应用）。构造旧 JSON 侧再手动重跑 migrate_v20 验证幂等。
+        // 注意 get_settings 会自动充实默认 ai_facet_configs（normalize_ai_facet_defaults），
+        // save_settings 已 skip_serializing 该字段 → 直接写原始 JSON 才能模拟老库。
+        // color 的 description 在建库链路（ensure_color_facet_config）已含默认 hint，
+        // 重置为短版以验证 migrate_v20 的 hint 拼接逻辑。
+        c.execute(
+            "UPDATE tag_facets SET description = '主色、色调与色彩关系' WHERE key = 'color'",
+            [],
+        )
+        .unwrap();
+        let old_json = r#"{"aiFacetConfigs":[{"facetKey":"color","hint":"主色由算法呈现","enabledForAi":false}]}"#;
+        c.execute(
+            "INSERT INTO settings (key, value) VALUES ('app_settings', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [old_json],
+        )
+        .unwrap();
+        migrate_v20(&c).unwrap();
+        migrate_v20(&c).unwrap(); // 幂等：description 不重复拼接
+        // color → manual_only；description 含 hint
+        let (mode, desc): (String, String) = c
+            .query_row(
+                "SELECT input_mode, description FROM tag_facets WHERE key='color'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(mode, "manual_only");
+        assert!(desc.contains("主色由算法呈现"), "hint 应并入 description: {desc}");
+        let count = desc.matches("主色由算法呈现").count();
+        assert_eq!(count, 1, "重跑不得重复拼接 hint");
+        // purpose/technical（系统 + 0 标签）→ manual_only；custom 保持列默认 ai_and_manual
+        for key in ["purpose", "technical"] {
+            let m: String = c
+                .query_row("SELECT input_mode FROM tag_facets WHERE key=?1", [key], |r| r.get(0))
+                .unwrap();
+            assert_eq!(m, "manual_only", "{key} 应为 manual_only");
+        }
+        let custom: String = c
+            .query_row("SELECT input_mode FROM tag_facets WHERE key='custom'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(custom, "ai_and_manual", "custom 是 AI 未知词落脚点，保持默认");
+        // JSON 侧已清空（直接读原始 JSON：get_settings 会自动重建默认配置，不适合断言持久化状态）
+        let raw: String = c
+            .query_row("SELECT value FROM settings WHERE key='app_settings'", [], |r| r.get(0))
+            .unwrap();
+        assert!(
+            !raw.contains("aiFacetConfigs") || raw.contains(r#""aiFacetConfigs":[]"#),
+            "aiFacetConfigs 应回填后清空，实际 JSON: {raw}"
+        );
+    }
+
 }

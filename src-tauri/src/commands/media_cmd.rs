@@ -191,6 +191,61 @@ pub async fn rescan_asset_geo_taken(
     .map_err(|e| AppError::msg(format!("定位回填线程异常: {e}")))?
 }
 
+/// W1-4：图片宽高存量回填（RAW 分辨率修复，scope = all | missing | ids）。
+/// 独立命令：rawler decode_file 读整个文件，205 张 45MP 可能数分钟，必须可取消 + 有进度。
+#[tauri::command]
+pub async fn rescan_image_dimensions(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    ids: Option<Vec<i64>>,
+    scope: Option<String>,
+) -> AppResult<RescanResult> {
+    let scope = scope.unwrap_or_else(|| "missing".to_string());
+    if scope != "all" && scope != "missing" && scope != "ids" {
+        return Err(AppError::msg("scope 只允许 all | missing | ids"));
+    }
+    if scope == "ids" && ids.as_ref().map_or(true, |v| v.is_empty()) {
+        return Err(AppError::msg("未选择任何素材"));
+    }
+    let db = Arc::clone(&state.db);
+    let cancel = Arc::clone(&state.media_refill_cancel);
+    // 与其他回填互斥：先抢闸再重置取消标志（FX-12）。
+    let _gate = begin_refill(&state.refill_running, &cancel)?;
+
+    tauri::async_runtime::spawn_blocking(move || -> AppResult<RescanResult> {
+        let _gate = _gate;
+        let resolved: Vec<i64> = {
+            let conn = db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
+            match scope.as_str() {
+                "ids" => ids.unwrap_or_default(),
+                "missing" => assets::list_ids_needing_dimensions(&conn)?,
+                _ => {
+                    // all：全部未软删的图片
+                    let mut stmt = conn
+                        .prepare(
+                            "SELECT id FROM assets
+                              WHERE deleted_at IS NULL AND mime_type LIKE 'image/%'",
+                        )
+                        .map_err(crate::error::AppError::from)?;
+                    let rows = stmt.query_map([], |r| r.get(0))?;
+                    rows.filter_map(|r| r.ok()).collect()
+                }
+            }
+        };
+        let summary = media_refill::rescan_assets_dimensions(&db, &resolved, &cancel, |p| {
+            let _ = app.emit("media_refill://progress", p);
+        })?;
+        Ok(RescanResult {
+            total: summary.total,
+            success: summary.success,
+            failed: summary.failed,
+            skipped: summary.skipped,
+        })
+    })
+    .await
+    .map_err(|e| AppError::msg(format!("宽高回填线程异常: {e}")))?
+}
+
 /// FB4-03（§5.3）：色板状态查询 —— totalAssets / eligible / ready / missing / unavailable。
 /// 供设置页解释「为什么当前没有色条」并决定「生成缺失色条」按钮状态。
 #[tauri::command]

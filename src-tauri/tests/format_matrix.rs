@@ -157,3 +157,40 @@ fn truncated_jpeg_graceful() {
     let _ = imaging::decode_thumb(&cut, 1024);
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// W1-4：RAW 宽高探测 —— image crate 不支持 RW2（image_dimensions 必败），
+/// probe_dimensions 走 rawler 应能拿到宽高。用真机样本（f:/all 的松下 S5II RAW）；
+/// 样本不存在时跳过（CI/其它机器无样本），避免误报。
+#[test]
+fn raw_probe_dimensions_reads_rw2() {
+    use bagertea_ai_media_v2_lib::services::raw_decode;
+    let sample = std::path::Path::new("f:/all/_1091396.RW2");
+    if !sample.exists() {
+        eprintln!("跳过：真机 RW2 样本不存在（{sample:?}）");
+        return;
+    }
+    // 前置确认：image crate 确实不支持 RW2（这是 W1-4 存在的前提）
+    assert!(
+        image::image_dimensions(sample).is_err(),
+        "前提失效：image crate 已支持 RW2？请复核 probe_dimensions 是否还需要"
+    );
+    let dims = raw_decode::probe_dimensions(sample)
+        .expect("rawler 应能读出 RW2 宽高");
+    // S5II 最大 6000x4000（45MP 全画幅），宽高都应为正且在合理范围
+    assert!(dims.0 > 1000 && dims.0 <= 12000, "宽度异常: {dims:?}");
+    assert!(dims.1 > 1000 && dims.1 <= 12000, "高度异常: {dims:?}");
+}
+
+/// W1-4：probe_dimensions 对垃圾文件/不存在文件返回 None（不 panic）。
+#[test]
+fn raw_probe_dimensions_guards() {
+    use bagertea_ai_media_v2_lib::services::raw_decode;
+    let dir = fixture_dir("probe-dims");
+    let garbage = dir.join("g.rw2");
+    std::fs::write(&garbage, vec![0u8; 4096]).unwrap();
+    assert!(raw_decode::probe_dimensions(&garbage).is_none());
+    assert!(
+        raw_decode::probe_dimensions(std::path::Path::new("不存在.rw2")).is_none()
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}

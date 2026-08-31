@@ -158,6 +158,9 @@ fn like_predicate(q: &str, scope: SearchScope) -> SearchPredicate {
                   JOIN tags t ON t.id = at.tag_id
                   LEFT JOIN tag_aliases ta ON ta.tag_id = t.id AND ta.is_searchable = 1
                 WHERE at.asset_id = a.id
+                  AND t.status = 'active'
+                  AND EXISTS (SELECT 1 FROM tag_facets f
+                              WHERE f.key = t.facet_key AND f.status = 'active')
                   AND (t.name LIKE ? ESCAPE '\\' OR ta.alias LIKE ? ESCAPE '\\')
             ))",
             like(&["file_name", "content_description"])

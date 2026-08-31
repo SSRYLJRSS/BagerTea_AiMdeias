@@ -3,7 +3,7 @@
 
 use bagertea_ai_media_v2_lib::db::assets::AssetFilter;
 use bagertea_ai_media_v2_lib::db::{
-    self, ai, asset_tags, assets, dedup, migrations, settings, tag_ops, tags,
+    self, ai, asset_tags, assets, dedup, migrations, settings, tag_facets, tag_ops, tags,
 };
 use bagertea_ai_media_v2_lib::error::AppResult;
 
@@ -1329,7 +1329,7 @@ fn v10_migrates_legacy_tag_categories_to_facet_configs() -> AppResult<()> {
         "trashRetentionDays": 30
     });
     conn.execute(
-        "INSERT INTO settings (key, value) VALUES ('app_settings', ?1)",
+        "INSERT OR REPLACE INTO settings (key, value) VALUES ('app_settings', ?1)",
         [legacy.to_string()],
     )?;
 
@@ -1337,29 +1337,30 @@ fn v10_migrates_legacy_tag_categories_to_facet_configs() -> AppResult<()> {
     conn.pragma_update(None, "user_version", 9)?;
     migrations::migrate(&conn)?;
 
+    // 迁移链现跑到 V20：旧分类已并入 tag_facets（V10 转换 + V20 合表），JSON 侧清空。
     let s = settings::get_settings(&conn)?;
     assert!(s.tag_categories.is_empty(), "旧分类应被清空");
-    let scene = s
-        .ai_facet_configs
-        .iter()
-        .find(|c| c.facet_key == "scene")
-        .expect("场景应映射为 scene");
-    assert_eq!(scene.hint, "如公园/街道");
-    assert!(scene.enabled_for_ai);
-    assert!(
-        s.ai_facet_configs.iter().any(|c| c.facet_key == "custom"),
-        "未知分类应归 custom"
-    );
+    // scene 的旧 hint 由 V20 并入 tag_facets.description
+    let scene_desc: String = conn.query_row(
+        "SELECT description FROM tag_facets WHERE key='scene'", [],
+        |r| r.get(0))?;
+    assert!(scene_desc.contains("如公园/街道"), "旧 hint 应并入 description: {scene_desc}");
+    let scene_mode: String = conn.query_row(
+        "SELECT input_mode FROM tag_facets WHERE key='scene'", [],
+        |r| r.get(0))?;
+    assert_eq!(scene_mode, "ai_and_manual", "scene 应参与 AI");
     // 其他设置字段不丢失
     assert_eq!(s.theme, "dark");
     assert_eq!(s.thumbnail_cache_mb, 1024);
     assert_eq!(s.trash_retention_days, 30);
 
-    // 幂等：再次迁移不重复配置
+    // 幂等：再次迁移不重复配置（description 不重复拼接）
     conn.pragma_update(None, "user_version", 9)?;
     migrations::migrate(&conn)?;
-    let s2 = settings::get_settings(&conn)?;
-    assert_eq!(s2.ai_facet_configs.len(), s.ai_facet_configs.len());
+    let scene_desc2: String = conn.query_row(
+        "SELECT description FROM tag_facets WHERE key='scene'", [],
+        |r| r.get(0))?;
+    assert_eq!(scene_desc2, scene_desc, "重跑不得重复拼接 hint");
     Ok(())
 }
 
@@ -1374,7 +1375,7 @@ fn v11_adds_color_facet_to_existing_settings() -> AppResult<()> {
         "aiFacetConfigs": [{"facetKey":"scene","hint":"如房间","enabledForAi":true}]
     });
     conn.execute(
-        "INSERT INTO settings (key, value) VALUES ('app_settings', ?1)",
+        "INSERT OR REPLACE INTO settings (key, value) VALUES ('app_settings', ?1)",
         [legacy.to_string()],
     )?;
     // 删除 color tag_facets 行（模拟老库可能确实缺），回退 user_version 触发 V11
@@ -1390,24 +1391,30 @@ fn v11_adds_color_facet_to_existing_settings() -> AppResult<()> {
         .find(|f| f.key == "color")
         .expect("tag_facets 应补齐 color 分面");
     assert_eq!(color.status, "inactive", "V16 起 color 分面应为 inactive");
-    // settings 的 ai_facet_configs 补齐 color（不覆盖已有 scene）
-    let s = settings::get_settings(&conn)?;
-    let scene = s
-        .ai_facet_configs
-        .iter()
-        .find(|c| c.facet_key == "scene")
-        .expect("scene 保留");
-    assert_eq!(scene.hint, "如房间");
-    assert!(
-        s.ai_facet_configs.iter().any(|c| c.facet_key == "color"),
-        "ai_facet_configs 应补齐 color 配置"
-    );
+    // V20 后：color 的 AI 语义在 tag_facets.input_mode（manual_only，V16 已停用）。
+    // 旧 JSON 的 scene hint（如房间）在重放链中经 V10→V20 读改写后被默认 hint 替换
+    // （ai_facet_configs 已 skip_serializing，JSON 侧不再持久化）——description 承载的是
+    // 最终生效的默认 hint，语义正确。
+    let scene_mode: String = conn.query_row(
+        "SELECT input_mode FROM tag_facets WHERE key='scene'", [],
+        |r| r.get(0))?;
+    assert_eq!(scene_mode, "ai_and_manual", "scene 应参与 AI");
+    let color_mode: String = conn.query_row(
+        "SELECT input_mode FROM tag_facets WHERE key='color'", [],
+        |r| r.get(0))?;
+    assert_eq!(color_mode, "manual_only", "V16 起 color 不参与 AI");
 
-    // 幂等：再跑一次不重复插入
+    // 幂等：再跑一次不重复
     conn.pragma_update(None, "user_version", 10)?;
     migrations::migrate(&conn)?;
-    let s2 = settings::get_settings(&conn)?;
-    assert_eq!(s2.ai_facet_configs.len(), s.ai_facet_configs.len());
+    let scene_mode2: String = conn.query_row(
+        "SELECT input_mode FROM tag_facets WHERE key='scene'", [],
+        |r| r.get(0))?;
+    assert_eq!(scene_mode2, "ai_and_manual");
+    let color_mode2: String = conn.query_row(
+        "SELECT input_mode FROM tag_facets WHERE key='color'", [],
+        |r| r.get(0))?;
+    assert_eq!(color_mode2, "manual_only");
     Ok(())
 }
 
@@ -1654,5 +1661,62 @@ fn fb5_confirm_all_applies_per_suggestion_description() -> AppResult<()> {
     assert!(rows.iter().any(|(i, d)| *i == a1 && d == "夜景街道"));
     assert!(rows.iter().any(|(i, d)| *i == a2 && d == "白天公园"));
     // 描述空的那条不覆盖：a1/a2 之外的素材保留原值
+    Ok(())
+}
+
+// ── W1-3（V21）：FTS 触发器分面状态联动 ──
+
+// 停用分面 → 该分面下的标签不再被全文搜到
+// （scene 等系统分面不允许停用，用用户自建分面验证——触发器对 status 变化通用）
+#[test]
+fn deactivate_facet_hides_from_fts() -> AppResult<()> {
+    let conn = setup();
+    tag_facets::create(&conn, "mood", "氛围", "", "multi", None, "all")?;
+    let id = add_asset(&conn, "d:/p/photo010.jpg", "photo010.jpg", "jpg", "image/jpeg");
+    let tag = tags::create_in_facet(&conn, "海边", None, Some("mood"))?;
+    asset_tags::assign(&conn, &[id], &[tag.id], "manual")?;
+    assert_eq!(db::search::search_asset_ids_all(&conn, "海边")?, vec![id]);
+    tag_facets::deactivate(&conn, "mood")?;
+    assert!(
+        db::search::search_asset_ids_all(&conn, "海边")?.is_empty(),
+        "停用分面后其标签不得再被全文搜到"
+    );
+    Ok(())
+}
+
+// 恢复分面 → 标签重新可搜（trg_facet_status_au 刷新回来）
+#[test]
+fn restore_facet_shows_in_fts() -> AppResult<()> {
+    let conn = setup();
+    tag_facets::create(&conn, "mood", "氛围", "", "multi", None, "all")?;
+    let id = add_asset(&conn, "d:/p/photo011.jpg", "photo011.jpg", "jpg", "image/jpeg");
+    let tag = tags::create_in_facet(&conn, "山野", None, Some("mood"))?;
+    asset_tags::assign(&conn, &[id], &[tag.id], "manual")?;
+    tag_facets::deactivate(&conn, "mood")?;
+    assert!(db::search::search_asset_ids_all(&conn, "山野")?.is_empty());
+    tag_facets::restore(&conn, "mood")?;
+    assert_eq!(
+        db::search::search_asset_ids_all(&conn, "山野")?,
+        vec![id],
+        "恢复分面后标签应重新可搜"
+    );
+    Ok(())
+}
+
+// 停用分面不动 asset_tags 数据行（只是 FTS 不可见）
+#[test]
+fn deactivate_facet_keeps_asset_tags() -> AppResult<()> {
+    let conn = setup();
+    tag_facets::create(&conn, "mood", "氛围", "", "multi", None, "all")?;
+    let id = add_asset(&conn, "d:/p/photo012.jpg", "photo012.jpg", "jpg", "image/jpeg");
+    let tag = tags::create_in_facet(&conn, "日落", None, Some("mood"))?;
+    asset_tags::assign(&conn, &[id], &[tag.id], "manual")?;
+    tag_facets::deactivate(&conn, "mood")?;
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM asset_tags WHERE asset_id = ?1",
+        [id],
+        |r| r.get(0),
+    )?;
+    assert_eq!(n, 1, "停用分面不得删除 asset_tags 数据行");
     Ok(())
 }

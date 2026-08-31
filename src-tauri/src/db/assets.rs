@@ -75,6 +75,19 @@ pub struct Asset {
     pub latitude: Option<f64>,
     #[serde(default)]
     pub longitude: Option<f64>,
+    // V19：收藏/评级/手动旋转/phash（② T13）。追加在末尾（索引 49–52），严禁插中间。
+    /// 收藏标记（0/1）
+    #[serde(default)]
+    pub favorite: i64,
+    /// 评级（0–5；0 = 未评级，排序时排在有评级之后）
+    #[serde(default)]
+    pub rating: i64,
+    /// 用户手动旋转（0/90/180/270）。严禁复用 rotation（那是 V12 ffprobe 媒体元数据语义）
+    #[serde(default)]
+    pub user_rotation: i64,
+    /// 感知哈希 dHash 64 位（W5d 相似去重；未计算为 NULL）
+    #[serde(default)]
+    pub phash: Option<i64>,
 }
 
 /// FB2-08：色板单段（与前端 PaletteSegmentDto 同形）。
@@ -261,7 +274,7 @@ pub(crate) const COLUMNS: &str =
                        audio_sample_rate, audio_channels, audio_layout, rotation, \
                        media_metadata_json, metadata_version, metadata_scanned_at, metadata_error, \
                        palette_json, dominant_hue, dominant_sat, dominant_lum, \
-                       content_description, latitude, longitude";
+                       content_description, latitude, longitude,                        favorite, rating, user_rotation, phash";
 
 pub(crate) fn from_row(row: &Row) -> rusqlite::Result<Asset> {
     Ok(Asset {
@@ -315,6 +328,10 @@ pub(crate) fn from_row(row: &Row) -> rusqlite::Result<Asset> {
         content_description: row.get(46)?,
         latitude: row.get(47)?,
         longitude: row.get(48)?,
+        favorite: row.get(49)?,
+        rating: row.get(50)?,
+        user_rotation: row.get(51)?,
+        phash: row.get(52)?,
         tags: Vec::new(),
     })
 }
@@ -1136,6 +1153,29 @@ pub fn list_geo_taken_all_ids(conn: &Connection) -> AppResult<Vec<i64>> {
 
 /// 回填 GPS 定位与拍摄时间（仅补空，不覆盖已有值；老素材无定位保持 NULL）。
 /// 注意 COALESCE 参数顺序：已有列值在前，新值在后 —— COALESCE(旧, 新) 才是「只补空」。
+/// W1-4：图片宽高缺失候选（RAW 无法被 image_dimensions 解码的历史存量）。
+pub fn list_ids_needing_dimensions(conn: &Connection) -> AppResult<Vec<i64>> {
+    let mut stmt = conn.prepare(
+        "SELECT id FROM assets
+          WHERE deleted_at IS NULL
+            AND mime_type LIKE 'image/%'
+            AND (width IS NULL OR height IS NULL)",
+    )?;
+    let rows = stmt.query_map([], |r| r.get(0))?;
+    Ok(rows.filter_map(|r| r.ok()).collect())
+}
+
+/// W1-4：写回宽高（只补空，不覆盖已有值）。
+pub fn set_dimensions(conn: &Connection, id: i64, width: Option<i64>, height: Option<i64>) -> AppResult<()> {
+    conn.execute(
+        "UPDATE assets SET width = COALESCE(width, ?1),
+            height = COALESCE(height, ?2)
+          WHERE id = ?3",
+        rusqlite::params![width, height, id],
+    )?;
+    Ok(())
+}
+
 pub fn set_geo_taken(
     conn: &Connection,
     id: i64,
@@ -1626,5 +1666,29 @@ mod tests {
         };
         assert_eq!(loc_count("yes"), 1);
         assert_eq!(loc_count("no"), 3);
+    }
+
+    /// W1-1（V19）：新列经 INSERT/SELECT 往返不丢值（COLUMNS 位置映射 + from_row 索引 49–52 对齐）。
+    #[test]
+    fn asset_roundtrip_includes_new_columns() {
+        let c = mem();
+        let id = ins(&c, "/a.jpg", "image/jpeg");
+        c.execute(
+            "UPDATE assets SET favorite=1, rating=5, user_rotation=90, phash=12345678901234567 WHERE id=?1",
+            [id],
+        )
+        .unwrap();
+        let a = get(&c, id).unwrap();
+        assert_eq!(a.favorite, 1);
+        assert_eq!(a.rating, 5);
+        assert_eq!(a.user_rotation, 90);
+        assert_eq!(a.phash, Some(12345678901234567));
+        // 默认值：新插入行四列均为默认
+        let id2 = ins(&c, "/b.jpg", "image/jpeg");
+        let b = get(&c, id2).unwrap();
+        assert_eq!(b.favorite, 0);
+        assert_eq!(b.rating, 0);
+        assert_eq!(b.user_rotation, 0);
+        assert_eq!(b.phash, None);
     }
 }

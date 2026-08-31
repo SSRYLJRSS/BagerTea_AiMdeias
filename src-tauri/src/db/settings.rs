@@ -421,7 +421,9 @@ pub struct Settings {
     #[serde(default, skip_serializing)]
     pub tag_categories: Vec<TagCategory>,
     /// AI 分面配置（P1B 唯一事实源，facet_key 稳定不可修改）
-    #[serde(default)]
+    /// V20 后语义已搬进 tag_facets.input_mode：本字段只作旧 JSON 反序列化输入
+    /// （migrate_v20 回填读它），此后不再序列化。
+    #[serde(default, skip_serializing)]
     pub ai_facet_configs: Vec<AiFacetConfig>,
     /// 总库位置（R-32）；空 = 原位索引模式
     #[serde(default)]

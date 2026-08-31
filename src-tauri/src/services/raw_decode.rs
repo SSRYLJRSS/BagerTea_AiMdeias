@@ -24,6 +24,16 @@ const XYZ_TO_SRGB: [[f32; 3]; 3] = [
     [0.0557, -0.2040, 1.0570],
 ];
 
+/// W1-4：只读 RAW 宽高（不 binning、不做色彩管线）。
+/// image::image_dimensions 不支持 RAW（image crate 无 RAW 解码器）→ 205 张 RW2 宽高全 NULL。
+/// 这里只取 rawler::decode_file 的 width/height 就返回。
+/// 注意：decode_file 会读整个文件（非只读头），45MP 级文件每次调用约百毫秒~秒级，
+/// 适合入库单次与手动回填，不适合批量热路径。
+pub fn probe_dimensions(src: &std::path::Path) -> Option<(u32, u32)> {
+    let raw = rawler::decode_file(src).ok()?;
+    Some((raw.width as u32, raw.height as u32))
+}
+
 /// RAW 真解码为 DynamicImage（半分辨率 binning 结果，未缩放到目标边长）
 /// 调用方负责再 thumbnail()；失败返回 None 由策略链降级
 pub fn decode_raw(src: &std::path::Path) -> Option<DynamicImage> {

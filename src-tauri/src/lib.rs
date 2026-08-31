@@ -264,6 +264,8 @@ pub fn run() {
             commands::rescan_asset_palette,
             // V18：GPS 定位 + 视频拍摄时间存量回填（独立的 rescan_*）
             commands::rescan_asset_geo_taken,
+            // W1-4：图片宽高存量回填（RAW 分辨率修复）
+            commands::rescan_image_dimensions,
             // FB4-03：色板状态查询 + 定向补丁（设置页状态行 / 局部同步）
             commands::get_palette_status,
             commands::get_asset_palette_patches,
