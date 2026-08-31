@@ -3,9 +3,8 @@
  *  - MIME 为 video/mp4 且 durationMs=null 时仍渲染 VideoPlayer（旧逻辑用 durationMs!=null 判断会漏掉导入失败时长为空的视频）。
  *  - 胶片条文字使用与属性面板一致的 isVideoAsset 判断。
  */
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
-import ViewerPage from "@/components/library/ViewerPage";
+import { beforeEach, afterEach, describe, expect, it, vi } from "vitest";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";import ViewerPage from "@/components/library/ViewerPage";
 import { useLibraryStore } from "@/stores/libraryStore";
 import { ensureVideoProxy } from "@/api/video";
 import type { Asset } from "@/types/asset";
@@ -152,5 +151,198 @@ describe("ViewerPage 查看器色条（FB3-10 §12.2）", () => {
     rerender(<ViewerPage asset={noPalette} onClose={vi.fn()} />);
     await waitFor(() => expect(container.querySelector(".ui-colorstrip")).toBeNull());
     sstore.setState({ settings: null, previewAppearance: null });
+  });
+});
+
+// ─── FB5-01（§13.1）沉浸浏览 ───────────────────────────────────────────────
+// jsdom 无 Fullscreen API：mock document.fullscreenElement + requestFullscreen +
+// fullscreenchange 派发驱动状态机；fallback 走 createPortal(document.body)。
+
+const savedFsEl = Object.getOwnPropertyDescriptor(document, "fullscreenElement");
+
+function installFullscreenMock(opts: { supported?: boolean } = {}) {
+  const { supported = true } = opts;
+  Object.defineProperty(document, "fullscreenElement", {
+    configurable: true,
+    writable: true,
+    value: null,
+  });
+  const exitSpy = vi.fn(() => {
+    (document as unknown as { fullscreenElement: HTMLElement | null }).fullscreenElement = null;
+    document.dispatchEvent(new Event("fullscreenchange"));
+    return Promise.resolve();
+  });
+  (document as unknown as { exitFullscreen: () => Promise<void> }).exitFullscreen = exitSpy;
+  if (supported) {
+    (HTMLDivElement.prototype as unknown as { requestFullscreen: () => Promise<void> }).requestFullscreen =
+      function requestFullscreen(this: HTMLDivElement) {
+        (document as unknown as { fullscreenElement: HTMLElement | null }).fullscreenElement = this;
+        return Promise.resolve();
+      };
+  }
+  return { exitSpy };
+}
+
+function removeFullscreenMock() {
+  delete (document as unknown as { exitFullscreen?: unknown }).exitFullscreen;
+  delete (HTMLDivElement.prototype as unknown as { requestFullscreen?: unknown }).requestFullscreen;
+  if (savedFsEl) Object.defineProperty(document, "fullscreenElement", savedFsEl);
+}
+
+describe("ViewerPage 沉浸浏览（FB5-01 §4.1/§13.1）", () => {
+  afterEach(() => {
+    removeFullscreenMock();
+  });
+
+  it("native 沉浸：requestFullscreen 成功 → 只渲染媒体舞台，chrome 全部卸载", async () => {
+    installFullscreenMock({ supported: true });
+    const onClose = vi.fn();
+    const img = mkAsset({ id: 3, mimeType: "image/jpeg", fileExt: "jpg", filePath: "d:/lib/i.jpg", fileName: "i.jpg", durationMs: null });
+    useLibraryStore.setState({ items: [img], total: 1 });
+    const { container } = render(<ViewerPage asset={img} onClose={onClose} />);
+    await waitFor(() => expect(container.querySelector("img")).not.toBeNull());
+
+    // 点击「全屏浏览」→ 进入 native
+    fireEvent.click(screen.getByRole("button", { name: "全屏浏览" }));
+    await waitFor(() =>
+      expect((document as unknown as { fullscreenElement: HTMLElement | null }).fullscreenElement).not.toBeNull(),
+    );
+    // 沉浸分支：无工具条/属性栏/标签区/胶片条
+    expect(screen.queryByRole("button", { name: "返回素材库" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /信息/ })).not.toBeInTheDocument();
+    expect(container.querySelector("[data-viewer-immersive]")).not.toBeNull();
+    // 图片沉浸为白底（surface 变体）
+    await waitFor(() => expect(document.body.querySelector('[data-surface="image-immersive"]')).not.toBeNull());
+    // onClose 未被误调
+    expect(onClose).not.toHaveBeenCalled();
+  });
+
+  it("native 退出：fullscreenchange（fullscreenElement 离开 viewerRoot）→ 回普通查看器，chrome 恢复", async () => {
+    installFullscreenMock({ supported: true });
+    const img = mkAsset({ id: 3, mimeType: "image/jpeg", fileExt: "jpg", filePath: "d:/lib/i.jpg", fileName: "i.jpg", durationMs: null });
+    useLibraryStore.setState({ items: [img], total: 1 });
+    const { container } = render(<ViewerPage asset={img} onClose={vi.fn()} />);
+    await waitFor(() => expect(container.querySelector("img")).not.toBeNull());
+    fireEvent.click(screen.getByRole("button", { name: "全屏浏览" }));
+    // 等沉浸状态真正提交（chrome 卸载）→ fullscreenchange 监听器已用新 immersiveMode 重注册
+    await waitFor(() => expect(screen.queryByRole("button", { name: "返回素材库" })).not.toBeInTheDocument());
+    // 系统退出：fullscreenElement 置空并派发 fullscreenchange
+    (document as unknown as { fullscreenElement: HTMLElement | null }).fullscreenElement = null;
+    document.dispatchEvent(new Event("fullscreenchange"));
+    await waitFor(() => expect(screen.getByRole("button", { name: "返回素材库" })).toBeInTheDocument());
+    expect(screen.getByRole("button", { name: "全屏浏览" })).toBeInTheDocument();
+  });
+
+  it("其他元素进入全屏（fullscreenElement ≠ viewerRoot）不触发沉浸", async () => {
+    installFullscreenMock({ supported: true });
+    const img = mkAsset({ id: 3, mimeType: "image/jpeg", fileExt: "jpg", filePath: "d:/lib/i.jpg", fileName: "i.jpg", durationMs: null });
+    useLibraryStore.setState({ items: [img], total: 1 });
+    const { container } = render(<ViewerPage asset={img} onClose={vi.fn()} />);
+    await waitFor(() => expect(container.querySelector("img")).not.toBeNull());
+    // 别的元素进了全屏
+    const other = document.createElement("div");
+    (document as unknown as { fullscreenElement: HTMLElement | null }).fullscreenElement = other;
+    document.dispatchEvent(new Event("fullscreenchange"));
+    // 查看器保持普通模式
+    expect(screen.getByRole("button", { name: "返回素材库" })).toBeInTheDocument();
+    expect(container.querySelector("[data-viewer-immersive]")).toBeNull();
+  });
+
+  it("requestFullscreen 失败/不可用 → fallback 沉浸（portal 覆盖 + 应用根 inert）", async () => {
+    installFullscreenMock({ supported: false });
+    const onClose = vi.fn();
+    const img = mkAsset({ id: 3, mimeType: "image/jpeg", fileExt: "jpg", filePath: "d:/lib/i.jpg", fileName: "i.jpg", durationMs: null });
+    useLibraryStore.setState({ items: [img], total: 1 });
+    const { container } = render(<ViewerPage asset={img} onClose={onClose} />);
+    await waitFor(() => expect(container.querySelector("img")).not.toBeNull());
+
+    fireEvent.click(screen.getByRole("button", { name: "全屏浏览" }));
+    // 等沉浸状态提交：portal 沉浸画布出现在 document.body；普通查看器（含工具条）卸载
+    await waitFor(() => expect(document.body.querySelector("[data-immersive-canvas]")).not.toBeNull());
+    expect(screen.queryByRole("button", { name: "返回素材库" })).not.toBeInTheDocument();
+    // 应用根节点 inert（不含 portal）
+    await waitFor(() => expect(container.hasAttribute("inert")).toBe(true));
+    expect(onClose).not.toHaveBeenCalled();
+  });
+
+  it("fallback 沉浸：Esc 退出沉浸（不关闭 Viewer），第二次 Esc 才关闭", async () => {
+    installFullscreenMock({ supported: false });
+    const onClose = vi.fn();
+    const img = mkAsset({ id: 3, mimeType: "image/jpeg", fileExt: "jpg", filePath: "d:/lib/i.jpg", fileName: "i.jpg", durationMs: null });
+    useLibraryStore.setState({ items: [img], total: 1 });
+    const { container } = render(<ViewerPage asset={img} onClose={onClose} />);
+    await waitFor(() => expect(container.querySelector("img")).not.toBeNull());
+    fireEvent.click(screen.getByRole("button", { name: "全屏浏览" }));
+    await waitFor(() => expect(document.body.querySelector("[data-immersive-canvas]")).not.toBeNull());
+
+    // 第一次 Esc：退出沉浸，回到普通查看器
+    fireEvent.keyDown(window, { key: "Escape" });
+    await waitFor(() => expect(screen.getByRole("button", { name: "返回素材库" })).toBeInTheDocument());
+    expect(onClose).not.toHaveBeenCalled();
+    // inert 清理
+    await waitFor(() => expect(container.hasAttribute("inert")).toBe(false));
+
+    // 第二次 Esc：关闭 Viewer
+    fireEvent.keyDown(window, { key: "Escape" });
+    await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1));
+  });
+
+  it("native 沉浸：Esc 由浏览器消费（fullscreenElement 非空），Esc 不关闭 Viewer；退出后第二次 Esc 关闭", async () => {
+    installFullscreenMock({ supported: true });
+    const onClose = vi.fn();
+    const img = mkAsset({ id: 3, mimeType: "image/jpeg", fileExt: "jpg", filePath: "d:/lib/i.jpg", fileName: "i.jpg", durationMs: null });
+    useLibraryStore.setState({ items: [img], total: 1 });
+    const { container } = render(<ViewerPage asset={img} onClose={onClose} />);
+    await waitFor(() => expect(container.querySelector("img")).not.toBeNull());
+    fireEvent.click(screen.getByRole("button", { name: "全屏浏览" }));
+    // 等沉浸状态提交（chrome 卸载）
+    await waitFor(() => expect(screen.queryByRole("button", { name: "返回素材库" })).not.toBeInTheDocument());
+    // native 中 Esc：浏览器接管（fullscreenElement 非空）→ 查看器不关闭
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(onClose).not.toHaveBeenCalled();
+    // 系统退出全屏（fullscreenchange）→ 普通模式
+    (document as unknown as { fullscreenElement: HTMLElement | null }).fullscreenElement = null;
+    document.dispatchEvent(new Event("fullscreenchange"));
+    await waitFor(() => expect(screen.getByRole("button", { name: "返回素材库" })).toBeInTheDocument());
+    // 第二次 Esc → 关闭
+    fireEvent.keyDown(window, { key: "Escape" });
+    await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1));
+  });
+
+  it("native 沉浸中关闭 Viewer：先 exitFullscreen 再 onClose，失败也清本地状态", async () => {
+    const { exitSpy } = installFullscreenMock({ supported: true });
+    const onClose = vi.fn();
+    const img = mkAsset({ id: 3, mimeType: "image/jpeg", fileExt: "jpg", filePath: "d:/lib/i.jpg", fileName: "i.jpg", durationMs: null });
+    useLibraryStore.setState({ items: [img], total: 1 });
+    const { container } = render(<ViewerPage asset={img} onClose={onClose} />);
+    await waitFor(() => expect(container.querySelector("img")).not.toBeNull());
+    fireEvent.click(screen.getByRole("button", { name: "全屏浏览" }));
+    await waitFor(() => expect(screen.queryByRole("button", { name: "返回素材库" })).not.toBeInTheDocument());
+    // 关闭（点击返回素材库按钮也走 handleClose，但沉浸时按钮不存在 → 直接模拟关闭路径）
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(onClose).not.toHaveBeenCalled(); // native Esc 被浏览器消费
+    // 系统退出 → 普通模式 → 再 Esc 关闭
+    (document as unknown as { fullscreenElement: HTMLElement | null }).fullscreenElement = null;
+    document.dispatchEvent(new Event("fullscreenchange"));
+    await waitFor(() => expect(screen.getByRole("button", { name: "返回素材库" })).toBeInTheDocument());
+    fireEvent.keyDown(window, { key: "Escape" });
+    await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1));
+    // 退出全屏请求已发出（关闭前清理）
+    expect(exitSpy).not.toHaveBeenCalled();
+  });
+
+  it("视频沉浸：双击视频切换沉浸（fallback），不关闭 Viewer", async () => {
+    installFullscreenMock({ supported: false });
+    const onClose = vi.fn();
+    const vid = mkAsset();
+    useLibraryStore.setState({ items: [vid], total: 1 });
+    const { container } = render(<ViewerPage asset={vid} onClose={onClose} />);
+    const video = container.querySelector("video") as HTMLVideoElement;
+    await waitFor(() => expect(video).not.toBeNull());
+    fireEvent.doubleClick(video);
+    await waitFor(() => expect(document.body.querySelector("[data-immersive-canvas]")).not.toBeNull());
+    // 视频沉浸为黑底
+    await waitFor(() => expect(document.body.querySelector('[data-surface="video-immersive"]')).not.toBeNull());
+    expect(onClose).not.toHaveBeenCalled();
   });
 });

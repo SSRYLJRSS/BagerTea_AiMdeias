@@ -41,6 +41,18 @@ pub struct RescanResult {
     pub skipped: i64,
 }
 
+/// FB4-03（§5.6）：色板回算独立返回类型 —— updatedIds 只包含本轮成功执行
+/// set_palette 的素材 id（不包含失败、跳过或仅被扫描的 id）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PaletteRescanResult {
+    pub total: i64,
+    pub success: i64,
+    pub failed: i64,
+    pub skipped: i64,
+    pub updated_ids: Vec<i64>,
+}
+
 #[tauri::command]
 pub async fn rescan_asset_metadata(
     app: AppHandle,
@@ -88,8 +100,56 @@ pub async fn rescan_asset_metadata(
 
 /// FB2-08（§14.7）：算法色板回算（scope = all | missing | ids；复用 media_refill 取消标志与骨架）。
 /// 独立命令而非塞进 rescan_asset_metadata：语义与耗时都不同，混在一起用户没法只跑其中一个。
+/// FB4-03（§5.6）：返回 PaletteRescanResult，updatedIds 只含本轮真实写库成功的素材。
 #[tauri::command]
 pub async fn rescan_asset_palette(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    ids: Option<Vec<i64>>,
+    scope: Option<String>,
+) -> AppResult<PaletteRescanResult> {
+    let scope = scope.unwrap_or_else(|| "missing".to_string());
+    if scope != "all" && scope != "missing" && scope != "ids" {
+        return Err(AppError::msg("scope 只允许 all | missing | ids"));
+    }
+    if scope == "ids" && ids.as_ref().map_or(true, |v| v.is_empty()) {
+        return Err(AppError::msg("未选择任何素材"));
+    }
+    let db = Arc::clone(&state.db);
+    let cancel = Arc::clone(&state.media_refill_cancel);
+    // FX-12：与元数据回填互斥（抢闸失败时明确报错），先抢闸再重置取消标志。
+    let _gate = begin_refill(&state.refill_running, &cancel)?;
+
+    tauri::async_runtime::spawn_blocking(move || -> AppResult<PaletteRescanResult> {
+        let _gate = _gate;
+        let resolved: Vec<i64> = {
+            let conn = db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
+            match scope.as_str() {
+                "ids" => ids.unwrap_or_default(),
+                "missing" => assets::list_ids_needing_palette(&conn)?,
+                _ => assets::list_all_ids(&conn)?,
+            }
+        };
+        let summary = media_refill::rescan_assets_palette(&db, &resolved, &cancel, |p| {
+            let _ = app.emit("media_refill://progress", p);
+        })?;
+        Ok(PaletteRescanResult {
+            total: summary.total,
+            success: summary.success,
+            failed: summary.failed,
+            skipped: summary.skipped,
+            updated_ids: summary.updated_ids,
+        })
+    })
+    .await
+    .map_err(|e| AppError::msg(format!("色板回算线程异常: {e}")))?
+}
+
+/// V18：GPS 定位 + 视频拍摄时间存量回填（scope = all | missing | ids）。
+/// 独立命令：语义与媒体元数据回填/色板回算都不同，且视频优先解析已存 ffprobe JSON，
+/// 大部分情况免拉子进程，单独跑成本低。只补空（COALESCE），不覆盖已有值。
+#[tauri::command]
+pub async fn rescan_asset_geo_taken(
     app: AppHandle,
     state: State<'_, AppState>,
     ids: Option<Vec<i64>>,
@@ -104,7 +164,7 @@ pub async fn rescan_asset_palette(
     }
     let db = Arc::clone(&state.db);
     let cancel = Arc::clone(&state.media_refill_cancel);
-    // FX-12：与元数据回填互斥（抢闸失败时明确报错），先抢闸再重置取消标志。
+    // 与其他回填互斥：先抢闸再重置取消标志（FX-12）。
     let _gate = begin_refill(&state.refill_running, &cancel)?;
 
     tauri::async_runtime::spawn_blocking(move || -> AppResult<RescanResult> {
@@ -113,11 +173,11 @@ pub async fn rescan_asset_palette(
             let conn = db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
             match scope.as_str() {
                 "ids" => ids.unwrap_or_default(),
-                "missing" => assets::list_ids_needing_palette(&conn)?,
-                _ => assets::list_all_ids(&conn)?,
+                "missing" => assets::list_ids_needing_geo_taken(&conn)?,
+                _ => assets::list_geo_taken_all_ids(&conn)?,
             }
         };
-        let summary = media_refill::rescan_assets_palette(&db, &resolved, &cancel, |p| {
+        let summary = media_refill::rescan_assets_geo_taken(&db, &resolved, &cancel, |p| {
             let _ = app.emit("media_refill://progress", p);
         })?;
         Ok(RescanResult {
@@ -128,7 +188,25 @@ pub async fn rescan_asset_palette(
         })
     })
     .await
-    .map_err(|e| AppError::msg(format!("色板回算线程异常: {e}")))?
+    .map_err(|e| AppError::msg(format!("定位回填线程异常: {e}")))?
+}
+
+/// FB4-03（§5.3）：色板状态查询 —— totalAssets / eligible / ready / missing / unavailable。
+/// 供设置页解释「为什么当前没有色条」并决定「生成缺失色条」按钮状态。
+#[tauri::command]
+pub fn get_palette_status(state: State<AppState>) -> AppResult<assets::PaletteStatus> {
+    let conn = state.db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
+    assets::get_palette_status(&conn)
+}
+
+/// FB4-03（§5.5）：按 id 定向读取色板补丁（前端分批，单次 ≤1000；只返回存在的 id）。
+#[tauri::command]
+pub fn get_asset_palette_patches(
+    state: State<AppState>,
+    ids: Vec<i64>,
+) -> AppResult<Vec<assets::AssetPalettePatch>> {
+    let conn = state.db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
+    assets::get_asset_palette_patches(&conn, &ids)
 }
 
 /// 取消正在进行的媒体元数据回填。

@@ -895,7 +895,10 @@ mod tests {
     #[test]
     fn build_serve_command_injects_keep_alive_and_proxy() {
         let cmd = build_serve_command("C:\\ollama\\ollama.exe", Some("http://127.0.0.1:7890"));
-        let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        let args: Vec<_> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
         assert_eq!(args, vec!["serve"]);
         let envs: Vec<_> = cmd.get_envs().collect();
         let keep = envs
@@ -914,8 +917,12 @@ mod tests {
     fn build_serve_command_no_proxy_omits_proxy_env() {
         let cmd = build_serve_command("ollama", None);
         let envs: Vec<_> = cmd.get_envs().collect();
-        assert!(envs.iter().all(|(k, _)| k.to_string_lossy() != "HTTPS_PROXY"));
-        assert!(envs.iter().all(|(k, _)| k.to_string_lossy() != "HTTP_PROXY"));
+        assert!(envs
+            .iter()
+            .all(|(k, _)| k.to_string_lossy() != "HTTPS_PROXY"));
+        assert!(envs
+            .iter()
+            .all(|(k, _)| k.to_string_lossy() != "HTTP_PROXY"));
         // keep_alive 仍注入（L1 不依赖是否配置代理）
         assert!(envs
             .iter()

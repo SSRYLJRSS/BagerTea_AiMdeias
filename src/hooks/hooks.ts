@@ -1,5 +1,5 @@
 /** T04 通用 hooks：防抖 / Tauri 事件订阅 / Esc 键 / 元素尺寸 */
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 
 /** 值防抖（搜索关键词等） */
@@ -51,15 +51,68 @@ export function useEscape(handler: () => void, active = true) {
 export function useElementSize<T extends HTMLElement>() {
   const ref = useRef<T | null>(null);
   const [size, setSize] = useState({ width: 0, height: 0 });
-  useEffect(() => {
+
+  const commitSize = useCallback((width: number, height: number) => {
+    if (!Number.isFinite(width) || !Number.isFinite(height)) return false;
+    const nextWidth = Math.max(0, width);
+    const nextHeight = Math.max(0, height);
+    setSize((current) =>
+      current.width === nextWidth && current.height === nextHeight
+        ? current
+        : { width: nextWidth, height: nextHeight },
+    );
+    return nextWidth > 0 || nextHeight > 0;
+  }, []);
+
+  const measure = useCallback(() => {
+    const el = ref.current;
+    if (!el) return false;
+    const rect = el.getBoundingClientRect();
+    return commitSize(
+      rect.width || el.clientWidth || el.offsetWidth,
+      rect.height || el.clientHeight || el.offsetHeight,
+    );
+  }, [commitSize]);
+
+  useLayoutEffect(() => {
     const el = ref.current;
     if (!el) return;
+
+    let active = true;
+    let retryFrame = 0;
+    let retryCount = 0;
+    const retryUntilVisible = () => {
+      if (!active || retryCount >= 120) return;
+      retryCount += 1;
+      retryFrame = requestAnimationFrame(() => {
+        retryFrame = 0;
+        if (!measure()) retryUntilVisible();
+      });
+    };
+
+    // WebView2 冷启动时 ResizeObserver 偶尔先回报 0x0，且父级完成布局后不再补发。
+    // 先同步读一次布局；若仍为 0，则在首两秒内逐帧重试，避免虚拟网格缓存错误行高。
+    if (!measure()) retryUntilVisible();
+
     const ro = new ResizeObserver(([entry]) => {
       const { width, height } = entry.contentRect;
-      setSize({ width, height });
+      const ready = commitSize(width, height);
+      if (!ready && retryFrame === 0) retryUntilVisible();
     });
     ro.observe(el);
-    return () => ro.disconnect();
-  }, []);
+    const onWindowResize = () => {
+      retryCount = 0;
+      if (!measure() && retryFrame === 0) retryUntilVisible();
+    };
+    window.addEventListener("resize", onWindowResize);
+
+    return () => {
+      active = false;
+      if (retryFrame) cancelAnimationFrame(retryFrame);
+      window.removeEventListener("resize", onWindowResize);
+      ro.disconnect();
+    };
+  }, [commitSize, measure]);
+
   return { ref, ...size };
 }

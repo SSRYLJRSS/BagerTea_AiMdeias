@@ -5,7 +5,7 @@
 
 use rusqlite::{params, Connection};
 
-use crate::error::{AppResult, AppError};
+use crate::error::{AppError, AppResult};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AiConnection {
@@ -181,7 +181,10 @@ pub fn bind_usage(conn: &Connection, usage: &str, connection_id: &str) -> AppRes
 
 /// 删除连接档案（同时清除用途绑定）。
 pub fn delete(conn: &Connection, id: &str) -> AppResult<()> {
-    conn.execute("DELETE FROM ai_usage_bindings WHERE connection_id = ?1", params![id])?;
+    conn.execute(
+        "DELETE FROM ai_usage_bindings WHERE connection_id = ?1",
+        params![id],
+    )?;
     conn.execute("DELETE FROM ai_connections WHERE id = ?1", params![id])?;
     Ok(())
 }
@@ -194,7 +197,17 @@ mod tests {
     #[test]
     fn upsert_get_binding_roundtrip() {
         let conn = init_memory().unwrap();
-        upsert(&conn, "c1", "通义", "cloud", "openai_chat", "https://a/v1", "qwen-max", Some("c1")).unwrap();
+        upsert(
+            &conn,
+            "c1",
+            "通义",
+            "cloud",
+            "openai_chat",
+            "https://a/v1",
+            "qwen-max",
+            Some("c1"),
+        )
+        .unwrap();
         let c = get(&conn, "c1").unwrap().unwrap();
         assert_eq!(c.protocol, "openai_chat");
         assert!(c.enabled);
@@ -213,11 +226,17 @@ mod tests {
         upsert(&conn, "c2", "B", "local", "openai_chat", "u2", "m", None).unwrap();
         bind_usage(&conn, "super_search", "c1").unwrap();
         bind_usage(&conn, "tagging", "c2").unwrap();
-        assert_eq!(binding_for(&conn, "super_search").unwrap().unwrap().id, "c1");
+        assert_eq!(
+            binding_for(&conn, "super_search").unwrap().unwrap().id,
+            "c1"
+        );
         assert_eq!(binding_for(&conn, "tagging").unwrap().unwrap().id, "c2");
         // 修改 super_search 不影响 tagging
         bind_usage(&conn, "super_search", "c2").unwrap();
-        assert_eq!(binding_for(&conn, "super_search").unwrap().unwrap().id, "c2");
+        assert_eq!(
+            binding_for(&conn, "super_search").unwrap().unwrap().id,
+            "c2"
+        );
         assert_eq!(binding_for(&conn, "tagging").unwrap().unwrap().id, "c2");
     }
 

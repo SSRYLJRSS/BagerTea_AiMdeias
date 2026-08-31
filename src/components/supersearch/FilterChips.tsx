@@ -1,10 +1,15 @@
-/** 超级搜索条件芯片（P2.7 + §11.6）：可单独删除、可清除全部。AI 与手动条件用同一种芯片。
- *  §11.6（FB-05）：AI 解析后显示可读 chips——「主体：建筑 × 色彩：红色 × 关系：全部满足」；
- *  标签名取自后端 resolvedTags（含 tagId→名称/分面），未知退回「标签#id」；
- *  用户删除 chip 直接改 query（不重新调 AI）。 */
+/** 超级搜索条件芯片（FB5-05 §9.6.1）：expr 为唯一条件源。
+ *  - chips 递归遍历 expr：AND 组显示「同时满足」，OR 根按组显示「任一组 N」，NOT 叶显示「排除：…」；
+ *  - 每个 chip 保存稳定 expr path，删除只摘除该节点后 normalize（禁止走 setQuery 清空整棵 AI 树）；
+ *  - 排序 chip 独立（setSort）；「清除全部」调用 clearConditions 同时清 expr 与兼容扁平筛选；
+ *  - 无 expr 时（纯手动条件链路）退回扁平 query 渲染，仍可逐项删除。 */
 import { useShallow } from "zustand/react/shallow";
 import { useSuperSearchStore } from "@/stores/superSearchStore";
 import type { MetadataFilter } from "@/types/asset";
+import {
+  flattenExprForDisplay,
+  type ExprChipModel,
+} from "@/utils/queryExprUtils";
 
 const LABELS: Record<string, string> = {
   file_ext: "格式", mime_type: "MIME", width: "宽", height: "高",
@@ -22,10 +27,6 @@ const FACET_NAMES: Record<string, string> = {
   technical: "可用性/技术特征", custom: "自定义", location: "地点", event: "事件",
 };
 
-function facetName(key: string): string {
-  return FACET_NAMES[key] ?? key;
-}
-
 const OP_TEXT: Record<string, string> = { gt: ">", gte: "≥", lt: "<", lte: "≤", eq: "=", contains: "含", between: "", in: "∈" };
 
 function fmtValue(v: string | number) { return String(v); }
@@ -39,69 +40,81 @@ function metaLabel(f: MetadataFilter): string {
 }
 
 export default function FilterChips() {
-  const { query, resolvedTags, relation, setQuery, replaceQuery } = useSuperSearchStore(
+  const { query, expr, resolvedTags, removeExprAtPath, setQuery, setSort, clearConditions } = useSuperSearchStore(
     useShallow((s) => ({
       query: s.query,
+      expr: s.expr,
       resolvedTags: s.resolvedTags,
-      relation: s.relation,
+      removeExprAtPath: s.removeExprAtPath,
       setQuery: s.setQuery,
-      replaceQuery: s.replaceQuery,
+      setSort: s.setSort,
+      clearConditions: s.clearConditions,
     })),
   );
 
-  type Chip = { key: string; label: string; onRemove: () => void };
+  type Chip = { key: string; label: string; group?: string; onRemove: () => void };
   const chips: Chip[] = [];
 
-  if (query.search) {
-    chips.push({ key: "search", label: `关键词：${query.search}`, onRemove: () => setQuery({ search: "" }) });
-  }
-  if (query.assetType !== "all") {
-    chips.push({
-      key: "type", label: `类型：${query.assetType === "image" ? "图片" : "视频"}`,
-      onRemove: () => setQuery({ assetType: "all" }),
-    });
-  }
-  if (query.untaggedOnly) {
-    chips.push({ key: "untagged", label: "未打标", onRemove: () => setQuery({ untaggedOnly: false }) });
-  }
-  // §11.6 可读标签：优先 AI resolvedTags（含名称/分面），未知退回「标签#id」
-  const nameById = new Map<number, { facetKey: string; text: string }>();
-  for (const rt of resolvedTags) nameById.set(rt.tagId, { facetKey: rt.facetKey, text: rt.text });
-  for (const f of query.facetFilters) {
-    for (const tid of f.tagIds) {
-      const info = nameById.get(tid);
-      const fname = facetName(f.facetKey);
+  if (expr) {
+    // §9.6.1：expr 是唯一条件源（AI 树 / 构建器树）
+    const models: ExprChipModel[] = flattenExprForDisplay(expr, resolvedTags);
+    for (const m of models) {
+      chips.push({ key: m.key, label: m.label, group: m.group, onRemove: () => removeExprAtPath(m.path) });
+    }
+  } else {
+    // 纯手动条件链路（无 expr）：扁平 query 渲染，仍逐项删除
+    if (query.search) {
+      chips.push({ key: "search", label: `关键词：${query.search}`, onRemove: () => setQuery({ search: "" }) });
+    }
+    if (query.assetType !== "all") {
       chips.push({
-        key: `facet:${f.facetKey}:${tid}`,
-        label: info ? `${fname}：${info.text}` : `${fname} · 标签#${tid}`,
-        onRemove: () =>
-          setQuery({
-            facetFilters: query.facetFilters
-              .map((g) => (g.facetKey === f.facetKey ? { ...g, tagIds: g.tagIds.filter((x) => x !== tid) } : g))
-              .filter((g) => g.tagIds.length > 0 || g.facetKey !== f.facetKey),
-          }),
+        key: "type", label: `类型：${query.assetType === "image" ? "图片" : "视频"}`,
+        onRemove: () => setQuery({ assetType: "all" }),
+      });
+    }
+    if (query.untaggedOnly) {
+      chips.push({ key: "untagged", label: "未打标", onRemove: () => setQuery({ untaggedOnly: false }) });
+    }
+    const nameById = new Map<number, { facetKey: string; text: string }>();
+    for (const rt of resolvedTags) nameById.set(rt.tagId, { facetKey: rt.facetKey, text: rt.text });
+    for (const f of query.facetFilters) {
+      for (const tid of f.tagIds) {
+        const info = nameById.get(tid);
+        const fname = FACET_NAMES[f.facetKey] ?? f.facetKey;
+        chips.push({
+          key: `facet:${f.facetKey}:${tid}`,
+          label: info ? `${fname}：${info.text}` : `${fname} · 标签#${tid}`,
+          onRemove: () =>
+            setQuery({
+              facetFilters: query.facetFilters
+                .map((g) => (g.facetKey === f.facetKey ? { ...g, tagIds: g.tagIds.filter((x) => x !== tid) } : g))
+                .filter((g) => g.tagIds.length > 0 || g.facetKey !== f.facetKey),
+            }),
+        });
+      }
+    }
+    for (const tid of query.excludeTagIds) {
+      const info = nameById.get(tid);
+      chips.push({
+        key: `exclude:${tid}`,
+        label: info ? `排除：${info.text}` : `排除：标签#${tid}`,
+        onRemove: () => setQuery({ excludeTagIds: query.excludeTagIds.filter((x) => x !== tid) }),
+      });
+    }
+    for (const m of query.metadataFilters) {
+      chips.push({
+        key: `meta:${m.key}:${m.op}:${m.value ?? m.min ?? ""}:${m.max ?? ""}`,
+        label: metaLabel(m),
+        onRemove: () => setQuery({ metadataFilters: query.metadataFilters.filter((x) => x !== m) }),
       });
     }
   }
-  for (const tid of query.excludeTagIds) {
-    const info = nameById.get(tid);
-    chips.push({
-      key: `exclude:${tid}`,
-      label: info ? `排除：${info.text}` : `排除：标签#${tid}`,
-      onRemove: () => setQuery({ excludeTagIds: query.excludeTagIds.filter((x) => x !== tid) }),
-    });
-  }
-  for (const m of query.metadataFilters) {
-    chips.push({
-      key: `meta:${m.key}:${m.op}:${m.value ?? m.min ?? ""}:${m.max ?? ""}`,
-      label: metaLabel(m),
-      onRemove: () => setQuery({ metadataFilters: query.metadataFilters.filter((x) => x !== m) }),
-    });
-  }
+
+  // 排序 chip 不属于 expr：独立 setSort
   if (query.sortBy !== "created_at" || query.sortDir !== "desc") {
     chips.push({
       key: "sort", label: `排序：${query.sortBy} ${query.sortDir}`,
-      onRemove: () => setQuery({ sortBy: "created_at", sortDir: "desc" }),
+      onRemove: () => setSort("created_at", "desc"),
     });
   }
 
@@ -109,14 +122,14 @@ export default function FilterChips() {
 
   return (
     <div className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto py-1" aria-label="筛选条件">
-      <span className="shrink-0 text-[11px] text-[var(--color-text-tertiary)]">
-        条件（{relation === "or" ? "任一" : "全部"}）
-      </span>
       {chips.map((chip) => (
         <span
           key={chip.key}
           className="inline-flex h-7 shrink-0 items-center gap-1 rounded-full border border-[var(--color-border)] bg-[var(--color-surface)] pl-2.5 pr-1 text-xs text-[var(--color-text)]"
         >
+          {chip.group && (
+            <span className="text-[10px] text-[var(--color-text-tertiary)]">{chip.group}</span>
+          )}
           {chip.label}
           <button
             type="button"
@@ -131,7 +144,7 @@ export default function FilterChips() {
       ))}
       <button
         type="button"
-        onClick={() => void replaceQuery({ search: "", assetType: "all", untaggedOnly: false, facetFilters: [], excludeTagIds: [], missingFacetKeys: [], metadataFilters: [], sortBy: "created_at", sortDir: "desc" })}
+        onClick={() => void clearConditions()}
         className="shrink-0 rounded-full px-2 py-1 text-[11px] text-[var(--color-text-secondary)] hover:text-[var(--color-text)]"
       >
         清除全部

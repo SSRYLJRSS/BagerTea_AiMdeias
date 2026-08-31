@@ -283,6 +283,11 @@ struct AssetMeta {
     frame_rate: Option<f64>,
     rotation: Option<i64>,
     media_metadata_json: Option<String>,
+    // GPS 定位（带符号十进制度，北纬东经为正）与视频拍摄时间（V18 列）
+    latitude: Option<f64>,
+    longitude: Option<f64>,
+    /// 仅视频：ffprobe creation_time → epoch 毫秒（图片走 exif.taken_at）
+    taken_at: Option<i64>,
     exif: Option<exif_meta::ExifData>,
 }
 
@@ -297,7 +302,7 @@ fn extract_meta(file: &Path, mime_type: &str) -> Option<AssetMeta> {
             has_any = true;
         }
         let ex = exif_meta::extract(file);
-        if ex.camera.is_some() || ex.taken_at.is_some() || ex.aperture.is_some() {
+        if ex.camera.is_some() || ex.taken_at.is_some() || ex.aperture.is_some() || ex.latitude.is_some() {
             meta.exif = Some(ex);
             has_any = true;
         }
@@ -314,6 +319,10 @@ fn extract_meta(file: &Path, mime_type: &str) -> Option<AssetMeta> {
             meta.frame_rate = vm.frame_rate;
             meta.rotation = vm.rotation;
             meta.media_metadata_json = vm.raw_json;
+            // GPS 定位与拍摄时间（format.tags 解析，尽力而为）
+            meta.latitude = vm.latitude;
+            meta.longitude = vm.longitude;
+            meta.taken_at = vm.taken_at;
             has_any = true;
         }
     }
@@ -353,6 +362,8 @@ fn write_meta(
                     shutter: ex.shutter.as_deref(),
                     focal: ex.focal,
                     taken_at: ex.taken_at,
+                    latitude: ex.latitude,
+                    longitude: ex.longitude,
                 },
             )?;
         }
@@ -360,8 +371,9 @@ fn write_meta(
         conn.execute(
             "UPDATE assets SET width=?1, height=?2, duration_ms=?3, video_codec=?4, audio_codec=?5,
                             container_format=?6, video_profile=?7, pixel_format=?8, frame_rate=?9,
-                            rotation=?10, media_metadata_json=?11
-             WHERE id=?12",
+                            rotation=?10, media_metadata_json=?11,
+                            latitude=COALESCE(latitude, ?12), longitude=COALESCE(longitude, ?13), taken_at=COALESCE(taken_at, ?14)
+             WHERE id=?15",
             rusqlite::params![
                 m.width,
                 m.height,
@@ -374,6 +386,9 @@ fn write_meta(
                 m.frame_rate,
                 m.rotation,
                 m.media_metadata_json,
+                m.latitude,
+                m.longitude,
+                m.taken_at,
                 id
             ],
         )?;
@@ -657,7 +672,12 @@ pub fn import_paths<F: Fn(ImportProgress) + Sync>(
             "用户取消（已导入 {} 条，重复 {} 条）",
             result.imported, result.duplicates
         ));
-        emit_done(&task_id, &result, Some("已取消，保留已导入记录".into()), &progress);
+        emit_done(
+            &task_id,
+            &result,
+            Some("已取消，保留已导入记录".into()),
+            &progress,
+        );
         return Ok(result);
     }
 

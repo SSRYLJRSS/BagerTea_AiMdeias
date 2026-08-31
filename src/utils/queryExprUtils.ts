@@ -1,6 +1,19 @@
-/** QueryExpr 与 AssetFilter 的互转 + 构建器 JSON 序列化。 */
+/** QueryExpr 与 AssetFilter 的互转 + 构建器 JSON 序列化 + FB5-05（§9.6.1）expr 驱动 chips。 */
 import type { AssetFilter, FacetTagFilter, MetadataFilter, ResolvedSearchQuery } from "@/types/asset";
 import type { LeafCond, QueryExpr } from "@/types/queryExpr";
+import type { ResolvedTag } from "@/types/superSearch";
+
+/** FB5-05（§9.6.1）：expr 节点路径（从根逐层取子下标） */
+export type ExprPath = number[];
+
+/** FB5-05（§9.6.1）：可展示 chip 模型。group 为 OR/AND 组标签（任一组 N / 同时满足）。 */
+export interface ExprChipModel {
+  key: string;
+  label: string;
+  /** 删除时传给 removeExprAtPath 的稳定路径 */
+  path: ExprPath;
+  group?: string;
+}
 
 /** 扁平 AssetFilter → QueryExpr（多 AND + 排除 NOT）。当 expr 已存在时直接返回它。 */
 export function buildExprFromFilter(f: AssetFilter): QueryExpr {
@@ -128,4 +141,172 @@ export function queryExprToAssetFilterFields(e: QueryExpr): Partial<AssetFilter>
 /** 序列化整棵树（JSON 字符串，供 store 比较脏状态） */
 export function serializeExpr(e: QueryExpr): string {
   return JSON.stringify(e);
+}
+
+/** FB5-05（§9.5.6/§9.6.1）：前端归一化——空组删除、单子节点组折叠、连续相同 AND/OR 扁平化、重复 leaf 去重。 */
+export function normalizeExpr(expr: QueryExpr): QueryExpr | undefined {
+  if (expr.op === "leaf") return expr;
+  if (expr.op === "not") {
+    const child = normalizeExpr(expr.child);
+    return child ? { op: "not", child } : undefined;
+  }
+  const isAnd = expr.op === "and";
+  const out: QueryExpr[] = [];
+  for (const c of expr.children) {
+    const norm = normalizeExpr(c);
+    if (!norm) continue;
+    if (norm.op === "and" && isAnd) out.push(...norm.children);
+    else if (norm.op === "or" && !isAnd) out.push(...norm.children);
+    else out.push(norm);
+  }
+  // 重复 leaf 去重
+  const seen = new Set<string>();
+  const dedup = out.filter((e) => {
+    const key = JSON.stringify(e);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+  if (dedup.length === 0) return undefined;
+  if (dedup.length === 1) return dedup[0];
+  return { op: isAnd ? "and" : "or", children: dedup };
+}
+
+/** 摘除 path 指向的节点后归一化；返回 undefined 表示整树被清空。 */
+export function removeExprAtPath(expr: QueryExpr, path: ExprPath): QueryExpr | undefined {
+  const removed = removeAt(expr, path);
+  return removed === undefined ? undefined : normalizeExpr(removed);
+}
+
+function removeAt(expr: QueryExpr, path: ExprPath): QueryExpr | undefined {
+  if (path.length === 0) return undefined;
+  if (expr.op === "leaf") return undefined;
+  if (expr.op === "not") {
+    if (path.length === 1) return undefined; // 删除 NOT 本身
+    const child = removeAt(expr.child, path.slice(1));
+    return child === undefined ? undefined : { op: "not", child };
+  }
+  const [head, ...rest] = path;
+  const children: QueryExpr[] = [];
+  let changed = false;
+  expr.children.forEach((c, i) => {
+    if (i === head) {
+      const removed = removeAt(c, rest);
+      if (removed === undefined) {
+        changed = true; // 该子节点被删除
+        return;
+      }
+      children.push(removed);
+    } else {
+      children.push(c);
+    }
+  });
+  return changed ? { ...expr, children } : expr;
+}
+
+/** FB5-05（§9.6.1）：递归遍历 expr 生成展示 chips。
+ *  AND 组显示「同时满足」；OR 根按组显示「任一组 1 / 任一组 2」；NOT 叶显示「排除：…」。 */
+export function flattenExprForDisplay(expr: QueryExpr, resolvedTags: ResolvedTag[]): ExprChipModel[] {
+  const nameById = new Map<number, ResolvedTag>();
+  for (const rt of resolvedTags) nameById.set(rt.tagId, rt);
+  const chips: ExprChipModel[] = [];
+  walk(expr, [], undefined, chips, nameById);
+  return chips;
+}
+
+function walk(
+  expr: QueryExpr,
+  path: ExprPath,
+  group: string | undefined,
+  out: ExprChipModel[],
+  nameById: Map<number, ResolvedTag>,
+): void {
+  switch (expr.op) {
+    case "and": {
+      const hasNested = expr.children.some((c) => c.op !== "leaf");
+      const g = hasNested ? "同时满足" : group;
+      expr.children.forEach((c, i) => walk(c, [...path, i], g, out, nameById));
+      break;
+    }
+    case "or": {
+      expr.children.forEach((c, i) => walk(c, [...path, i], `任一组 ${i + 1}`, out, nameById));
+      break;
+    }
+    case "not": {
+      // NOT 叶：显示「排除：…」（tag → 名称；search → 排除内容）
+      out.push({ key: `not:${path.join(".")}`, label: notLabel(expr.child, nameById), path });
+      break;
+    }
+    case "leaf": {
+      const label = leafLabel(expr, nameById);
+      out.push({ key: `leaf:${path.join(".")}`, label, path, group });
+      break;
+    }
+  }
+}
+
+function notLabel(leaf: QueryExpr, nameById: Map<number, ResolvedTag>): string {
+  if (leaf.op !== "leaf") return "排除：条件";
+  const cond = leaf.cond;
+  if (cond.type === "tag") {
+    const names = cond.tagIds.map((id) => nameById.get(id)?.text ?? `标签#${id}`).join("、");
+    return `排除：${names}`;
+  }
+  if (cond.type === "search") return `排除内容：${cond.value}`;
+  return `排除：${leafLabel(leaf, nameById)}`;
+}
+
+/** 分面 key → 显示名（与 tagStore BASE_FACET_DEFAULTS 对齐；未知回退 key） */
+const FACET_NAMES: Record<string, string> = {
+  subject: "主体/对象", scene: "场景/地点", purpose: "用途", style: "风格/氛围",
+  color: "色彩", composition: "构图/视角", lighting: "光线/时间", people: "人物属性",
+  technical: "可用性/技术特征", custom: "自定义", location: "地点", event: "事件",
+};
+
+function leafLabel(leaf: QueryExpr, nameById: Map<number, ResolvedTag>): string {
+  if (leaf.op !== "leaf") return "条件";
+  const cond = leaf.cond;
+  switch (cond.type) {
+    case "search": {
+      const scopeLabel =
+        cond.scope === "fileName" ? "文件名" : cond.scope === "description" ? "描述" : cond.scope === "content" ? "内容" : "关键词";
+      return `${scopeLabel}：${cond.value}`;
+    }
+    case "tag": {
+      const fname = FACET_NAMES[cond.facetKey] ?? cond.facetKey;
+      const info = cond.tagIds.map((id) => nameById.get(id)?.text ?? `标签#${id}`).join("、");
+      return `${fname}：${info}`;
+    }
+    case "excludeTag": {
+      const info = cond.tagIds.map((id) => nameById.get(id)?.text ?? `标签#${id}`).join("、");
+      return `排除标签：${info}`;
+    }
+    case "assetType":
+      return cond.value === "image" ? "类型：图片" : cond.value === "video" ? "类型：视频" : "类型：全部";
+    case "untagged":
+      return "未打标";
+    case "metadata":
+      return metaLabel(cond.filter);
+    default:
+      return "条件";
+  }
+}
+
+const LABELS: Record<string, string> = {
+  file_ext: "格式", mime_type: "MIME", width: "宽", height: "高",
+  resolution: "分辨率", aspect_ratio: "宽高比", file_size: "文件大小",
+  duration_ms: "视频时长", taken_at: "拍摄时间", created_at: "入库时间",
+  modified_at: "修改时间", camera: "相机", lens: "镜头", iso: "ISO",
+  aperture: "光圈", shutter: "快门", focal: "焦距", video_codec: "视频编码",
+  audio_codec: "音频编码", folder: "文件夹",
+};
+
+const OP_TEXT: Record<string, string> = { gt: ">", gte: "≥", lt: "<", lte: "≤", eq: "=", contains: "含", between: "", in: "∈" };
+
+function metaLabel(f: MetadataFilter): string {
+  const name = LABELS[f.key] ?? f.key;
+  if (f.op === "between") return `${name} ${String(f.min ?? "")}–${String(f.max ?? "")}`;
+  if (f.op === "in") return `${name} ∈ ${(f.values ?? []).map(String).join("|")}`;
+  if (f.op === "eq" && f.value !== undefined) return `${name} = ${String(f.value)}`;
+  return `${name} ${OP_TEXT[f.op] ?? f.op} ${f.value !== undefined ? String(f.value) : ""}`;
 }

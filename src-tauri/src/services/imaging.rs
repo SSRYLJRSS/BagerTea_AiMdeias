@@ -505,7 +505,11 @@ mod tests {
         data.extend_from_slice(&[0xFF, 0xD9]);
         std::fs::write(&f, &data).unwrap();
         let j = marker_scan_jpeg(&f).unwrap();
-        assert!(j.len() > 300 * 1024, "应提取到跨块完整 JPEG，实际 {}", j.len());
+        assert!(
+            j.len() > 300 * 1024,
+            "应提取到跨块完整 JPEG，实际 {}",
+            j.len()
+        );
         assert_eq!(&j[..2], &[0xFF, 0xD8]);
         assert_eq!(&j[j.len() - 2..], &[0xFF, 0xD9]);
         std::fs::remove_dir_all(&dir).ok();

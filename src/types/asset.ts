@@ -50,6 +50,8 @@ export interface Asset {
   dominantHue?: number | null;
   dominantSat?: number | null;
   dominantLum?: number | null;
+  // FB5-05（§7.3）：一句话描述（最多 20 字符，素材字段，不进标签树/统计）
+  contentDescription?: string;
   tags: import("./tag").Tag[];
 }
 
@@ -120,7 +122,11 @@ export type MetadataFilterKey =
   // FB2-08：算法主色（dominant_color）可检索维度
   | "dominant_hue"
   | "dominant_sat"
-  | "dominant_lum";
+  | "dominant_lum"
+  // V18：GPS 定位（带符号十进制度）与定位有无分面（值域 yes/no）
+  | "latitude"
+  | "longitude"
+  | "has_location";
 
 export type MetadataOp =
   | "eq"
@@ -175,49 +181,18 @@ export interface ResolvedFacetFilter {
   includeDescendants: boolean;
 }
 
-/** 执行对象：后端/前端统一查询协议（P0 contract-v1 §3） */
+/** 执行对象：后端/前端统一查询协议（P0 contract-v1 §3）。
+ *  FB5-05（§9.5）：移除 missingFacetKeys——无法映射的概念已由 content 搜索 leaf/warning 承接；
+ *  AI 结果以 QueryExpr 为唯一事实源，本扁平对象仅供手动条件链路使用。 */
 export interface ResolvedSearchQuery {
   search: string;
   assetType: AssetType;
   untaggedOnly: boolean;
   facetFilters: ResolvedFacetFilter[];
   excludeTagIds: number[];
-  missingFacetKeys: string[];
   metadataFilters: MetadataFilter[];
   sortBy: "created_at" | "taken_at" | "modified_at" | "name" | "size" | "resolution";
   sortDir: "desc" | "asc";
-}
-
-/** AI 输出的标签条件（SearchIntent 内，text 为文字，不含 id） */
-export interface SearchIntentTag {
-  facetKey: string;
-  text: string;
-  includeDescendants?: boolean;
-}
-
-/** §11.2 原子概念：模型拆分的主体/颜色/场景等（role + facetHint + confidence） */
-export interface SearchConcept {
-  text: string;
-  role?: string;
-  facetHint?: string | null;
-  confidence?: number | null;
-}
-
-/** SearchIntent：AI 自然语言解析产物（P0 contract-v1 §2 + §11.2 概念层） */
-export interface SearchIntent {
-  search?: string;
-  assetType?: AssetType;
-  tags?: SearchIntentTag[];
-  excludeTags?: SearchIntentTag[];
-  metadata?: MetadataFilter[];
-  sortBy?: ResolvedSearchQuery["sortBy"];
-  sortDir?: "desc" | "asc";
-  /** §11.2 原子概念（模型输出；前端不消费原有字段的前提下可展示 chips） */
-  concepts?: SearchConcept[];
-  /** 概念间关系：and（默认）| or */
-  relation?: "and" | "or";
-  /** 模型识别不了的具体词（进全文 search 并 warning） */
-  unresolved?: string[];
 }
 
 export interface ImportResult {

@@ -42,7 +42,10 @@ fn hd_inflight() -> &'static Mutex<HashMap<String, Arc<Mutex<()>>>> {
 fn temp_path_for(out: &Path, uid: &str) -> PathBuf {
     let stem = out.file_stem().and_then(|s| s.to_str()).unwrap_or("thumb");
     let ext = out.extension().and_then(|s| s.to_str()).unwrap_or("bin");
-    let dir = out.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let dir = out
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
     dir.join(format!("{stem}.{uid}.{ext}"))
 }
 
@@ -122,7 +125,9 @@ impl ThumbnailService {
             atomic_generate(&out, |tmp| imaging::write_thumb(src, tmp, PLACEHOLDER_SIZE))
         } else if is_video {
             let _permit = imaging::acquire();
-            atomic_generate(&out, |tmp| video::extract_frame(src, 0, tmp, PLACEHOLDER_SIZE))
+            atomic_generate(&out, |tmp| {
+                video::extract_frame(src, 0, tmp, PLACEHOLDER_SIZE)
+            })
         } else {
             false
         };
@@ -314,9 +319,7 @@ pub fn looks_like_generic_placeholder(img: &image::DynamicImage) -> bool {
     if w < 8 || h < 8 {
         return false;
     }
-    let near = |p: image::Rgba<u8>, q: image::Rgba<u8>| {
-        (0..3).all(|i| p[i].abs_diff(q[i]) <= 4)
-    };
+    let near = |p: image::Rgba<u8>, q: image::Rgba<u8>| (0..3).all(|i| p[i].abs_diff(q[i]) <= 4);
     let rgba = img.to_rgba8();
     let corners = [
         rgba.get_pixel(0, 0),
@@ -359,7 +362,8 @@ mod tests {
         }
 
         // 纯色暖灰图：四角是背景色但正中不是色块 → 是真实素材，不得误判
-        let solid = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(64, 64, GENERIC_BG));
+        let solid =
+            image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(64, 64, GENERIC_BG));
         assert!(!looks_like_generic_placeholder(&solid), "纯色图不是占位图");
         // 普通照片
         let photo = image::DynamicImage::ImageRgba8(image::RgbaImage::from_fn(64, 64, |x, y| {

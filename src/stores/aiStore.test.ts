@@ -154,7 +154,8 @@ describe("aiStore 打标状态机", () => {
     ]);
 
     await useAiStore.getState().confirm(101, { 场景: ["公园"] });
-    expect(aiConfirmSuggestion).toHaveBeenCalledWith(101, { 场景: ["公园"] });
+    // FB5-05：第三参为可选 description（缺省 undefined → 后端按 None 处理）
+    expect(aiConfirmSuggestion).toHaveBeenCalledWith(101, { 场景: ["公园"] }, undefined);
     expect(useAiStore.getState().suggestions[0].status).toBe("confirmed");
   });
 

@@ -60,7 +60,11 @@ pub fn compute_palette(img: &DynamicImage) -> Vec<PaletteEntry> {
         let lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
         let maxc = r.max(g).max(b);
         let minc = r.min(g).min(b);
-        let sat = if maxc == 0.0 { 0.0 } else { (maxc - minc) / maxc };
+        let sat = if maxc == 0.0 {
+            0.0
+        } else {
+            (maxc - minc) / maxc
+        };
         // L* < 4（近纯黑）或 L* > 96（近纯白）且饱和度极低 → 丢
         if (lum < 0.02 && sat < 0.5) || (lum > 0.96 && sat < 0.05) {
             continue;
@@ -90,14 +94,7 @@ pub fn compute_palette(img: &DynamicImage) -> Vec<PaletteEntry> {
     let mut best = kmeans_colors::Kmeans::new();
     let mut best_score = f32::MAX;
     for i in 0..RUNS {
-        let run = kmeans_colors::get_kmeans_hamerly(
-            K,
-            MAX_ITER,
-            CONVERGE,
-            false,
-            &lab,
-            i as u64,
-        );
+        let run = kmeans_colors::get_kmeans_hamerly(K, MAX_ITER, CONVERGE, false, &lab, i as u64);
         if run.score < best_score {
             best_score = run.score;
             best = run;
@@ -141,7 +138,11 @@ pub fn compute_palette(img: &DynamicImage) -> Vec<PaletteEntry> {
         .collect();
 
     // 5. 按占比降序
-    clusters.sort_by(|a, b| b.ratio.partial_cmp(&a.ratio).unwrap_or(std::cmp::Ordering::Equal));
+    clusters.sort_by(|a, b| {
+        b.ratio
+            .partial_cmp(&a.ratio)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     // 6. 合并 ΔE<6 的相邻簇（从小的往大的吸，避免色条上出现两块看不出差别的分段）
     clusters = merge_clusters(clusters);
@@ -198,7 +199,11 @@ fn merge_clusters(mut clusters: Vec<Cluster>) -> Vec<Cluster> {
         for i in 0..clusters.len() {
             for j in (i + 1)..clusters.len() {
                 let d = delta_(
-                    clusters[i].l, clusters[i].a, clusters[i].b_v, clusters[j].l, clusters[j].a,
+                    clusters[i].l,
+                    clusters[i].a,
+                    clusters[i].b_v,
+                    clusters[j].l,
+                    clusters[j].a,
                     clusters[j].b_v,
                 );
                 if d < EPSILON && best.map(|(_, _, bd)| d < bd).unwrap_or(true) {
@@ -210,7 +215,11 @@ fn merge_clusters(mut clusters: Vec<Cluster>) -> Vec<Cluster> {
         // 保留占比大的那个作为代表色：每轮开头都按占比降序排列过，i<j ⇒ ratio[i] ≥ ratio[j]
         let victim = clusters.remove(j);
         clusters[i].ratio += victim.ratio;
-        clusters.sort_by(|a, b| b.ratio.partial_cmp(&a.ratio).unwrap_or(std::cmp::Ordering::Equal));
+        clusters.sort_by(|a, b| {
+            b.ratio
+                .partial_cmp(&a.ratio)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
     }
     clusters
 }
@@ -243,7 +252,11 @@ mod tests {
         let p = compute_palette(&solid_img(30, 120, 200));
         assert!(!p.is_empty(), "纯色图不应空");
         // 主色占比应压倒性
-        assert!(p[0].ratio > 0.9, "纯色主色占比应 ≈100%，实际 {}", p[0].ratio);
+        assert!(
+            p[0].ratio > 0.9,
+            "纯色主色占比应 ≈100%，实际 {}",
+            p[0].ratio
+        );
         // 主色应偏向蓝/青色系（r 低 b 高）
         assert!(p[0].b > p[0].r);
     }
@@ -261,7 +274,11 @@ mod tests {
         let p = compute_palette(&DynamicImage::ImageRgba8(img));
         // 预筛回退（PRESCREEN_KEEP_MIN）后用全样本：黑白各半应聚出黑、白两簇。
         assert!(p.len() >= 2, "黑白各半应聚出 ≥2 簇，实际 {}", p.len());
-        assert!(p[0].ratio < 0.95, "两侧各半，主色占比不应压倒性，实际 {}", p[0].ratio);
+        assert!(
+            p[0].ratio < 0.95,
+            "两侧各半，主色占比不应压倒性，实际 {}",
+            p[0].ratio
+        );
     }
 
     #[test]
@@ -293,7 +310,11 @@ mod tests {
     fn overexposed_sky_does_not_lose_subject() {
         // FX-04 回归：60% 近白天空 + 40% 深色地面。预筛若无回退，天空会被整体丢掉。
         let img = image::RgbaImage::from_fn(50, 50, |_, y| {
-            if y < 30 { image::Rgba([252, 252, 253, 255]) } else { image::Rgba([48, 62, 40, 255]) }
+            if y < 30 {
+                image::Rgba([252, 252, 253, 255])
+            } else {
+                image::Rgba([48, 62, 40, 255])
+            }
         });
         let p = compute_palette(&DynamicImage::ImageRgba8(img));
         assert!(p.len() >= 2, "天空与地面应各成一簇，实际 {}", p.len());
@@ -305,8 +326,18 @@ mod tests {
     fn sorted_desc_ratio_no_more_than_8() {
         // 一个多色图（12 个颜色）
         let colors: [[u8; 3]; 12] = [
-            [200,0,0],[0,200,0],[0,0,200],[200,200,0],[0,200,200],[200,0,200],
-            [120,120,120],[40,40,40],[220,220,220],[150,80,20],[20,150,80],[180,20,150],
+            [200, 0, 0],
+            [0, 200, 0],
+            [0, 0, 200],
+            [200, 200, 0],
+            [0, 200, 200],
+            [200, 0, 200],
+            [120, 120, 120],
+            [40, 40, 40],
+            [220, 220, 220],
+            [150, 80, 20],
+            [20, 150, 80],
+            [180, 20, 150],
         ];
         let mut img = image::RgbaImage::new(48, 16);
         // 12 色 × 4 列 = 48 列，每色 4 列宽
@@ -326,7 +357,11 @@ mod tests {
     #[test]
     fn merges_transitively_close_clusters() {
         let img = image::RgbaImage::from_fn(60, 1, |x, _| {
-            let c = match x % 3 { 0 => [100, 120, 140], 1 => [102, 122, 142], _ => [104, 124, 144] };
+            let c = match x % 3 {
+                0 => [100, 120, 140],
+                1 => [102, 122, 142],
+                _ => [104, 124, 144],
+            };
             image::Rgba([c[0], c[1], c[2], 255])
         });
         let p = compute_palette(&DynamicImage::ImageRgba8(img));
@@ -338,7 +373,12 @@ mod tests {
     #[test]
     fn ratios_sum_close_to_one() {
         let colors: [[u8; 3]; 6] = [
-            [200,0,0],[0,200,0],[0,0,200],[200,200,0],[0,200,200],[200,0,200],
+            [200, 0, 0],
+            [0, 200, 0],
+            [0, 0, 200],
+            [200, 200, 0],
+            [0, 200, 200],
+            [200, 0, 200],
         ];
         let img = image::RgbaImage::from_fn(60, 10, |x, _| {
             let c = colors[(x as usize / 10).min(5)];
@@ -346,7 +386,10 @@ mod tests {
         });
         let p = compute_palette(&DynamicImage::ImageRgba8(img));
         let sum: f32 = p.iter().map(|e| e.ratio).sum();
-        assert!((sum - 1.0).abs() < 0.05, "ratio 总和应≈1（单次舍入），实际 {sum}");
+        assert!(
+            (sum - 1.0).abs() < 0.05,
+            "ratio 总和应≈1（单次舍入），实际 {sum}"
+        );
     }
 
     /// FX-15 附带：k-means 的 indices 必须为每个被引用的桶都提供至少一个样本
@@ -357,12 +400,22 @@ mod tests {
     #[test]
     fn kmeans_buckets_have_no_holes() {
         let mut state: u32 = 0x5EED;
-        let mut next = || { state ^= state << 13; state ^= state >> 17; state ^= state << 5; state };
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state
+        };
         for _ in 0..200 {
             let n = 7 + (next() as usize % 40);
             let img = image::RgbaImage::from_fn(n as u32, 1, |_, _| {
                 let r = next();
-                image::Rgba([(r & 0xff) as u8, ((r >> 8) & 0xff) as u8, ((r >> 16) & 0xff) as u8, 255])
+                image::Rgba([
+                    (r & 0xff) as u8,
+                    ((r >> 8) & 0xff) as u8,
+                    ((r >> 16) & 0xff) as u8,
+                    255,
+                ])
             });
             // 不 panic 即通过（内部会走 ag.r / ag.count）
             let _ = compute_palette(&DynamicImage::ImageRgba8(img));

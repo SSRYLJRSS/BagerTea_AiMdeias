@@ -1,8 +1,8 @@
 /**
- * ViewerToolbar（指导书 §2.3/§4.1 + FB3-04 §6.2）：查看器顶部工具栏。
+ * ViewerToolbar（指导书 §2.3/§4.1 + FB3-04 §6.2 + FB5-01 §4.1）：查看器顶部工具栏。
  *  返回/关闭 · 文件名 · 位置 · 信息开关 · 全屏浏览。
- *  FB3-04：「详情」改为「信息」（仍控制左侧属性栏）；新「全屏浏览」= 查看器级全屏，
- *  全屏时隐藏胶片条/标签栏/属性栏/应用底栏。图标统一 lucide-react，按钮带 aria-label。
+ *  FB3-04：「详情」改为「信息」（仍控制左侧属性栏）；新「全屏浏览」= 查看器级全屏。
+ *  FB5-01：prop 名从含糊 fullscreen 收敛为 immersive（与状态机一致）；进入按钮 title 提示 Esc 退出。
  */
 import { ArrowLeft, Info, Maximize2, Minimize2, X } from "lucide-react";
 
@@ -13,13 +13,13 @@ interface ViewerToolbarProps {
   /** 左侧属性信息栏开关（FB3-04：语义改为「信息」） */
   detailsOpen: boolean;
   onToggleDetails: () => void;
-  /** 查看器级全屏状态 */
-  fullscreen: boolean;
-  onToggleFullscreen: () => void;
+  /** FB5-01：沉浸浏览状态 */
+  immersive: boolean;
+  onToggleImmersive: () => void;
   onClose: () => void;
 }
 
-export default function ViewerToolbar({ fileName, position, detailsOpen, onToggleDetails, fullscreen, onToggleFullscreen, onClose }: ViewerToolbarProps) {
+export default function ViewerToolbar({ fileName, position, detailsOpen, onToggleDetails, immersive, onToggleImmersive, onClose }: ViewerToolbarProps) {
   return (
     <div className="flex h-10 shrink-0 items-center gap-2 border-b border-[var(--color-border)] px-2">
       <button
@@ -47,12 +47,12 @@ export default function ViewerToolbar({ fileName, position, detailsOpen, onToggl
       </button>
       <button
         type="button"
-        onClick={onToggleFullscreen}
-        aria-label={fullscreen ? "退出全屏浏览" : "全屏浏览"}
-        title={fullscreen ? "退出全屏浏览（Esc）" : "全屏浏览"}
+        onClick={onToggleImmersive}
+        aria-label={immersive ? "退出全屏浏览" : "全屏浏览"}
+        title={immersive ? "退出全屏浏览（Esc）" : "全屏浏览（Esc 退出）"}
         className="flex h-9 shrink-0 items-center gap-1 rounded-md px-2 text-[var(--color-text-secondary)] transition-colors hover:bg-[var(--color-surface)] hover:text-[var(--color-text)]"
       >
-        {fullscreen ? <Minimize2 size={16} strokeWidth={1.75} aria-hidden="true" /> : <Maximize2 size={16} strokeWidth={1.75} aria-hidden="true" />}
+        {immersive ? <Minimize2 size={16} strokeWidth={1.75} aria-hidden="true" /> : <Maximize2 size={16} strokeWidth={1.75} aria-hidden="true" />}
         <span className="text-xs">全屏浏览</span>
       </button>
       <button

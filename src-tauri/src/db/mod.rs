@@ -8,6 +8,7 @@ pub mod dedup;
 pub mod export;
 pub mod migrations;
 pub mod query_expr;
+pub mod reset;
 pub mod search;
 pub mod search_query;
 pub mod settings;
@@ -40,6 +41,8 @@ pub fn init(path: &Path) -> AppResult<Connection> {
     let conn = Connection::open(path)?;
     configure(&conn)?;
     migrations::migrate(&conn)?;
+    // 自愈兜底：历史「重置标签」清空 tag_facets 且未补种的库，启动时重建系统分面
+    tag_facets::seed_system_facets_if_empty(&conn)?;
     Ok(conn)
 }
 
@@ -48,5 +51,6 @@ pub fn init_memory() -> AppResult<Connection> {
     let conn = Connection::open_in_memory()?;
     configure(&conn)?;
     migrations::migrate(&conn)?;
+    tag_facets::seed_system_facets_if_empty(&conn)?;
     Ok(conn)
 }

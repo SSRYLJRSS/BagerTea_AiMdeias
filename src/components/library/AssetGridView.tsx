@@ -80,11 +80,18 @@ export default function AssetGridView({
 
   // FB2-01/02：外观驱动尺寸
   const { grid, colorStrip } = useAppearance();
-  const cell = CELL_STEPS[grid.libraryCellStep];
-  const columns = Math.max(2, Math.floor((width + GAP) / (cell + GAP)));
-  const rowCount = Math.ceil(items.length / columns);
+  const cell = CELL_STEPS[grid.libraryCellStep] ?? CELL_STEPS[3];
+  // 冷启动时 WebView2 可能在父级布局完成前短暂回报 width=0。不能用 0 算列数/行高，
+  // 否则 Virtualizer 会缓存成「2 列 + 几像素行高」，实际大卡片便逐行重叠。
+  const layoutReady = Number.isFinite(width) && width > GAP;
+  const columns = layoutReady
+    ? Math.max(2, Math.floor((width + GAP) / (cell + GAP)))
+    : 1;
+  const rowCount = layoutReady ? Math.ceil(items.length / columns) : 0;
   const orderedIds = useMemo(() => items.map((a) => a.id), [items]);
-  const cellWidth = Math.max(1, (width - GAP * (columns - 1)) / columns);
+  const cellWidth = layoutReady
+    ? Math.max(1, (width - GAP * (columns - 1)) / columns)
+    : cell;
   const [rw, rh] = ASPECT_RATIO[grid.cellAspect] ?? ASPECT_RATIO["1:1"];
   // FB2-08（FX-07 隐藏坑）：色条在媒体容器之外，开启后每张卡片实际高度多出 stripPx，
   // 不补进 rowHeight 虚拟滚动会逐行累积错位（滚动时卡片重叠/大片空白）。
@@ -126,13 +133,15 @@ export default function AssetGridView({
     getScrollElement: () => scrollElementRef?.current ?? ref.current,
     estimateSize: () => rowHeight,
     overscan: 3,
+    enabled: layoutReady,
   });
 
   // 比例/格宽变化后必须显式 re-measure（TanStack Virtual 不会因 estimateSize 闭包变化自动重算）
   useEffect(() => {
+    if (!layoutReady) return;
     virtualizer.measure();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [rowHeight]);
+  }, [layoutReady, rowHeight]);
 
   useEffect(() => {
     const last = virtualizer.getVirtualItems().at(-1);

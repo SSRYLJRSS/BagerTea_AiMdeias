@@ -46,10 +46,8 @@ export function listSuperAssetIds(q: ResolvedSearchQuery, expr?: QueryExpr): Pro
   return listAssetIds(queryToFilter(q, 0, undefined, expr));
 }
 
-/** P3：AI 自然语言 → 查询意图 + 执行对象 */
-export function aiParseSearchQuery(
-  text: string,
-  currentQuery?: ResolvedSearchQuery,
-): Promise<AiSearchParseResult> {
-  return invoke<AiSearchParseResult>("ai_parse_search_query", { text, currentQuery });
+/** FB5-05（§9.5）：AI 自然语言 → SearchIntentV2 + 后端生成的 QueryExpr（唯一执行事实源）。
+ *  已删除未使用的 currentQuery 参数——append 由前端明确合并 expr。 */
+export function aiParseSearchQuery(text: string): Promise<AiSearchParseResult> {
+  return invoke<AiSearchParseResult>("ai_parse_search_query", { text });
 }

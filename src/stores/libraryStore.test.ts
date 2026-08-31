@@ -3,7 +3,7 @@
  * mock 掉 @/api/assets 的 invoke 封装，Zustand 直接实例化断言。
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { listAssets, listAssetIds } from "@/api/assets";
+import { listAssets, listAssetIds, getAssetPalettePatches } from "@/api/assets";
 import { useLibraryStore } from "@/stores/libraryStore";
 import { useSelectionStore } from "@/stores/selectionStore";
 import type { Asset, AssetPage } from "@/types/asset";
@@ -11,6 +11,7 @@ import type { Asset, AssetPage } from "@/types/asset";
 vi.mock("@/api/assets", () => ({
   listAssets: vi.fn(),
   listAssetIds: vi.fn(),
+  getAssetPalettePatches: vi.fn(),
 }));
 
 const mkAsset = (id: number, over: Partial<Asset> = {}): Asset => ({
@@ -182,5 +183,116 @@ describe("libraryStore 数据装载", () => {
     vi.mocked(listAssets).mockResolvedValue(pageOf([mkAsset(1), mkAsset(1), mkAsset(2)], 3));
     await useLibraryStore.getState().refresh();
     expect(useLibraryStore.getState().items.map((a) => a.id)).toEqual([1, 2]);
+  });
+});
+
+describe("refreshPaletteFields（FB4-03 §6.2 定向同步）", () => {
+  const paletteOf = (id: number): Asset["palette"] => [
+    { hex: `#00000${id}`, r: id, g: id, b: id, ratio: 1 },
+  ];
+
+  beforeEach(() => {
+    vi.mocked(getAssetPalettePatches).mockReset();
+  });
+
+  it("只向 API 请求当前 items 与 updatedIds 的交集（不去重外的 id）", async () => {
+    useLibraryStore.setState({
+      items: [mkAsset(1, { tags: [] }), mkAsset(2), mkAsset(3)],
+      total: 3,
+    });
+    vi.mocked(getAssetPalettePatches).mockResolvedValue([]);
+    await useLibraryStore.getState().refreshPaletteFields([2, 3, 99, 2]);
+    // 去重 + 交集 → 只请求 [2,3]
+    expect(getAssetPalettePatches).toHaveBeenCalledTimes(1);
+    expect(getAssetPalettePatches).toHaveBeenCalledWith([2, 3]);
+  });
+
+  it("返回后只改变命中项的色板字段；顺序、长度、total 完全不变；未命中保持对象引用", async () => {
+    const a1 = mkAsset(1, { tags: [] });
+    const a2 = mkAsset(2);
+    const a3 = mkAsset(3);
+    useLibraryStore.setState({ items: [a1, a2, a3], total: 3 });
+    vi.mocked(getAssetPalettePatches).mockResolvedValue([
+      { id: 2, palette: paletteOf(2), dominantHue: 22, dominantSat: 23, dominantLum: 24 },
+    ]);
+    await useLibraryStore.getState().refreshPaletteFields([2]);
+    const s = useLibraryStore.getState();
+    expect(s.items.map((a) => a.id)).toEqual([1, 2, 3]);
+    expect(s.total).toBe(3);
+    // 命中项替换色板字段
+    expect(s.items[1].palette).toEqual(paletteOf(2));
+    expect(s.items[1].dominantHue).toBe(22);
+    expect(s.items[1].dominantSat).toBe(23);
+    expect(s.items[1].dominantLum).toBe(24);
+    // 未命中保持原引用
+    expect(s.items[0]).toBe(a1);
+    expect(s.items[2]).toBe(a3);
+  });
+
+  it("不修改 tags、fileName、placeholderPath 等无关字段", async () => {
+    const tags = [{ id: 9 } as never];
+    useLibraryStore.setState({
+      items: [mkAsset(1, { tags, fileName: "keep.jpg", placeholderPath: "ph.jpg" })],
+      total: 1,
+    });
+    vi.mocked(getAssetPalettePatches).mockResolvedValue([
+      { id: 1, palette: paletteOf(1), dominantHue: 1, dominantSat: 2, dominantLum: 3 },
+    ]);
+    await useLibraryStore.getState().refreshPaletteFields([1]);
+    const a = useLibraryStore.getState().items[0];
+    expect(a.tags).toBe(tags);
+    expect(a.fileName).toBe("keep.jpg");
+    expect(a.placeholderPath).toBe("ph.jpg");
+  });
+
+  it("调用过程中发生筛选/删除时，只 patch 最新 items 中仍存在的素材", async () => {
+    useLibraryStore.setState({ items: [mkAsset(1), mkAsset(2), mkAsset(3)], total: 3 });
+    let resolvePatches!: (v: never[]) => void;
+    vi.mocked(getAssetPalettePatches).mockImplementationOnce(
+      () => new Promise((res) => (resolvePatches = res as never)),
+    );
+    const pending = useLibraryStore.getState().refreshPaletteFields([1, 2, 3]);
+    // IPC 返回前素材 2 被删除
+    useLibraryStore.setState({ items: [mkAsset(1), mkAsset(3)], total: 2 });
+    resolvePatches([
+      { id: 1, palette: paletteOf(1), dominantHue: 1, dominantSat: 1, dominantLum: 1 },
+      { id: 2, palette: paletteOf(2), dominantHue: 2, dominantSat: 2, dominantLum: 2 },
+    ] as never);
+    await pending;
+    const s = useLibraryStore.getState();
+    expect(s.items.map((a) => a.id)).toEqual([1, 3]);
+    expect(s.items[0].dominantHue).toBe(1);
+    expect(s.items[1].palette).toBeUndefined();
+    expect(s.total).toBe(2); // 删除产生的 total 变化不被同步覆盖
+  });
+
+  it("超过 1000 个交集 id 时正确分批（每批 ≤1000）", async () => {
+    const ids = Array.from({ length: 2500 }, (_, i) => i + 1);
+    useLibraryStore.setState({ items: ids.map((id) => mkAsset(id)), total: ids.length });
+    vi.mocked(getAssetPalettePatches).mockImplementation(async (batch: number[]) =>
+      batch.map((id) => ({ id, palette: paletteOf(id), dominantHue: id, dominantSat: id, dominantLum: id })),
+    );
+    await useLibraryStore.getState().refreshPaletteFields(ids);
+    expect(getAssetPalettePatches).toHaveBeenCalledTimes(3);
+    expect((vi.mocked(getAssetPalettePatches).mock.calls[0][0] as number[]).length).toBe(1000);
+    expect((vi.mocked(getAssetPalettePatches).mock.calls[2][0] as number[]).length).toBe(500);
+    const s = useLibraryStore.getState();
+    expect(s.items).toHaveLength(2500);
+    expect(s.items[2499].dominantHue).toBe(2500);
+  });
+
+  it("空交集不调用 API", async () => {
+    useLibraryStore.setState({ items: [mkAsset(1)], total: 1 });
+    await useLibraryStore.getState().refreshPaletteFields([99]);
+    expect(getAssetPalettePatches).not.toHaveBeenCalled();
+  });
+
+  it("方法内部从不调用 listAssets 或 refresh", async () => {
+    useLibraryStore.setState({ items: [mkAsset(1)], total: 1 });
+    vi.mocked(getAssetPalettePatches).mockResolvedValue([
+      { id: 1, palette: paletteOf(1), dominantHue: 1, dominantSat: 1, dominantLum: 1 },
+    ]);
+    await useLibraryStore.getState().refreshPaletteFields([1]);
+    expect(listAssets).not.toHaveBeenCalled();
   });
 });

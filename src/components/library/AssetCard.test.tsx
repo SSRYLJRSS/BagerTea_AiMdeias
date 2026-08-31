@@ -364,4 +364,77 @@ describe("AssetCard §6.1 + FB2-03（素材库 hover 原位视频预览）", () 
     expect(screen.getByRole("button").getAttribute("aria-selected")).toBe("true");
     expect(container.querySelector(".rounded-full")).not.toBeNull(); // 勾选圆形角标
   });
+
+  // FB6 需求三：媒体框与色条无缝拼接（底部直角 + 底边圆角，无白缝）
+  describe("FB6 需求三：色条拼接几何", () => {
+    const palette = [
+      { hex: "#1b2a3c", r: 27, g: 42, b: 60, ratio: 0.6 },
+      { hex: "#e6dfc8", r: 230, g: 223, b: 200, ratio: 0.4 },
+    ];
+
+    it("色条可见时：媒体框顶圆底方（style.borderRadius），色条底部圆角、顶边贴合", () => {
+      enableColorStrip();
+      const { container } = render(
+        <AssetCard
+          asset={mkAsset({ mimeType: "image/jpeg", palette } as Partial<Asset>)}
+          index={0}
+          thumbSize={512}
+          selected={false}
+          onSelect={noop}
+          onPreview={noop}
+          onContextMenu={noop}
+        />,
+      );
+      const media = screen.getByRole("button") as HTMLElement;
+      expect(media.style.borderRadius).toBe("var(--radius-item) var(--radius-item) 0 0");
+      const strip = container.querySelector(".ui-colorstrip") as HTMLElement;
+      expect(strip.style.borderRadius).toBe("0 0 4px 4px");
+      // 拼接处无缝：媒体框与色条之间无 margin / gap 元素
+      expect(media.style.margin).toBe("");
+      expect(strip.style.margin).toBe("");
+      // FB6 白线修复：媒体框自身不带 inset 描边（底边 hairline 会贴着色条顶边画白线），
+      // 描边上移到外层 wrapper（媒体框+色条整体描边）
+      expect(media.className).not.toContain("ring-1");
+      expect(media.parentElement!.className).toContain("ring-1");
+      expect(media.parentElement!.className).toContain("rounded-md");
+      expect(media.parentElement!.className).toContain("overflow-hidden");
+      // 色条恒定槽位与 rowHeight 共用 HEIGHT_PX（行高不变）
+      const slot = Array.from(container.querySelectorAll<HTMLElement>('[aria-hidden]')).find((el) => el.style.height);
+      expect(slot?.style.height).toBe("10px");
+    });
+
+    it("空 palette（空槽）时媒体框保持整体圆角（不创建空色条占位）", () => {
+      enableColorStrip();
+      const { container } = render(
+        <AssetCard
+          asset={mkAsset({ mimeType: "image/jpeg", palette: null } as Partial<Asset>)}
+          index={0}
+          thumbSize={512}
+          selected={false}
+          onSelect={noop}
+          onPreview={noop}
+          onContextMenu={noop}
+        />,
+      );
+      expect((screen.getByRole("button") as HTMLElement).style.borderRadius).toBe("");
+      expect(screen.getByRole("button").className).toContain("rounded-md");
+      expect(container.querySelector(".ui-colorstrip")).toBeNull();
+    });
+
+    it("色条开关关闭时媒体框保持整体圆角", () => {
+      const { container } = render(
+        <AssetCard
+          asset={mkAsset({ mimeType: "image/jpeg", palette } as Partial<Asset>)}
+          index={0}
+          thumbSize={512}
+          selected={false}
+          onSelect={noop}
+          onPreview={noop}
+          onContextMenu={noop}
+        />,
+      );
+      expect((screen.getByRole("button") as HTMLElement).style.borderRadius).toBe("");
+      expect(container.querySelector(".ui-colorstrip")).toBeNull();
+    });
+  });
 });

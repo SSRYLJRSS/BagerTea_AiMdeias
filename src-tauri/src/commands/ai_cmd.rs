@@ -15,20 +15,6 @@ fn lock_db(state: &AppState) -> AppResult<std::sync::MutexGuard<'_, rusqlite::Co
     state.db.lock().map_err(|_| AppError::msg("数据库锁中毒"))
 }
 
-/// 拉取服务商可用模型列表（网络请求走 spawn_blocking，不堵主线程）
-#[tauri::command]
-pub async fn ai_list_models(
-    base_url: String,
-    api_key: String,
-    api_mode: String,
-) -> AppResult<Vec<String>> {
-    tauri::async_runtime::spawn_blocking(move || {
-        ai_cloud::list_models(&base_url, &api_key, &api_mode)
-    })
-    .await
-    .map_err(|e| AppError::msg(format!("模型列表任务失败: {e}")))?
-}
-
 /// 用选中素材创建批次（pending 建议占位）
 /// mode：cloud/local/manual/auto（auto = 按激活档案 kind 解析，P3-01a）
 #[tauri::command]
@@ -46,10 +32,11 @@ pub fn ai_create_batch(
     let conn = lock_db(&state)?;
     let mut s = settings::get_settings(&conn)?;
     // §4.4：打标用途绑定优先（影响 auto/cloud 的本地/云端判定）
-    let _ = crate::db::ai_connections::apply_usage_binding(&conn, "tagging", &mut s.ai).map_err(|e| {
-        tracing::warn!("打标读取用途绑定失败，回退默认档案: {e}");
-        e
-    });
+    let _ =
+        crate::db::ai_connections::apply_usage_binding(&conn, "tagging", &mut s.ai).map_err(|e| {
+            tracing::warn!("打标读取用途绑定失败，回退默认档案: {e}");
+            e
+        });
     // auto/cloud 统一按激活档案 kind 落实际模式：本地档案 → local，否则 cloud
     let mode = if mode == "manual" {
         mode
@@ -257,14 +244,16 @@ pub fn ai_decide_suggestion_item(
 }
 
 /// 确认单条建议（tags 为最终值，含人工修改）
+/// FB5-05（§7.6）：description 为审核后的最终描述；同一事务内写入素材。
 #[tauri::command]
 pub fn ai_confirm_suggestion(
     state: State<AppState>,
     id: i64,
     tags: CategorizedTags,
+    description: Option<String>,
 ) -> AppResult<()> {
     let conn = lock_db(&state)?;
-    ai::confirm_suggestion(&conn, id, &tags)
+    ai::confirm_suggestion_with_description(&conn, id, &tags, description.as_deref())
 }
 
 /// 撤销拒绝（v2.11）：恢复为待确认

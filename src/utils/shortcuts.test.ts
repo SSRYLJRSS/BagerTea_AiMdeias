@@ -4,6 +4,7 @@ import {
   isEditableTarget,
   isInsidePlayer,
   escapeShouldExitFullscreen,
+  isViewerNativeFullscreen,
   requestFullscreenSafe,
   IMAGE_ZOOM_MIN,
   IMAGE_ZOOM_MAX,
@@ -40,6 +41,30 @@ describe("isInsidePlayer（FB3-05）", () => {
 describe("escapeShouldExitFullscreen（FB3-04）", () => {
   it("无 fullscreenElement 时返回 false（Esc 走关闭查看器）", () => {
     expect(escapeShouldExitFullscreen()).toBe(false);
+  });
+});
+
+describe("isViewerNativeFullscreen（FB5-01 §4.1）", () => {
+  it("只有 fullscreenElement === viewerRoot 时才算 native 沉浸", () => {
+    const root = document.createElement("div");
+    const other = document.createElement("div");
+    expect(isViewerNativeFullscreen(null)).toBe(false);
+    // jsdom 无 fullscreenElement：undefined → false
+    expect(isViewerNativeFullscreen(root)).toBe(false);
+    // 其他元素进全屏 → 不算
+    const doc = {
+      get fullscreenElement() {
+        return other;
+      },
+    } as unknown as Document;
+    expect(isViewerNativeFullscreen(root, doc)).toBe(false);
+    // viewerRoot 自己进全屏 → true
+    const doc2 = {
+      get fullscreenElement() {
+        return root;
+      },
+    } as unknown as Document;
+    expect(isViewerNativeFullscreen(root, doc2)).toBe(true);
   });
 });
 

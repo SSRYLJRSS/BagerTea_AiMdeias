@@ -406,39 +406,7 @@ fn migrate_v8(conn: &Connection) -> AppResult<()> {
     add_column_if_missing(conn, "asset_tags", "source_batch_id", "INTEGER")?;
 
     conn.execute_batch(SCHEMA_V8)?;
-    let now = chrono::Utc::now().timestamp_millis();
-    const FACETS: &[(&str, &str, &str, i64, i64)] = &[
-        ("subject", "主体/对象", "画面中可观察到的主要对象", 5, 10),
-        ("scene", "场景/地点", "素材发生的环境或地点", 3, 20),
-        ("purpose", "用途", "稳定的发布或设计用途", 3, 30),
-        ("style", "风格/氛围", "视觉风格与整体情绪", 4, 40),
-        ("color", "色彩", "主色、色调与色彩关系", 3, 50),
-        ("composition", "构图/视角", "景别、视角和构图关系", 4, 60),
-        ("lighting", "光线/时间", "光线方向、质感和时间氛围", 3, 70),
-        ("people", "人物属性", "人物数量、年龄段和可观察动作", 4, 80),
-        (
-            "technical",
-            "可用性/技术特征",
-            "透明背景、可裁切等非文件格式属性",
-            4,
-            90,
-        ),
-        (
-            "custom",
-            "自定义",
-            "用户自定义且暂未归入固定分面的标签",
-            0,
-            100,
-        ),
-    ];
-    for (key, name, description, max_items, sort_order) in FACETS {
-        conn.execute(
-            "INSERT OR IGNORE INTO tag_facets
-             (key, display_name, description, selection_mode, max_items, sort_order, is_system, status, created_at, updated_at)
-             VALUES (?1, ?2, ?3, 'multi', NULLIF(?4, 0), ?5, 1, 'active', ?6, ?6)",
-            rusqlite::params![key, name, description, max_items, sort_order, now],
-        )?;
-    }
+    super::tag_facets::seed_system_facets(conn)?;
 
     conn.execute(
         "UPDATE tags SET canonical_name = name WHERE canonical_name IS NULL OR canonical_name = ''",
@@ -639,12 +607,12 @@ fn migrate_v11(conn: &Connection) -> AppResult<()> {
 /// 只新增列，不改业务行；不在此迁移中扫描/回填视频（回填由可取消后台任务负责）。
 /// 逐列 ALTER，幂等可重入（中途崩溃重启重跑不 panic）。
 const V12_COLUMNS: &[(&str, &str)] = &[
-    ("media_kind", "TEXT"),                 // image | video | unknown（后端探测事实源）
+    ("media_kind", "TEXT"), // image | video | unknown（后端探测事实源）
     ("container_format", "TEXT"),
     ("video_profile", "TEXT"),
     ("pixel_format", "TEXT"),
     ("bit_depth", "INTEGER"),
-    ("frame_rate", "REAL"),                 // 简化：平均帧率小数；分子/分母原始值见 media_metadata_json
+    ("frame_rate", "REAL"), // 简化：平均帧率小数；分子/分母原始值见 media_metadata_json
     ("video_bit_rate", "INTEGER"),
     ("color_range", "TEXT"),
     ("color_space", "TEXT"),
@@ -654,10 +622,10 @@ const V12_COLUMNS: &[(&str, &str)] = &[
     ("audio_channels", "INTEGER"),
     ("audio_layout", "TEXT"),
     ("rotation", "INTEGER"),
-    ("media_metadata_json", "TEXT"),        // 原始 ffprobe JSON 留底
-    ("metadata_version", "INTEGER"),        // 探测协议版本
-    ("metadata_scanned_at", "INTEGER"),     // 最近一次探测时间（ms）
-    ("metadata_error", "TEXT"),             // 探测失败原因；NULL 表示未探测/成功
+    ("media_metadata_json", "TEXT"),    // 原始 ffprobe JSON 留底
+    ("metadata_version", "INTEGER"),    // 探测协议版本
+    ("metadata_scanned_at", "INTEGER"), // 最近一次探测时间（ms）
+    ("metadata_error", "TEXT"),         // 探测失败原因；NULL 表示未探测/成功
 ];
 
 fn migrate_v12(conn: &Connection) -> AppResult<()> {
@@ -776,7 +744,11 @@ fn migrate_v15(conn: &Connection) -> AppResult<()> {
 
     // 读取旧 settings（app_settings），迁入连接表
     let raw: Option<String> = conn
-        .query_row("SELECT value FROM settings WHERE key = 'app_settings'", [], |r| r.get(0))
+        .query_row(
+            "SELECT value FROM settings WHERE key = 'app_settings'",
+            [],
+            |r| r.get(0),
+        )
         .ok();
     let Some(raw) = raw else {
         return Ok(());
@@ -789,17 +761,33 @@ fn migrate_v15(conn: &Connection) -> AppResult<()> {
         }
     };
     let ai = s.get("ai").cloned().unwrap_or_default();
-    let profiles = ai.get("profiles").and_then(|p| p.as_array()).cloned().unwrap_or_default();
-    let active_id = ai.get("activeProfile").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let profiles = ai
+        .get("profiles")
+        .and_then(|p| p.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let active_id = ai
+        .get("activeProfile")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
     let now = chrono::Utc::now().timestamp_millis();
 
     for p in &profiles {
-        let id = p.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let id = p
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         if id.is_empty() {
             tracing::warn!("v15 迁移：跳过无 id 的 profile");
             continue;
         }
-        let name = p.get("name").and_then(|v| v.as_str()).unwrap_or("未命名").to_string();
+        let name = p
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("未命名")
+            .to_string();
         let kind = p.get("kind").and_then(|v| v.as_str()).unwrap_or("");
         let deployment = if kind == "local" { "local" } else { "cloud" };
         let api_mode = p.get("apiMode").and_then(|v| v.as_str()).unwrap_or("");
@@ -809,9 +797,21 @@ fn migrate_v15(conn: &Connection) -> AppResult<()> {
                 "v15 迁移：profile {name}({id}) 的 apiMode 缺失/未知({api_mode:?})，按 openai_chat 处理"
             );
         }
-        let base_url = p.get("baseUrl").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let model = p.get("model").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let api_key = p.get("apiKey").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let base_url = p
+            .get("baseUrl")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let model = p
+            .get("model")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let api_key = p
+            .get("apiKey")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
 
         // API Key → keyring；成功才置 api_key_ref，失败保留旧 JSON（不丢 key + warning）
         let mut api_key_ref: Option<String> = None;
@@ -835,12 +835,11 @@ fn migrate_v15(conn: &Connection) -> AppResult<()> {
 
     // 旧 active_profile 同时绑定 super_search + tagging（UI 可分别修改）
     if !active_id.is_empty() {
-        let exists: i64 = conn
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM ai_connections WHERE id = ?1)",
-                [&active_id],
-                |r| r.get(0),
-            )?;
+        let exists: i64 = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM ai_connections WHERE id = ?1)",
+            [&active_id],
+            |r| r.get(0),
+        )?;
         if exists != 0 {
             for usage in ["super_search", "tagging"] {
                 conn.execute(
@@ -866,7 +865,11 @@ fn migrate_v15(conn: &Connection) -> AppResult<()> {
         if let Some(profiles) = profiles {
             let mut all_migrated = true;
             for p in profiles.iter_mut() {
-                let has_key = p.get("apiKey").and_then(|v| v.as_str()).map(|k| !k.is_empty()).unwrap_or(false);
+                let has_key = p
+                    .get("apiKey")
+                    .and_then(|v| v.as_str())
+                    .map(|k| !k.is_empty())
+                    .unwrap_or(false);
                 if has_key {
                     let id = p.get("id").and_then(|v| v.as_str()).unwrap_or("");
                     // 只有该连接成功写入凭据才清除明文；否则保留（不丢 key）
@@ -963,7 +966,10 @@ fn migrate_v16(conn: &Connection) -> AppResult<()> {
                         "color" => {
                             if let Some(o) = cfg.as_object_mut() {
                                 o.insert("enabledForAi".into(), serde_json::Value::Bool(false));
-                                o.insert("visibleInWorkbench".into(), serde_json::Value::Bool(false));
+                                o.insert(
+                                    "visibleInWorkbench".into(),
+                                    serde_json::Value::Bool(false),
+                                );
                                 changed = true;
                             }
                         }
@@ -996,6 +1002,129 @@ fn migrate_v16(conn: &Connection) -> AppResult<()> {
         }
     }
     tx.commit()?;
+    Ok(())
+}
+
+/// FB5-05（§7.2）V17：素材一句话描述（content_description）。
+///
+///  - 幂等加列：assets.content_description / ai_suggestions.suggested_description
+///    + confirmed_description / fts_content.content_description；
+///  - FTS5 虚拟表不能 ALTER 加索引列 → 重建 assets_fts 为三列
+///    （file_name/tag_names/content_description），重建 trg_fc_*（delete 必须写全旧三列，防幽灵 token）
+///    与 trg_assets_ai / trg_assets_au；
+///  - trg_assets_au 改为 `AFTER UPDATE OF file_name, content_description`，两列都经 cjk_bigram；
+///  - 保留 V8「规范标签 + 可搜索别名 + active 状态」的 tag_names 聚合语义
+///    （trg_at_* / trg_tags_au / trg_tag_alias_* 不动，不退回 V1 简单 group_concat）；
+///  - 从 assets 回填 fts_content.content_description（回填 UPDATE 经过新三列触发器）；
+///  - INSERT INTO assets_fts(assets_fts) VALUES('rebuild')；
+///  - 全部完成后再写 user_version=17：中途崩溃保留 version=16，下次启动重跑，
+///    重建是 DROP/CREATE + 回源回填，不重复丢业务数据。
+fn migrate_v17(conn: &Connection) -> AppResult<()> {
+    // 1. 加列（幂等）
+    add_column_if_missing(
+        conn,
+        "assets",
+        "content_description",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    add_column_if_missing(
+        conn,
+        "ai_suggestions",
+        "suggested_description",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    add_column_if_missing(conn, "ai_suggestions", "confirmed_description", "TEXT")?;
+    add_column_if_missing(
+        conn,
+        "fts_content",
+        "content_description",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+
+    // 2-5. 重建 FTS 虚表 + 第一/第二层触发器（trg_at_*/trg_tags_au/trg_tag_alias_* 保留 V8 语义）
+    conn.execute_batch(
+        r#"
+DROP TRIGGER IF EXISTS trg_fc_ai;
+DROP TRIGGER IF EXISTS trg_fc_ad;
+DROP TRIGGER IF EXISTS trg_fc_au;
+DROP TRIGGER IF EXISTS trg_assets_ai;
+DROP TRIGGER IF EXISTS trg_assets_au;
+
+DROP TABLE IF EXISTS assets_fts;
+CREATE VIRTUAL TABLE assets_fts USING fts5(
+  file_name,
+  tag_names,
+  content_description,
+  content='fts_content',
+  content_rowid='asset_id',
+  tokenize='unicode61'
+);
+
+-- 第一层：FTS 索引维护（delete 写全旧三列，否则旧 token 残留产生幻影命中）
+CREATE TRIGGER trg_fc_ai AFTER INSERT ON fts_content BEGIN
+  INSERT INTO assets_fts(rowid, file_name, tag_names, content_description)
+    VALUES (new.asset_id, new.file_name, new.tag_names, new.content_description);
+END;
+CREATE TRIGGER trg_fc_ad AFTER DELETE ON fts_content BEGIN
+  INSERT INTO assets_fts(assets_fts, rowid, file_name, tag_names, content_description)
+    VALUES ('delete', old.asset_id, old.file_name, old.tag_names, old.content_description);
+END;
+CREATE TRIGGER trg_fc_au AFTER UPDATE ON fts_content BEGIN
+  INSERT INTO assets_fts(assets_fts, rowid, file_name, tag_names, content_description)
+    VALUES ('delete', old.asset_id, old.file_name, old.tag_names, old.content_description);
+  INSERT INTO assets_fts(rowid, file_name, tag_names, content_description)
+    VALUES (new.asset_id, new.file_name, new.tag_names, new.content_description);
+END;
+
+-- 第二层：业务表只维护 fts_content（file_name 与 content_description 都经 cjk_bigram）
+CREATE TRIGGER trg_assets_ai AFTER INSERT ON assets BEGIN
+  INSERT INTO fts_content(asset_id, file_name, tag_names, content_description)
+    VALUES (new.id, cjk_bigram(new.file_name), '', cjk_bigram(new.content_description));
+END;
+CREATE TRIGGER trg_assets_au AFTER UPDATE OF file_name, content_description ON assets BEGIN
+  UPDATE fts_content
+     SET file_name = cjk_bigram(new.file_name),
+         content_description = cjk_bigram(new.content_description)
+   WHERE asset_id = new.id;
+END;
+"#,
+    )?;
+
+    // 5b. 预同步：重建后先 rebuild 一次，把既有 fts_content 行灌进新索引——
+    //     否则回填 UPDATE 触发的 delete 命令会命中「索引中不存在」的行，
+    //     FTS5 外部内容表对此报 SQLITE_CORRUPT_VTAB(267)（已实测）。
+    //     不违反 §7.2 顺序：触发器仍在回填之前就位，最后仍有一次 rebuild 收尾。
+    conn.execute_batch("INSERT INTO assets_fts(assets_fts) VALUES('rebuild');")?;
+
+    // 7. 从 assets 回填 fts_content.content_description（此时新触发器已就位，回填 UPDATE 同步 FTS）
+    conn.execute(
+        "UPDATE fts_content SET content_description = (
+           SELECT cjk_bigram(COALESCE(a.content_description, ''))
+             FROM assets a WHERE a.id = fts_content.asset_id
+         )",
+        [],
+    )?;
+
+    // 8. 重建 FTS 索引（确保 assets_fts 与 fts_content 完全一致）
+    conn.execute_batch("INSERT INTO assets_fts(assets_fts) VALUES('rebuild');")?;
+    Ok(())
+}
+
+/// GPS 定位属性 V18：assets 加经纬度列。
+///
+///  - `latitude REAL` / `longitude REAL`：有符号十进制度（北纬东经为正），无定位为 NULL；
+///  - 各自建索引（按经纬度区间检索 / 位置分面聚合走索引）；
+///  - 幂等：add_column_if_missing + CREATE INDEX IF NOT EXISTS（重复执行无副作用）。
+///  - 本期只存原始经纬度，不做城市反向地理编码（决策）。
+fn migrate_v18(conn: &Connection) -> AppResult<()> {
+    add_column_if_missing(conn, "assets", "latitude", "REAL")?;
+    add_column_if_missing(conn, "assets", "longitude", "REAL")?;
+    conn.execute_batch(
+        r#"
+CREATE INDEX IF NOT EXISTS idx_assets_latitude ON assets(latitude);
+CREATE INDEX IF NOT EXISTS idx_assets_longitude ON assets(longitude);
+"#,
+    )?;
     Ok(())
 }
 
@@ -1075,6 +1204,16 @@ pub fn migrate(conn: &Connection) -> AppResult<()> {
         migrate_v16(conn)?;
         conn.pragma_update(None, "user_version", 16)?;
     }
+    if version < 17 {
+        // FB5-05（§7.2）：一句话描述列 + FTS 三列重建 + 触发器升级
+        migrate_v17(conn)?;
+        conn.pragma_update(None, "user_version", 17)?;
+    }
+    if version < 18 {
+        // GPS 定位属性：latitude/longitude 列 + 索引（只增列，不回填；回填走 media_refill）
+        migrate_v18(conn)?;
+        conn.pragma_update(None, "user_version", 18)?;
+    }
     Ok(())
 }
 
@@ -1130,26 +1269,40 @@ mod tests {
             "activeProfile": "p1"
           }
         }"#;
-        c.execute("INSERT INTO settings (key, value) VALUES ('app_settings', ?1)", [old_json]).unwrap();
+        c.execute(
+            "INSERT INTO settings (key, value) VALUES ('app_settings', ?1)",
+            [old_json],
+        )
+        .unwrap();
 
         migrate_v15(&c).unwrap();
 
         // p1: cloud + openai→openai_chat
         let (deploy, proto) = c
-            .query_row("SELECT deployment, protocol FROM ai_connections WHERE id='p1'", [], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-            })
+            .query_row(
+                "SELECT deployment, protocol FROM ai_connections WHERE id='p1'",
+                [],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )
             .unwrap();
         assert_eq!(deploy, "cloud");
         assert_eq!(proto, "openai_chat");
         // p2: local
         let deploy2: String = c
-            .query_row("SELECT deployment FROM ai_connections WHERE id='p2'", [], |r| r.get(0))
+            .query_row(
+                "SELECT deployment FROM ai_connections WHERE id='p2'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(deploy2, "local");
         // p3: anthropic→anthropic_messages
         let proto3: String = c
-            .query_row("SELECT protocol FROM ai_connections WHERE id='p3'", [], |r| r.get(0))
+            .query_row(
+                "SELECT protocol FROM ai_connections WHERE id='p3'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(proto3, "anthropic_messages");
 
@@ -1162,24 +1315,44 @@ mod tests {
             .map(|r| r.unwrap())
             .collect();
         assert_eq!(usages, vec!["super_search", "tagging"]);
-        let count: i64 = c.query_row("SELECT COUNT(*) FROM ai_connections", [], |r| r.get(0)).unwrap();
+        let count: i64 = c
+            .query_row("SELECT COUNT(*) FROM ai_connections", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(count, 3);
 
         // 分情形断言密钥迁移结果（二选一，均合法）
         let ref1: Option<String> = c
-            .query_row("SELECT api_key_ref FROM ai_connections WHERE id='p1'", [], |r| r.get(0))
+            .query_row(
+                "SELECT api_key_ref FROM ai_connections WHERE id='p1'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         let kept: String = c
-            .query_row("SELECT value FROM settings WHERE key='app_settings'", [], |r| r.get(0))
+            .query_row(
+                "SELECT value FROM settings WHERE key='app_settings'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         let backup: Option<String> = c
-            .query_row("SELECT value FROM settings WHERE key='app_settings_backup_v15'", [], |r| r.get(0))
+            .query_row(
+                "SELECT value FROM settings WHERE key='app_settings_backup_v15'",
+                [],
+                |r| r.get(0),
+            )
             .ok();
         if ref1.is_some() {
             // keyring 可用：明文清除 + 备份副本保留
-            assert!(!kept.contains("sk-a"), "迁移成功后 settings JSON 不得再含明文 API Key");
+            assert!(
+                !kept.contains("sk-a"),
+                "迁移成功后 settings JSON 不得再含明文 API Key"
+            );
             assert!(!kept.contains("sk-b"));
-            assert!(backup.is_some() && backup.unwrap().contains("sk-a"), "备份副本应保留原始明文");
+            assert!(
+                backup.is_some() && backup.unwrap().contains("sk-a"),
+                "备份副本应保留原始明文"
+            );
         } else {
             // keyring 不可用：旧明文保留（不丢 key），迁移仍完成
             assert!(kept.contains("sk-a"), "keyring 写失败时旧明文 key 必须保留");
@@ -1192,10 +1365,16 @@ mod tests {
     fn v15_is_idempotent() {
         let c = legacy_v14_fixture();
         let old_json = r#"{"ai":{"profiles":[{"id":"p1","name":"A","apiMode":"openai","kind":"cloud","baseUrl":"u","model":"m"}],"activeProfile":"p1"}}"#;
-        c.execute("INSERT INTO settings (key, value) VALUES ('app_settings', ?1)", [old_json]).unwrap();
+        c.execute(
+            "INSERT INTO settings (key, value) VALUES ('app_settings', ?1)",
+            [old_json],
+        )
+        .unwrap();
         migrate_v15(&c).unwrap();
         migrate_v15(&c).unwrap();
-        let count: i64 = c.query_row("SELECT COUNT(*) FROM ai_connections", [], |r| r.get(0)).unwrap();
+        let count: i64 = c
+            .query_row("SELECT COUNT(*) FROM ai_connections", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(count, 1, "重复执行不得重复插入连接");
     }
 
@@ -1204,7 +1383,9 @@ mod tests {
     fn v15_no_settings_is_noop() {
         let c = legacy_v14_fixture();
         migrate_v15(&c).unwrap();
-        let count: i64 = c.query_row("SELECT COUNT(*) FROM ai_connections", [], |r| r.get(0)).unwrap();
+        let count: i64 = c
+            .query_row("SELECT COUNT(*) FROM ai_connections", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(count, 0);
     }
 
@@ -1213,7 +1394,11 @@ mod tests {
     fn v15_passes_foreign_key_check() {
         let c = legacy_v14_fixture();
         let old_json = r#"{"ai":{"profiles":[{"id":"p1","name":"A","apiMode":"openai","kind":"cloud","baseUrl":"u","model":"m"}],"activeProfile":"p1"}}"#;
-        c.execute("INSERT INTO settings (key, value) VALUES ('app_settings', ?1)", [old_json]).unwrap();
+        c.execute(
+            "INSERT INTO settings (key, value) VALUES ('app_settings', ?1)",
+            [old_json],
+        )
+        .unwrap();
         migrate_v15(&c).unwrap();
         let mut stmt = c.prepare("PRAGMA foreign_key_check").unwrap();
         let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
@@ -1225,9 +1410,11 @@ mod tests {
     /// 正是 FX-01（migrate_v16 写不存在的 tag_facets.hint）逃过测试的原因。
     #[test]
     fn v16_adds_palette_columns_and_deactivates_color_facet() {
-        let c = crate::db::init_memory().unwrap(); // 已跑到 user_version = 16
-        let v: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(v, 16, "全新库应迁移到 V16");
+        let c = crate::db::init_memory().unwrap(); // 已跑到最新版本（V16 → V17 链上）
+        let v: i64 = c
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert!(v >= 16, "全新库应至少迁移到 V16，实际 {v}");
 
         for col in [
             "palette_json",
@@ -1254,7 +1441,9 @@ mod tests {
             assert_eq!(n, 1, "索引 {idx} 应存在");
         }
         let st: String = c
-            .query_row("SELECT status FROM tag_facets WHERE key='color'", [], |r| r.get(0))
+            .query_row("SELECT status FROM tag_facets WHERE key='color'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(st, "inactive");
 
@@ -1262,7 +1451,9 @@ mod tests {
         migrate_v16(&c).unwrap();
         migrate_v16(&c).unwrap();
         let st2: String = c
-            .query_row("SELECT status FROM tag_facets WHERE key='color'", [], |r| r.get(0))
+            .query_row("SELECT status FROM tag_facets WHERE key='color'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(st2, "inactive");
     }
@@ -1285,7 +1476,11 @@ mod tests {
         migrate_v16(&c).unwrap(); // 跑两次验幂等
 
         let raw: String = c
-            .query_row("SELECT value FROM settings WHERE key='app_settings'", [], |r| r.get(0))
+            .query_row(
+                "SELECT value FROM settings WHERE key='app_settings'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
         let arr = v["aiFacetConfigs"].as_array().unwrap();
@@ -1299,16 +1494,246 @@ mod tests {
             style_hint.contains("不包含颜色"),
             "style hint 应追加消歧说明，实际：{style_hint}"
         );
-        assert_eq!(style_hint.matches("不包含颜色").count(), 1, "重复执行不得重复追加");
+        assert_eq!(
+            style_hint.matches("不包含颜色").count(),
+            1,
+            "重复执行不得重复追加"
+        );
         // tag_facets 表不得因此长出 hint 列
-        assert!(!has_column(&c, "tag_facets", "hint").unwrap(), "hint 属于 settings JSON，不是表列");
+        assert!(
+            !has_column(&c, "tag_facets", "hint").unwrap(),
+            "hint 属于 settings JSON，不是表列"
+        );
     }
 
     /// FX-01 回归：无 app_settings 行（全新库尚未存过设置）时 V16 不报错。
     #[test]
     fn v16_no_settings_row_is_noop() {
         let c = crate::db::init_memory().unwrap();
-        c.execute("DELETE FROM settings WHERE key='app_settings'", []).unwrap();
+        c.execute("DELETE FROM settings WHERE key='app_settings'", [])
+            .unwrap();
         migrate_v16(&c).unwrap();
+    }
+
+    // ── FB5-05（§13.6）：V17 与一句话描述 ──
+
+    /// V17：三实体列 + FTS 三列 + trg_assets_au 升级为 UPDATE OF file_name, content_description；
+    /// 全新库迁移链直达 V17。
+    #[test]
+    fn v17_migrates_fresh_db_to_17() {
+        let c = crate::db::init_memory().unwrap();
+        let v: i64 = c
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert!(v >= 17, "全新库应至少迁移到 V17，实际 {v}");
+
+        assert!(has_column(&c, "assets", "content_description").unwrap());
+        assert!(has_column(&c, "ai_suggestions", "suggested_description").unwrap());
+        assert!(has_column(&c, "ai_suggestions", "confirmed_description").unwrap());
+        assert!(has_column(&c, "fts_content", "content_description").unwrap());
+
+        // FTS 虚表三列（+ rowid）
+        let cols: Vec<String> = c
+            .prepare("SELECT name FROM pragma_table_info('assets_fts')")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(cols, vec!["file_name", "tag_names", "content_description"]);
+
+        // trg_assets_au 明确包含 UPDATE OF file_name, content_description
+        let sql: String = c
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='trg_assets_au'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            sql.contains("UPDATE OF file_name, content_description"),
+            "trg_assets_au 应为两列触发：{sql}"
+        );
+    }
+
+    /// V17：描述写入 assets → 触发器同步 fts_content（bigram）→ FTS 可命中；
+    /// file_name 更新仍触发（回归）。
+    #[test]
+    fn v17_description_flows_into_fts() {
+        let c = crate::db::init_memory().unwrap();
+        // 插入素材（assets 触发器写 fts_content）
+        c.execute(
+            "INSERT INTO assets (file_path, file_name, content_description, file_ext, file_size, mime_type, created_at, modified_at) VALUES ('/a/1.jpg', 'IMG_1001.jpg', '夜晚树下多人合影', '.jpg', 100, 'image/jpeg', 1, 1)",
+            [],
+        )
+        .unwrap();
+        let fts_desc: String = c
+            .query_row("SELECT content_description FROM fts_content", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            fts_desc, "夜 晚 树 下 多 人 合 影",
+            "fts_content 应存 bigram 描述"
+        );
+        // FTS 命中
+        let n: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM assets_fts WHERE assets_fts MATCH '\"夜 晚\"'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1, "描述词应可被 FTS 命中");
+
+        // 更新描述 → 触发器刷新
+        c.execute(
+            "UPDATE assets SET content_description = '白天海边合影' WHERE file_name = 'IMG_1001.jpg'",
+            [],
+        )
+        .unwrap();
+        let fts_desc2: String = c
+            .query_row("SELECT content_description FROM fts_content", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(fts_desc2, "白 天 海 边 合 影");
+        let n2: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM assets_fts WHERE assets_fts MATCH '\"海 边\"'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n2, 1);
+
+        // 描述为空 → 回退空串，不报错
+        c.execute(
+            "UPDATE assets SET content_description = '' WHERE file_name = 'IMG_1001.jpg'",
+            [],
+        )
+        .unwrap();
+        let fts_desc3: String = c
+            .query_row("SELECT content_description FROM fts_content", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(fts_desc3, "");
+    }
+
+    /// V17：重复跑迁移幂等；模拟「写完数据但未写 user_version=17」的中断 →
+    /// 重跑 migrate() 后虚表/触发器恢复、业务数据不丢。
+    #[test]
+    fn v17_idempotent_and_crash_recoverable() {
+        let c = crate::db::init_memory().unwrap();
+        c.execute(
+            "INSERT INTO assets (file_path, file_name, content_description, file_ext, file_size, mime_type, created_at, modified_at) VALUES ('/a/2.jpg', 'keep.jpg', '保留描述', '.jpg', 100, 'image/jpeg', 1, 1)",
+            [],
+        )
+        .unwrap();
+
+        // 幂等：直接再跑两次（FTS5 外部内容表：重建后先 rebuild 一次，保证回填 UPDATE
+        // 的 delete 命令命中既有行，否则 SQLITE_CORRUPT_VTAB(267)）
+        migrate_v17(&c).unwrap();
+        migrate_v17(&c).unwrap();
+
+        // 模拟中断：数据已完成但 user_version 未写 17 → 下次启动重跑整条 migrate 链
+        c.pragma_update(None, "user_version", 16).unwrap();
+        crate::db::migrations::migrate(&c).unwrap();
+
+        let v: i64 = c
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert!(v >= 17, "重跑后应至少补写到 V17，实际 {v}");
+        // 业务数据不丢
+        let (keep, desc): (String, String) = c
+            .query_row(
+                "SELECT file_name, content_description FROM assets WHERE file_name='keep.jpg'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(keep, "keep.jpg");
+        assert_eq!(desc, "保留描述");
+        // 虚表与触发器恢复（FTS 仍可命中）
+        let n: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM assets_fts WHERE assets_fts MATCH '\"保 留\"'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1, "重跑后 FTS 应可命中描述");
+    }
+
+    // ── GPS 定位属性：V18 ──
+
+    /// V18：全新库迁移链直达 V18，assets 有 latitude/longitude 两列与各自索引；
+    /// 重复执行幂等。
+    #[test]
+    fn v18_adds_geo_columns_and_indexes() {
+        let c = crate::db::init_memory().unwrap();
+        let v: i64 = c
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, 18, "全新库应迁移到 V18");
+
+        assert!(has_column(&c, "assets", "latitude").unwrap(), "latitude 列应存在");
+        assert!(has_column(&c, "assets", "longitude").unwrap(), "longitude 列应存在");
+        for idx in ["idx_assets_latitude", "idx_assets_longitude"] {
+            let n: i64 = c
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name=?1",
+                    [idx],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1, "索引 {idx} 应存在");
+        }
+
+        // 幂等：重复执行不报错、不重复建索引
+        migrate_v18(&c).unwrap();
+        migrate_v18(&c).unwrap();
+        let n: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_assets_latitude'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1, "重复执行不得重复建索引");
+    }
+
+    /// V18：老素材无定位时两列为 NULL（向后兼容契约），可正常读写。
+    #[test]
+    fn v18_geo_columns_default_null_and_writable() {
+        let c = crate::db::init_memory().unwrap();
+        c.execute(
+            "INSERT INTO assets (file_path, file_name, file_ext, file_size, mime_type, created_at, modified_at)
+             VALUES ('/a/geo.jpg', 'geo.jpg', '.jpg', 100, 'image/jpeg', 1, 1)",
+            [],
+        )
+        .unwrap();
+        let (lat, lng): (Option<f64>, Option<f64>) = c
+            .query_row(
+                "SELECT latitude, longitude FROM assets WHERE file_name='geo.jpg'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert!(lat.is_none() && lng.is_none(), "老素材无定位时应为 NULL");
+        c.execute(
+            "UPDATE assets SET latitude = 30.25, longitude = 120.167 WHERE file_name='geo.jpg'",
+            [],
+        )
+        .unwrap();
+        let lat: f64 = c
+            .query_row(
+                "SELECT latitude FROM assets WHERE file_name='geo.jpg'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(lat, 30.25);
     }
 }

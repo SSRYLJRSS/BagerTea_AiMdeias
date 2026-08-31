@@ -15,6 +15,9 @@ pub struct ExifData {
     pub shutter: Option<String>,
     pub focal: Option<f64>,
     pub taken_at: Option<i64>,
+    /// GPS 定位（度分秒 Rational → 带符号十进制度，北纬东经为正；超出合法范围视为脏数据丢弃）
+    pub latitude: Option<f64>,
+    pub longitude: Option<f64>,
 }
 
 fn text(ex: &Exif, tag: Tag) -> Option<String> {
@@ -57,6 +60,48 @@ pub fn fmt_f_number(v: f64) -> f64 {
     (v * 10.0).round() / 10.0
 }
 
+/// GPS 坐标度分秒（度/分/秒三个 Rational，秒可缺省）→ 十进制度。
+/// 非数值/分母为零/结果非有限 → None；返回不带符号的绝对值，符号由 Ref 半球字段决定。
+pub fn gps_dms_to_decimal(dms: &[exif::Rational]) -> Option<f64> {
+    if dms.is_empty() {
+        return None;
+    }
+    let deg = dms[0].to_f64();
+    let minutes = if dms.len() > 1 { dms[1].to_f64() } else { 0.0 };
+    let seconds = if dms.len() > 2 { dms[2].to_f64() } else { 0.0 };
+    let v = deg + minutes / 60.0 + seconds / 3600.0;
+    if v.is_finite() && v >= 0.0 {
+        Some(v)
+    } else {
+        None
+    }
+}
+
+/// 读单个 GPS 坐标分量（Tag::GPSLatitude / Tag::GPSLongitude）并应用半球符号：
+/// Ref 为 S/W 取负；缺 Ref 默认正。越界（纬度 >90 / 经度 >180）视为脏数据丢弃。
+fn gps_coordinate(ex: &Exif, coord: Tag, ref_tag: Tag, limit: f64) -> Option<f64> {
+    let field = ex.get_field(coord, exif::In::PRIMARY)?;
+    let dms: Vec<exif::Rational> = match &field.value {
+        Value::Rational(v) => v.clone(),
+        _ => return None,
+    };
+    let v = gps_dms_to_decimal(&dms)?;
+    let sign = match text(ex, ref_tag).as_deref() {
+        Some(r) if r.trim().to_ascii_uppercase().starts_with('S')
+            || r.trim().to_ascii_uppercase().starts_with('W') =>
+        {
+            -1.0
+        }
+        _ => 1.0,
+    };
+    let signed = sign * v;
+    if signed.abs() <= limit {
+        Some(signed)
+    } else {
+        None
+    }
+}
+
 pub fn extract(path: &Path) -> ExifData {
     let mut data = extract_container(path);
     // RAW 兜底（Phase 2 F05）：CR3（ISOBMFF）/RW2（非标 TIFF 魔数）等容器
@@ -91,6 +136,8 @@ fn extract_container(path: &Path) -> ExifData {
         shutter: text(&ex, Tag::ExposureTime).map(|s| s.trim_end_matches(" s").to_string()),
         focal: num(&ex, Tag::FocalLength).map(|v| v.round()),
         taken_at,
+        latitude: gps_coordinate(&ex, Tag::GPSLatitude, Tag::GPSLatitudeRef, 90.0),
+        longitude: gps_coordinate(&ex, Tag::GPSLongitude, Tag::GPSLongitudeRef, 180.0),
     }
 }
 
@@ -143,6 +190,9 @@ fn raw_fallback(path: &Path) -> Option<ExifData> {
             .date_time_original
             .as_deref()
             .and_then(parse_exif_datetime),
+        // rawler 兜底不提供 GPS（Exif 结构内无坐标字段），保持 None 由上层合并逻辑处理
+        latitude: None,
+        longitude: None,
     })
 }
 
@@ -168,6 +218,12 @@ fn merge_missing(dst: &mut ExifData, fb: ExifData) {
     }
     if dst.taken_at.is_none() {
         dst.taken_at = fb.taken_at;
+    }
+    if dst.latitude.is_none() {
+        dst.latitude = fb.latitude;
+    }
+    if dst.longitude.is_none() {
+        dst.longitude = fb.longitude;
     }
 }
 
@@ -232,5 +288,43 @@ mod tests {
         assert_eq!(dst.camera.as_deref(), Some("原值"));
         assert_eq!(dst.iso, Some(100));
         assert_eq!(dst.lens.as_deref(), Some("兜底镜头"));
+    }
+
+    // ── GPS 定位解析 ──
+    // kamadak-exif 0.5 的 Rational 是公开字段无符号结构体（num: u32 / denom: u32），无 new 构造函数
+    use exif::Rational;
+    fn rat(num: u32, denom: u32) -> Rational {
+        Rational { num, denom }
+    }
+
+    #[test]
+    fn gps_dms_full_triple_converts() {
+        // 30°15'30" = 30.2583…
+        let dms = [rat(30, 1), rat(15, 1), rat(30, 1)];
+        let v = gps_dms_to_decimal(&dms).unwrap();
+        assert!((v - 30.258333).abs() < 1e-4);
+    }
+
+    #[test]
+    fn gps_dms_fractional_rationals_and_missing_seconds() {
+        // 120°10.014'（分带小数、无秒）= 120.1669…
+        let dms = [rat(120, 1), rat(10014, 1000)];
+        let v = gps_dms_to_decimal(&dms).unwrap();
+        assert!((v - 120.166900).abs() < 1e-4);
+        // 零分母 → None（脏数据容错）
+        let bad = [rat(1, 0), rat(0, 1)];
+        assert!(gps_dms_to_decimal(&bad).is_none());
+        // 空数组 → None
+        assert!(gps_dms_to_decimal(&[]).is_none());
+    }
+
+    #[test]
+    fn gps_dms_degrees_only_and_nonfinite_rejected() {
+        // 只有度一个分量 → 直接十进制度
+        let d = [rat(45, 1)];
+        assert_eq!(gps_dms_to_decimal(&d), Some(45.0));
+        // 零分母 → 非有限值 → None（脏数据容错；符号由 Ref 字段承载，Rational 本身无符号）
+        let bad = [rat(30, 0)];
+        assert!(gps_dms_to_decimal(&bad).is_none());
     }
 }

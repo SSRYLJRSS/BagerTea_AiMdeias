@@ -1,23 +1,49 @@
-/** 标签树形导航：可折叠、父标签显示合计数、点击连带筛选子标签（PRD 5.4-3） */
-import { useEffect, useState, type MouseEvent as ReactMouseEvent } from "react";
+/** 标签树形导航：可折叠、父标签显示合计数、点击连带筛选子标签（PRD 5.4-3）
+ *  FB6 需求四：顶部统一标题行——左「智能标签」、右「全部展开/全部收起」（不与文件属性共用状态）。 */
+import { useEffect, useMemo, useState, type MouseEvent as ReactMouseEvent } from "react";
 import clsx from "clsx";
 import { useShallow } from "zustand/react/shallow";
 import { flattenVisible, useTagStore } from "@/stores/tagStore";
 import { useLibraryStore } from "@/stores/libraryStore";
+import type { TagNode } from "@/types/tag";
 
 interface TagTreeProps {
   onManage?: () => void;
 }
 
 export default function TagTree({ onManage }: TagTreeProps) {
-  const { tree, facets, expanded, refresh, toggleExpand } = useTagStore(
-    useShallow((s) => ({ tree: s.tree, facets: s.facets, expanded: s.expanded, refresh: s.refresh, toggleExpand: s.toggleExpand })),
+  const { tree, facets, expanded, refresh, toggleExpand, expandAll, collapseAll } = useTagStore(
+    useShallow((s) => ({
+      tree: s.tree,
+      facets: s.facets,
+      expanded: s.expanded,
+      refresh: s.refresh,
+      toggleExpand: s.toggleExpand,
+      expandAll: s.expandAll,
+      collapseAll: s.collapseAll,
+    })),
   );
   const { filter, setFilter } = useLibraryStore(useShallow((s) => ({ filter: s.filter, setFilter: s.setFilter })));
 
   useEffect(() => {
     if (tree.length === 0) void refresh();
   }, [tree.length, refresh]);
+
+  // FB6 需求四：全局展开控制。allExpanded 必须覆盖树中所有可展开节点（递归），空树时按钮隐藏。
+  const expandableIds = useMemo(() => {
+    const ids: number[] = [];
+    const walk = (nodes: TagNode[]) => {
+      for (const n of nodes) {
+        if (n.children.length > 0) {
+          ids.push(n.tag.id);
+          walk(n.children);
+        }
+      }
+    };
+    walk(tree);
+    return ids;
+  }, [tree]);
+  const allExpanded = expandableIds.length > 0 && expandableIds.every((id) => expanded.has(id));
 
   const groups = (facets.length > 0
     ? facets.map((facet) => ({ facet, rows: flattenVisible(tree.filter((n) => n.tag.facetKey === facet.key), expanded) }))
@@ -50,6 +76,21 @@ export default function TagTree({ onManage }: TagTreeProps) {
 
   return (
     <div className="flex flex-col py-1 text-sm">
+      {/* FB6 需求四：统一标题行——左标题、右展开控制（有可展开节点才显示按钮） */}
+      <div className="flex min-h-8 items-center justify-between px-2">
+        <h4 className="text-[11px] font-semibold text-[var(--color-text)]">智能标签</h4>
+        {expandableIds.length > 0 && (
+          <button
+            type="button"
+            onClick={allExpanded ? collapseAll : expandAll}
+            aria-label={allExpanded ? "全部收起" : "全部展开"}
+            title={allExpanded ? "收起所有标签的子标签" : "展开所有标签的子标签"}
+            className="px-1.5 py-1 text-[10px] text-[var(--color-text-secondary)] transition-colors hover:text-[var(--color-text)]"
+          >
+            {allExpanded ? "全部收起" : "全部展开"}
+          </button>
+        )}
+      </div>
       {/* 「未打标」归标签区（v2.7 修订）；点标签行筛选，再点已激活标签取消 */}
       <TreeRow
         label="未打标"

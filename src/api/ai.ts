@@ -50,8 +50,17 @@ export function aiDecideSuggestionItem(
   });
 }
 
-export function aiConfirmSuggestion(id: number, tags: CategorizedTags): Promise<void> {
-  return invoke<void>("ai_confirm_suggestion", { id, tags });
+/** FB5-05（§7.6）：确认单条建议。description = 审核后的最终描述（同一事务写入素材；空串不覆盖已有描述）。 */
+export function aiConfirmSuggestion(
+  id: number,
+  tags: CategorizedTags,
+  description?: string | null,
+): Promise<void> {
+  return invoke<void>("ai_confirm_suggestion", {
+    id,
+    tags,
+    description: description ?? null,
+  });
 }
 
 /** 批量套用标签到任意素材（胶片条多选套用） */
@@ -70,11 +79,6 @@ export function aiRestoreSuggestion(id: number): Promise<void> {
 
 export function aiConfirmAll(batchId: number): Promise<void> {
   return invoke<void>("ai_confirm_all", { batchId });
-}
-
-/** 拉取服务商可用模型列表（OpenAI 兼容 /models） */
-export function aiListModels(baseUrl: string, apiKey: string, apiMode: string): Promise<string[]> {
-  return invoke<string[]>("ai_list_models", { baseUrl, apiKey, apiMode });
 }
 
 export function onAiProgress(handler: (p: AiProgress) => void): Promise<UnlistenFn> {

@@ -12,8 +12,20 @@ import { startGlobalTaskWatch } from "@/stores/taskStore";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { useLibraryStore } from "@/stores/libraryStore";
 import { markStartup } from "@/utils/startupMarks";
+import { useTauriEvent } from "@/hooks/hooks";
+import { on } from "@/api/client";
 
 type PageKey = TabKey | "settings" | "superSearch";
+
+/** FB4-03（§6.5）：导入后置色板完成事件（只允许 import 来源发送；手动回算不发） */
+interface PaletteUpdatedEvent {
+  source: "import";
+  total: number;
+  success: number;
+  failed: number;
+  skipped: number;
+  updatedIds: number[];
+}
 
 /** 首屏骨架最长等待：设置/素材 IPC 若异常挂起，最多等这么久就放行页面（§3.2 超时兜底） */
 const STARTUP_MAX_WAIT_MS = 6000;
@@ -71,6 +83,18 @@ export default function App() {
   // §7.3 方案 A：Viewer 打开时隐藏全局 BottomBar（Viewer 自带胶片条，避免双重导航）
   const viewerOpen = useLibraryStore((s) => s.viewerOpen);
 
+  // FB4-03（§6.5）：全局订阅导入后置色板完成事件 → 只做定向同步（refreshPaletteFields），
+  // 禁止调用 libraryStore.refresh()（会重置分页/滚动/Viewer 上下文）。
+  // App 级监听：用户可能在素材库/查看器/入库页/设置页之间切换，不依赖某个页面是否挂载；
+  // 订阅失败由 useTauriEvent 统一记录，不得阻塞应用首屏。
+  useTauriEvent(
+    () =>
+      on<PaletteUpdatedEvent>("palette://updated", (payload) => {
+        void useLibraryStore.getState().refreshPaletteFields(payload.updatedIds);
+      }),
+    [],
+  );
+
   const showSkeleton = !settingsLoaded && !startupTimedOut;
 
   return (
@@ -85,7 +109,7 @@ export default function App() {
           <PageErrorBoundary key={page} onReset={() => setPage(page)} onBack={() => setPage("library")}>
             {page === "import" && <ImportPage />}
             {page === "library" && <LibraryPage />}
-            {page === "superSearch" && <SuperSearchPage onBack={() => setPage(prevPage)} />}
+            {page === "superSearch" && <SuperSearchPage />}
             {page === "ai" && <AiTaggingPage />}
             {page === "settings" && <SettingsPage onBack={() => setPage(prevPage)} />}
           </PageErrorBoundary>

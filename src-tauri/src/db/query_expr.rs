@@ -19,6 +19,22 @@ use rusqlite::{params_from_iter, Connection, OptionalExtension};
 use super::sql_utils::offset_placeholders;
 use crate::error::{AppError, AppResult};
 
+/// FB5-05（§8.2/§8.3）：搜索范围。列名只能由本枚举映射，绝不能来自模型或用户字符串。
+/// serde camelCase + Default = All（旧数据缺 scope 时按 all 处理）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SearchScope {
+    /// 文件名 + 标签 + 描述
+    #[default]
+    All,
+    /// 文件名 + 描述（AI 未映射的具体画面概念使用此范围）
+    Content,
+    /// 只搜 content_description
+    Description,
+    /// 只搜 file_name
+    FileName,
+}
+
 /// 单一叶子条件。字段都带 type 标记，便于前端序列化与校验。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -51,8 +67,12 @@ pub enum LeafCond {
         #[serde(flatten)]
         filter: super::search_query::MetadataFilter,
     },
-    /// 关键词（FTS/LIKE）
-    Search { value: String },
+    /// 关键词（FTS/LIKE）。scope 缺省 = all（旧表达式兼容）。
+    Search {
+        value: String,
+        #[serde(default)]
+        scope: SearchScope,
+    },
 }
 
 fn default_true() -> bool {
@@ -134,7 +154,7 @@ fn validate_leaf(cond: &LeafCond) -> AppResult<()> {
         }
         LeafCond::Untagged => Ok(()),
         LeafCond::Metadata { filter } => super::search_query::compile_metadata(filter).map(|_| ()),
-        LeafCond::Search { value } => {
+        LeafCond::Search { value, .. } => {
             if value.chars().count() > 200 {
                 return Err(AppError::msg("搜索关键词过长"));
             }
@@ -159,6 +179,7 @@ pub fn from_filter(
             leaves.push(QueryExpr::Leaf {
                 cond: LeafCond::Search {
                     value: s.to_string(),
+                    scope: SearchScope::All,
                 },
             });
         }
@@ -214,8 +235,8 @@ pub fn from_filter(
 /// 返回的 SQL 使用从 ?1 起的占位符（与单独编译一致，由上层 offset）。
 pub fn compile_leaf(conn: &Connection, cond: &LeafCond) -> AppResult<(String, Vec<Value>)> {
     match cond {
-        LeafCond::Search { value } => {
-            let pred = super::search::build_search_predicate(conn, value)?
+        LeafCond::Search { value, scope } => {
+            let pred = super::search::build_search_predicate(conn, value, *scope)?
                 .unwrap_or_else(|| super::search::SearchPredicate::empty());
             let sql = if pred.sql.is_empty() {
                 "1=0".to_string()
@@ -279,7 +300,11 @@ fn validate_tag_leaf_facet(conn: &Connection, facet_key: &str, tag_ids: &[i64]) 
         return Ok(());
     }
     let exists: Option<i64> = conn
-        .query_row("SELECT 1 FROM tag_facets WHERE key = ?1", [facet_key], |r| r.get(0))
+        .query_row(
+            "SELECT 1 FROM tag_facets WHERE key = ?1",
+            [facet_key],
+            |r| r.get(0),
+        )
         .optional()?;
     if exists.is_none() {
         return Err(AppError::msg(format!("未知分面：{facet_key}")));
@@ -367,6 +392,49 @@ fn compile_tag_leaf(
             ),
             params,
         ))
+    }
+}
+
+/// FB5-05（§9.5.6）：统一归一化——空组删除、单子节点组折叠、连续相同 AND/OR 扁平化、
+/// 重复 leaf 去重。返回 None 表示整树无有效条件（调用方置 expr=None，不创建空 AND）。
+pub fn normalize_expr(expr: QueryExpr) -> Option<QueryExpr> {
+    match expr {
+        QueryExpr::Leaf { cond } => Some(QueryExpr::Leaf { cond }),
+        QueryExpr::And { children } => normalize_group(children, true),
+        QueryExpr::Or { children } => normalize_group(children, false),
+        QueryExpr::Not { child } => {
+            normalize_expr(*child).map(|c| QueryExpr::Not { child: Box::new(c) })
+        }
+    }
+}
+
+fn normalize_group(children: Vec<QueryExpr>, is_and: bool) -> Option<QueryExpr> {
+    let mut out: Vec<QueryExpr> = Vec::new();
+    for c in children {
+        let Some(norm) = normalize_expr(c) else {
+            continue; // 空组删除
+        };
+        match norm {
+            // 连续相同节点扁平化
+            QueryExpr::And { children: subs } if is_and => out.extend(subs),
+            QueryExpr::Or { children: subs } if !is_and => out.extend(subs),
+            other => out.push(other),
+        }
+    }
+    // 重复 leaf 去重（序列化比较，稳定）
+    let mut seen = std::collections::HashSet::new();
+    out.retain(|e| {
+        let key = serde_json::to_string(e).unwrap_or_default();
+        seen.insert(key)
+    });
+    match out.len() {
+        0 => None,
+        1 => out.into_iter().next(),
+        _ => Some(if is_and {
+            QueryExpr::And { children: out }
+        } else {
+            QueryExpr::Or { children: out }
+        }),
     }
 }
 

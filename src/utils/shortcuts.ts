@@ -43,14 +43,22 @@ export function escapeShouldExitFullscreen(doc: Document = document): boolean {
   return Boolean(doc.fullscreenElement);
 }
 
-/** requestFullscreen 的安全封装：环境不支持/rejected 时回落应用内全屏（不抛页面级错误） */
+/**
+ * FB5-01（§4.1）：只认「查看器根节点」处于 Fullscreen API 时为 native 沉浸浏览。
+ * 其他元素（如未来其它浮层）进入全屏不得改变 ViewerShell 的沉浸状态。
+ */
+export function isViewerNativeFullscreen(root: HTMLElement | null, doc: Document = document): boolean {
+  return !!root && doc.fullscreenElement === root;
+}
+
+/** requestFullscreen 的安全封装：环境不支持/rejected 时回落应用内沉浸（不抛页面级错误） */
 export async function requestFullscreenSafe(el: HTMLElement | null): Promise<boolean> {
   try {
     if (!el?.requestFullscreen) return false;
     await el.requestFullscreen();
     return true;
   } catch {
-    // WebView2 权限拒绝/不可用时退化为应用内 data-viewer-fullscreen CSS 状态
+    // WebView2 权限拒绝/不可用时由 ViewerPage 走 fallback 沉浸（createPortal 覆盖应用窗口）
     return false;
   }
 }

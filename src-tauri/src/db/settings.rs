@@ -731,7 +731,11 @@ mod tests {
             "color 由算法主色负责，不得播种成参与 AI 打标"
         );
         // 其他分面不受影响
-        let scene = s.ai_facet_configs.iter().find(|c| c.facet_key == "scene").unwrap();
+        let scene = s
+            .ai_facet_configs
+            .iter()
+            .find(|c| c.facet_key == "scene")
+            .unwrap();
         assert!(scene.enabled_for_ai);
     }
 
@@ -773,7 +777,10 @@ mod tests {
     fn appearance_missing_fields_default_to_expectations() {
         // 缺 appearance 字段反序列化 → 全默认；尤其 hover_preview.enabled 默认为 true
         let s: Settings = serde_json::from_str(r#"{}"#).unwrap();
-        assert_eq!(s.appearance.grid.library_cell_step, default_library_cell_step());
+        assert_eq!(
+            s.appearance.grid.library_cell_step,
+            default_library_cell_step()
+        );
         assert_eq!(s.appearance.grid.cell_aspect, "1:1");
         assert_eq!(s.appearance.grid.cell_fit, "cover");
         assert!(s.appearance.hover_preview.enabled, "hover 默认应开启");
@@ -807,8 +814,14 @@ mod tests {
         let s = Settings::default();
         let json = serde_json::to_string(&s).unwrap();
         let back: Settings = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.appearance.grid.library_cell_step, s.appearance.grid.library_cell_step);
-        assert_eq!(back.appearance.hover_preview.enabled, s.appearance.hover_preview.enabled);
+        assert_eq!(
+            back.appearance.grid.library_cell_step,
+            s.appearance.grid.library_cell_step
+        );
+        assert_eq!(
+            back.appearance.hover_preview.enabled,
+            s.appearance.hover_preview.enabled
+        );
     }
 
     #[test]

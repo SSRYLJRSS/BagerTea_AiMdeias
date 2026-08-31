@@ -1,39 +1,39 @@
-/** FB3-04（§6.3）：工具栏语义 —— 「全屏浏览」按钮存在；「详情」不得再作为按钮名 */
+/** FB3-04（§6.3）+ FB5-01（§4.1）：工具栏语义 —— 「全屏浏览」按钮存在；prop 名收敛为 immersive */
 import { describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen } from "@testing-library/react";
 import ViewerToolbar from "@/components/viewer/ViewerToolbar";
 
 const noop = () => undefined;
 
-describe("ViewerToolbar（FB3-04）", () => {
-  it("存在「全屏浏览」按钮（aria-label），点击调用 onToggleFullscreen", () => {
-    const onFs = vi.fn();
+describe("ViewerToolbar（FB3-04 + FB5-01）", () => {
+  it("存在「全屏浏览」按钮（aria-label），点击调用 onToggleImmersive", () => {
+    const onImmersive = vi.fn();
     render(
       <ViewerToolbar
         fileName="a.jpg"
         position="1 / 10"
         detailsOpen
         onToggleDetails={noop}
-        fullscreen={false}
-        onToggleFullscreen={onFs}
+        immersive={false}
+        onToggleImmersive={onImmersive}
         onClose={noop}
       />,
     );
     const btn = screen.getByRole("button", { name: "全屏浏览" });
     expect(btn).toBeInTheDocument();
     fireEvent.click(btn);
-    expect(onFs).toHaveBeenCalledTimes(1);
+    expect(onImmersive).toHaveBeenCalledTimes(1);
   });
 
-  it("全屏时按钮文案切换为「退出全屏浏览」", () => {
+  it("沉浸时按钮文案切换为「退出全屏浏览」", () => {
     render(
       <ViewerToolbar
         fileName="a.jpg"
         position="1 / 10"
         detailsOpen
         onToggleDetails={noop}
-        fullscreen
-        onToggleFullscreen={noop}
+        immersive
+        onToggleImmersive={noop}
         onClose={noop}
       />,
     );
@@ -48,8 +48,8 @@ describe("ViewerToolbar（FB3-04）", () => {
         position=""
         detailsOpen={false}
         onToggleDetails={noop}
-        fullscreen={false}
-        onToggleFullscreen={noop}
+        immersive={false}
+        onToggleImmersive={noop}
         onClose={noop}
       />,
     );
@@ -66,8 +66,8 @@ describe("ViewerToolbar（FB3-04）", () => {
         position=""
         detailsOpen
         onToggleDetails={onToggle}
-        fullscreen={false}
-        onToggleFullscreen={noop}
+        immersive={false}
+        onToggleImmersive={noop}
         onClose={noop}
       />,
     );

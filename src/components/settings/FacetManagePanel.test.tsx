@@ -8,7 +8,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { render, screen, waitFor, fireEvent } from "@testing-library/react";
 import FacetManagePanel from "@/components/settings/FacetManagePanel";
-import { listAllTagFacets, createTagFacet } from "@/api/tags";
+import { listAllTagFacets, createTagFacet, updateTagFacetDisplay } from "@/api/tags";
 import type { TagFacet } from "@/types/tag";
 
 vi.mock("@/api/tags", () => ({
@@ -104,5 +104,50 @@ describe("FacetManagePanel 分面生命周期（§9.2）", () => {
     await waitFor(() => expect(screen.getByText("衣服颜色")).toBeInTheDocument());
     fireEvent.click(screen.getByText("衣服颜色"));
     expect(screen.getByRole("button", { name: "恢复分类" })).toBeInTheDocument();
+  });
+
+  it("名称失焦自动保存（无需点「保存规则」）", async () => {
+    vi.mocked(listAllTagFacets).mockResolvedValue([facet()]);
+    render(<FacetManagePanel />);
+    await waitFor(() => expect(screen.getByText("衣服颜色")).toBeInTheDocument());
+    fireEvent.click(screen.getByText("衣服颜色"));
+
+    const name = screen.getByLabelText("分类名称");
+    fireEvent.change(name, { target: { value: "新名字" } });
+    fireEvent.blur(name);
+    await waitFor(() =>
+      expect(updateTagFacetDisplay).toHaveBeenCalledWith("clothing_color", "新名字", "描述"),
+    );
+  });
+
+  it("名称/说明无变化时失焦不写库", async () => {
+    vi.mocked(listAllTagFacets).mockResolvedValue([facet()]);
+    render(<FacetManagePanel />);
+    await waitFor(() => expect(screen.getByText("衣服颜色")).toBeInTheDocument());
+    fireEvent.click(screen.getByText("衣服颜色"));
+
+    fireEvent.blur(screen.getByLabelText("分类名称"));
+    fireEvent.blur(screen.getByLabelText("给人的说明"));
+    expect(updateTagFacetDisplay).not.toHaveBeenCalled();
+  });
+
+  it("无配置条目的分面：「参与 AI」如实显示为关（缺条目 = AI 不产出）", async () => {
+    vi.mocked(listAllTagFacets).mockResolvedValue([facet()]);
+    render(<FacetManagePanel />);
+    await waitFor(() => expect(screen.getByText("衣服颜色")).toBeInTheDocument());
+    fireEvent.click(screen.getByText("衣服颜色"));
+    expect(screen.getByRole("checkbox", { name: /参与 AI 打标与搜索/ })).not.toBeChecked();
+  });
+
+  it("停用分面的 AI 行为开关禁用并说明原因（后端只收 active 分面）", async () => {
+    vi.mocked(listAllTagFacets).mockResolvedValue([facet({ status: "inactive" })]);
+    render(<FacetManagePanel />);
+    await waitFor(() => expect(screen.getByText("衣服颜色")).toBeInTheDocument());
+    fireEvent.click(screen.getByText("衣服颜色"));
+
+    expect(screen.getByRole("checkbox", { name: /参与 AI 打标与搜索/ })).toBeDisabled();
+    expect(screen.getByLabelText("给 AI 的识别规则")).toBeDisabled();
+    expect(screen.getByRole("checkbox", { name: /在打标工作台显示/ })).toBeDisabled();
+    expect(screen.getByText(/恢复分类」后这些开关才生效/)).toBeInTheDocument();
   });
 });

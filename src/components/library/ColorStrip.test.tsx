@@ -20,6 +20,22 @@ describe("ColorStrip", () => {
     expect(container.firstChild).toBeNull();
   });
 
+  // FB6 需求三：rounded 只负责底边圆角（顶边与媒体框直角贴合，无缝拼接）
+  it("rounded=true 时只有底边圆角，顶部无圆角无空白", () => {
+    render(<ColorStrip palette={[seg("#000", 1, 0)]} rounded />);
+    const el = screen.getByRole("img") as HTMLElement;
+    expect(el.style.borderRadius).toBe("0 0 4px 4px");
+    // 不产生上边距/外边框/额外 padding
+    expect(el.style.margin).toBe("");
+    expect(el.style.border).toBe("");
+    expect(el.style.padding).toBe("");
+  });
+
+  it("rounded=false 时无圆角（Viewer 场景）", () => {
+    render(<ColorStrip palette={[seg("#000", 1, 0)]} />);
+    expect((screen.getByRole("img") as HTMLElement).style.borderRadius).toBe("");
+  });
+
   it("role=img + aria-label 含中文色名与占比", () => {
     render(<ColorStrip palette={[seg("#ff0000", 0.31, 0, 80, 50), seg("#fff", 0.22, 0, 3, 95)]} />);
     const el = screen.getByRole("img");

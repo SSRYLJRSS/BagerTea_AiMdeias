@@ -48,6 +48,18 @@ export function bucketToFilter(key: string, label: string): MetadataFilter | nul
       }
       break;
     }
+    case "hue":
+      // V18 色调分桶：后端按 dominant_hue 分桶（红色跨 0°），灰度按 dominant_sat<=10 判定。
+      // 红色桶 min>max（345~15）由后端环形 between 特判编译为双区间 OR。
+      if (label === "gray") return { key: "dominant_sat", op: "lte", value: 10 };
+      if (label === "red") return { key: "dominant_hue", op: "between", min: 345, max: 15 };
+      if (label === "orange") return { key: "dominant_hue", op: "between", min: 15, max: 45 };
+      if (label === "yellow") return { key: "dominant_hue", op: "between", min: 45, max: 70 };
+      if (label === "green") return { key: "dominant_hue", op: "between", min: 70, max: 155 };
+      if (label === "cyan") return { key: "dominant_hue", op: "between", min: 155, max: 225 };
+      if (label === "blue") return { key: "dominant_hue", op: "between", min: 225, max: 295 };
+      if (label === "purple") return { key: "dominant_hue", op: "between", min: 295, max: 345 };
+      break;
     default:
       // 离散等值分面（camera/lens/iso/…）：eq 单值让后端走 in/eq
       return { key: key as MetadataFilter["key"], op: "eq", value: label };

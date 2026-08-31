@@ -16,6 +16,7 @@ import { useHoverPreviewPlayback } from "@/hooks/useHoverPreviewPlayback";
 import { acquireVideoSlot } from "@/utils/videoSlot";
 import { useAppearance } from "@/hooks/useAppearance";
 import { CELL_STEPS } from "@/types/settings";
+import { currentAppearance, useSettingsStore } from "@/stores/settingsStore";
 import { ASPECT_CSS, ASPECT_RATIO, resolveFit } from "@/utils/cellFit";
 import type { ImportPlan, ImportPlanItem } from "@/api/import";
 
@@ -268,6 +269,77 @@ export default function PendingList({
   // FB2-01/02：入库网格格宽档位驱动（CELL_STEPS[importCellStep]）
   const { grid } = useAppearance();
 
+  // FB6 需求二：缩略图视图 Alt/Ctrl/Cmd + 滚轮增减卡片档位（复用素材库 CELL_STEPS 档位语义）。
+  // 仅 grid 视图挂原生 wheel listener（passive:false）；普通滚轮只滚动；
+  // 档位到边界时不 preventDefault（普通滚动继续）；60ms 节流防触控板惯性一次跳多档；
+  // 切档前记录视口中心附近的卡片，切档后一帧恢复中心（不跳顶）；入库 running 中不挂载。
+  const scrollRef = useRef<HTMLDivElement>(null);
+  /** 节流时间戳放 effect 外（组件级）：effect 因档位变化重建时不清零，保证 60ms 真实生效；-Infinity = 从未步进 */
+  const lastWheelStepAt = useRef(-Infinity);
+  useEffect(() => {
+    if (view !== "grid" || running) return;
+    const el = scrollRef.current;
+    if (!el) return;
+    let raf = 0;
+    const onWheel = (e: WheelEvent) => {
+      if (!e.altKey && !e.ctrlKey && !e.metaKey) return; // 普通滚轮：只滚动
+      const target = e.target as HTMLElement | null;
+      if (target && target.closest("input, textarea, select")) return; // 输入聚焦时不拦截
+      const app = currentAppearance(
+        useSettingsStore.getState().settings,
+        useSettingsStore.getState().previewAppearance,
+      );
+      const cur = app.grid.importCellStep;
+      const next = Math.max(0, Math.min(CELL_STEPS.length - 1, cur + (e.deltaY < 0 ? 1 : -1)));
+      if (next === cur) return; // 边界档位：不阻止默认行为（普通滚动继续）
+      const now = performance.now();
+      if (now - lastWheelStepAt.current < 60) return; // 节流窗内不改变档位（也不拦截滚动）
+      e.preventDefault();
+      lastWheelStepAt.current = now;
+
+      // 锚点：切档前视口中心附近的卡片（读 scrollTop/clientHeight + getBoundingClientRect，不读 offsetX/Y）
+      const gridEl = el.querySelector<HTMLElement>("[data-pending-grid]");
+      let anchor: HTMLElement | null = null;
+      if (gridEl) {
+        const elRect = el.getBoundingClientRect();
+        const centerY = elRect.top + el.clientHeight / 2;
+        for (const child of Array.from(gridEl.children) as HTMLElement[]) {
+          const r = child.getBoundingClientRect();
+          if (r.top <= centerY && r.bottom >= centerY) {
+            anchor = child;
+            break;
+          }
+        }
+        anchor ??= (gridEl.firstElementChild as HTMLElement) ?? null;
+      }
+
+      cancelAnimationFrame(raf);
+      raf = requestAnimationFrame(() => {
+        useSettingsStore.getState().commitAppearanceDebounced((a) => ({
+          ...a,
+          grid: { ...a.grid, importCellStep: next },
+        }));
+        // 新布局绘制后把锚点卡片回中（等价于素材库 scrollToIndex(center)；jsdom 中 rect 高度为 0 时跳过）
+        if (el && gridEl && anchor) {
+          requestAnimationFrame(() => {
+            const elRect = el.getBoundingClientRect();
+            const gRect = gridEl.getBoundingClientRect();
+            const aRect = anchor!.getBoundingClientRect();
+            if (!aRect.height) return;
+            const gridTopInContent = gRect.top - elRect.top + el.scrollTop;
+            const anchorCenter = aRect.top - gRect.top + aRect.height / 2;
+            el.scrollTop = gridTopInContent + anchorCenter - el.clientHeight / 2;
+          });
+        }
+      });
+    };
+    el.addEventListener("wheel", onWheel, { passive: false });
+    return () => {
+      el.removeEventListener("wheel", onWheel);
+      cancelAnimationFrame(raf);
+    };
+  }, [view, running, grid.importCellStep]);
+
   return (
     <div className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-lg border border-[var(--color-border)]">
       {/* 固定动作头部：添加文件/文件夹、视图切换、清空、数量与总大小。按钮不直接 invoke，事件交上层页面。 */}
@@ -330,7 +402,7 @@ export default function PendingList({
         </button>
       </div>
 
-      <div className="min-h-0 flex-1 overflow-y-auto">
+      <div ref={scrollRef} data-testid="pending-grid-scroll" className="min-h-0 flex-1 overflow-y-auto">
         {view === "list" ? (
           <div>
             {items.map((i) => (
@@ -359,6 +431,7 @@ export default function PendingList({
           </div>
         ) : (
           <div
+            data-pending-grid
             className="grid gap-2 p-2"
             style={{ gridTemplateColumns: `repeat(auto-fill, minmax(${CELL_STEPS[grid.importCellStep]}px, 1fr))` }}
           >

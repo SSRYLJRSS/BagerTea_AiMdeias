@@ -66,6 +66,9 @@ pub struct MediaMetadata {
     pub shutter: Option<String>,
     pub focal: Option<f64>,
     pub taken_at: Option<i64>,
+    /// GPS 定位（带符号十进制度；图片来自 EXIF，视频来自 ffprobe format.tags 的 ISO 6709）
+    pub latitude: Option<f64>,
+    pub longitude: Option<f64>,
     pub error: Option<String>,
 }
 
@@ -87,6 +90,10 @@ pub struct RefillSummary {
     pub success: i64,
     pub failed: i64,
     pub skipped: i64,
+    /// FB4-03（§5.6）：本轮成功执行 set_palette 的素材 id（元数据命令忽略；色板命令转成 updatedIds）。
+    /// 只在写库成功后 push，失败/跳过/仅被扫描的素材不得进入。
+    #[serde(skip_serializing)]
+    pub updated_ids: Vec<i64>,
 }
 
 /// 探测单个素材（视频走 ffprobe；图片读尺寸 + EXIF；其余无法识别 → error）。
@@ -106,6 +113,9 @@ pub fn probe_asset(asset: &Asset) -> MediaMetadata {
                 frame_rate: vm.frame_rate,
                 rotation: vm.rotation,
                 media_metadata_json: vm.raw_json,
+                latitude: vm.latitude,
+                longitude: vm.longitude,
+                taken_at: vm.taken_at,
                 error: None,
                 ..Default::default()
             },
@@ -132,6 +142,8 @@ pub fn probe_asset(asset: &Asset) -> MediaMetadata {
         m.shutter = ex.shutter;
         m.focal = ex.focal;
         m.taken_at = ex.taken_at;
+        m.latitude = ex.latitude;
+        m.longitude = ex.longitude;
         if m.width.is_none() {
             m.error = Some("无法读取图片尺寸".into());
         }
@@ -205,8 +217,15 @@ pub fn rescan_assets_with(
                     shutter: meta.shutter.as_deref(),
                     focal: meta.focal,
                     taken_at: meta.taken_at,
+                    latitude: meta.latitude,
+                    longitude: meta.longitude,
                 };
                 let _ = assets::set_exif(&conn, id, &ex);
+            }
+            // V18：视频重扫时同步补定位与拍摄时间（COALESCE 只补空，不覆盖已有值）
+            if r && meta.error.is_none() && meta.media_kind == "video" {
+                let _ =
+                    assets::set_geo_taken(&conn, id, meta.latitude, meta.longitude, meta.taken_at);
             }
             r
         };
@@ -241,6 +260,153 @@ pub fn rescan_assets(
     rescan_assets_with(db, asset_ids, cancel, probe_asset, on_progress)
 }
 
+/// V18 定位/拍摄时间回填的单次探测结果。
+#[derive(Debug, Default, Clone)]
+pub struct GeoTakenProbe {
+    pub latitude: Option<f64>,
+    pub longitude: Option<f64>,
+    pub taken_at: Option<i64>,
+    /// 非空 = 探测失败（可辨识原因）；为 None 且字段全空 = 源素材无数据（不是错误，计 skipped）
+    pub error: Option<String>,
+}
+
+/// 探测单个素材的定位/拍摄时间（V18 回填用）：
+/// 图片重读 EXIF GPS；视频优先解析已存 ffprobe 原始 JSON（format.tags 的 location/creation_time，
+/// 免拉起子进程），仅当存储 JSON 缺失/损坏才重新 ffprobe。
+pub fn probe_geo_taken(asset: &Asset) -> GeoTakenProbe {
+    if asset.mime_type.starts_with("image/") {
+        let ex = exif_meta::extract(Path::new(&asset.file_path));
+        GeoTakenProbe {
+            latitude: ex.latitude,
+            longitude: ex.longitude,
+            taken_at: ex.taken_at,
+            error: None,
+        }
+    } else if asset.mime_type.starts_with("video/") {
+        if let Some(json) = asset.media_metadata_json.as_deref() {
+            if let Ok(meta) = video::parse_ffprobe_json(json.as_bytes()) {
+                return GeoTakenProbe {
+                    latitude: meta.latitude,
+                    longitude: meta.longitude,
+                    taken_at: meta.taken_at,
+                    error: None,
+                };
+            }
+        }
+        match video::probe(Path::new(&asset.file_path)) {
+            Ok(vm) => GeoTakenProbe {
+                latitude: vm.latitude,
+                longitude: vm.longitude,
+                taken_at: vm.taken_at,
+                error: None,
+            },
+            Err(e) => GeoTakenProbe {
+                error: Some(e.to_string()),
+                ..Default::default()
+            },
+        }
+    } else {
+        GeoTakenProbe {
+            error: Some("无法识别的媒体类型".into()),
+            ..Default::default()
+        }
+    }
+}
+
+/// V18 存量回填：GPS 定位 + 视频拍摄时间（仅补空，COALESCE 不覆盖）。
+/// 复用 rescan 骨架（短锁读/写 + 取消 + 进度），计数三分：
+/// 已齐全/源素材无对应数据 → skipped（不是错误）；探测/写库失败 → failed；实际补写字段 → success。
+pub fn rescan_assets_geo_taken_with(
+    db: &Arc<Mutex<Connection>>,
+    asset_ids: &[i64],
+    cancel: &AtomicBool,
+    probe: impl Fn(&Asset) -> GeoTakenProbe,
+    mut on_progress: impl FnMut(&RefillProgress),
+) -> AppResult<RefillSummary> {
+    let lock = || {
+        db.lock()
+            .map_err(|_| crate::error::AppError::msg("数据库锁中毒"))
+    };
+    let mut summary = RefillSummary {
+        total: asset_ids.len() as i64,
+        ..Default::default()
+    };
+    for (i, &id) in asset_ids.iter().enumerate() {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        let asset = {
+            let conn = lock()?;
+            assets::get(&conn, id).ok()
+        };
+        let Some(asset) = asset else {
+            summary.skipped += 1;
+            emit_progress(&mut on_progress, i + 1, &summary, id);
+            continue;
+        };
+        let is_video = asset.mime_type.starts_with("video/");
+        let need_geo = asset.latitude.is_none();
+        let need_taken = is_video && asset.taken_at.is_none();
+        // 已齐全：不再探测（只补空语义）
+        if !need_geo && !need_taken {
+            summary.skipped += 1;
+            emit_progress(&mut on_progress, i + 1, &summary, id);
+            continue;
+        }
+        let p = probe(&asset); // 锁外探测（EXIF 解析 / ffprobe）
+        if p.error.is_some() {
+            summary.failed += 1;
+            emit_progress(&mut on_progress, i + 1, &summary, id);
+            continue;
+        }
+        // 探测结果未覆盖任何缺失字段：源素材确实无数据 —— 不是错误，计 skipped
+        let geo_useful = need_geo && p.latitude.is_some();
+        let taken_useful = need_taken && p.taken_at.is_some();
+        if !geo_useful && !taken_useful {
+            summary.skipped += 1;
+            emit_progress(&mut on_progress, i + 1, &summary, id);
+            continue;
+        }
+        let ok = {
+            let conn = lock()?;
+            assets::set_geo_taken(&conn, id, p.latitude, p.longitude, p.taken_at).is_ok()
+        };
+        if ok {
+            summary.success += 1;
+        } else {
+            summary.failed += 1;
+        }
+        emit_progress(&mut on_progress, i + 1, &summary, id);
+    }
+    Ok(summary)
+}
+
+fn emit_progress(
+    on_progress: &mut impl FnMut(&RefillProgress),
+    done: usize,
+    summary: &RefillSummary,
+    current_id: i64,
+) {
+    on_progress(&RefillProgress {
+        done: done as i64,
+        total: summary.total,
+        success: summary.success,
+        failed: summary.failed,
+        skipped: summary.skipped,
+        current_id,
+    });
+}
+
+/// 实际定位/拍摄时间回填：用 `probe_geo_taken` 探测。
+pub fn rescan_assets_geo_taken(
+    db: &Arc<Mutex<Connection>>,
+    asset_ids: &[i64],
+    cancel: &AtomicBool,
+    on_progress: impl FnMut(&RefillProgress),
+) -> AppResult<RefillSummary> {
+    rescan_assets_geo_taken_with(db, asset_ids, cancel, probe_geo_taken, on_progress)
+}
+
 /// FB2-08（§14.6/14.7）：存量色板回算。复用 rescan_assets_with 的骨架（短锁读/写 + 取消 + 进度）。
 /// 取材（FX-13）：图片 placeholder（256px 入库即生成）→ hd → 原图；视频只认 hd 封面。
 /// 计数三分（FX-10）：无可信取材/色板为空 → skipped（不是错误）；解码/写库失败 → failed；
@@ -252,7 +418,10 @@ pub fn rescan_assets_palette(
     mut on_progress: impl FnMut(&RefillProgress),
 ) -> AppResult<RefillSummary> {
     const PALETTE_VERSION: i64 = 1;
-    let lock = || db.lock().map_err(|_| crate::error::AppError::msg("数据库锁中毒"));
+    let lock = || {
+        db.lock()
+            .map_err(|_| crate::error::AppError::msg("数据库锁中毒"))
+    };
     let mut summary = RefillSummary {
         total: asset_ids.len() as i64,
         ..Default::default()
@@ -279,10 +448,18 @@ pub fn rescan_assets_palette(
                 .placeholder_path
                 .as_deref()
                 .map(std::path::PathBuf::from)
-                .or_else(|| asset.hd_thumbnail_path.as_deref().map(std::path::PathBuf::from))
+                .or_else(|| {
+                    asset
+                        .hd_thumbnail_path
+                        .as_deref()
+                        .map(std::path::PathBuf::from)
+                })
                 .or_else(|| Some(std::path::PathBuf::from(&asset.file_path)))
         } else if is_video {
-            asset.hd_thumbnail_path.as_deref().map(std::path::PathBuf::from)
+            asset
+                .hd_thumbnail_path
+                .as_deref()
+                .map(std::path::PathBuf::from)
         } else {
             None
         };
@@ -338,6 +515,8 @@ pub fn rescan_assets_palette(
                 let (hue, sat, lum) = crate::services::palette::dominant_from_rgb(p0.r, p0.g, p0.b);
                 let conn = lock()?;
                 if assets::set_palette(&conn, id, &json, PALETTE_VERSION, hue, sat, lum).is_ok() {
+                    // FB4-03：只有真实写库成功的 id 才进 updated_ids（失败/跳过不得冒充更新成功）
+                    summary.updated_ids.push(id);
                     Ok(())
                 } else {
                     Err(()) // 写库失败 = 真错误
@@ -391,8 +570,10 @@ mod tests {
             rusqlite::params![id_name, "a", "mp4", mime, duration],
         )
         .unwrap();
-        c.query_row("SELECT id FROM assets WHERE file_path=?1", [id_name], |r| r.get(0))
-            .unwrap()
+        c.query_row("SELECT id FROM assets WHERE file_path=?1", [id_name], |r| {
+            r.get(0)
+        })
+        .unwrap()
     }
 
     #[test]
@@ -418,13 +599,31 @@ mod tests {
         drop(c);
         let cancel = AtomicBool::new(false);
         // 注入 probe：video 模拟成功有 duration，图片模拟失败
-        let summary = rescan_assets_with(&db, &ids, &cancel, |a| {
-            if a.mime_type.starts_with("video/") {
-                MediaMetadata { media_kind: "video".into(), duration_ms: Some(12345), width: Some(1920), height: Some(1080), error: None, ..Default::default() }
-            } else {
-                MediaMetadata { media_kind: "image".into(), error: Some("图片损坏".into()), ..Default::default() }
-            }
-        }, |_| {}).unwrap();
+        let summary = rescan_assets_with(
+            &db,
+            &ids,
+            &cancel,
+            |a| {
+                if a.mime_type.starts_with("video/") {
+                    MediaMetadata {
+                        media_kind: "video".into(),
+                        duration_ms: Some(12345),
+                        width: Some(1920),
+                        height: Some(1080),
+                        error: None,
+                        ..Default::default()
+                    }
+                } else {
+                    MediaMetadata {
+                        media_kind: "image".into(),
+                        error: Some("图片损坏".into()),
+                        ..Default::default()
+                    }
+                }
+            },
+            |_| {},
+        )
+        .unwrap();
         assert_eq!(summary.total, 2);
         assert_eq!(summary.success, 1);
         assert_eq!(summary.failed, 1);
@@ -450,10 +649,22 @@ mod tests {
         drop(c);
         let cancel = AtomicBool::new(false);
         let mut calls = 0;
-        let summary = rescan_assets_with(&db, &ids, &cancel, |_| {
-            cancel.store(true, Ordering::Relaxed); // 处理第一个后即取消
-            MediaMetadata { media_kind: "video".into(), duration_ms: Some(1), error: None, ..Default::default() }
-        }, |_| calls += 1).unwrap();
+        let summary = rescan_assets_with(
+            &db,
+            &ids,
+            &cancel,
+            |_| {
+                cancel.store(true, Ordering::Relaxed); // 处理第一个后即取消
+                MediaMetadata {
+                    media_kind: "video".into(),
+                    duration_ms: Some(1),
+                    error: None,
+                    ..Default::default()
+                }
+            },
+            |_| calls += 1,
+        )
+        .unwrap();
         // 取消后只探了第一个
         assert_eq!(summary.success, 1);
         assert_eq!(calls, 1);
@@ -489,5 +700,105 @@ mod tests {
         assert!(a.dominant_hue.is_none(), "dominant_hue 必须保持 NULL");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── V18 定位 / 拍摄时间回填 ──
+
+    /// 注入 probe 返回数据：缺字段的素材补写成功，已齐全的计 skipped，不覆盖已有值。
+    #[test]
+    fn geo_taken_rescan_fills_missing_and_skips_complete() {
+        let db = db();
+        let (img, vid, vid_done) = {
+            let c = db.lock().unwrap();
+            let img = insert_asset(&c, "/i.jpg", "image/jpeg", None);
+            let vid = insert_asset(&c, "/v.mp4", "video/mp4", None);
+            let vid_done = insert_asset(&c, "/v2.mp4", "video/mp4", None);
+            assets::set_geo_taken(&c, vid_done, Some(1.0), Some(2.0), Some(123)).unwrap();
+            (img, vid, vid_done)
+        };
+        let cancel = AtomicBool::new(false);
+        let summary = rescan_assets_geo_taken_with(
+            &db,
+            &[img, vid, vid_done],
+            &cancel,
+            |_| GeoTakenProbe {
+                latitude: Some(30.25),
+                longitude: Some(120.16),
+                taken_at: Some(1_710_484_200_000),
+                error: None,
+            },
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(summary.total, 3);
+        assert_eq!(summary.success, 2);
+        assert_eq!(summary.skipped, 1, "已齐全的视频应计 skipped");
+        assert_eq!(summary.failed, 0);
+        let c = db.lock().unwrap();
+        let a = assets::get(&c, img).unwrap();
+        assert_eq!(a.latitude, Some(30.25));
+        assert_eq!(a.longitude, Some(120.16));
+        let v = assets::get(&c, vid).unwrap();
+        assert_eq!(v.taken_at, Some(1_710_484_200_000), "视频 taken_at 应被补上");
+        let d = assets::get(&c, vid_done).unwrap();
+        assert_eq!(d.latitude, Some(1.0), "已有值不得被覆盖");
+        assert_eq!(d.taken_at, Some(123), "已有 taken_at 不得被覆盖");
+    }
+
+    /// 探测无任何数据（源素材真没有）→ 计 skipped 而非 failed；探测报错 → failed。
+    #[test]
+    fn geo_taken_rescan_no_data_skipped_probe_error_failed() {
+        let db = db();
+        let (img, vid) = {
+            let c = db.lock().unwrap();
+            (
+                insert_asset(&c, "/i.jpg", "image/jpeg", None),
+                insert_asset(&c, "/v.mp4", "video/mp4", None),
+            )
+        };
+        let cancel = AtomicBool::new(false);
+        let summary = rescan_assets_geo_taken_with(
+            &db,
+            &[img, vid],
+            &cancel,
+            |a| {
+                if a.mime_type.starts_with("image/") {
+                    GeoTakenProbe::default() // 无数据 → skipped
+                } else {
+                    GeoTakenProbe {
+                        error: Some("ffprobe 失败".into()),
+                        ..Default::default()
+                    }
+                }
+            },
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(summary.skipped, 1, "源素材无定位应计 skipped 而非 failed");
+        assert_eq!(summary.failed, 1, "探测报错应计 failed");
+        assert_eq!(summary.success, 0);
+    }
+
+    /// probe_geo_taken 视频分支：优先解析已存 ffprobe 原始 JSON（location/creation_time），免拉子进程。
+    #[test]
+    fn probe_geo_taken_video_prefers_stored_json() {
+        let json = r#"{"format":{"tags":{"location":"+30.2500+120.1670/","creation_time":"2024-03-15T06:30:00Z"}}}"#;
+        let db = db();
+        let id = {
+            let c = db.lock().unwrap();
+            insert_asset(&c, "/v.mp4", "video/mp4", None)
+        };
+        {
+            let c = db.lock().unwrap();
+            let mut u = assets::MediaProbeUpdate::default();
+            u.media_metadata_json = Some(json.to_string());
+            assets::update_media_metadata(&c, id, &u).unwrap();
+        }
+        let a = assets::get(&db.lock().unwrap(), id).unwrap();
+        let p = probe_geo_taken(&a);
+        assert!(p.error.is_none());
+        assert_eq!(p.latitude, Some(30.25));
+        assert_eq!(p.longitude, Some(120.167));
+        assert_eq!(p.taken_at, Some(1_710_484_200_000));
     }
 }

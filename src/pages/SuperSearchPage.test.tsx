@@ -22,8 +22,10 @@ vi.mock("@/api/assets", () => ({
 }));
 vi.mock("@/api/superSearch", () => ({
   aiParseSearchQuery: vi.fn().mockResolvedValue({
-    intent: {},
-    query: { search: "", assetType: "all", untaggedOnly: false, facetFilters: [], excludeTagIds: [], missingFacetKeys: [], metadataFilters: [], sortBy: "created_at", sortDir: "desc" },
+    intent: { groups: [], exclusions: [], sortBy: null, sortDir: null },
+    expr: null,
+    sortBy: "created_at",
+    sortDir: "desc",
     explanation: "",
     warnings: [],
     resolvedTags: [],
@@ -101,11 +103,12 @@ beforeEach(() => {
   useSelectionStore.setState({ selected: new Set(), anchorIndex: null });
   useSettingsStore.setState({ settings: null, previewAppearance: null });
   useSuperSearchStore.setState({
-    query: { search: "", assetType: "all", untaggedOnly: false, facetFilters: [], excludeTagIds: [], missingFacetKeys: [], metadataFilters: [], sortBy: "created_at", sortDir: "desc" },
+    query: { search: "", assetType: "all", untaggedOnly: false, facetFilters: [], excludeTagIds: [], metadataFilters: [], sortBy: "created_at", sortDir: "desc" },
     items: [],
     total: 0,
     loading: false,
     error: null,
+    aiError: null,
     aiInput: "",
     aiLoading: false,
     aiExplanation: null,
@@ -114,12 +117,22 @@ beforeEach(() => {
 });
 
 describe("SuperSearchPage", () => {
-  it("渲染标题与返回按钮", () => {
-    render(<SuperSearchPage onBack={() => undefined} />);
-    expect(screen.getByText("超级搜索")).toBeInTheDocument();
-    expect(screen.getByText("← 返回")).toBeInTheDocument();
-    expect(screen.getAllByRole("searchbox")).toHaveLength(1);
+  it("FB6 需求五：无顶栏返回按钮和重复标题；搜索框上方唯一「超级搜索」标识", () => {
+    render(<SuperSearchPage />);
+    // 不存在顶栏返回按钮
+    expect(screen.queryByText("← 返回")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /返回/ })).not.toBeInTheDocument();
+    // 「超级搜索」标识存在且唯一（AiSearchBar 内的 h1，非输入框 placeholder）
+    const titles = screen.getAllByText("超级搜索");
+    expect(titles).toHaveLength(1);
+    expect(titles[0].tagName).toBe("H1");
+    const searchbox = screen.getByRole("searchbox");
+    expect(searchbox.getAttribute("placeholder")).not.toContain("超级搜索");
+    // 搜索框在标识下方（同一容器内 h1 位于 form 之前）
+    expect(titles[0].compareDocumentPosition(searchbox) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     expect(screen.getByRole("region", { name: "条件公式" })).toBeInTheDocument();
+    // 结果计数保留在摘要行
+    expect(screen.getByText(/项/)).toBeInTheDocument();
   });
 
   function scrollTo(top: number) {
@@ -129,7 +142,7 @@ describe("SuperSearchPage", () => {
   }
 
   it("FB-06：下滚收起详细条件，上滚恢复（FB2-06 改为 grid-template-rows 折叠，面板常驻 DOM）", () => {
-    render(<SuperSearchPage onBack={() => undefined} />);
+    render(<SuperSearchPage />);
     const panel = document.getElementById("super-search-filters") as HTMLElement;
     expect(panel).toBeInTheDocument();
     expect(panel.style.gridTemplateRows).toBe("1fr"); // 初始展开
@@ -145,14 +158,14 @@ describe("SuperSearchPage", () => {
   });
 
   it("FB2-06：顶部区（scrollTop < 48）恒为展开态", () => {
-    render(<SuperSearchPage onBack={() => undefined} />);
+    render(<SuperSearchPage />);
     scrollTo(30); // 低于 minScrollTop，即使下滚也保持展开
     const panel = document.getElementById("super-search-filters") as HTMLElement;
     expect(panel.style.gridTemplateRows).toBe("1fr");
   });
 
   it("FB2-06：focus 搜索框强制展开、focus 结果卡片不展开", () => {
-    render(<SuperSearchPage onBack={() => undefined} />);
+    render(<SuperSearchPage />);
     scrollTo(100); // 收起
     const panel = document.getElementById("super-search-filters") as HTMLElement;
     expect(panel.style.gridTemplateRows).toBe("0fr");
@@ -171,7 +184,7 @@ describe("SuperSearchPage", () => {
       items: [mkAsset(1, [{ hex: "#1b6ad2", r: 27, g: 106, b: 210, ratio: 0.7 }])],
       total: 1,
     });
-    render(<SuperSearchPage onBack={() => undefined} />);
+    render(<SuperSearchPage />);
 
     const dominant = screen.getByRole("button", { name: /^搜索.+系素材$/ });
     fireEvent.click(dominant);
@@ -185,5 +198,53 @@ describe("SuperSearchPage", () => {
     fireEvent.click(screen.getByRole("button", { name: /^搜索.+系素材$/ }));
     const next = useSuperSearchStore.getState().query.metadataFilters;
     expect(next.filter((f) => f.key === "dominant_hue")).toHaveLength(1);
+  });
+
+  describe("FB5-03 中央 Chevron 披露按钮（§3.5/§13.4）", () => {
+    it("披露按钮位于中央独立行，只显示 Chevron 图标（无旧文字按钮）", () => {
+      render(<SuperSearchPage />);
+      // 旧文字按钮不复存在
+      expect(screen.queryByText(/展开详细条件 ⤵|收起 ⤴/)).not.toBeInTheDocument();
+      // 中央披露按钮：仅图标（aria-label 驱动查询）
+      expect(screen.getByRole("button", { name: "收起详细条件" })).toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "展开详细条件" })).not.toBeInTheDocument();
+      // 按钮位于 max-w-5xl 容器内的独立行（祖先含 mx-auto max-w-5xl）
+      const btn = screen.getByRole("button", { name: "收起详细条件" });
+      expect(btn.closest(".mx-auto.max-w-5xl")).not.toBeNull();
+      // 行高 24px
+      const row = btn.closest(".h-6") as HTMLElement;
+      expect(row).not.toBeNull();
+    });
+
+    it("aria-expanded 与面板状态同步；点击切换 Chevron 方向", () => {
+      render(<SuperSearchPage />);
+      const btn = screen.getByRole("button", { name: "收起详细条件" });
+      expect(btn.getAttribute("aria-expanded")).toBe("true");
+      const panel = document.getElementById("super-search-filters") as HTMLElement;
+      expect(panel.style.gridTemplateRows).toBe("1fr");
+
+      fireEvent.click(btn);
+      expect(screen.getByRole("button", { name: "展开详细条件" }).getAttribute("aria-expanded")).toBe("false");
+      expect(panel.style.gridTemplateRows).toBe("0fr");
+      expect(panel.getAttribute("aria-hidden")).toBe("true");
+
+      fireEvent.click(screen.getByRole("button", { name: "展开详细条件" }));
+      expect(screen.getByRole("button", { name: "收起详细条件" }).getAttribute("aria-expanded")).toBe("true");
+      expect(panel.style.gridTemplateRows).toBe("1fr");
+    });
+
+    it("现有滚动收起/顶部展开/focus 展开逻辑全部保留", () => {
+      render(<SuperSearchPage />);
+      const panel = document.getElementById("super-search-filters") as HTMLElement;
+      // 下滚收起
+      scrollTo(100);
+      expect(panel.style.gridTemplateRows).toBe("0fr");
+      // focus 搜索框强制展开
+      fireEvent.focus(screen.getByRole("searchbox") as HTMLElement);
+      expect(panel.style.gridTemplateRows).toBe("1fr");
+      // 上滚回顶部保持展开
+      scrollTo(0);
+      expect(panel.style.gridTemplateRows).toBe("1fr");
+    });
   });
 });

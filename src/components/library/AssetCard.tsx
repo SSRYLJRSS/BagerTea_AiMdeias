@@ -93,9 +93,25 @@ export default memo(function AssetCard({ asset, index, selected, thumbSize, onSe
     () => (stripOn ? toPaletteSegments(asset.palette) : []),
     [stripOn, asset.palette],
   );
+  // FB6 需求三：色条实际可见时媒体框底部直角、色条只留底边圆角 → 两者无缝拼接无白缝；
+  // 色条关闭/空 palette 时媒体卡片保持原有整体圆角（空 palette 不渲染色条内容，几何由恒定槽位保证）。
+  // FB6（白线修复）：媒体框的 inset 描边会在底边画 1px hairline（深色主题为白 8%），紧贴色条顶边
+  //形成「白线」。色条可见时把描边/选中 ring/hover 全部上移到卡片外层（媒体框+色条作为一个整体
+  // 描边，接缝处无线）；色条不可见时维持原结构（ring 在媒体框上）。
+  const stripVisible = stripOn && (asset.palette?.length ?? 0) > 0;
+  const ringClasses = selected
+    ? "ring-2 ring-[var(--color-accent)]"
+    : "ring-1 ring-inset ring-[var(--color-hairline)] hover:ring-[var(--color-border-strong)]";
 
   return (
-    <div className="relative">
+    <div
+      className={clsx(
+        "relative",
+        stripVisible &&
+          "group overflow-hidden rounded-md ring-offset-2 ring-offset-[var(--color-bg)] transition-shadow",
+        stripVisible && ringClasses,
+      )}
+    >
       <div
         role="button"
         tabIndex={0}
@@ -104,12 +120,14 @@ export default memo(function AssetCard({ asset, index, selected, thumbSize, onSe
         onDoubleClick={handleDoubleClick}
         onContextMenu={handleContextMenu}
         {...triggerProps}
-        style={{ aspectRatio: aspectCSS }}
+        style={{ aspectRatio: aspectCSS, borderRadius: stripVisible ? "var(--radius-item) var(--radius-item) 0 0" : undefined }}
         className={clsx(
-          "group relative cursor-pointer overflow-hidden rounded-md outline-none select-none",
-          "ring-offset-2 ring-offset-[var(--color-bg)] transition-shadow",
-          selected ? "ring-2 ring-[var(--color-accent)]"
-                   : "ring-1 ring-inset ring-[var(--color-hairline)] hover:ring-[var(--color-border-strong)]",
+          "relative cursor-pointer overflow-hidden outline-none select-none",
+          // 色条不可见时：媒体框自带 group + 描边（原结构）；色条可见时 group/描边在外层 wrapper
+          !stripVisible && "group rounded-md",
+          !stripVisible && "ring-offset-2 ring-offset-[var(--color-bg)] transition-shadow",
+          !stripVisible && ringClasses,
+          stripVisible && "group rounded-b-none",
         )}
       >
         <Thumbnail assetId={asset.id} placeholderPath={asset.placeholderPath} alt={asset.fileName} size={thumbSize} fit={fit} />

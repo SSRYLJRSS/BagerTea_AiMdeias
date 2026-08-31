@@ -5,7 +5,7 @@
  *  - viewerOpen=true 时全局 BottomBar 隐藏（Viewer 自带胶片条，避免双重导航），TitleBar 保留。
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { render, screen, waitFor } from "@testing-library/react";
 import App from "@/App";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { useLibraryStore } from "@/stores/libraryStore";
@@ -85,7 +85,14 @@ vi.mock("@/api/export", () => ({
 }));
 vi.mock("@/api/ai", () => ({
   onAiProgress: vi.fn().mockRejectedValue(new Error("no tauri")),
-  aiListModels: vi.fn().mockResolvedValue([]),
+}));
+// FB4-03：@/api/client 的 on() 用于 App 级 palette://updated 订阅（测试里捕获 handler 手动触发）
+const clientMocks = vi.hoisted(() => ({
+  on: vi.fn(),
+}));
+vi.mock("@/api/client", () => ({
+  on: clientMocks.on,
+  invoke: vi.fn(),
 }));
 
 vi.stubGlobal("ResizeObserver", class {
@@ -157,6 +164,8 @@ beforeEach(() => {
   mocks.trashRestore.mockResolvedValue(undefined);
   mocks.getThumbnailUrl.mockResolvedValue("asset://hd.webp");
   mocks.toFileUrl.mockImplementation((p: string) => `asset://${p}`);
+  // 默认：on() 不捕获（订阅失败路径由 useTauriEvent 兜底）
+  clientMocks.on.mockReset().mockRejectedValue(new Error("no tauri"));
 });
 
 describe("App 启动骨架（§3.2）", () => {
@@ -195,5 +204,52 @@ describe("App §7.3 方案 A（Viewer 打开隐藏 BottomBar）", () => {
     expect(screen.getByText("素材库")).toBeInTheDocument();
     expect(screen.getByText("入库")).toBeInTheDocument();
     expect(screen.getByText("打标")).toBeInTheDocument();
+  });
+});
+
+describe("App palette://updated 全局监听（FB4-03 §6.5/§10.7）", () => {
+  const loadedStore = {
+    settings: mkSettings(),
+    loaded: true,
+    loading: false,
+    loadError: null,
+    saving: false,
+  };
+
+  it("收到导入色板事件后只调用 refreshPaletteFields(updatedIds)，不调用 refresh", async () => {
+    useSettingsStore.setState(loadedStore);
+    let handler: ((p: unknown) => void) | undefined;
+    clientMocks.on.mockImplementation((_event: string, h: (p: unknown) => void) => {
+      handler = h;
+      return Promise.resolve(() => undefined);
+    });
+    render(<App />);
+    // 订阅建立（"palette://updated" 事件被监听）
+    await waitFor(() =>
+      expect(clientMocks.on).toHaveBeenCalledWith("palette://updated", expect.any(Function)),
+    );
+    // 挂载 spy：当前 store 对象上的 refresh 与 refreshPaletteFields（事件触发时 getState() 返回同一对象）
+    const st = useLibraryStore.getState();
+    const refreshSpy = vi.spyOn(st, "refresh").mockResolvedValue(undefined);
+    const fieldsSpy = vi.spyOn(st, "refreshPaletteFields").mockResolvedValue(undefined);
+    // 触发事件（source 固定 import）
+    handler!({
+      source: "import",
+      total: 3,
+      success: 3,
+      failed: 0,
+      skipped: 0,
+      updatedIds: [11, 22],
+    });
+    await waitFor(() => expect(fieldsSpy).toHaveBeenCalledWith([11, 22]));
+    expect(refreshSpy).not.toHaveBeenCalled();
+  });
+
+  it("订阅失败（非 Tauri 环境）不阻塞首屏渲染", async () => {
+    useSettingsStore.setState(loadedStore);
+    clientMocks.on.mockRejectedValue(new Error("no tauri"));
+    render(<App />);
+    // 首屏正常（TitleBar 设置按钮在），不抛错
+    expect(screen.getByRole("button", { name: "设置" })).toBeInTheDocument();
   });
 });

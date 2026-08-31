@@ -50,10 +50,6 @@ export function formatValue(value: unknown, renderPositive: (v: unknown) => stri
   return renderPositive(value);
 }
 
-function mb(bytes: number): string {
-  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
-}
-
 export function formatFileSize(bytes: number): string {
   if (bytes >= 1 << 30) return `${(bytes / (1 << 30)).toFixed(1)} GB`;
   if (bytes >= 1 << 20) return `${(bytes / (1 << 20)).toFixed(1)} MB`;
@@ -80,6 +76,13 @@ export function displaySize(width: number | null, height: number | null, rotatio
   return `${width}×${height}`;
 }
 
+/** 码率展示：ffprobe bit_rate 单位是 bit/s —— 按量级显示 Mbps/kbps，不误标为 MB（FB6 需求六）。 */
+export function formatBitRate(bitsPerSecond: number): string {
+  if (bitsPerSecond >= 1_000_000) return `${(bitsPerSecond / 1_000_000).toFixed(2)} Mbps`;
+  if (bitsPerSecond >= 1_000) return `${(bitsPerSecond / 1_000).toFixed(0)} kbps`;
+  return `${bitsPerSecond} bps`;
+}
+
 function field(label: string, text: string, copyable = false, status: MetaValueStatus = "notProvided"): MetaField {
   return { key: label, label, text, status, copyable };
 }
@@ -100,14 +103,12 @@ export function buildCommonFields(a: Asset): MetaField[] {
   ];
 }
 
-/** 图片字段：仅对图片素材展示（否则整组不显示）。 */
+/** 图片字段（FB6 需求六用户白名单）：分辨率/色彩空间/拍摄时间/相机/镜头/焦距/光圈/快门/ISO。
+ *  方向/旋转、像素格式、位深不再出现在普通属性页（数据保留在 Rust/DB 与原始 JSON 诊断中）。 */
 export function buildImageFields(a: Asset): MetaField[] {
   return [
-    field("分辨率", a.width != null && a.height != null ? displaySize(a.width, a.height, a.rotation) : "未提供"),
-    field("方向/旋转", a.rotation != null ? `${a.rotation}°` : "未提供"),
+    field("分辨率", a.width != null && a.height != null ? `${a.width}×${a.height}` : "未提供"),
     field("色彩空间", a.colorSpace || "未提供"),
-    field("位深", a.bitDepth != null ? `${a.bitDepth} bit` : "未提供"),
-    field("像素格式", a.pixelFormat || "未提供"),
     field("拍摄时间", a.takenAt ? formatDate(a.takenAt) : "未提供"),
     field("相机机身", a.camera || "未提供"),
     field("镜头", a.lens || "未提供"),
@@ -118,23 +119,21 @@ export function buildImageFields(a: Asset): MetaField[] {
   ];
 }
 
-/** 视频字段：仅对视频素材展示。 */
+/** 视频字段（FB6 需求六用户白名单）：分辨率/时长/容器/编码/Profile/帧率/码率/色彩四件套/音频四项。
+ *  像素格式、位深、旋转不出现在普通属性页（保留在原始 JSON 诊断与后续视频解码使用）。 */
 export function buildVideoFields(a: Asset): MetaField[] {
   return [
-    field("分辨率", a.width != null && a.height != null ? displaySize(a.width, a.height, a.rotation) : "未提供"),
+    field("分辨率", a.width != null && a.height != null ? `${a.width}×${a.height}` : "未提供"),
     field("时长", a.durationMs != null ? formatDuration(a.durationMs) : "未读取"),
     field("容器格式", a.containerFormat || "未提供"),
     field("视频编码", a.videoCodec || "未提供"),
     field("Profile", a.videoProfile || "未提供"),
-    field("像素格式", a.pixelFormat || "未提供"),
-    field("位深", a.bitDepth != null ? `${a.bitDepth} bit` : "未提供"),
     field("帧率", a.frameRate != null ? `${a.frameRate.toFixed(2)} fps` : "未提供"),
-    field("视频码率", a.videoBitRate != null ? `${mb(a.videoBitRate)}` : "未提供"),
+    field("视频码率", a.videoBitRate != null ? formatBitRate(a.videoBitRate) : "未提供"),
     field("色彩范围", a.colorRange || "未提供"),
     field("色彩空间", a.colorSpace || "未提供"),
     field("传输曲线", a.colorTransfer || "未提供"),
     field("色彩原色", a.colorPrimaries || "未提供"),
-    field("旋转", a.rotation != null ? `${a.rotation}°` : "未提供"),
     field("音频编码", a.audioCodec || "未提供"),
     field("采样率", a.audioSampleRate != null ? `${(a.audioSampleRate / 1000).toFixed(1)} kHz` : "未提供"),
     field("声道数", a.audioChannels != null ? String(a.audioChannels) : "未提供"),

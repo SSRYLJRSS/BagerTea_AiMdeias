@@ -1,11 +1,14 @@
 /** 超级搜索页（P4 + §12 FB-06 / FB2-06）：搜索优先——中央大搜索框 + 布尔条件公式构建器 + 结果网格。
  *  FB2-06（§7.2 方案 A）：把「可折叠头部」移出滚动容器——折叠只改 header 高度，不再改变滚动容器
  *  scrollHeight，从根上断掉「卸载 ↔ scrollHeight 钳制」的正反馈环（原先的闪烁根因）。
- *  结构：顶栏（固定）→ header 区（shrink-0 不滚动，含摘要条 + grid-template-rows 折叠的详细条件）
+ *  FB6 需求五：不再有顶栏返回按钮和重复「超级搜索」标题——返回统一由底部「素材库」按钮
+ *  单击/双击完成（BottomBar.useDoubleAction）。「超级搜索」标识由 AiSearchBar 在搜索框上方显示。
+ *  结构：header 区（shrink-0 不滚动，含搜索区 + grid-template-rows 折叠的详细条件）
  *  → 滚动容器（只装虚拟化网格）。
  */
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useShallow } from "zustand/react/shallow";
+import { ChevronDown, ChevronUp } from "lucide-react";
 import AiSearchBar from "@/components/supersearch/AiSearchBar";
 import QueryBuilder from "@/components/supersearch/QueryBuilder";
 import FilterChips from "@/components/supersearch/FilterChips";
@@ -24,7 +27,7 @@ import { dominantFiltersFor } from "@/utils/dominantFilter";
 
 type DialogKey = "delete" | "export" | "tags" | null;
 
-export default function SuperSearchPage({ onBack }: { onBack: () => void }) {
+export default function SuperSearchPage() {
   const { refresh, error, total, loading, items, loadMore, fetchAllIds, applyAiSearch, query, setQuery } = useSuperSearchStore(
     useShallow((s) => ({
       refresh: s.refresh,
@@ -112,17 +115,7 @@ export default function SuperSearchPage({ onBack }: { onBack: () => void }) {
 
   return (
     <div className="relative flex h-full flex-col">
-      {/* 顶栏：返回 + 结果数（固定，不滚动） */}
-      <div className="flex h-10 shrink-0 items-center gap-2 border-b border-[var(--color-border)] px-3">
-        <button
-          onClick={onBack}
-          className="shrink-0 rounded px-2 py-1 text-sm text-[var(--color-text-secondary)] hover:bg-[var(--color-surface)] hover:text-[var(--color-text)]"
-        >
-          ← 返回
-        </button>
-        <h1 className="shrink-0 text-sm font-semibold tracking-wide text-[var(--color-text)]">超级搜索</h1>
-        <span className="ml-auto shrink-0 text-xs text-[var(--color-text-secondary)]">{total} 项</span>
-      </div>
+      {/* FB6 需求五：顶栏已移除（无返回按钮、无重复标题）。结果计数保留在下方摘要行。 */}
 
       {/* header 区（shrink-0，不滚动）：摘要条 + 可折叠详细条件。
           折叠只改 header 高度，不再改变滚动容器的 scrollHeight（FB2-06 方案 A） */}
@@ -131,23 +124,34 @@ export default function SuperSearchPage({ onBack }: { onBack: () => void }) {
         onFocusCapture={forceExpand}
         className="shrink-0"
       >
-        {/* 摘要条：搜索框 + chips + 计数 + 常驻展开/收起开关（移出滚动容器后为普通块级） */}
-        <div className="border-b border-[var(--color-border)] bg-[var(--color-bg)] px-4 py-3">
+        {/* 摘要条：搜索框 + chips + 计数（FB5-03 §3.5：文字披露按钮移出，改为中央 Chevron 披露行） */}
+        <div className="bg-[var(--color-bg)] px-4 pt-3">
           <div className="mx-auto max-w-5xl">
             <AiSearchBar onSubmit={(text) => void applyAiSearch(text)} />
             <div className="mt-1.5 flex items-center gap-2">
               <FilterChips />
               <span className="ml-auto shrink-0 text-[11px] text-[var(--color-text-tertiary)]">{total} 项</span>
-              <button
-                type="button"
-                onClick={() => setChrome(chrome === "expanded" ? "collapsed" : "expanded")}
-                aria-expanded={chrome === "expanded"}
-                aria-controls="super-search-filters"
-                className="shrink-0 rounded px-2 py-0.5 text-[11px] text-[var(--color-text-secondary)] transition-colors hover:text-[var(--color-text)] focus-visible:ring-1 focus-visible:ring-[var(--color-status)]"
-              >
-                {chrome === "expanded" ? "收起 ⤴" : "展开详细条件 ⤵"}
-              </button>
             </div>
+          </div>
+        </div>
+
+        {/* FB5-03（§3.5）：中央 Chevron 披露行 —— 摘要区与详细条件面板之间，固定 24px。
+            左右一条细分隔线表达「展开下方」，按钮只显示 Chevron 图标（无文字），
+            aria-expanded/aria-controls 与 grid-template-rows 折叠逻辑保持不变。 */}
+        <div className="mx-auto max-w-5xl px-4">
+          <div className="relative flex h-6 items-center justify-center">
+            <div className="absolute inset-x-0 top-1/2 h-px -translate-y-1/2 bg-[var(--color-border)]" aria-hidden="true" />
+            <button
+              type="button"
+              onClick={() => setChrome(chrome === "expanded" ? "collapsed" : "expanded")}
+              aria-expanded={chrome === "expanded"}
+              aria-controls="super-search-filters"
+              aria-label={chrome === "expanded" ? "收起详细条件" : "展开详细条件"}
+              title={chrome === "expanded" ? "收起详细条件" : "展开详细条件"}
+              className="relative z-10 flex size-6 items-center justify-center rounded-full bg-[var(--color-bg)] text-[var(--color-text-secondary)] transition-colors hover:text-[var(--color-text)] focus-visible:ring-1 focus-visible:ring-[var(--color-status)]"
+            >
+              {chrome === "expanded" ? <ChevronUp size={14} strokeWidth={1.75} aria-hidden="true" /> : <ChevronDown size={14} strokeWidth={1.75} aria-hidden="true" />}
+            </button>
           </div>
         </div>
 

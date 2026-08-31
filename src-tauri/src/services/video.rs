@@ -100,6 +100,11 @@ pub struct VideoMeta {
     pub audio_layout: Option<String>,
     /// 原始 ffprobe JSON 保留（未来补字段无需重读文件）
     pub raw_json: Option<String>,
+    /// GPS 定位（format.tags 的 ISO 6709 location 解析，带符号十进制度，北纬东经为正）
+    pub latitude: Option<f64>,
+    pub longitude: Option<f64>,
+    /// 拍摄时间（format.tags.creation_time，ISO 8601 UTC → epoch 毫秒，与图片 taken_at 口径一致）
+    pub taken_at: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -134,6 +139,9 @@ struct FfprobeStream {
     #[serde(rename = "sample_rate")]
     sample_rate: Option<String>,
     channels: Option<i64>,
+    /// 声道布局（如 stereo/5.1）——FB6 需求六：audio_layout 的正确来源（此前误用 tags.language/title）
+    #[serde(rename = "channel_layout")]
+    channel_layout: Option<String>,
     tags: Option<std::collections::HashMap<String, serde_json::Value>>,
     side_data_list: Option<Vec<FfprobeSideData>>,
 }
@@ -152,6 +160,8 @@ struct FfprobeFormat {
     duration: Option<String>,
     #[serde(rename = "bit_rate")]
     bit_rate: Option<String>,
+    /// 容器级标签：location / com.apple.quicktime.location（ISO 6709）、creation_time（ISO 8601 UTC）
+    tags: Option<std::collections::HashMap<String, serde_json::Value>>,
 }
 
 /// 把 `2/1`、`30000/1001` 之类的分数解析为 f64；非分数/无效返回 None。
@@ -183,6 +193,82 @@ fn as_rotation(v: &serde_json::Value) -> Option<i64> {
         v.as_str()?.trim().parse::<f64>().ok()?
     };
     Some((n.rem_euclid(360.0)) as i64)
+}
+
+/// ISO 6709 单个坐标分量 → 十进制度。`dd_len` 是度的位数（纬 2 / 经 3）：
+///  - 带小数点 → 十进制度形式（+30.2500）；
+///  - 纯数字按位数判定：dd 位 = 度，dd+2 = 度分，dd+4 = 度分秒。
+fn parse_iso6709_component(s: &str, dd_len: usize) -> Option<f64> {
+    let (sign, rest) = match s.chars().next()? {
+        '+' => (1.0, &s[1..]),
+        '-' => (-1.0, &s[1..]),
+        _ => return None,
+    };
+    if rest.is_empty() || !rest.chars().all(|c| c.is_ascii_digit() || c == '.') {
+        return None;
+    }
+    let v = if rest.contains('.') {
+        rest.parse::<f64>().ok()?
+    } else {
+        match rest.len() {
+            n if n == dd_len => rest.parse::<f64>().ok()?,
+            n if n == dd_len + 2 => {
+                let deg: f64 = rest[..dd_len].parse().ok()?;
+                let minutes: f64 = rest[dd_len..].parse().ok()?;
+                if minutes >= 60.0 {
+                    return None;
+                }
+                deg + minutes / 60.0
+            }
+            n if n == dd_len + 4 => {
+                let deg: f64 = rest[..dd_len].parse().ok()?;
+                let minutes: f64 = rest[dd_len..dd_len + 2].parse().ok()?;
+                let seconds: f64 = rest[dd_len + 2..].parse().ok()?;
+                if minutes >= 60.0 || seconds >= 60.0 {
+                    return None;
+                }
+                deg + minutes / 60.0 + seconds / 3600.0
+            }
+            _ => return None,
+        }
+    };
+    if !v.is_finite() {
+        return None;
+    }
+    Some(sign * v)
+}
+
+/// ISO 6709 定位串（手机视频常见，形如 `+30.2500+120.1670/`，可含高度尾段）→
+/// (纬度, 经度) 带符号十进制度。格式异常一律 None，绝不 panic。
+pub fn parse_iso6709_location(s: &str) -> Option<(f64, f64)> {
+    let s = s.trim().trim_end_matches('/');
+    if s.len() < 2 {
+        return None;
+    }
+    // 纬度之后的第一个 +/- 是经度起始（位置 0 的符号属于纬度）
+    let split = s[1..].find(['+', '-']).map(|i| i + 1)?;
+    let (lat_s, rest) = s.split_at(split);
+    // rest 可能还带高度段（+30.25+120.16+10.5）：只取前两段，高度丢弃。
+    // 经度结束于其后第一个符号字符（若有）。
+    let lon_end = rest[1..]
+        .find(['+', '-'])
+        .map(|i| i + 1)
+        .unwrap_or(rest.len());
+    let lon_s = &rest[..lon_end];
+    let lat = parse_iso6709_component(lat_s, 2)?;
+    let lon = parse_iso6709_component(lon_s, 3)?;
+    if lat.abs() > 90.0 || lon.abs() > 180.0 {
+        return None;
+    }
+    Some((lat, lon))
+}
+
+/// ffprobe format.tags.creation_time（ISO 8601 UTC，如 2024-03-15T14:30:00.123456Z）
+/// → epoch 毫秒（绝对时刻，与图片 taken_at 同口径；本地时区换算在展示层发生）。
+pub fn parse_creation_time_ms(s: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(s.trim())
+        .ok()
+        .map(|dt| dt.timestamp_millis())
 }
 
 /// 从 ffprobe JSON 字节流解析出 `VideoMeta`（导出的纯函数，便于 fixture 单测）。
@@ -225,11 +311,7 @@ pub fn parse_ffprobe_json(bytes: &[u8]) -> Result<VideoMeta, ProbeError> {
                         }
                     }
                     if meta.rotation.is_none() {
-                        if let Some(r) = s
-                            .tags
-                            .as_ref()
-                            .and_then(|t| t.get("rotate"))
-                        {
+                        if let Some(r) = s.tags.as_ref().and_then(|t| t.get("rotate")) {
                             meta.rotation = as_rotation(r);
                         }
                     }
@@ -238,21 +320,12 @@ pub fn parse_ffprobe_json(bytes: &[u8]) -> Result<VideoMeta, ProbeError> {
                     // 只取第一条音轨作为主音轨摘要（多音轨完整信息保留在 raw_json）
                     if meta.audio_codec.is_none() {
                         meta.audio_codec = s.codec_name.clone();
-                        meta.audio_sample_rate = s.sample_rate.as_deref().and_then(|v| v.parse::<i64>().ok());
+                        meta.audio_sample_rate =
+                            s.sample_rate.as_deref().and_then(|v| v.parse::<i64>().ok());
                         meta.audio_channels = s.channels;
-                        meta.audio_layout = s
-                            .tags
-                            .as_ref()
-                            .and_then(|t| t.get("language"))
-                            .and_then(|v| v.as_str())
-                            .map(str::to_string)
-                            .or_else(|| {
-                                s.tags
-                                    .as_ref()
-                                    .and_then(|t| t.get("title"))
-                                    .and_then(|v| v.as_str())
-                                    .map(str::to_string)
-                            });
+                        // FB6 需求六：声道布局来自 ffprobe 的 channel_layout（stereo/5.1 等）；
+                        // 缺失时保持 None（UI 显示「未提供」），不再误把 language/title 当布局。
+                        meta.audio_layout = s.channel_layout.clone();
                     }
                 }
                 _ => {}
@@ -266,6 +339,23 @@ pub fn parse_ffprobe_json(bytes: &[u8]) -> Result<VideoMeta, ProbeError> {
         }
         if meta.video_bit_rate.is_none() {
             meta.video_bit_rate = f.bit_rate.as_deref().and_then(|b| b.parse::<i64>().ok());
+        }
+        // GPS 定位与拍摄时间：容器级 tags。com.apple.quicktime.location 是 QuickTime 原生字段，
+        // 优先于通用 location（两者同源，前者存在时更可靠）；均为 ISO 6709，格式异常丢弃。
+        if let Some(tags) = &f.tags {
+            let loc = tags
+                .get("com.apple.quicktime.location")
+                .or_else(|| tags.get("location"))
+                .and_then(|v| v.as_str())
+                .and_then(parse_iso6709_location);
+            if let Some((lat, lon)) = loc {
+                meta.latitude = Some(lat);
+                meta.longitude = Some(lon);
+            }
+            meta.taken_at = tags
+                .get("creation_time")
+                .and_then(|v| v.as_str())
+                .and_then(parse_creation_time_ms);
         }
     }
     if let Ok(text) = std::str::from_utf8(bytes) {
@@ -333,7 +423,11 @@ pub fn probe(path: &Path) -> Result<VideoMeta, ProbeError> {
                     // 先 join 读线程避免资源泄漏
                     let _ = stdout_reader.join();
                     let _ = stderr_reader.join();
-                    tracing::warn!("ffprobe 探测超时（>{:?}），已终止：{}", FFMPEG_TIMEOUT, path.display());
+                    tracing::warn!(
+                        "ffprobe 探测超时（>{:?}），已终止：{}",
+                        FFMPEG_TIMEOUT,
+                        path.display()
+                    );
                     return Err(ProbeError::Timeout);
                 }
                 std::thread::sleep(Duration::from_millis(20));
@@ -353,7 +447,10 @@ pub fn probe(path: &Path) -> Result<VideoMeta, ProbeError> {
     let stderr_bytes = stderr_reader.join().unwrap_or_default();
 
     let status = status.ok_or_else(|| {
-        ProbeError::Spawn(std::io::Error::new(std::io::ErrorKind::Other, "ffprobe 未返回状态"))
+        ProbeError::Spawn(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "ffprobe 未返回状态",
+        ))
     })?;
     if !status.success() {
         let stderr = String::from_utf8_lossy(&stderr_bytes).trim().to_string();
@@ -474,7 +571,8 @@ pub fn transcode_to_h264(
         match child.try_wait() {
             Ok(Some(st)) => break Some(st),
             Ok(None) => {
-                if Instant::now() >= deadline || cancel.map_or(false, |c| c.load(Ordering::Relaxed)) {
+                if Instant::now() >= deadline || cancel.map_or(false, |c| c.load(Ordering::Relaxed))
+                {
                     let _ = child.kill();
                     let _ = child.wait();
                     let _ = stderr_reader.join();
@@ -569,7 +667,10 @@ mod tests {
         assert_eq!(meta.color_space.as_deref(), Some("bt709"));
         assert_eq!(meta.rotation, Some(90));
         assert_eq!(meta.audio_codec.as_deref(), Some("aac"));
-        assert_eq!(meta.container_format.as_deref(), Some("mov,mp4,m4a,3gp,3g2,mj2"));
+        assert_eq!(
+            meta.container_format.as_deref(),
+            Some("mov,mp4,m4a,3gp,3g2,mj2")
+        );
         assert!(meta.raw_json.is_some());
     }
 
@@ -626,8 +727,152 @@ mod tests {
     }
 
     #[test]
+    fn audio_layout_comes_from_channel_layout_field() {
+        // FB6 需求六：声道布局取 ffprobe 的 channel_layout（stereo/5.1），不再误用 language/title
+        let j = r#"
+        {
+          "streams": [
+            {"index":0,"codec_type":"video","codec_name":"h264","width":640,"height":360},
+            {"index":1,"codec_type":"audio","codec_name":"aac","sample_rate":"48000","channels":2,
+             "channel_layout":"stereo","tags":{"language":"eng","title":"Main"}}
+          ],
+          "format": {"format_name":"mov,mp4,m4a"}
+        }"#;
+        let meta = parse_ffprobe_json(&json(j)).unwrap();
+        assert_eq!(meta.audio_layout.as_deref(), Some("stereo"));
+        assert_eq!(meta.audio_channels, Some(2));
+        assert_eq!(meta.audio_sample_rate, Some(48000));
+
+        // 缺失 channel_layout → None（UI 显示「未提供」，不伪造）
+        let j2 = r#"
+        {
+          "streams": [
+            {"index":0,"codec_type":"video","codec_name":"h264"},
+            {"index":1,"codec_type":"audio","codec_name":"mp3","channels":2,
+             "tags":{"language":"jpn"}}
+          ],
+          "format": {"format_name":"mp3"}
+        }"#;
+        let meta2 = parse_ffprobe_json(&json(j2)).unwrap();
+        assert_eq!(meta2.audio_layout, None);
+    }
+
+    #[test]
     fn corrupted_json_returns_parse_error() {
         let err = parse_ffprobe_json(&json("{ not valid json "));
         assert!(matches!(err, Err(ProbeError::Parse(_))));
+    }
+
+    // ── GPS 定位（ISO 6709）与拍摄时间 ──
+
+    #[test]
+    fn iso6709_decimal_degrees_parses() {
+        let (lat, lon) = parse_iso6709_location("+30.2500+120.1670/").unwrap();
+        assert!((lat - 30.25).abs() < 1e-9);
+        assert!((lon - 120.167).abs() < 1e-9);
+        // 南纬西经为负；无尾斜杠也合法
+        let (lat, lon) = parse_iso6709_location("-33.8688-070.6693").unwrap();
+        assert!((lat + 33.8688).abs() < 1e-9);
+        assert!((lon + 70.6693).abs() < 1e-9);
+    }
+
+    #[test]
+    fn iso6709_with_altitude_and_packed_dms() {
+        // 高度尾段丢弃，只取前两段
+        let (lat, lon) = parse_iso6709_location("+30.2500+120.1670+15.500/").unwrap();
+        assert!((lat - 30.25).abs() < 1e-9);
+        assert!((lon - 120.167).abs() < 1e-9);
+        // 打包度分秒：+301500 = 30°15'00" = 30.25；+1201030 = 120°10'30"
+        let (lat, lon) = parse_iso6709_location("+301500+1201030/").unwrap();
+        assert!((lat - 30.25).abs() < 1e-9);
+        assert!((lon - (120.0 + 10.0 / 60.0 + 30.0 / 3600.0)).abs() < 1e-9);
+        // 打包度分：+3015+12010 = 30.25° 120.1667°
+        let (lat, lon) = parse_iso6709_location("+3015+12010/").unwrap();
+        assert!((lat - 30.25).abs() < 1e-9);
+        assert!((lon - (120.0 + 10.0 / 60.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn iso6709_malformed_is_none() {
+        assert!(parse_iso6709_location("").is_none());
+        assert!(parse_iso6709_location("/").is_none());
+        assert!(parse_iso6709_location("+").is_none());
+        assert!(parse_iso6709_location("abc").is_none());
+        assert!(parse_iso6709_location("+30.25").is_none()); // 缺经度段
+        assert!(parse_iso6709_location("+91.0000+120.1670/").is_none()); // 纬度越界
+        assert!(parse_iso6709_location("+30.2500+181.1670/").is_none()); // 经度越界
+        assert!(parse_iso6709_location("+3075+12010/").is_none()); // 分 ≥60 非法
+    }
+
+    #[test]
+    fn creation_time_utc_to_epoch_millis() {
+        // 2024-03-15T06:30:00Z = 1710484200000 ms（UTC 绝对时刻，本地时区展示在展示层换算）
+        let ms = parse_creation_time_ms("2024-03-15T06:30:00Z").unwrap();
+        assert_eq!(ms, 1710484200000);
+        // 带微秒小数（ffprobe 常见 6 位小数）与带偏移量形式均能解析，时刻与 UTC 形式一致/等价
+        let ms2 = parse_creation_time_ms("2024-03-15T06:30:00.123456Z").unwrap();
+        assert_eq!(ms2, 1710484200123);
+        let ms3 = parse_creation_time_ms("2024-03-15T14:30:00+08:00").unwrap();
+        assert_eq!(ms3, 1710484200000, "带时区偏移须换算为同一绝对时刻");
+        // 非法格式容错
+        assert!(parse_creation_time_ms("not-a-date").is_none());
+        assert!(parse_creation_time_ms("").is_none());
+    }
+
+    #[test]
+    fn parses_format_tags_location_and_creation_time() {
+        let j = r#"
+        {
+          "streams": [{"index":0,"codec_type":"video","codec_name":"hevc","width":1920,"height":1080}],
+          "format": {"format_name":"mov,mp4,m4a,3gp,3g2,mj2","duration":"5.0",
+            "tags": {
+              "major_brand":"qt  ",
+              "creation_time":"2024-03-15T06:30:00.000000Z",
+              "com.apple.quicktime.location":"+30.2500+120.1670/",
+              "location":"+30.2500+120.1670/"
+            }}
+        }"#;
+        let meta = parse_ffprobe_json(&json(j)).unwrap();
+        assert_eq!(meta.latitude, Some(30.25));
+        assert!((meta.longitude.unwrap() - 120.167).abs() < 1e-9);
+        assert_eq!(meta.taken_at, Some(1710484200000));
+    }
+
+    #[test]
+    fn format_tags_location_fallback_and_bad_values() {
+        // 只有通用 location（无 quicktime 字段）也能解析；creation_time 非法时 taken_at 保持 None，
+        // location 非法时经纬度保持 None，互不影响、不报错。
+        let j = r#"
+        {
+          "streams": [{"index":0,"codec_type":"video","codec_name":"h264"}],
+          "format": {"format_name":"mov,mp4",
+            "tags": {"creation_time":"garbage", "location":"+39.9042+116.4074/"}}
+        }"#;
+        let meta = parse_ffprobe_json(&json(j)).unwrap();
+        assert!((meta.latitude.unwrap() - 39.9042).abs() < 1e-9);
+        assert!((meta.longitude.unwrap() - 116.4074).abs() < 1e-9);
+        assert_eq!(meta.taken_at, None);
+
+        let j2 = r#"
+        {
+          "streams": [{"index":0,"codec_type":"video","codec_name":"h264"}],
+          "format": {"format_name":"mov,mp4",
+            "tags": {"creation_time":"2024-03-15T06:30:00Z", "location":"not-a-location"}}
+        }"#;
+        let meta2 = parse_ffprobe_json(&json(j2)).unwrap();
+        assert_eq!(meta2.latitude, None);
+        assert_eq!(meta2.longitude, None);
+        assert_eq!(meta2.taken_at, Some(1710484200000));
+
+        // 无 tags 的普通视频：三个字段均 None，向后兼容不报错（复用既有 fixture）
+        let j3 = r#"
+        {
+          "streams": [{"index":0,"codec_type":"video","codec_name":"h264"}],
+          "format": {"format_name":"matroska,webm","duration":"1"}
+        }"#;
+        let meta3 = parse_ffprobe_json(&json(j3)).unwrap();
+        assert_eq!(meta3.latitude, None);
+        assert_eq!(meta3.longitude, None);
+        assert_eq!(meta3.taken_at, None);
     }
 }

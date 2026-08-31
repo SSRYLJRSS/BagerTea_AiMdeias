@@ -14,7 +14,6 @@ use bagertea_ai_media_v2_lib::services::ollama_setup::{self, PullProgress};
 
 use common::{HttpResponse, MockServer};
 
-
 /// Windows 本地回环瞬态连接失败（见 ai_service_integration.rs 的 conn_retry_test 说明，
 /// 实测失败率 ~13-19%）的用例级重试外壳：仅当失败特征是连接层错误时重建 mock 重跑，
 /// 业务断言失败不重试（不掩盖真错）。
@@ -22,9 +21,7 @@ macro_rules! conn_retry_test {
     ($name:ident, $body:block) => {
         #[test]
         fn $name() {
-            let attempt = || {
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| $body))
-            };
+            let attempt = || std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| $body));
             for n in 0..=2u32 {
                 match attempt() {
                     Ok(()) => return,
@@ -43,7 +40,11 @@ macro_rules! conn_retry_test {
                             || msg.contains("错误应含状态码")
                             || msg.contains("应失败");
                         if is_conn && n < 2 {
-                            eprintln!("[conn-retry {}] 连接层错误，重建 mock 重跑: {}", n + 1, &msg.chars().take(160).collect::<String>());
+                            eprintln!(
+                                "[conn-retry {}] 连接层错误，重建 mock 重跑: {}",
+                                n + 1,
+                                &msg.chars().take(160).collect::<String>()
+                            );
                             continue;
                         }
                         std::panic::resume_unwind(payload);
@@ -114,46 +115,46 @@ fn ping_connection_refused_returns_not_running() {
 // 且 base_url 带 /v1 时请求打到 api_root 剥离后的 /api/pull
 conn_retry_test!(pull_streams_progress_until_success, {
     let run = || -> AppResult<()> {
-    let _g = common::net_lock_guard();
-    let srv = MockServer::start(|req| {
-        assert_eq!(req.path, "/api/pull");
-        let body: serde_json::Value = serde_json::from_str(&req.body).unwrap();
-        assert_eq!(body["name"], "qwen2.5vl:3b");
-        assert_eq!(body["stream"], true);
-        HttpResponse::ok_json(
-            "{\"status\":\"pulling manifest\"}\n\
+        let _g = common::net_lock_guard();
+        let srv = MockServer::start(|req| {
+            assert_eq!(req.path, "/api/pull");
+            let body: serde_json::Value = serde_json::from_str(&req.body).unwrap();
+            assert_eq!(body["name"], "qwen2.5vl:3b");
+            assert_eq!(body["stream"], true);
+            HttpResponse::ok_json(
+                "{\"status\":\"pulling manifest\"}\n\
              {\"status\":\"downloading digest\",\"total\":1000,\"completed\":250}\n\
              {\"status\":\"downloading digest\",\"total\":1000,\"completed\":1000}\n\
              {\"status\":\"verifying sha256 digest\"}\n\
              {\"status\":\"success\"}\n",
-        )
-    });
-    let cancel = Arc::new(AtomicBool::new(false));
-    let (sink, progress) = pull_sink();
-    // 带 /v1 的档案 base_url：应剥离后请求 /api/pull
-    ollama_setup::pull(
-        &format!("{}/v1", srv.url()),
-        "qwen2.5vl:3b",
-        &cancel,
-        progress,
-    )?;
+            )
+        });
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (sink, progress) = pull_sink();
+        // 带 /v1 的档案 base_url：应剥离后请求 /api/pull
+        ollama_setup::pull(
+            &format!("{}/v1", srv.url()),
+            "qwen2.5vl:3b",
+            &cancel,
+            progress,
+        )?;
 
-    let events = sink.lock().unwrap().clone();
-    assert_eq!(events.len(), 5);
-    assert_eq!(events[0].status, "pulling manifest");
-    assert!(!events[0].done);
-    assert_eq!(events[2].completed, 1000);
-    let last = events.last().unwrap();
-    assert!(last.done);
-    assert_eq!(last.status, "success");
-    assert!(last.error.is_none());
-    let reqs = srv.requests();
-    assert_eq!(reqs.len(), 1);
-    assert_eq!(
-        reqs[0].path, "/api/pull",
-        "应剥离开放兼容层 /v1 直连 Ollama 原生 API"
-    );
-    Ok(())
+        let events = sink.lock().unwrap().clone();
+        assert_eq!(events.len(), 5);
+        assert_eq!(events[0].status, "pulling manifest");
+        assert!(!events[0].done);
+        assert_eq!(events[2].completed, 1000);
+        let last = events.last().unwrap();
+        assert!(last.done);
+        assert_eq!(last.status, "success");
+        assert!(last.error.is_none());
+        let reqs = srv.requests();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(
+            reqs[0].path, "/api/pull",
+            "应剥离开放兼容层 /v1 直连 Ollama 原生 API"
+        );
+        Ok(())
     };
     run().unwrap();
 });
@@ -235,26 +236,26 @@ conn_retry_test!(pull_non_200_status_fails, {
 // list_models：/api/tags 返回 name+size → 结构化列表；base_url 带 /v1 剥离到根路径
 conn_retry_test!(list_models_returns_name_and_size, {
     let run = || -> AppResult<()> {
-    let _g = common::net_lock_guard();
-    let srv = MockServer::start(|req| {
-        assert_eq!(req.path, "/api/tags");
-        HttpResponse::ok_json(
-            r#"{"models":[{"name":"llava:latest","size":1234567890},{"name":"qwen2.5vl:7b","size":4096000000}]}"#,
-        )
-    });
-    let list = ollama_setup::list_models(&format!("{}/v1", srv.url()))?;
-    assert_eq!(list.len(), 2);
-    assert_eq!(list[0].name, "llava:latest");
-    assert_eq!(list[0].size, 1234567890);
-    assert_eq!(list[1].name, "qwen2.5vl:7b");
-    assert_eq!(list[1].size, 4096000000);
-    let reqs = srv.requests();
-    assert_eq!(reqs.len(), 1);
-    assert_eq!(
-        reqs[0].path, "/api/tags",
-        "应剥离开放兼容层 /v1 直连原生 API"
-    );
-    Ok(())
+        let _g = common::net_lock_guard();
+        let srv = MockServer::start(|req| {
+            assert_eq!(req.path, "/api/tags");
+            HttpResponse::ok_json(
+                r#"{"models":[{"name":"llava:latest","size":1234567890},{"name":"qwen2.5vl:7b","size":4096000000}]}"#,
+            )
+        });
+        let list = ollama_setup::list_models(&format!("{}/v1", srv.url()))?;
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].name, "llava:latest");
+        assert_eq!(list[0].size, 1234567890);
+        assert_eq!(list[1].name, "qwen2.5vl:7b");
+        assert_eq!(list[1].size, 4096000000);
+        let reqs = srv.requests();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(
+            reqs[0].path, "/api/tags",
+            "应剥离开放兼容层 /v1 直连原生 API"
+        );
+        Ok(())
     };
     run().unwrap();
 });
@@ -273,26 +274,26 @@ conn_retry_test!(list_models_non_200_fails, {
 // handler 内不 assert（panic 会重置连接表现为 send error），统一在测试体查请求日志
 conn_retry_test!(delete_model_sends_delete_with_name, {
     let run = || -> AppResult<()> {
-    let _g = common::net_lock_guard();
-    let srv = MockServer::start(|req| {
-        assert!(req.path.starts_with("/api/delete"));
-        HttpResponse::ok_json("{}")
-    });
-    ollama_setup::delete_model(&format!("{}/v1", srv.url()), "qwen2.5vl:3b")?;
-    let reqs = srv.requests();
-    assert_eq!(reqs.len(), 1);
-    assert_eq!(
-        reqs[0].method, "DELETE",
-        "应使用 DELETE 方法，实际: {:?}",
-        reqs[0].method
-    );
-    assert_eq!(
-        reqs[0].path, "/api/delete",
-        "应剥离开放兼容层 /v1 直连原生 API"
-    );
-    let body: serde_json::Value = serde_json::from_str(&reqs[0].body).unwrap();
-    assert_eq!(body["name"], "qwen2.5vl:3b");
-    Ok(())
+        let _g = common::net_lock_guard();
+        let srv = MockServer::start(|req| {
+            assert!(req.path.starts_with("/api/delete"));
+            HttpResponse::ok_json("{}")
+        });
+        ollama_setup::delete_model(&format!("{}/v1", srv.url()), "qwen2.5vl:3b")?;
+        let reqs = srv.requests();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(
+            reqs[0].method, "DELETE",
+            "应使用 DELETE 方法，实际: {:?}",
+            reqs[0].method
+        );
+        assert_eq!(
+            reqs[0].path, "/api/delete",
+            "应剥离开放兼容层 /v1 直连原生 API"
+        );
+        let body: serde_json::Value = serde_json::from_str(&reqs[0].body).unwrap();
+        assert_eq!(body["name"], "qwen2.5vl:3b");
+        Ok(())
     };
     run().unwrap();
 });

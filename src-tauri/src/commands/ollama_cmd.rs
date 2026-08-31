@@ -372,7 +372,9 @@ pub async fn ollama_start_service(state: State<'_, AppState>) -> AppResult<Ollam
         // L2：已有服务标记 External，绝不重启/改环境（§8.2）
         if ollama_setup::ping(installer::LOCAL_BASE_URL).running {
             {
-                let mut rt = runtime.lock().map_err(|_| AppError::msg("Ollama 运行态锁中毒"))?;
+                let mut rt = runtime
+                    .lock()
+                    .map_err(|_| AppError::msg("Ollama 运行态锁中毒"))?;
                 rt.mark_external();
             }
             tracing::info!("检测到已运行的 Ollama 服务（标记 External，应用不重启）");
@@ -393,7 +395,9 @@ pub async fn ollama_start_service(state: State<'_, AppState>) -> AppResult<Ollam
         };
         // 保存 Child/pid 为 AppOwned（防重复启动）
         {
-            let mut rt = runtime.lock().map_err(|_| AppError::msg("Ollama 运行态锁中毒"))?;
+            let mut rt = runtime
+                .lock()
+                .map_err(|_| AppError::msg("Ollama 运行态锁中毒"))?;
             rt.register_app_owned(child);
         }
         if installer::wait_ready(installer::LOCAL_BASE_URL, Duration::from_secs(20)).is_some() {
@@ -432,7 +436,9 @@ pub async fn ollama_runtime_status(state: State<'_, AppState>) -> AppResult<Olla
 pub async fn ollama_stop_service(state: State<'_, AppState>) -> AppResult<OllamaStopResult> {
     let runtime = std::sync::Arc::clone(&state.ollama_runtime);
     tauri::async_runtime::spawn_blocking(move || {
-        let mut rt = runtime.lock().map_err(|_| AppError::msg("Ollama 运行态锁中毒"))?;
+        let mut rt = runtime
+            .lock()
+            .map_err(|_| AppError::msg("Ollama 运行态锁中毒"))?;
         let before = rt.snapshot().ownership;
         let stopped = rt.stop_app_owned();
         let after = rt.snapshot();

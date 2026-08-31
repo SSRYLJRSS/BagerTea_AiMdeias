@@ -51,9 +51,10 @@ export default function SideBar() {
         </div>
       </div>
 
-      {/* 标签区 */}
-      <div className="min-h-0 flex-1 overflow-y-auto px-2 py-2">
-        <div className="sticky top-0 z-10 bg-[var(--color-bg)] px-2 pt-1 pb-2">
+      {/* 标签区（FB4-02）：固定头部与滚动正文为兄弟节点，禁止把标题放回滚动层。
+          头部不在滚动容器内，正文层只允许纵向滚动（overflow-x-hidden），杜绝顶部漏字与横向滚动条。 */}
+      <div className="flex min-h-0 flex-1 flex-col">
+        <div className="shrink-0 border-b border-[var(--color-border)] bg-[var(--color-bg)] px-4 py-3">
           <h3 className="text-base font-semibold text-[var(--color-text)]">
             标签
           </h3>
@@ -77,9 +78,11 @@ export default function SideBar() {
             </button>
           </div>
         </div>
-        {tagMode === "smart"
-          ? <TagTree onManage={() => setManageOpen(true)} />
-          : <MetadataPanel />}
+        <div className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden px-2 py-2">
+          {tagMode === "smart"
+            ? <TagTree onManage={() => setManageOpen(true)} />
+            : <MetadataPanel />}
+        </div>
       </div>
       <TagManageDialog open={manageOpen} onClose={() => setManageOpen(false)} />
     </aside>

@@ -716,7 +716,7 @@ conn_retry_test!(resume_after_cancel_skips_generated, {
     Ok(())
 });
 
-// list_models：OpenAI /models 解析 + 鉴权头
+// discover_models：OpenAI /models 解析 + 鉴权头（FB5-04 取代 list_models）
 conn_retry_test!(list_models_parses_openai_response, {
     let _g = common::net_lock_guard();
     let srv = MockServer::start(|req| {
@@ -725,19 +725,20 @@ conn_retry_test!(list_models_parses_openai_response, {
             r#"{"object":"list","data":[{"id":"qwen-vl-plus"},{"id":"qwen-vl-max"}]}"#,
         )
     });
-    let models = ai_cloud::list_models(&srv.url(), "k", "openai")?;
-    assert_eq!(models, vec!["qwen-vl-plus", "qwen-vl-max"]);
+    let models = ai_cloud::discover_models(&srv.url(), "k", "openai_chat", false)?;
+    // discover_models 去重 + 大小写不敏感排序（qwen-vl-max < qwen-vl-plus）
+    assert_eq!(models, vec!["qwen-vl-max", "qwen-vl-plus"]);
     let reqs = srv.requests();
     assert_eq!(reqs[0].method, "GET");
     assert_eq!(reqs[0].header_authorization.as_deref(), Some("Bearer k"));
     Ok(())
 });
 
-// list_models：401 → 明确 Err，不 panic
+// discover_models：401 → 明确 Err，不 panic
 conn_retry_test!(list_models_error_propagates, {
     let _g = common::net_lock_guard();
     let srv = MockServer::start(|_| HttpResponse::status_only(401));
-    let r = ai_cloud::list_models(&srv.url(), "k", "openai");
+    let r = ai_cloud::discover_models(&srv.url(), "k", "openai_chat", false);
     assert!(r.is_err(), "401 应返回 Err");
     Ok(())
 });

@@ -1,24 +1,32 @@
 /**
- * MediaViewport（指导书 §4.2 / §7）：查看器媒体舞台。
+ * MediaViewport（指导书 §4.2 / §7 + FB5-01 §4.3）：查看器媒体舞台。
  *  - 图片：Pointer Events 平移/双击缩放/Alt+滚轮锚点缩放/左键缩放后拖拽/中键兼容平移；
  *  - ViewState 状态机 idle|panning|temporaryZoom（§7.4：idle -> panning -> idle；idle -> temporaryZoom -> idle）；
  *    缩放钳制 0.2–8，初始 1；恢复 1x 时 offset 归零；
  *  - 坐标契约（§7.2）：唯一坐标函数 pointerInStage（viewportMath.ts），只使用 clientX/clientY
  *    + stageRef.getBoundingClientRect()；禁止读取 SyntheticEvent/target 的 offsetX/offsetY；
- *  - 代际保护（§7.3）：assetId/图片源变化递增 generation；原生 wheel listener、图片 onError、
+ *  - 代际保护（§7.3）：assetId/图片源/沉浸状态变化递增 generation；原生 wheel listener、图片 onError、
  *    拖拽回调捕获代际，执行前不一致则丢弃（快速切图后旧回调不改新素材）；
  *  - pointer capture 在 pointerup/pointercancel/卸载时释放；dragStart 为空时 pointermove 直接返回；
+ *  - FB5-01（§4.3）：immersive 沉浸浏览 —— 图片白底（StageFrame surface），1x 也可左键平移
+ *    （canLeftPan = immersive || view.scale > 1），平移 offset 经 clampImmersiveOffset 约束
+ *    （至少保留 48px 图像边缘在画布内）；进入/退出沉浸或切 assetId 时重置居中适应状态；
+ *    双击在 1x/2x 间切换；视频双击调用 onToggleImmersive；
  *  - 视频：不参与图片平移逻辑，由上层传入 video 节点渲染，锚定尺寸约束；
  *  - 致命错误（§7.5）：沿用现有边界视觉显示「当前素材暂时无法显示」，重新加载需由上层重新获取 URL/高清图。
  */
 import { useCallback, useEffect, useRef, useState } from "react";
 import clsx from "clsx";
-import StageFrame from "@/components/viewer/StageFrame";
-import { pointerInStage, clampScale, ZOOM_MIN, ZOOM_MAX } from "@/components/viewer/viewportMath";
+import { RotateCw } from "lucide-react";
+import StageFrame, { type StageSurface } from "@/components/viewer/StageFrame";
+import { pointerInStage, clampScale, clampImmersiveOffset, ZOOM_MIN, ZOOM_MAX } from "@/components/viewer/viewportMath";
 
 export { ZOOM_MIN, ZOOM_MAX };
 
 const DOUBLE_CLICK_ZOOM = 2;
+
+/** temporaryZoom 自动回落 idle 的延时（匹配 transform 120ms 过渡完成后再回落） */
+const TEMP_ZOOM_REVERT_MS = 160;
 
 export type ViewState = {
   scale: number;
@@ -29,14 +37,15 @@ export type ViewState = {
 
 export const INITIAL_VIEW: ViewState = { scale: 1, offsetX: 0, offsetY: 0, mode: "idle" };
 
-/** temporaryZoom 自动回落 idle 的延时（匹配 transform 120ms 过渡完成后再回落） */
-const TEMP_ZOOM_REVERT_MS = 160;
-
 interface MediaViewportProps {
   /** 素材 id：切换时重置视图（代际保护的一环） */
   assetId: number;
   /** 是否为视频：视频由 video 节点渲染，不挂图片平移交互 */
   isVideo: boolean;
+  /** FB5-01（§4.3）：沉浸浏览。图片 1x 可平移 + 白底；视频双击可切换沉浸 */
+  immersive?: boolean;
+  /** FB5-01（§4.3）：视频双击切换沉浸模式（由 ViewerPage 统一状态机驱动） */
+  onToggleImmersive?: () => void;
   /** 图片高清源（URL）；null 时显示占位；视频路径可省略 */
   imageSrc?: string | null;
   /** 原文件兜底 URL（缩略图失效时） */
@@ -57,6 +66,8 @@ interface MediaViewportProps {
 export default function MediaViewport({
   assetId,
   isVideo,
+  immersive = false,
+  onToggleImmersive,
   imageSrc,
   imageFallbackUrl,
   fileName,
@@ -67,6 +78,7 @@ export default function MediaViewport({
   onBackToLibrary,
 }: MediaViewportProps) {
   const stageRef = useRef<HTMLDivElement>(null);
+  const imgRef = useRef<HTMLImageElement>(null);
   const [view, setView] = useState<ViewState>(INITIAL_VIEW);
   /** 拖拽起点（元素坐标 + 起点偏移） */
   const dragStart = useRef<{ x: number; y: number; offsetX: number; offsetY: number; gen: number } | null>(null);
@@ -74,12 +86,30 @@ export default function MediaViewport({
   const activePointer = useRef<number | null>(null);
   /** temporaryZoom 回落 idle 的定时器 */
   const zoomTimer = useRef<number | null>(null);
-  /** 代际保护（§7.3）：assetId/图片源变化、重试、卸载时递增 */
+  /** 代际保护（§7.3）：assetId/图片源/沉浸状态变化、重试、卸载时递增 */
   const generation = useRef(0);
   /** 首挂载不递增：首个 onError 闭包捕获的代际必须与挂载时一致（否则第一次错误就被丢弃） */
   const firstRender = useRef(true);
+  /** FB6 需求六：查看器临时旋转角（只影响视觉，不写回文件/数据库；累加不取模） */
+  const [viewerRotation, setViewerRotation] = useState(0);
+  /** 旋转按钮可见性：仅当指针碰到底部居中的旋钮热区（或键盘聚焦按钮）才浮现 */
+  const [rotateVisible, setRotateVisible] = useState(false);
 
-  // 切素材/换源：代际 +1，重置视图 + 清拖拽状态（§7.3）
+  const showRotateControls = useCallback(() => setRotateVisible(true), []);
+  /** 指针离开旋钮热区/舞台：立即隐藏，不让按钮残留 */
+  const hideRotateControls = useCallback(() => setRotateVisible(false), []);
+
+  // FB6 需求六：顺时针旋转 90°——回到当前缩放比例的居中状态（offset 归零），避免图片被转出舞台。
+  // 角度累加不取模：第 4 次点击继续滚到 360°（CSS 过渡始终顺时针 +90°），
+  // 若 %360 会在 270°→0° 时倒转 270°，视觉上像倒带。切图时统一归零。
+  const rotateClockwise = useCallback(() => {
+    setViewerRotation((r) => r + 90);
+    setView((v) => (v.offsetX !== 0 || v.offsetY !== 0 ? { ...v, offsetX: 0, offsetY: 0 } : v));
+    showRotateControls();
+  }, [showRotateControls]);
+
+  // 切素材/换源/切沉浸：代际 +1，重置视图 + 清拖拽状态（§7.3 + FB5-01：进入/退出沉浸重置居中）
+  // FB6 需求六：同时隐藏旋转按钮并归零临时旋转（切图不继承上一张的旋转角）
   useEffect(() => {
     if (firstRender.current) {
       firstRender.current = false;
@@ -87,13 +117,15 @@ export default function MediaViewport({
     }
     generation.current += 1;
     setView(INITIAL_VIEW);
+    setViewerRotation(0);
+    setRotateVisible(false);
     dragStart.current = null;
     activePointer.current = null;
     if (zoomTimer.current != null) {
       window.clearTimeout(zoomTimer.current);
       zoomTimer.current = null;
     }
-  }, [assetId, imageSrc]);
+  }, [assetId, imageSrc, immersive]);
 
   // 卸载时清理：释放 pointer capture、清 temporaryZoom 定时器、代际 +1 使旧回调失效
   useEffect(() => {
@@ -108,14 +140,14 @@ export default function MediaViewport({
         try {
           el.releasePointerCapture(activePointer.current);
         } catch {
-          /* 已释放/无效 id 忽略 */
+          /* 忽略 */
         }
       }
+      activePointer.current = null;
     };
   }, []);
 
-  /** 统一缩放 reducer（§7.2 双击、wheel、触摸缩放都走这里）：
-   *  以指针为锚点；next 回到 1x 时 offset 归零；返回 clamped scale。 */
+  /** 锚点缩放 reducer：temporaryZoom 状态（§7.4） */
   const zoomAt = useCallback((clientX: number, clientY: number, nextRaw: number, gen: number) => {
     const rect = stageRef.current?.getBoundingClientRect();
     const { x, y } = pointerInStage(clientX, clientY, rect);
@@ -164,18 +196,21 @@ export default function MediaViewport({
         zoomAt(e.clientX, e.clientY, DOUBLE_CLICK_ZOOM, gen);
         armTemporaryZoomRevert();
       } else {
-        setView(INITIAL_VIEW); // 已放大：回 1x，offset 归零
+        setView(INITIAL_VIEW); // 已放大：回 1x，offset 归零（适应屏幕并居中）
       }
     },
     [isVideo, view.scale, zoomAt, armTemporaryZoomRevert],
   );
 
+  // FB5-01（§4.3）：沉浸模式 1x 也可左键平移；正常模式保持「未放大时左键不拖拽」。
+  const canLeftPan = immersive || view.scale > 1;
+
   const onPointerDown = (e: React.PointerEvent) => {
     if (isVideo) return;
     const gen = generation.current; // 按下时捕获代际（§7.3）
-    // 左键：未放大不拖拽（等待双击）；放大后拖拽平移。中键兼容平移；其他按键忽略。
+    // 左键：未放大且非沉浸不拖拽（等待双击）；沉浸/放大后拖拽平移。中键兼容平移；其他按键忽略。
     if (e.button === 0) {
-      if (view.scale <= 1) return;
+      if (!canLeftPan) return;
     } else if (e.button !== 1) {
       return;
     }
@@ -197,11 +232,30 @@ export default function MediaViewport({
     if (start.gen !== generation.current) return; // 旧代际丢弃
     const dx = e.clientX - start.x;
     const dy = e.clientY - start.y;
-    setView((v) => ({
-      ...v,
-      offsetX: start.offsetX + dx,
-      offsetY: start.offsetY + dy,
-    }));
+    setView((v) => {
+      let offsetX = start.offsetX + dx;
+      let offsetY = start.offsetY + dy;
+      // FB5-01（§4.3）：沉浸平移受 clampImmersiveOffset 约束（至少保留 48px 图像边缘）。
+      // 正常模式缩放>1 的平移保持原有语义（用户可把放大图拖到边缘裁切浏览）。
+      if (immersive) {
+        const rect = stageRef.current?.getBoundingClientRect();
+        const img = imgRef.current;
+        if (rect && img) {
+          const clamped = clampImmersiveOffset(
+            offsetX,
+            offsetY,
+            v.scale,
+            img.naturalWidth || img.width || 0,
+            img.naturalHeight || img.height || 0,
+            rect.width,
+            rect.height,
+          );
+          offsetX = clamped.x;
+          offsetY = clamped.y;
+        }
+      }
+      return { ...v, offsetX, offsetY };
+    });
   };
 
   const endPan = (e: React.PointerEvent) => {
@@ -219,12 +273,13 @@ export default function MediaViewport({
   const showSrc = imageSrc ?? imageFallbackUrl ?? null;
   // 图片 onError 捕获当前代际（§7.3）：切图后旧 img 的错误回调不得改写新素材
   const errorGen = generation.current;
-  const cursor = view.scale > 1 && !isVideo ? (view.mode === "panning" ? "grabbing" : "grab") : undefined;
+  const cursor = canLeftPan && !isVideo ? (view.mode === "panning" ? "grabbing" : "grab") : undefined;
+  const surface: StageSurface = isVideo ? (immersive ? "video-immersive" : "app") : immersive ? "image-immersive" : "app";
 
   /* §7.5 致命错误：主图与兜底都失败时的 Viewer 局部错误（沿用现有边界视觉，不新建第二套边界） */
   if (fatal && !isVideo) {
     return (
-      <StageFrame className="flex-col gap-3 p-6 text-center">
+      <StageFrame className="flex-col gap-3 p-6 text-center" surface={surface}>
         <p className="text-base font-medium text-[var(--color-text)]">当前素材暂时无法显示</p>
         <p className="max-w-md text-sm text-[var(--color-text-secondary)]">
           可能是文件损坏、路径不可用或媒体解码失败。
@@ -251,13 +306,27 @@ export default function MediaViewport({
 
   // 视频：不挂图片平移交互；内部事件由 VideoPlayer 自行 stopPropagation。
   // 直接作为 StageFrame 子节点（FB3-03：VideoPlayer 根节点 h-full flex-col，自带高度契约）。
+  // FB5-01（§4.3）：视频双击切换沉浸模式。
   if (isVideo) {
-    return <StageFrame stageRef={stageRef}>{video}</StageFrame>;
+    return (
+      <StageFrame stageRef={stageRef} surface={surface}>
+        <div
+          className="h-full w-full"
+          onDoubleClick={(e) => {
+            e.stopPropagation();
+            onToggleImmersive?.();
+          }}
+        >
+          {video}
+        </div>
+      </StageFrame>
+    );
   }
 
   return (
     <StageFrame
       stageRef={stageRef}
+      surface={surface}
       className={clsx("select-none", cursor && "cursor-grab active:cursor-grabbing")}
       style={cursor ? { cursor } : undefined}
       handlers={{
@@ -266,12 +335,15 @@ export default function MediaViewport({
         onPointerUp: endPan,
         onPointerCancel: endPan,
         onDoubleClick,
+        // FB6 需求六：指针离开舞台兜底隐藏（主开关在旋钮热区上）
+        onPointerLeave: () => hideRotateControls(),
         onContextMenu: (e) => e.preventDefault(),
       }}
     >
       {showSrc ? (
         <img
           key={assetId}
+          ref={imgRef}
           src={showSrc}
           alt={fileName}
           draggable={false}
@@ -281,16 +353,48 @@ export default function MediaViewport({
             if (errorGen !== generation.current) return;
             onImageError?.();
           }}
-          className="max-h-full max-w-full object-contain select-none"
+          className="max-h-full max-w-full object-contain select-none motion-reduce:transition-none"
           style={{
-            transform: `translate(${view.offsetX}px, ${view.offsetY}px) scale(${view.scale})`,
+            transform: `translate(${view.offsetX}px, ${view.offsetY}px) scale(${view.scale}) rotate(${viewerRotation}deg)`,
             transition: view.mode === "panning" ? "none" : "transform 120ms ease-out",
           }}
         />
       ) : (
         <div className="h-32 w-32 animate-pulse rounded bg-[var(--color-border)]" />
       )}
-      {view.scale !== 1 && !isVideo && (
+      {/* FB6 需求六：图片悬浮旋转按钮（仅图片模式；水平居中、贴舞台下沿 —— 位于图片底部、
+          查看器色条上方）。平时完全隐藏，鼠标碰到底部居中的热区才浮现，移开即消失；
+          键盘 Tab 聚焦按钮同样浮现（无障碍可达）。fatal 分支不渲染。 */}
+      <div
+        data-testid="rotate-hotzone"
+        className="absolute bottom-0 left-1/2 z-10 -translate-x-1/2 p-3"
+        onPointerEnter={() => showRotateControls()}
+        onPointerLeave={() => hideRotateControls()}
+      >
+        <button
+          type="button"
+          aria-label="顺时针旋转"
+          title="顺时针旋转"
+          // 隐藏态：移出无障碍树与 Tab 序（浮现时恢复），避免「看不见却可聚焦」
+          aria-hidden={rotateVisible ? undefined : true}
+          tabIndex={rotateVisible ? 0 : -1}
+          onClick={(e) => {
+            e.stopPropagation();
+            rotateClockwise();
+          }}
+          onPointerDown={(e) => e.stopPropagation()}
+          onFocus={() => showRotateControls()}
+          onBlur={() => hideRotateControls()}
+          className={clsx(
+            "flex size-9 items-center justify-center rounded-full bg-black/45 text-white shadow-sm transition-opacity duration-150 hover:bg-black/60 focus-visible:ring-1 focus-visible:ring-[var(--color-status)] focus-visible:outline-none motion-reduce:transition-none",
+            rotateVisible ? "opacity-100" : "pointer-events-none opacity-0",
+          )}
+        >
+          <RotateCw size={18} strokeWidth={1.75} aria-hidden="true" />
+        </button>
+      </div>
+      {/* 缩放 badge：普通模式显示；沉浸模式不显示文件名/页码/缩放 badge（§3.2） */}
+      {view.scale !== 1 && !isVideo && !immersive && (
         <span className="absolute top-2 right-3 rounded bg-black/50 px-2 py-0.5 text-xs text-white">
           {Math.round(view.scale * 100)}%
         </span>

@@ -245,3 +245,210 @@ describe("MediaViewport 视频路径（§4.2 视频不参与图片平移）", ()
     expect(stage.querySelector("img")).toBeNull();
   });
 });
+
+describe("MediaViewport 沉浸浏览（FB5-01 §4.3/§13.2）", () => {
+  it("immersive 模式 1x 左键即可拖拽（canLeftPan = immersive || scale>1）", () => {
+    render(
+      <MediaViewport assetId={1} isVideo={false} immersive imageSrc="asset://thumb/hd.webp" fileName="a.jpg" />,
+    );
+    const stage = screen.getByTestId("media-viewport") as HTMLElement;
+    expect(parseTransform(stage).scale).toBe(1);
+    fireEvent.pointerDown(stage, { button: 0, clientX: 100, clientY: 100, pointerId: 3 });
+    const before = currentStyle(stage);
+    fireEvent.pointerMove(stage, { clientX: 130, clientY: 110, pointerId: 3 });
+    const moved = currentStyle(stage);
+    expect(moved).not.toBe(before);
+    const [bx, by] = before.match(/translate\((-?[\d.]+)px, (-?[\d.]+)px\)/)!.slice(1).map(Number);
+    const [mx, my] = moved.match(/translate\((-?[\d.]+)px, (-?[\d.]+)px\)/)!.slice(1).map(Number);
+    expect(mx - bx).toBeCloseTo(30);
+    expect(my - by).toBeCloseTo(10);
+  });
+
+  it("进入/退出 immersive 重置居中（scale 回 1、offset 归零）", () => {
+    const { stage, rerender } = renderImg();
+    fireEvent.doubleClick(stage, { clientX: 10, clientY: 10 });
+    expect(parseTransform(stage).scale).toBe(2);
+    // 进入沉浸 → 重置
+    rerender(
+      <MediaViewport assetId={1} isVideo={false} immersive imageSrc="asset://thumb/hd.webp" fileName="a.jpg" />,
+    );
+    const in1 = parseTransform(stage);
+    expect(in1.scale).toBe(1);
+    expect(in1.tx).toBeCloseTo(0);
+    expect(in1.ty).toBeCloseTo(0);
+    // 退出沉浸 → 同样重置居中
+    rerender(
+      <MediaViewport assetId={1} isVideo={false} imageSrc="asset://thumb/hd.webp" fileName="a.jpg" />,
+    );
+    const out = parseTransform(stage);
+    expect(out.scale).toBe(1);
+    expect(out.tx).toBeCloseTo(0);
+    expect(out.ty).toBeCloseTo(0);
+  });
+
+  it("immersive 平移受 clamp 约束：至少保留 48px 图像边缘在画布内", () => {
+    render(
+      <MediaViewport assetId={1} isVideo={false} immersive imageSrc="asset://thumb/hd.webp" fileName="a.jpg" />,
+    );
+    const stage = screen.getByTestId("media-viewport") as HTMLElement;
+    // 舞台 400x300，图像自然尺寸 200x100，scale=1（居中 offset 0）
+    mockStageRect(stage, { left: 0, top: 0, width: 400, height: 300 });
+    const img = stage.querySelector("img") as HTMLImageElement;
+    Object.defineProperty(img, "naturalWidth", { value: 200, configurable: true });
+    Object.defineProperty(img, "naturalHeight", { value: 100, configurable: true });
+
+    // 疯狂向左上拖 → clamp 到 min = margin - half（x: 48-100=-52；y: 48-50=-2）
+    fireEvent.pointerDown(stage, { button: 0, clientX: 100, clientY: 100, pointerId: 4 });
+    fireEvent.pointerMove(stage, { clientX: -5000, clientY: -5000, pointerId: 4 });
+    let { tx, ty } = parseTransform(stage);
+    expect(tx).toBeCloseTo(-52, 1);
+    expect(ty).toBeCloseTo(-2, 1);
+
+    // 疯狂向右下拖 → clamp 到 max = canvas/2 + half - margin（x: 200+100-48=252；y: 150+50-48=152）
+    fireEvent.pointerDown(stage, { button: 0, clientX: 100, clientY: 100, pointerId: 4 });
+    fireEvent.pointerMove(stage, { clientX: 9000, clientY: 9000, pointerId: 4 });
+    ({ tx, ty } = parseTransform(stage));
+    expect(tx).toBeCloseTo(252, 1);
+    expect(ty).toBeCloseTo(152, 1);
+  });
+
+  it("immersive 隐藏缩放 badge（沉浸中不显示文件名/页码/缩放标记）", () => {
+    const { stage, rerender } = renderImg();
+    // 普通模式缩放 → badge 显示
+    fireEvent.doubleClick(stage, { clientX: 10, clientY: 10 });
+    expect(stage.textContent).toContain("200%");
+    // 进入沉浸 → badge 消失（同一组件 rerender，不产生第二个实例）
+    rerender(
+      <MediaViewport assetId={1} isVideo={false} immersive imageSrc="asset://thumb/hd.webp" fileName="a.jpg" />,
+    );
+    fireEvent.doubleClick(stage, { clientX: 10, clientY: 10 });
+    expect(parseTransform(stage).scale).toBe(2);
+    expect(stage.textContent).not.toContain("200%");
+  });
+
+  it("图片沉浸 surface=image-immersive（白底）；正常模式 surface=app", () => {
+    const { stage, rerender } = renderImg();
+    expect(stage.getAttribute("data-surface")).toBe("app");
+    rerender(
+      <MediaViewport assetId={1} isVideo={false} immersive imageSrc="asset://thumb/hd.webp" fileName="a.jpg" />,
+    );
+    expect(stage.getAttribute("data-surface")).toBe("image-immersive");
+  });
+
+  it("视频沉浸 surface=video-immersive（黑底）", () => {
+    render(
+      <MediaViewport
+        assetId={3}
+        isVideo
+        immersive
+        fileName="v.mp4"
+        video={<video data-testid="vid" src="asset://v" />}
+      />,
+    );
+    expect(screen.getByTestId("media-viewport").getAttribute("data-surface")).toBe("video-immersive");
+  });
+
+  it("视频双击调用 onToggleImmersive（统一沉浸入口）", () => {
+    const onToggle = vi.fn();
+    render(
+      <MediaViewport
+        assetId={3}
+        isVideo
+        fileName="v.mp4"
+        onToggleImmersive={onToggle}
+        video={<video data-testid="vid" src="asset://v" />}
+      />,
+    );
+    fireEvent.doubleClick(screen.getByTestId("vid"));
+    expect(onToggle).toHaveBeenCalledTimes(1);
+  });
+});
+
+/** FB6 需求六：图片悬浮旋转按钮（半透明、2 秒无操作隐藏、不破坏缩放/拖拽/切图） */
+describe("MediaViewport 图片旋转（FB6 需求六）", () => {
+  /** 旋钮热区：鼠标碰到底部居中热区才浮现按钮（FB6 需求六交互修订） */
+  function hotzone(): HTMLElement {
+    return screen.getByTestId("rotate-hotzone");
+  }
+
+  it("鼠标碰到旋钮热区才出现按钮；移开热区立即隐藏", () => {
+    const { stage } = renderImg();
+    // 悬停图片其他区域 / 初始态：按钮隐藏（aria-hidden，不可达）
+    fireEvent.pointerMove(stage, { clientX: 10, clientY: 10 });
+    expect(screen.queryByRole("button", { name: "顺时针旋转" })).toBeNull();
+    // 碰到热区：浮现；位置在舞台底部水平居中（图片下底部、查看器色条上方）
+    fireEvent.pointerEnter(hotzone());
+    const btn = screen.getByRole("button", { name: "顺时针旋转" });
+    expect(btn.className).toContain("opacity-100");
+    // 热区位于舞台底部水平居中（图片下底部、查看器色条上方）
+    expect(hotzone().className).toContain("left-1/2");
+    expect(hotzone().className).toContain("bottom-0");
+    // 移开热区：立即隐藏
+    fireEvent.pointerLeave(hotzone());
+    expect(screen.queryByRole("button", { name: "顺时针旋转" })).toBeNull();
+    // 再次碰到：重现
+    fireEvent.pointerEnter(hotzone());
+    expect(screen.getByRole("button", { name: "顺时针旋转" })).toBeInTheDocument();
+  });
+
+  it("点击一次顺时针旋转 90°，再点 180°；旋转后回中", () => {
+    const { stage } = renderImg();
+    fireEvent.pointerEnter(hotzone());
+    fireEvent.click(screen.getByRole("button", { name: "顺时针旋转" }));
+    expect(currentStyle(stage)).toContain("rotate(90deg)");
+    fireEvent.click(screen.getByRole("button", { name: "顺时针旋转" }));
+    expect(currentStyle(stage)).toContain("rotate(180deg)");
+    // 旋转后回中：offset 归零
+    expect(currentStyle(stage)).toContain("translate(0px, 0px)");
+  });
+
+  it("连续旋转 4 次：角度累加到 360°（继续顺时针滚，不倒转回 0）", () => {
+    const { stage } = renderImg();
+    fireEvent.pointerEnter(hotzone());
+    for (let i = 1; i <= 4; i++) {
+      fireEvent.click(screen.getByRole("button", { name: "顺时针旋转" }));
+      expect(currentStyle(stage)).toContain(`rotate(${i * 90}deg)`);
+    }
+    expect(currentStyle(stage)).toContain("rotate(360deg)");
+  });
+
+  it("视频模式不出现旋转按钮（热区不存在）", () => {
+    render(
+      <MediaViewport assetId={3} isVideo fileName="v.mp4" video={<video data-testid="vid" src="asset://v" />} />,
+    );
+    expect(screen.queryByTestId("rotate-hotzone")).toBeNull();
+    expect(screen.queryByRole("button", { name: "顺时针旋转" })).toBeNull();
+  });
+
+  it("切图不继承上一张的临时旋转角，按钮回到隐藏态", () => {
+    const { stage, rerender, unmount } = renderImg();
+    fireEvent.pointerEnter(hotzone());
+    fireEvent.click(screen.getByRole("button", { name: "顺时针旋转" }));
+    expect(currentStyle(stage)).toContain("rotate(90deg)");
+    rerender(<MediaViewport assetId={2} isVideo={false} imageSrc="asset://thumb/hd2.webp" fileName="b.jpg" />);
+    expect(currentStyle(stage)).toContain("rotate(0deg)");
+    expect(screen.queryByRole("button", { name: "顺时针旋转" })).toBeNull();
+    expect(() => unmount()).not.toThrow();
+  });
+
+  it("旋转后双击缩放与 Alt+滚轮仍可用；旋转只改视觉不改源文件语义", () => {
+    const { stage } = renderImg();
+    fireEvent.pointerEnter(hotzone());
+    fireEvent.click(screen.getByRole("button", { name: "顺时针旋转" }));
+    expect(currentStyle(stage)).toContain("rotate(90deg)");
+    // 双击缩放仍生效
+    fireEvent.doubleClick(stage, { clientX: 100, clientY: 100 });
+    expect(currentStyle(stage)).toContain("scale(2)");
+    expect(currentStyle(stage)).toContain("rotate(90deg)");
+    // Alt+滚轮仍生效
+    fireEvent.wheel(stage, { altKey: true, deltaY: -100, clientX: 50, clientY: 50 });
+    expect(parseTransform(stage).scale).toBeCloseTo(2.3, 2);
+  });
+
+  it("fatal 分支不渲染旋转按钮（错误视觉替代）", () => {
+    render(
+      <MediaViewport assetId={1} isVideo={false} imageSrc={null} fileName="a.jpg" fatal onRetryCurrent={() => {}} />,
+    );
+    expect(screen.queryByRole("button", { name: "顺时针旋转" })).toBeNull();
+  });
+});

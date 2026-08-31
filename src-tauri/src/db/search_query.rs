@@ -64,15 +64,23 @@ fn key_spec(key: &str) -> Option<KeySpec> {
             null_guard: None,
         },
         "iso" | "aperture" | "focal" | "width" | "height" | "file_size" | "duration_ms"
-        | "dominant_hue" | "dominant_sat" | "dominant_lum" => {
-            KeySpec {
-                kind: ValueKind::Number,
-                null_guard: Some("IS NOT NULL"),
-            }
-        }
+        | "dominant_hue" | "dominant_sat" | "dominant_lum" => KeySpec {
+            kind: ValueKind::Number,
+            null_guard: Some("IS NOT NULL"),
+        },
         "resolution" | "aspect_ratio" => KeySpec {
             kind: ValueKind::Number,
             null_guard: Some("IS NOT NULL"),
+        },
+        // GPS 定位（V18）：带符号十进制度，北纬东经为正；允许负值（不在非负校验名单）
+        "latitude" | "longitude" => KeySpec {
+            kind: ValueKind::Number,
+            null_guard: Some("IS NOT NULL"),
+        },
+        // 定位有无（分面用）：编译为 CASE 表达式，值域 yes/no
+        "has_location" => KeySpec {
+            kind: ValueKind::String,
+            null_guard: None,
         },
         "taken_at" | "created_at" | "modified_at" => KeySpec {
             kind: ValueKind::Date,
@@ -94,7 +102,11 @@ fn allowed_ops(key: &str) -> &'static [&'static str] {
         // P0-2：数值字段允许 `in`，以兼容普通素材库分面把多个离散值以字符串/数值数组传入。
         // 见 contract-v1 §4 及《入库标签与素材库改造开发指导书》阶段 0 P0-2。
         "iso" | "aperture" | "focal" | "width" | "height" | "resolution" | "aspect_ratio"
-        | "file_size" | "duration_ms" | "dominant_hue" | "dominant_sat" | "dominant_lum" => &["eq", "in", "gt", "gte", "lt", "lte", "between"],
+        | "file_size" | "duration_ms" | "dominant_hue" | "dominant_sat" | "dominant_lum"
+        | "latitude" | "longitude" => {
+            &["eq", "in", "gt", "gte", "lt", "lte", "between"]
+        }
+        "has_location" => &["eq", "in"],
         "taken_at" | "created_at" | "modified_at" => &["gte", "lte", "between"],
         "folder" => &["eq", "in"],
         _ => &[],
@@ -123,6 +135,12 @@ fn value_expr(key: &str) -> String {
         "dominant_hue" => "a.dominant_hue".into(),
         "dominant_sat" => "a.dominant_sat".into(),
         "dominant_lum" => "a.dominant_lum".into(),
+        "latitude" => "a.latitude".into(),
+        "longitude" => "a.longitude".into(),
+        "has_location" => {
+            "(CASE WHEN a.latitude IS NOT NULL AND a.longitude IS NOT NULL THEN 'yes' ELSE 'no' END)"
+                .into()
+        }
         "taken_at" => "a.taken_at".into(),
         "created_at" => "a.created_at".into(),
         "modified_at" => "a.modified_at".into(),
@@ -579,7 +597,9 @@ mod tests {
     /// FB2-08（§14.9③）：色相环形 —— min>max 编译为双区间 OR（搜红色 345~15 同时命中 350 与 10）。
     #[test]
     fn dominant_hue_wraps_red_across_zero() {
-        let c = compile_metadata(&between("dominant_hue", 345, 15)).unwrap().unwrap();
+        let c = compile_metadata(&between("dominant_hue", 345, 15))
+            .unwrap()
+            .unwrap();
         assert!(c.sql.contains("OR"), "应编译为双区间 OR，实际：{}", c.sql);
         assert_eq!(c.params.len(), 2);
     }
@@ -587,7 +607,9 @@ mod tests {
     /// FB2-08：dominant_sat 白名单 / between 正向区间正常。
     #[test]
     fn dominant_sat_between_compiles() {
-        let c = compile_metadata(&between("dominant_sat", 10, 60)).unwrap().unwrap();
+        let c = compile_metadata(&between("dominant_sat", 10, 60))
+            .unwrap()
+            .unwrap();
         assert!(c.sql.contains(">= ?1") && c.sql.contains("<= ?2"));
     }
 
@@ -598,5 +620,50 @@ mod tests {
         assert!(c.is_err());
         let err = c.unwrap_err().to_string();
         assert!(err.contains("未知元数据字段"), "实际：{}", err);
+    }
+
+    /// GPS 定位（V18）：latitude/longitude 数值白名单，between/gt 正常编译且允许负值。
+    #[test]
+    fn latitude_longitude_numeric_ops_compile() {
+        // between 正常区间（南半球负纬度合法）
+        let c = compile_metadata(&between("latitude", -45, 45)).unwrap().unwrap();
+        assert!(c.sql.contains("a.latitude >= ?1") && c.sql.contains("a.latitude <= ?2"));
+        assert!(c.sql.contains("IS NOT NULL"), "NULL 守卫不得命中无定位素材");
+        // lt 负值（西经）不报「不能为负」
+        let lt = MetadataFilter {
+            key: "longitude".into(),
+            op: "lt".into(),
+            value: Some(serde_json::json!(-120.5)),
+            values: None,
+            min: None,
+            max: None,
+        };
+        let c = compile_metadata(&lt).unwrap().unwrap();
+        assert!(c.sql.contains("a.longitude < ?1"));
+    }
+
+    /// GPS 定位（V18）：has_location 编译为 CASE 表达式，仅支持 eq/in。
+    #[test]
+    fn has_location_compiles_case_expr() {
+        let eq = MetadataFilter {
+            key: "has_location".into(),
+            op: "eq".into(),
+            value: Some(serde_json::json!("yes")),
+            values: None,
+            min: None,
+            max: None,
+        };
+        let c = compile_metadata(&eq).unwrap().unwrap();
+        assert!(c.sql.contains("CASE WHEN a.latitude IS NOT NULL"), "实际：{}", c.sql);
+        // 不支持 gt
+        let gt = MetadataFilter {
+            key: "has_location".into(),
+            op: "gt".into(),
+            value: Some(serde_json::json!("yes")),
+            values: None,
+            min: None,
+            max: None,
+        };
+        assert!(compile_metadata(&gt).is_err());
     }
 }

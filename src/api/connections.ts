@@ -70,3 +70,26 @@ export interface AiConnectionTestResult {
 export function testAiConnection(connectionId: string): Promise<AiConnectionTestResult> {
   return invoke<AiConnectionTestResult>("test_ai_connection", { connectionId });
 }
+
+/**
+ * FB5-04（§3.6）：连接感知模型发现。
+ * - connectionId 提供时：密钥从 keyring 读取；显式 apiKey（编辑中的草稿）优先于 keyring；
+ *   地址/协议/部署未显式提供时用档案保存值。
+ * - 无 connectionId：走 legacy 显式字段（AiTaggingPage 的 settings profile，apiKey 在 JSON 中）。
+ * 错误为分类后的可读文案（401/403、404/405、429、超时、网络等），不含密钥。
+ */
+export function discoverAiModels(input: {
+  connectionId?: string | null;
+  deployment?: AiDeployment;
+  protocol?: AiProtocol;
+  baseUrl?: string;
+  apiKey?: string;
+}): Promise<string[]> {
+  return invoke<string[]>("discover_ai_models", {
+    connectionId: input.connectionId ?? null,
+    deployment: input.deployment ?? null,
+    protocol: input.protocol ?? null,
+    baseUrl: input.baseUrl ?? null,
+    apiKey: input.apiKey ?? null,
+  });
+}

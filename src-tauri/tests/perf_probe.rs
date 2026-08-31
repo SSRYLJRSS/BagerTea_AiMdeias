@@ -96,7 +96,9 @@ fn probe_raw_benchmark() {
         println!("RAW_BENCH 样本目录不存在: {dir:?}（设 RAW_SAMPLES_DIR 指向真实 RAW 目录后再跑）");
         return;
     }
-    let raws = ["cr3", "nef", "arw", "raf", "rw2", "dng", "cr2", "orf", "pef", "srw", "x3f"];
+    let raws = [
+        "cr3", "nef", "arw", "raf", "rw2", "dng", "cr2", "orf", "pef", "srw", "x3f",
+    ];
     let mut entries: Vec<_> = std::fs::read_dir(&dir)
         .map(|rd| rd.filter_map(|e| e.ok()).map(|e| e.path()).collect())
         .unwrap_or_default();
@@ -143,14 +145,27 @@ fn probe_raw_benchmark() {
         println!(
             "RAW_BENCH |{format}|{file_size}|{resolution}|emb={embedded_preview_found}|{embedded_preview_ms}ms|ph={placeholder_ms}ms|hd={hd_preview_ms}ms|{failure_reason}"
         );
-        rows.push((format, file_size, resolution, embedded_preview_found, embedded_preview_ms, placeholder_ms, hd_preview_ms, failure_reason));
+        rows.push((
+            format,
+            file_size,
+            resolution,
+            embedded_preview_found,
+            embedded_preview_ms,
+            placeholder_ms,
+            hd_preview_ms,
+            failure_reason,
+        ));
     }
     let found = rows.iter().filter(|r| r.3).count();
     println!(
         "RAW_BENCH 汇总: {} 样本，内嵌预览命中 {}，占比 {:.1}%",
         rows.len(),
         found,
-        if rows.is_empty() { 0.0 } else { found as f64 / rows.len() as f64 * 100.0 }
+        if rows.is_empty() {
+            0.0
+        } else {
+            found as f64 / rows.len() as f64 * 100.0
+        }
     );
 }
 

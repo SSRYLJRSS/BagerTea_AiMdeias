@@ -2,6 +2,9 @@
  *  表达式构建器产物 → 通过 AssetFilter.expr 传给后端，由 query_expr 递归编译。 */
 import type { AssetType, MetadataFilter } from "./asset";
 
+/** FB5-05（§8.2）：搜索范围。列名由后端枚举映射，前端只传枚举值，不出现 FTS/bigram 实现词。 */
+export type SearchScope = "all" | "content" | "description" | "fileName";
+
 /** 单一叶子条件（type 字段区分类型） */
 export type LeafCond =
   | { type: "tag"; facetKey: string; tagIds: number[]; mode?: "any" | "all"; includeDescendants: boolean }
@@ -9,7 +12,7 @@ export type LeafCond =
   | { type: "assetType"; value: AssetType }
   | { type: "untagged" }
   | { type: "metadata"; filter: MetadataFilter }
-  | { type: "search"; value: string };
+  | { type: "search"; value: string; scope?: SearchScope };
 
 /** 布尔表达式树 */
 export type QueryExpr =

@@ -1,5 +1,6 @@
 use std::sync::atomic::Ordering;
 
+use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::db::assets::ImportResult;
@@ -8,6 +9,40 @@ use crate::error::{AppError, AppResult};
 use crate::services::importer::{self, ImportOptions, ImportProgress};
 use crate::services::{media_refill, thumbnail::ThumbnailService};
 use crate::state::AppState;
+
+/// FB4-03（§6.4）：导入后置色板完成事件。只允许导入后置任务发送；手动设置页回算不发。
+/// 发送条件（全部满足）：由 import_files 后台后置任务触发 + 成功抢到 refill gate +
+/// 后台任务实际执行并返回 Ok(summary) + updatedIds 非空。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PaletteUpdatedEvent {
+    /// 固定 "import"（前端据此区分来源）
+    source: &'static str,
+    total: i64,
+    success: i64,
+    failed: i64,
+    skipped: i64,
+    updated_ids: Vec<i64>,
+}
+
+impl PaletteUpdatedEvent {
+    /// 事件判定（§6.4/§10.7）：只在真实写库成功的素材非空时构造事件。
+    /// 零更新（updated_ids 为空）→ None，不发送；gate 占用 / 扫描错误在调用点
+    /// （Option<AppResult<RefillSummary>> 解包）就不进入本函数，天然不发。
+    fn from_import_summary(s: &media_refill::RefillSummary) -> Option<Self> {
+        if s.updated_ids.is_empty() {
+            return None;
+        }
+        Some(Self {
+            source: "import",
+            total: s.total,
+            success: s.success,
+            failed: s.failed,
+            skipped: s.skipped,
+            updated_ids: s.updated_ids.clone(),
+        })
+    }
+}
 
 /// 入库：async + spawn_blocking 工作线程（不堵主线程 IPC，取消即时生效）；
 /// collection/rename 来自入库页选项；总库位置以设置为准（R-32，单一事实源）
@@ -26,6 +61,8 @@ pub async fn import_files(
     let db = std::sync::Arc::clone(&state.db);
     let data_dir = state.data_dir.clone();
     let cancel = std::sync::Arc::clone(&state.import_cancel);
+    // 后置色板任务也需要 emit：AppHandle 是 Clone，先克隆一份供第二个 spawn_blocking 使用
+    let post_app = app.clone();
 
     let result = tauri::async_runtime::spawn_blocking(move || {
         let thumbs = ThumbnailService::new(&data_dir)?;
@@ -83,6 +120,11 @@ pub async fn import_files(
                     s.skipped,
                     s.failed
                 );
+                // FB4-03（§6.4）：只有真实写库成功的素材非空才发全局事件（供 App 定向同步）。
+                // 闸被占用（None）、扫描错误（Some(Err)）、零更新（updatedIds 空）均不发。
+                if let Some(ev) = PaletteUpdatedEvent::from_import_summary(&s) {
+                    let _ = post_app.emit("palette://updated", ev);
+                }
             }
         });
     }
@@ -106,7 +148,9 @@ pub async fn inspect_import(app: AppHandle, paths: Vec<String>) -> AppResult<imp
 
 /// 与 assets_cmd::allow_asset 同语义的本地放行函数（仅在 inspect_import 内使用）
 fn allow_import_asset(app: &AppHandle, path: &str) {
-    let _ = app.asset_protocol_scope().allow_file(std::path::Path::new(path));
+    let _ = app
+        .asset_protocol_scope()
+        .allow_file(std::path::Path::new(path));
 }
 
 #[tauri::command]
@@ -141,4 +185,65 @@ pub fn open_file_external(app: tauri::AppHandle, path: String) -> AppResult<()> 
     app.opener()
         .open_path(&path, None::<&str>)
         .map_err(|e| AppError::msg(format!("系统打开文件失败: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::services::media_refill::RefillSummary;
+
+    /// §10.7：导入后置真实写库成功且 updatedIds 非空时发一次事件，payload source 固定 "import"。
+    #[test]
+    fn import_palette_event_emitted_when_updated_ids_non_empty() {
+        let s = RefillSummary {
+            total: 3,
+            success: 2,
+            failed: 1,
+            skipped: 0,
+            updated_ids: vec![11, 22],
+        };
+        let ev = PaletteUpdatedEvent::from_import_summary(&s).expect("updatedIds 非空应发事件");
+        assert_eq!(ev.source, "import");
+        assert_eq!(ev.total, 3);
+        assert_eq!(ev.success, 2);
+        assert_eq!(ev.failed, 1);
+        assert_eq!(ev.skipped, 0);
+        assert_eq!(ev.updated_ids, vec![11, 22]);
+    }
+
+    /// §10.7：零更新（updatedIds 空）不发事件 —— 不得把"扫描了但没写库"冒充成功完成。
+    #[test]
+    fn import_palette_event_not_emitted_on_zero_updates() {
+        let s = RefillSummary {
+            total: 5,
+            success: 0,
+            failed: 0,
+            skipped: 5,
+            updated_ids: vec![],
+        };
+        assert!(
+            PaletteUpdatedEvent::from_import_summary(&s).is_none(),
+            "零更新不得发事件"
+        );
+    }
+
+    /// §10.7：gate 占用 / 扫描错误不发事件 —— 调用点只对 Some(Ok(summary)) 构造事件，
+    /// 其余路径（None / Some(Err)）根本不会进入 from_import_summary；这里再补一个显式回归：
+    /// 失败与跳过素材的 id 绝不能出现在 updated_ids（resolved ids 伪装禁止）。
+    #[test]
+    fn failed_and_skipped_ids_never_masquerade_as_updated() {
+        let s = RefillSummary {
+            total: 4,
+            success: 1,
+            failed: 2,
+            skipped: 1,
+            updated_ids: vec![7],
+        };
+        let ev = PaletteUpdatedEvent::from_import_summary(&s).unwrap();
+        assert_eq!(ev.updated_ids, vec![7]);
+        assert!(
+            !ev.updated_ids.contains(&999),
+            "失败/跳过素材 id 不得进入 updatedIds"
+        );
+    }
 }

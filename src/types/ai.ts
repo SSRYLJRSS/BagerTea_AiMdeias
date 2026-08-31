@@ -31,11 +31,16 @@ export interface AiSuggestion {
   /** 单条打标失败原因（v6：失败详情落库，前端展示） */
   lastError: string | null;
   createdAt: number;
+  // FB5-05（§7.6）：一句话描述。AI 建议值 / 审核后确认值 / 素材当前值。
+  suggestedDescription?: string;
+  confirmedDescription?: string | null;
+  currentDescription?: string;
 }
 
 export interface AiSuggestionItem {
   id: number;
   suggestionId: number;
+  assetId: number;
   facetKey: string;
   rawName: string;
   normalizedName: string;
@@ -45,6 +50,16 @@ export interface AiSuggestionItem {
   decisionReason: string | null;
   createdAt: number;
 }
+
+/** FB6 需求一：AI 打标页内进度 UI 状态（由 aiStore 数据派生；进度事件只经页面内唯一
+ *  onAiProgress 订阅写入 aiStore，本类型不再触发第二个事件监听）。 */
+export type AiTaggingUiState =
+  | { phase: "idle" }
+  | { phase: "starting"; total: number }
+  | { phase: "running"; processed: number; total: number; currentAssetId?: number }
+  | { phase: "cancelling"; processed: number; total: number }
+  | { phase: "done"; processed: number; total: number }
+  | { phase: "error"; message: string; processed: number; total: number };
 
 export interface ModelStatus {
   tier: "light" | "standard";

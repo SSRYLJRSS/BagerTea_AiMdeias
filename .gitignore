@@ -6,6 +6,7 @@ dist/
 # Rust / Tauri
 src-tauri/target/
 src-tauri/target-codex-verify/
+src-tauri/target-test/
 src-tauri/gen/
 
 # 系统
@@ -14,6 +15,7 @@ Thumbs.db
 
 # 本地工作数据
 .workbuddy/
+.qoder/
 
 # 测试输出
 test-output.txt

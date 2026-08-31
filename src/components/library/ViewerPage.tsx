@@ -1,10 +1,15 @@
-/** 查看器（指导书 §4.1 + FB3-04）：ViewerPage 只负责当前素材、上一张/下一张、打开/关闭、组合子组件与错误边界。
+/** 查看器（指导书 §4.1 + FB3-04 + FB5-01 §4.1）：ViewerPage 只负责当前素材、上一张/下一张、打开/关闭、组合子组件与错误边界。
  *  布局由 ViewerShell 承载：工具条（固定）→ 左属性栏 + 右媒体舞台 → 底部胶片条。
- *  FB3-04：查看器级全屏（viewerRootRef.requestFullscreen）——全屏时 Shell 只保留工具条与舞台；
- *  Fullscreen API 不可用时退化为应用内 data-viewer-fullscreen 状态（requestFullscreenSafe）。
- *  Escape 优先级（§6.2⑥）：任一全屏（查看器级或播放器级）> 关闭查看器。
+ *  FB5-01（§4.1）：沉浸浏览状态机 ImmersiveMode = "off" | "native" | "fallback"。
+ *   - native：viewerRoot.requestFullscreen() 成功，Fullscreen API 覆盖整个显示器；
+ *   - fallback：Fullscreen API 不可用/被拒时，createPortal 把沉浸层挂到 document.body（fixed inset-0 z-[100]），
+ *     覆盖整个应用窗口，并让应用根节点 inert 防止 Tab 聚焦底层控件；
+ *   - 只认 document.fullscreenElement === viewerRootRef.current 为 native 沉浸；播放器不再有独立 fullscreen。
+ *  Escape 优先级：native（浏览器消费 Esc 退出全屏，fullscreenchange 同步回 off）> fallback（退出沉浸）
+ *  > 关闭查看器（第二次 Esc）。
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import clsx from "clsx";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { useShallow } from "zustand/react/shallow";
@@ -23,7 +28,7 @@ import { ensureVideoProxy, cancelVideoProxy, toProxyFileUrl } from "@/api/video"
 import { useLibraryStore } from "@/stores/libraryStore";
 import { useSelectionStore } from "@/stores/selectionStore";
 import { useAppearance } from "@/hooks/useAppearance";
-import { isEditableTarget, isInsidePlayer, escapeShouldExitFullscreen, requestFullscreenSafe } from "@/utils/shortcuts";
+import { isEditableTarget, isInsidePlayer, isViewerNativeFullscreen, requestFullscreenSafe } from "@/utils/shortcuts";
 import { isVideoAsset } from "@/utils/assetKind";
 import type { Asset } from "@/types/asset";
 
@@ -31,6 +36,9 @@ interface ViewerPageProps {
   asset: Asset;
   onClose: () => void;
 }
+
+/** FB5-01（§4.1）：沉浸浏览状态。off=普通查看器；native=Fullscreen API；fallback=应用内覆盖层。 */
+type ImmersiveMode = "off" | "native" | "fallback";
 
 export default function ViewerPage({ asset: initial, onClose }: ViewerPageProps) {
   const { items, total, loadMore, patchLocal } = useLibraryStore(
@@ -61,37 +69,65 @@ export default function ViewerPage({ asset: initial, onClose }: ViewerPageProps)
   const [assignOpen, setAssignOpen] = useState(false);
   const prevSelected = useRef<ReadonlySet<number> | null>(null);
 
-  // FB3-04：查看器级全屏。真 Fullscreen API 成功后由 fullscreenchange 同步；
-  // API 不可用/被拒时 fallback=true 走应用内 data-viewer-fullscreen CSS 状态。
+  // FB5-01（§4.1）：沉浸浏览状态机。native 依赖 viewerRootRef 进入 Fullscreen API；
+  // API 不可用/被拒时 fallback 走 createPortal 覆盖应用窗口（data-viewer-immersive）。
   const viewerRootRef = useRef<HTMLDivElement>(null);
-  const [fsFallback, setFsFallback] = useState(false);
-  const isFullscreen = Boolean(typeof document !== "undefined" && document.fullscreenElement) || fsFallback;
+  const [immersiveMode, setImmersiveMode] = useState<ImmersiveMode>("off");
+  const immersive = immersiveMode !== "off";
 
-  const toggleFullscreen = useCallback(async () => {
-    if (typeof document !== "undefined" && document.fullscreenElement) {
+  const toggleImmersive = useCallback(async () => {
+    if (immersiveMode === "native") {
       try {
         await document.exitFullscreen();
       } catch {
-        /* 拒绝时保持现状 */
+        /* 系统拒绝退出时也清本地状态（§4.1：失败也要清本地状态） */
       }
+      setImmersiveMode("off");
       return;
     }
-    if (fsFallback) {
-      setFsFallback(false); // 应用内全屏 → 退出
+    if (immersiveMode === "fallback") {
+      setImmersiveMode("off"); // 应用内覆盖层 → 退出
       return;
     }
     const ok = await requestFullscreenSafe(viewerRootRef.current);
-    if (!ok) setFsFallback(true); // 降级：应用内全屏
-  }, [fsFallback]);
+    setImmersiveMode(ok ? "native" : "fallback");
+  }, [immersiveMode]);
 
-  // 系统级退出全屏（Esc 由浏览器接管）→ 同步状态
+  // 系统级退出全屏（Esc 由浏览器接管）→ 只在 viewerRoot 处于全屏时认定 native 沉浸；
+  // 其他元素进入全屏不改变 ViewerShell 模式（§4.1）。
   useEffect(() => {
     const onFsChange = () => {
-      if (!document.fullscreenElement) setFsFallback(false); // 真全屏退出时清降级位（若有的话）
+      if (isViewerNativeFullscreen(viewerRootRef.current)) {
+        setImmersiveMode("native");
+      } else if (immersiveMode === "native") {
+        setImmersiveMode("off");
+      }
     };
     document.addEventListener("fullscreenchange", onFsChange);
     return () => document.removeEventListener("fullscreenchange", onFsChange);
-  }, []);
+  }, [immersiveMode]);
+
+  // fallback 沉浸：焦点移入沉浸画布，应用根节点（不含 portal）inert；退出/卸载清理 inert（§4.1）。
+  useEffect(() => {
+    if (immersiveMode !== "fallback") return;
+    const canvas = document.querySelector<HTMLElement>("[data-immersive-canvas]");
+    canvas?.focus({ preventScroll: true });
+    const appRoot = (document.getElementById("root") ?? document.body.firstElementChild) as HTMLElement | null;
+    const wasInert = appRoot?.hasAttribute("inert") ?? false;
+    appRoot?.setAttribute("inert", "");
+    return () => {
+      if (appRoot && !wasInert) appRoot.removeAttribute("inert");
+    };
+  }, [immersiveMode]);
+
+  // Viewer 关闭/切页：native 模式先请求退出全屏，失败也清本地状态（§4.1）
+  const handleClose = useCallback(() => {
+    if (isViewerNativeFullscreen(viewerRootRef.current)) {
+      void document.exitFullscreen().catch(() => undefined);
+    }
+    setImmersiveMode("off");
+    onClose();
+  }, [onClose]);
 
   const openAssign = () => {
     // TagAssignDialog 基于选中集工作：暂存原选中，换为当前单张，关闭时恢复
@@ -181,19 +217,18 @@ export default function ViewerPage({ asset: initial, onClose }: ViewerPageProps)
   };
 
   // 键盘：←→ 过片，Esc 退出。§4.3 忽略输入框/下拉/文本域/contentEditable/播放器根节点与子节点/模态层
-  // FB3-04：Escape 优先退任一级全屏（查看器级或播放器级——用 fullscreenElement 统一判断），
-  // 第二次 Esc 才关闭查看器。
+  // FB5-01（§4.1）：Esc 优先级 = native（浏览器消费，fullscreenchange 同步）> fallback（退出沉浸）> 关闭查看器。
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (isEditableTarget(e.target) || isInsidePlayer(e.target)) return;
       if (assignOpen) return; // 模态打开时页面切片不响应
       if (e.key === "Escape") {
-        if (escapeShouldExitFullscreen()) {
-          // 浏览器全屏：Esc 本身会被浏览器消费退出全屏；此处不关闭查看器
+        if (document.fullscreenElement) {
+          // 原生全屏：Esc 本身会被浏览器消费退出全屏；此处不关闭查看器
           return;
         }
-        if (fsFallback) {
-          setFsFallback(false);
+        if (immersiveMode === "fallback") {
+          setImmersiveMode("off");
           return;
         }
         onClose();
@@ -202,11 +237,11 @@ export default function ViewerPage({ asset: initial, onClose }: ViewerPageProps)
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [index, goto, onClose, assignOpen, fsFallback]);
+  }, [index, goto, onClose, assignOpen, immersiveMode]);
 
   const isVideo = isVideoAsset(current);
   // FB3-10（§12.2）：查看器接入算法主色色条（showInViewer 开关此前无实现）。
-  // 放标签栏上方；全屏时随 tagBar 一起被 ViewerShell 隐藏（不占布局）。
+  // 放标签栏上方；沉浸时随 tagBar 一起被 ViewerShell 卸载（不占布局）。
   const { colorStrip } = useAppearance();
   const viewerStripOn = colorStrip.enabled && colorStrip.showInViewer && !!current.palette?.length;
   const viewerSegments = useMemo(
@@ -214,94 +249,126 @@ export default function ViewerPage({ asset: initial, onClose }: ViewerPageProps)
     [viewerStripOn, current.palette],
   );
 
+  const stage = isVideo ? (
+    <MediaViewport
+      assetId={current.id}
+      isVideo
+      immersive={immersive}
+      onToggleImmersive={() => void toggleImmersive()}
+      fileName={current.fileName}
+      video={
+        <VideoPlayer
+          src={videoSrc ?? ""}
+          fileName={current.fileName}
+          immersive={immersive}
+          onToggleImmersive={() => void toggleImmersive()}
+          proxying={proxying}
+          proxyError={proxyError}
+          onCancelProxy={handleCancelProxy}
+          onRetryProxy={() => {
+            proxyAttempted.current = false;
+            setProxyError(null);
+            void handleVideoError();
+          }}
+          onError={() => void handleVideoError()}
+        />
+      }
+    />
+  ) : (
+    <MediaViewport
+      assetId={current.id}
+      isVideo={false}
+      immersive={immersive}
+      onToggleImmersive={() => void toggleImmersive()}
+      imageSrc={src}
+      imageFallbackUrl={toFileUrl(current.filePath)}
+      fileName={current.fileName}
+      onImageError={() => {
+        // §7.5：高清图失败→回落原文件；兜底也失败→致命错误（重新加载需重新获取 URL/高清图）
+        if (src && src === toFileUrl(current.filePath)) {
+          setMediaFatal(true);
+        } else {
+          setSrc(toFileUrl(current.filePath));
+        }
+      }}
+      fatal={mediaFatal}
+      onRetryCurrent={() => setReloadNonce((n) => n + 1)}
+      onBackToLibrary={handleClose}
+    />
+  );
+
+  // fallback 沉浸：createPortal 到 document.body，覆盖整个应用窗口（§4.1）。
+  if (immersiveMode === "fallback") {
+    return createPortal(
+      <div
+        data-viewer-immersive
+        data-immersive-canvas
+        tabIndex={-1}
+        className="fixed inset-0 z-[100] bg-[#000000]"
+      >
+        {stage}
+      </div>,
+      document.body,
+    );
+  }
+
   return (
     <div
       ref={viewerRootRef}
-      data-viewer-fullscreen={isFullscreen ? "" : undefined}
-      className={clsx(
-        "h-full min-h-0 transition-all duration-200 ease-out",
-        isFullscreen && "bg-black",
-        entered ? "opacity-100" : "opacity-0",
-      )}
+      data-viewer-immersive={immersive ? "" : undefined}
+      className={clsx("h-full min-h-0 transition-all duration-200 ease-out", entered ? "opacity-100" : "opacity-0")}
     >
       <ViewerShell
-        fullscreen={isFullscreen}
+        immersive={immersive}
         toolbar={
           <ViewerToolbar
             fileName={current.fileName}
             position={index >= 0 ? `${index + 1} / ${total}` : ""}
             detailsOpen={detailsOpen}
             onToggleDetails={() => setDetailsOpen((v) => !v)}
-            fullscreen={isFullscreen}
-            onToggleFullscreen={() => void toggleFullscreen()}
-            onClose={onClose}
+            immersive={immersive}
+            onToggleImmersive={() => void toggleImmersive()}
+            onClose={handleClose}
           />
         }
         sidebar={
-          detailsOpen ? (
+          detailsOpen && !immersive ? (
             <ViewerInfoSidebar asset={current} onRefreshed={(a) => patchLocal([a.id], a)} />
           ) : null
         }
         tagBar={
-          <>
-            {viewerStripOn && (
-              <div className="shrink-0 px-4 pt-1">
-                <ColorStrip palette={viewerSegments} mode={colorStrip.mode} height={colorStrip.height} count={colorStrip.count} />
-              </div>
-            )}
-            <ViewerTagBar assetId={current.id} tags={current.tags} onRemoveTag={(tid) => void removeTag(tid)} onAddTag={openAssign} />
-          </>
-        }
-        stage={
-          isVideo ? (
-            <MediaViewport assetId={current.id} isVideo fileName={current.fileName} video={
-              <VideoPlayer
-                src={videoSrc ?? ""}
-                fileName={current.fileName}
-                proxying={proxying}
-                proxyError={proxyError}
-                onCancelProxy={handleCancelProxy}
-                onRetryProxy={() => {
-                  proxyAttempted.current = false;
-                  setProxyError(null);
-                  void handleVideoError();
-                }}
-                onError={() => void handleVideoError()}
+          !immersive ? (
+            <>
+              {viewerStripOn && (
+                <div className="shrink-0 px-4 pt-1">
+                  <ColorStrip palette={viewerSegments} mode={colorStrip.mode} height={colorStrip.height} count={colorStrip.count} />
+                </div>
+              )}
+              <ViewerTagBar
+                assetId={current.id}
+                tags={current.tags}
+                contentDescription={current.contentDescription}
+                onRemoveTag={(tid) => void removeTag(tid)}
+                onAddTag={openAssign}
               />
-            } />
-          ) : (
-            <MediaViewport
-              assetId={current.id}
-              isVideo={false}
-              imageSrc={src}
-              imageFallbackUrl={toFileUrl(current.filePath)}
-              fileName={current.fileName}
-              onImageError={() => {
-                // §7.5：高清图失败→回落原文件；兜底也失败→致命错误（重新加载需重新获取 URL/高清图）
-                if (src && src === toFileUrl(current.filePath)) {
-                  setMediaFatal(true);
-                } else {
-                  setSrc(toFileUrl(current.filePath));
-                }
-              }}
-              fatal={mediaFatal}
-              onRetryCurrent={() => setReloadNonce((n) => n + 1)}
-              onBackToLibrary={onClose}
-            />
-          )
+            </>
+          ) : null
         }
+        stage={stage}
         filmstrip={
-          <ViewerFilmstrip
-            items={items}
-            currentId={currentId}
-            onJump={goto}
-            onPrev={() => goto(index - 1)}
-            onNext={() => goto(index + 1)}
-          />
+          !immersive ? (
+            <ViewerFilmstrip
+              items={items}
+              currentId={currentId}
+              onJump={goto}
+              onPrev={() => goto(index - 1)}
+              onNext={() => goto(index + 1)}
+            />
+          ) : null
         }
       />
 
-      <TagAssignDialog open={assignOpen} onClose={closeAssign} />
+      {!immersive && <TagAssignDialog open={assignOpen} onClose={closeAssign} />}
     </div>
   );
 }

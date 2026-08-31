@@ -78,6 +78,12 @@ pub struct AiSuggestion {
     /// 单条打标失败原因（v6：失败详情落库，前端可展示，不再只看到 rejected）
     pub last_error: Option<String>,
     pub created_at: i64,
+    // FB5-05（§7.6）：一句话描述。AI 建议值 / 审核后确认值 / 素材当前值。
+    #[serde(default)]
+    pub suggested_description: String,
+    pub confirmed_description: Option<String>,
+    #[serde(default)]
+    pub current_description: String,
 }
 
 fn batch_from_row(r: &rusqlite::Row) -> rusqlite::Result<AiBatch> {
@@ -157,7 +163,23 @@ pub fn inc_batch_processed(conn: &Connection, id: i64) -> AppResult<()> {
     Ok(())
 }
 
-/// 写/覆盖某条建议的 AI 候选标签（tagging_service 用，T05）
+/// FB5-05（§7.6）：写/覆盖某条建议的 AI 候选结果（标签 + 一句话描述）。
+/// tagging_service 用；描述为空也照写（空描述不导致有效标签整条失败）。
+pub fn set_suggestion_result(
+    conn: &Connection,
+    id: i64,
+    tags: &CategorizedTags,
+    description: &str,
+) -> AppResult<()> {
+    set_suggestion_tags(conn, id, tags)?;
+    conn.execute(
+        "UPDATE ai_suggestions SET suggested_description = ?1 WHERE id = ?2",
+        rusqlite::params![description, id],
+    )?;
+    Ok(())
+}
+
+/// 写/覆盖某条建议的 AI 候选标签（tagging_service 用，T05；描述由 set_suggestion_result 一并写）
 pub fn set_suggestion_tags(conn: &Connection, id: i64, tags: &CategorizedTags) -> AppResult<()> {
     conn.execute(
         "UPDATE ai_suggestions SET suggested_tags = ?1 WHERE id = ?2",
@@ -228,10 +250,16 @@ fn suggestion_from_row(r: &rusqlite::Row) -> rusqlite::Result<AiSuggestion> {
         confirmed_tags: confirmed.map(|s| parse_tags_json(&s)).unwrap_or_default(),
         last_error,
         created_at: r.get(7)?,
+        // FB5-05（§7.6）：suggested_description(10) / confirmed_description(11) / current_description(12)
+        suggested_description: r.get(10)?,
+        confirmed_description: r.get(11)?,
+        current_description: r.get(12)?,
     })
 }
 
-const SUGG_COLS: &str = "s.id, s.batch_id, s.asset_id, a.file_path, s.suggested_tags, s.status, s.confirmed_tags, s.created_at, s.last_error, a.mime_type";
+const SUGG_COLS: &str = "s.id, s.batch_id, s.asset_id, a.file_path, s.suggested_tags, s.status, \
+                         s.confirmed_tags, s.created_at, s.last_error, a.mime_type, \
+                         s.suggested_description, s.confirmed_description, a.content_description";
 
 pub fn list_suggestions(conn: &Connection, batch_id: i64) -> AppResult<Vec<AiSuggestion>> {
     let mut stmt = conn.prepare(&format!(
@@ -342,7 +370,15 @@ pub fn decide_suggestion_item(
 
 /// 确认建议（内部版，不开事务）：供外层已开事务的调用方使用（confirm_all_pending）
 /// B20：拆出 inner 版，与 asset_tags::assign / assign_inner 模式一致
-fn confirm_suggestion_inner(conn: &Connection, id: i64, tags: &CategorizedTags) -> AppResult<()> {
+/// FB5-05（§7.6）：description = 审核后的最终描述值；非空 → 同一事务内写入
+/// assets.content_description + confirmed_description；空 → 只记 confirmed_description=NULL，
+/// 不覆盖素材已有描述（「新建议描述为空：保留素材已有」）。
+fn confirm_suggestion_inner(
+    conn: &Connection,
+    id: i64,
+    tags: &CategorizedTags,
+    description: Option<&str>,
+) -> AppResult<()> {
     let (asset_id, batch_id, mode, status): (i64, i64, String, String) = conn.query_row(
         "SELECT s.asset_id, s.batch_id, b.mode, s.status FROM ai_suggestions s
          JOIN ai_batches b ON b.id = s.batch_id WHERE s.id = ?1",
@@ -393,6 +429,25 @@ fn confirm_suggestion_inner(conn: &Connection, id: i64, tags: &CategorizedTags) 
         "UPDATE ai_suggestions SET status = ?1, confirmed_tags = ?2 WHERE id = ?3",
         rusqlite::params![status, serde_json::to_string(tags)?, id],
     )?;
+    // FB5-05（§7.6）：同一事务内写描述（确认标签 + 描述原子落库）
+    match description.map(str::trim).filter(|d| !d.is_empty()) {
+        Some(desc) => {
+            conn.execute(
+                "UPDATE assets SET content_description = ?1 WHERE id = ?2",
+                rusqlite::params![desc, asset_id],
+            )?;
+            conn.execute(
+                "UPDATE ai_suggestions SET confirmed_description = ?1 WHERE id = ?2",
+                rusqlite::params![desc, id],
+            )?;
+        }
+        None => {
+            conn.execute(
+                "UPDATE ai_suggestions SET confirmed_description = NULL WHERE id = ?1",
+                [id],
+            )?;
+        }
+    }
     conn.execute(
         "UPDATE ai_batches SET confirmed = confirmed + 1 WHERE id = ?1",
         [batch_id],
@@ -435,13 +490,24 @@ fn confirm_suggestion_inner(conn: &Connection, id: i64, tags: &CategorizedTags) 
     Ok(())
 }
 
-/// 确认建议：tags 为最终确认值（含人工修改）；写入 asset_tags 并联动批次计数
+/// 确认建议：tags 为最终确认值（含人工修改）；写入 asset_tags 并联动批次计数。
+/// FB5-05（§7.6）：description 为审核后的最终描述（None = 不修改描述）。
 /// B20：公开版开单事务调 inner
-pub fn confirm_suggestion(conn: &Connection, id: i64, tags: &CategorizedTags) -> AppResult<()> {
+pub fn confirm_suggestion_with_description(
+    conn: &Connection,
+    id: i64,
+    tags: &CategorizedTags,
+    description: Option<&str>,
+) -> AppResult<()> {
     let tx = conn.unchecked_transaction()?;
-    confirm_suggestion_inner(&tx, id, tags)?;
+    confirm_suggestion_inner(&tx, id, tags, description)?;
     tx.commit()?;
     Ok(())
+}
+
+/// 确认建议（不传描述，等价于 description=None）：兼容既有调用方
+pub fn confirm_suggestion(conn: &Connection, id: i64, tags: &CategorizedTags) -> AppResult<()> {
+    confirm_suggestion_with_description(conn, id, tags, None)
 }
 
 /// 批量套用标签到任意素材（PRD 5.3：胶片条多选套用；来源 manual）
@@ -498,23 +564,31 @@ pub fn reject_suggestion(conn: &Connection, id: i64) -> AppResult<()> {
 /// B20：外层包裹单事务，保证原子性（部分失败整批回滚）
 /// B-2：只处理解析后标签非空的建议——历史数据可能有 `{}`、空数组或空白 JSON，
 ///     不能只依赖 SQL 字符串比较；空建议不写入、不虚增批次 confirmed 计数。
+/// FB5-05（§7.6）：逐条应用各自描述（不得把第一张描述套给整批）；描述为空 → 保留素材已有描述。
 pub fn confirm_all_pending(conn: &Connection, batch_id: i64) -> AppResult<()> {
-    let pendings: Vec<(i64, CategorizedTags)> = {
+    let pendings: Vec<(i64, CategorizedTags, Option<String>)> = {
         let mut stmt = conn.prepare(
-            "SELECT id, suggested_tags FROM ai_suggestions WHERE batch_id = ?1 AND status = 'pending'",
+            "SELECT id, suggested_tags, suggested_description
+               FROM ai_suggestions WHERE batch_id = ?1 AND status = 'pending'",
         )?;
         let rows = stmt
             .query_map([batch_id], |r| {
                 let raw: String = r.get(1)?;
-                Ok((r.get::<_, i64>(0)?, parse_tags_json(&raw)))
+                let desc: String = r.get(2)?;
+                let desc_opt = if desc.trim().is_empty() {
+                    None
+                } else {
+                    Some(desc)
+                };
+                Ok((r.get::<_, i64>(0)?, parse_tags_json(&raw), desc_opt))
             })?
             .collect::<Result<Vec<_>, _>>()?;
         rows
     };
     // B-2：过滤解析后的空标签建议（不把无内容的建议误写成 confirmed）
-    let pendings: Vec<(i64, CategorizedTags)> = pendings
+    let pendings: Vec<(i64, CategorizedTags, Option<String>)> = pendings
         .into_iter()
-        .filter(|(_, tags)| !tags.is_empty())
+        .filter(|(_, tags, _)| !tags.is_empty())
         .collect();
     // B-2：没有可确认项目时返回成功空操作，不把批次错误计数
     if pendings.is_empty() {
@@ -522,8 +596,8 @@ pub fn confirm_all_pending(conn: &Connection, batch_id: i64) -> AppResult<()> {
     }
     // B20：外层单事务，部分失败整批回滚
     let tx = conn.unchecked_transaction()?;
-    for (id, tags) in pendings {
-        confirm_suggestion_inner(&tx, id, &tags)?;
+    for (id, tags, desc) in pendings {
+        confirm_suggestion_inner(&tx, id, &tags, desc.as_deref())?;
     }
     tx.commit()?;
     Ok(())

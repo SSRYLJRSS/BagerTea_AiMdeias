@@ -1,22 +1,44 @@
 /**
- * VideoPlayer 组件测试（指导书 §4.4/§12.3）：
- *  - 渲染 video 元素 + 图标化控制条（lucide 图标按钮带 aria-label/title）；
- *  - 倍速菜单 0.5/1/1.5/2x；
- *  - 测量指标上报（canPlayType 矩阵 + 网络/就绪状态）；
- *  - 键盘作用域：焦点在播放器根节点时 ←→ 只 seek（stopPropagation，不冒泡成素材切换）；
- *  - 自动播放被拒 → 「点击播放」可见（不静默吞错）。
+ * VideoPlayer 组件测试（指导书 §4.4/§12.3 + FB5-02 §13.3）：
+ *  - 控制条为 absolute overlay，不再是 shrink-0 底栏；无白色底板 class；
+ *  - 播放中 1800ms 后隐藏，pointermove/focus 恢复；暂停时不隐藏；
+ *  - progress/volume 操作不冒泡；buffered/played 百分比正确；
+ *  - 自定义 range 在 duration 未知时禁用；
+ *  - 倍速菜单 0.5/1/1.5/2，选择后关闭；
+ *  - F/全屏按钮调用父级 onToggleImmersive，不直接 requestFullscreen；
+ *  - 键盘左右 seek 不冒泡成 Viewer 切图。
  */
-import { describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import VideoPlayer from "@/components/media/VideoPlayer";
 
-describe("VideoPlayer（指导书 §4.4）", () => {
-  it("渲染 video 元素与控制器按钮（带 aria-label/title）", () => {
+beforeEach(() => {
+  vi.useFakeTimers();
+});
+
+afterEach(() => {
+  vi.useRealTimers();
+});
+
+describe("VideoPlayer（指导书 §4.4 + FB5-02）", () => {
+  it("渲染 video 元素与悬浮控制条（absolute overlay，非 shrink-0 底栏）", () => {
     const { container } = render(<VideoPlayer src="asset://v/mp4" fileName="demo.mp4" />);
     const video = container.querySelector("video");
     expect(video).not.toBeNull();
     expect(video!.getAttribute("src")).toBe("asset://v/mp4");
     expect(video!.getAttribute("playsinline")).not.toBeNull();
+
+    const controls = container.querySelector("[data-testid='video-controls']") as HTMLElement;
+    expect(controls).not.toBeNull();
+    // §13.3：控制条必须是 absolute 悬浮层
+    expect(controls.className).toContain("absolute");
+    // 根节点不再 flex-col 给控制条留高度
+    const root = container.querySelector("[data-player-root]") as HTMLElement;
+    expect(root.className).toContain("relative");
+    expect(root.className).not.toContain("flex-col");
+    // 不存在白色底板
+    expect(controls.className).not.toContain("bg-[var(--color-surface-raised)]");
+    expect(controls.className).not.toContain("border-t");
 
     expect(screen.getByRole("button", { name: /播放|暂停/ })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "后退 5 秒" })).toBeInTheDocument();
@@ -25,15 +47,20 @@ describe("VideoPlayer（指导书 §4.4）", () => {
     expect(screen.getByRole("button", { name: "全屏" })).toBeInTheDocument();
     expect(screen.getByRole("slider", { name: "播放进度" })).toBeInTheDocument();
     expect(screen.getByRole("slider", { name: "音量" })).toBeInTheDocument();
-    expect(screen.getByRole("combobox", { name: "倍速" })).toBeInTheDocument();
-    expect(screen.getByText("0:00 / 0:00")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "倍速" })).toBeInTheDocument();
   });
 
-  it("倍速菜单含 0.5/1/1.5/2x", () => {
+  it("倍速菜单含 0.5/1/1.5/2x，选择后写入并关闭", () => {
     render(<VideoPlayer src="asset://v/mp4" fileName="demo.mp4" />);
-    const sel = screen.getByRole("combobox", { name: "倍速" }) as HTMLSelectElement;
-    const opts = [...sel.options].map((o) => o.value);
-    expect(opts).toEqual(["0.5", "1", "1.5", "2"]);
+    const rateBtn = screen.getByRole("button", { name: "倍速" });
+    fireEvent.click(rateBtn);
+    const menu = screen.getByRole("menu", { name: "倍速选项" });
+    const items = within(menu).getAllByRole("menuitemradio");
+    expect(items.map((i) => i.textContent?.trim())).toEqual(["0.5x", "1x", "1.5x", "2x"]);
+    fireEvent.click(within(menu).getByText("2x"));
+    expect(menu).not.toBeInTheDocument(); // 选择后关闭
+    // 按钮文本更新为 2x
+    expect(screen.getByRole("button", { name: "倍速" }).textContent).toContain("2x");
   });
 
   it("§6.2 上报视频测量指标（canPlayType 矩阵 + 网络/就绪状态）", () => {
@@ -57,35 +84,15 @@ describe("VideoPlayer（指导书 §4.4）", () => {
     const root = container.querySelector("[data-player-root]") as HTMLElement;
     expect(root).not.toBeNull();
     root.focus();
-    // jsdom 中 video.currentTime 直接可写；断言冒泡被阻断
     fireEvent.keyDown(root, { key: "ArrowLeft" });
     expect(onStop).not.toHaveBeenCalled(); // stopPropagation 生效：外层收不到
   });
 
   it("自动播放被拒时显示「点击播放」而非静默吞错", () => {
     render(<VideoPlayer src="asset://v/mp4" fileName="demo.mp4" />);
-    // 模拟 play() 拒绝（NotAllowedError）——jsdom 中 play 未实现，直接在组件外层无法触发；
-    // 此用例验证状态机路径：手动触发 autoplayBlocked 后仍可再次发起播放（不抛错）
     fireEvent.keyDown(document.querySelector("[data-player-root]") as HTMLElement, { key: " " });
     // 不应抛错；控件仍存在
     expect(screen.getByRole("button", { name: /播放|暂停/ })).toBeInTheDocument();
-  });
-
-  it("FB3-03 高度契约：根节点 h-full flex-col + 媒体区 flex-1 min-h-0 + 控制条 shrink-0", () => {
-    const { container } = render(<VideoPlayer src="asset://v/mp4" fileName="demo.mp4" />);
-    const root = container.querySelector("[data-player-root]") as HTMLElement;
-    expect(root.className).toContain("h-full");
-    expect(root.className).toContain("flex-col");
-    expect(root.className).toContain("min-h-0");
-    // 媒体区（video 的父节点）必须 min-h-0 flex-1：视频固有高度被约束，控制条不被推出舞台
-    const video = container.querySelector("video") as HTMLVideoElement;
-    const mediaArea = video.parentElement as HTMLElement;
-    expect(mediaArea.className).toContain("flex-1");
-    expect(mediaArea.className).toContain("min-h-0");
-    expect(video.className).toContain("object-contain");
-    // 控制条 shrink-0：永远留在可视区内
-    const controls = root.querySelector(".shrink-0") as HTMLElement | null;
-    expect(controls).not.toBeNull();
   });
 
   it("FB3-03 loadedmetadata 后 range 用 duration 作为 max（metadata 前禁用）", () => {
@@ -113,5 +120,105 @@ describe("VideoPlayer（指导书 §4.4）", () => {
     const range2 = screen.getByRole("slider", { name: "播放进度" }) as HTMLInputElement;
     expect(range2.max).toBe("0");
     expect(range2.disabled).toBe(true);
+  });
+
+  it("FB5-02 §13.3：播放时 1800ms 后控制条隐藏；pointermove/focus 恢复；暂停时不隐藏", () => {
+    const { container } = render(<VideoPlayer src="asset://v/mp4" fileName="demo.mp4" />);
+    const root = container.querySelector("[data-player-root]") as HTMLElement;
+    const video = container.querySelector("video") as HTMLVideoElement;
+    const controlsHost = root.querySelector(".absolute.inset-x-0.bottom-0") as HTMLElement;
+    expect(controlsHost).not.toBeNull();
+
+    // 模拟播放中
+    fireEvent(video, new Event("play"));
+    // 播放开始后仍可见（刚切换状态，计时器尚未到期）
+    expect(controlsHost.style.opacity).toBe("1");
+    // 1800ms 后隐藏
+    act(() => {
+      vi.advanceTimersByTime(1800);
+    });
+    expect(controlsHost.style.opacity).toBe("0");
+    // pointermove 恢复
+    fireEvent.pointerMove(root);
+    expect(controlsHost.style.opacity).toBe("1");
+    // 再次隐藏后 focus 恢复
+    act(() => {
+      vi.advanceTimersByTime(1800);
+    });
+    expect(controlsHost.style.opacity).toBe("0");
+    fireEvent.focus(root);
+    expect(controlsHost.style.opacity).toBe("1");
+
+    // 暂停时不隐藏（即使计时器到期）
+    fireEvent(video, new Event("pause"));
+    act(() => {
+      vi.advanceTimersByTime(1800);
+    });
+    expect(controlsHost.style.opacity).toBe("1");
+  });
+
+  it("FB5-02 §13.3：progress/volume 操作不冒泡（不触发视频点击播放）", () => {
+    const { container } = render(<VideoPlayer src="asset://v/mp4" fileName="demo.mp4" />);
+    const video = container.querySelector("video") as HTMLVideoElement;
+    const playSpy = vi.spyOn(video, "play").mockImplementation(() => Promise.resolve());
+    const pauseSpy = vi.spyOn(video, "pause").mockImplementation(() => undefined);
+
+    const range = screen.getByRole("slider", { name: "播放进度" }) as HTMLInputElement;
+    // 点击进度条不应冒泡成 video click → 播放/暂停
+    fireEvent.click(range);
+    expect(playSpy).not.toHaveBeenCalled();
+    expect(pauseSpy).not.toHaveBeenCalled();
+
+    const vol = screen.getByRole("slider", { name: "音量" }) as HTMLInputElement;
+    fireEvent.click(vol);
+    expect(playSpy).not.toHaveBeenCalled();
+    expect(pauseSpy).not.toHaveBeenCalled();
+  });
+
+  it("FB5-02 §13.3：buffered/played 百分比由 progress/timeupdate 驱动", () => {
+    const { container } = render(<VideoPlayer src="asset://v/mp4" fileName="demo.mp4" />);
+    const video = container.querySelector("video") as HTMLVideoElement;
+    Object.defineProperty(video, "duration", { value: 100, configurable: true });
+    fireEvent(video, new Event("loadedmetadata"));
+    // 注入 buffered 区间
+    Object.defineProperty(video, "buffered", {
+      value: { length: 1, end: () => 60 },
+      configurable: true,
+    });
+    fireEvent(video, new Event("progress"));
+    // currentTime=40 → played 40%
+    Object.defineProperty(video, "currentTime", { value: 40, configurable: true });
+    fireEvent(video, new Event("timeupdate"));
+    const slider = screen.getByTestId("playback-slider");
+    const layers = slider.querySelectorAll("div[aria-hidden='true']");
+    // base + buffered + played 三层
+    expect(layers.length).toBe(3);
+    const buffered = layers[1] as HTMLElement;
+    const played = layers[2] as HTMLElement;
+    expect(buffered.style.width).toBe("60%");
+    expect(played.style.width).toBe("40%");
+  });
+
+  it("FB5-01 §4.4：F 键与全屏按钮调用父级 onToggleImmersive，不直接 requestFullscreen", () => {
+    const onToggle = vi.fn();
+    const { container } = render(
+      <VideoPlayer src="asset://v/mp4" fileName="demo.mp4" onToggleImmersive={onToggle} />,
+    );
+    const root = container.querySelector("[data-player-root]") as HTMLElement;
+    // jsdom 无 requestFullscreen：先定义再 spy
+    const reqSpy = vi.fn(() => Promise.resolve());
+    Object.defineProperty(HTMLElement.prototype, "requestFullscreen", {
+      configurable: true,
+      writable: true,
+      value: reqSpy,
+    });
+    // F 键
+    fireEvent.keyDown(root, { key: "f" });
+    expect(onToggle).toHaveBeenCalledTimes(1);
+    // 全屏按钮
+    fireEvent.click(screen.getByRole("button", { name: "全屏" }));
+    expect(onToggle).toHaveBeenCalledTimes(2);
+    // 从未直接请求浏览器全屏
+    expect(reqSpy).not.toHaveBeenCalled();
   });
 });

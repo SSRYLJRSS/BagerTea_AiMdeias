@@ -93,10 +93,12 @@ pub fn save_ai_connection(
         model.trim(),
         api_key_ref.as_deref(),
     )?;
-    let c = ai_connections::get(&conn, id.trim())?
-        .ok_or_else(|| AppError::msg("保存后读取失败"))?;
+    let c =
+        ai_connections::get(&conn, id.trim())?.ok_or_else(|| AppError::msg("保存后读取失败"))?;
     let has_key = match &c.api_key_ref {
-        Some(id) => credentials::get_api_key(id)?.map(|k| !k.is_empty()).unwrap_or(false),
+        Some(id) => credentials::get_api_key(id)?
+            .map(|k| !k.is_empty())
+            .unwrap_or(false),
         None => false,
     };
     Ok(AiConnectionView {
@@ -132,10 +134,7 @@ pub fn set_ai_usage_binding(
     }
     let conn = lock_db(&state)?;
     let Some(cid) = connection_id.filter(|s| !s.is_empty()) else {
-        conn.execute(
-            "DELETE FROM ai_usage_bindings WHERE usage = ?1",
-            [&usage],
-        )?;
+        conn.execute("DELETE FROM ai_usage_bindings WHERE usage = ?1", [&usage])?;
         return Ok(());
     };
     // 校验连接存在
@@ -147,7 +146,9 @@ pub fn set_ai_usage_binding(
 
 /// 读取两个用途的当前绑定（connection_id，无绑定为 null）。
 #[tauri::command]
-pub fn get_ai_usage_bindings(state: State<AppState>) -> AppResult<std::collections::HashMap<String, Option<String>>> {
+pub fn get_ai_usage_bindings(
+    state: State<AppState>,
+) -> AppResult<std::collections::HashMap<String, Option<String>>> {
     let conn = lock_db(&state)?;
     let mut out = std::collections::HashMap::new();
     for usage in ["super_search", "tagging"] {
@@ -194,17 +195,77 @@ pub async fn test_ai_connection(
             Some(id) => credentials::get_api_key(id)?.unwrap_or_default(),
             None => String::new(),
         };
-        (c.base_url, c.protocol, c.model, api_key, c.deployment == "local")
+        (
+            c.base_url,
+            c.protocol,
+            c.model,
+            api_key,
+            c.deployment == "local",
+        )
     };
     tauri::async_runtime::spawn_blocking(move || {
         Ok(crate::services::ai_cloud::test_connection(
-            &base_url,
-            &api_key,
-            &protocol,
-            &model,
-            is_local,
+            &base_url, &api_key, &protocol, &model, is_local,
         ))
     })
     .await
     .map_err(|e| AppError::msg(format!("连接测试任务失败: {e}")))?
+}
+
+/// FB5-04（§3.6）：连接感知模型发现（可手填 combobox 的「读取模型列表」）。
+/// - connection_id 提供时：密钥从 keyring 读取；显式 api_key（编辑中的草稿）优先于 keyring；
+///   地址/协议/部署未显式提供时用档案保存值（草稿值可覆盖）。
+/// - 无 connection_id：legacy 显式字段（AiTaggingPage 的 settings profile，apiKey 在 JSON 中，
+///   经「临时 apiKey」路径传入）。
+/// 网络请求 spawn_blocking；错误信息由 discover_models 分类（不含 key，URL 去 query）。
+#[tauri::command]
+pub async fn discover_ai_models(
+    state: State<'_, AppState>,
+    connection_id: Option<String>,
+    deployment: Option<String>,
+    protocol: Option<String>,
+    base_url: Option<String>,
+    api_key: Option<String>,
+) -> AppResult<Vec<String>> {
+    let (base_url, protocol, deployment, key) = {
+        let conn = lock_db(&state)?;
+        if let Some(cid) = &connection_id {
+            let c =
+                ai_connections::get(&conn, cid)?.ok_or_else(|| AppError::msg("连接档案不存在"))?;
+            // keyring 读取（阻塞）在短锁内完成；未配置时按空串处理（本地服务通常无需密钥）
+            let saved_key = match &c.api_key_ref {
+                Some(id) => credentials::get_api_key(id)?.unwrap_or_default(),
+                None => String::new(),
+            };
+            // 草稿 key 优先于 saved key（§13.5）
+            let key = match &api_key {
+                Some(k) if !k.trim().is_empty() => k.trim().to_string(),
+                _ => saved_key,
+            };
+            (
+                base_url.unwrap_or(c.base_url),
+                protocol.unwrap_or(c.protocol),
+                deployment.unwrap_or(c.deployment),
+                key,
+            )
+        } else {
+            let b = base_url.ok_or_else(|| AppError::msg("请先填写服务地址"))?;
+            (
+                b,
+                protocol.unwrap_or_else(|| "openai_chat".to_string()),
+                deployment.unwrap_or_else(|| "cloud".to_string()),
+                api_key.unwrap_or_default(),
+            )
+        }
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::services::ai_cloud::discover_models(
+            &base_url,
+            &key,
+            &protocol,
+            &deployment == "local",
+        )
+    })
+    .await
+    .map_err(|e| AppError::msg(format!("模型发现任务失败: {e}")))?
 }

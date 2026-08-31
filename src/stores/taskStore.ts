@@ -4,10 +4,9 @@
 import { create } from "zustand";
 import { onImportProgress, type ImportPhase, type ImportProgress } from "@/api/import";
 import { onExportProgress } from "@/api/export";
-import { onAiProgress } from "@/api/ai";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 
-export type TaskKind = "import" | "export" | "ai";
+export type TaskKind = "import" | "export";
 
 export interface TaskItem {
   /** 唯一键：入库用 taskId；导出/AI 用 kind */
@@ -139,8 +138,10 @@ export function markImportCancelling() {
 let subscribed = false;
 let unlisteners: UnlistenFn[] = [];
 
-/** 订阅三类进度事件（幂等，App 挂载时调用一次）；
- *  失败可恢复：部分成功时逐个回收已建立监听，复位 subscribed 允许下次调用惰性重试。 */
+/** 订阅入库/导出进度事件（幂等，App 挂载时调用一次）。
+ *  FB6 需求一：AI 打标进度不再进全局任务条——页面内 AiTaggingPage「当前批次」进度条是唯一
+ *  AI 进度 UI，由 aiStore.patchProgress（页面内唯一 onAiProgress 订阅）驱动；本 store 只是
+ *  入库/导出的事实订阅方。失败可恢复：部分成功时逐个回收已建立监听，复位 subscribed 允许下次惰性重试。 */
 export async function startGlobalTaskWatch(): Promise<void> {
   if (subscribed) return;
   subscribed = true;
@@ -148,7 +149,6 @@ export async function startGlobalTaskWatch(): Promise<void> {
     const results = await Promise.allSettled([
       onImportProgress((p) => upsertImport(p)),
       onExportProgress((p) => upsertGeneric("export", "导出中", p.done, p.total)),
-      onAiProgress((p) => upsertGeneric("ai", "AI 打标中", p.processed, p.total)),
     ]);
     const failures = results.filter((r) => r.status === "rejected").length;
     if (failures > 0) {
@@ -157,7 +157,7 @@ export async function startGlobalTaskWatch(): Promise<void> {
       }
       for (const fn of unlisteners.splice(0)) fn();
       subscribed = false;
-      console.error(`全局任务监听订阅失败 ${failures}/3 个事件，已回收并允许重试`);
+      console.error(`全局任务监听订阅失败 ${failures}/2 个事件，已回收并允许重试`);
     }
   } catch (e) {
     subscribed = false;

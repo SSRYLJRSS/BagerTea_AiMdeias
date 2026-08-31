@@ -81,7 +81,10 @@ fn inflight() -> &'static Mutex<HashMap<String, Arc<Mutex<()>>>> {
     INFLIGHT.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn with_single_flight(key: &str, f: impl FnOnce() -> AppResult<video_proxy::VideoProxy>) -> AppResult<video_proxy::VideoProxy> {
+fn with_single_flight(
+    key: &str,
+    f: impl FnOnce() -> AppResult<video_proxy::VideoProxy>,
+) -> AppResult<video_proxy::VideoProxy> {
     let lock = {
         let mut m = inflight().lock().unwrap_or_else(|e| e.into_inner());
         m.entry(key.to_string())
@@ -98,9 +101,11 @@ fn proxy_path(proxy_dir: &Path, asset_id: i64, variant: &str) -> PathBuf {
 
 /// 生成临时路径（与目标同目录、同扩展名），用于「写入临时文件 → 原子 rename」。
 fn temp_path(out: &Path, uid: &str) -> PathBuf {
-    out.parent()
-        .unwrap_or(Path::new("."))
-        .join(format!("{}.{}.mp4", out.file_stem().and_then(|s| s.to_str()).unwrap_or("p"), uid))
+    out.parent().unwrap_or(Path::new(".")).join(format!(
+        "{}.{}.mp4",
+        out.file_stem().and_then(|s| s.to_str()).unwrap_or("p"),
+        uid
+    ))
 }
 
 /// 原子 rename（同文件系统），Windows 目标被占用时重试。
@@ -110,7 +115,9 @@ fn atomic_rename(tmp: &Path, out: &Path) -> AppResult<()> {
             Ok(()) => return Ok(()),
             Err(e) => {
                 std::thread::sleep(std::time::Duration::from_millis(50));
-                if e.kind() != std::io::ErrorKind::PermissionDenied && e.kind() != std::io::ErrorKind::AlreadyExists {
+                if e.kind() != std::io::ErrorKind::PermissionDenied
+                    && e.kind() != std::io::ErrorKind::AlreadyExists
+                {
                     return Err(AppError::msg(format!("代理 rename 失败: {e}")));
                 }
             }
@@ -129,7 +136,10 @@ pub fn get_or_create_proxy(
     cancel: &AtomicBool,
     transcode: impl Fn(&Path, &Path, &AtomicBool) -> AppResult<()>,
 ) -> AppResult<video_proxy::VideoProxy> {
-    if !variant.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+    if !variant
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
         return Err(AppError::msg("非法代理变体"));
     }
     let key = format!("{asset_id}:{variant}");
@@ -156,7 +166,14 @@ pub fn get_or_create_proxy(
         if !mime.starts_with("video/") {
             {
                 let conn = db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
-                video_proxy::upsert(&conn, asset_id, variant, "failed", None, Some("素材不是视频"))?;
+                video_proxy::upsert(
+                    &conn,
+                    asset_id,
+                    variant,
+                    "failed",
+                    None,
+                    Some("素材不是视频"),
+                )?;
             }
             let conn = db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
             return video_proxy::get(&conn, asset_id, variant)?
@@ -166,7 +183,14 @@ pub fn get_or_create_proxy(
         let out = proxy_path(proxy_dir, asset_id, variant);
         if out.exists() {
             let conn = db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
-            video_proxy::upsert(&conn, asset_id, variant, "ready", Some(&out.to_string_lossy()), None)?;
+            video_proxy::upsert(
+                &conn,
+                asset_id,
+                variant,
+                "ready",
+                Some(&out.to_string_lossy()),
+                None,
+            )?;
             return video_proxy::get(&conn, asset_id, variant)?
                 .ok_or_else(|| AppError::msg("代理记录写入失败"));
         }
@@ -182,7 +206,11 @@ pub fn get_or_create_proxy(
             None => {
                 let canceled = cancel.load(Ordering::Relaxed);
                 let status = if canceled { "canceled" } else { "failed" };
-                let reason = if canceled { "已取消（等待转码许可）" } else { "等待转码许可超时" };
+                let reason = if canceled {
+                    "已取消（等待转码许可）"
+                } else {
+                    "等待转码许可超时"
+                };
                 let conn = db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
                 video_proxy::upsert(&conn, asset_id, variant, status, None, Some(reason))?;
                 return video_proxy::get(&conn, asset_id, variant)?
@@ -195,42 +223,65 @@ pub fn get_or_create_proxy(
         let transcode_result = transcode(&src, &tmp, cancel);
         drop(license); // 显式释放许可（任何分支都提前归还）
         match transcode_result {
-            Ok(()) => {
-                match atomic_rename(&tmp, &out) {
-                    Ok(()) => {
-                        let conn = db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
-                        video_proxy::upsert(&conn, asset_id, variant, "ready", Some(&out.to_string_lossy()), None)?;
-                    }
-                    Err(e) => {
-                        let _ = fs::remove_file(&tmp);
-                        let conn = db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
-                        video_proxy::upsert(&conn, asset_id, variant, "failed", None, Some(&e.to_string()))?;
-                    }
+            Ok(()) => match atomic_rename(&tmp, &out) {
+                Ok(()) => {
+                    let conn = db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
+                    video_proxy::upsert(
+                        &conn,
+                        asset_id,
+                        variant,
+                        "ready",
+                        Some(&out.to_string_lossy()),
+                        None,
+                    )?;
                 }
-            }
+                Err(e) => {
+                    let _ = fs::remove_file(&tmp);
+                    let conn = db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
+                    video_proxy::upsert(
+                        &conn,
+                        asset_id,
+                        variant,
+                        "failed",
+                        None,
+                        Some(&e.to_string()),
+                    )?;
+                }
+            },
             Err(e) => {
                 let _ = fs::remove_file(&tmp);
                 let canceled = cancel.load(Ordering::Relaxed);
-                let reason = if canceled { "已取消".to_string() } else { e.to_string() };
+                let reason = if canceled {
+                    "已取消".to_string()
+                } else {
+                    e.to_string()
+                };
                 let status = if canceled { "canceled" } else { "failed" };
                 let conn = db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
                 video_proxy::upsert(&conn, asset_id, variant, status, None, Some(&reason))?;
             }
         }
         let conn = db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
-        video_proxy::get(&conn, asset_id, variant)?
-            .ok_or_else(|| AppError::msg("代理记录写入失败"))
+        video_proxy::get(&conn, asset_id, variant)?.ok_or_else(|| AppError::msg("代理记录写入失败"))
     })
 }
 
 /// 查询代理状态（不触发生成）。
-pub fn proxy_status(db: &Arc<Mutex<Connection>>, asset_id: i64, variant: &str) -> AppResult<Option<video_proxy::VideoProxy>> {
+pub fn proxy_status(
+    db: &Arc<Mutex<Connection>>,
+    asset_id: i64,
+    variant: &str,
+) -> AppResult<Option<video_proxy::VideoProxy>> {
     let conn = db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
     video_proxy::get(&conn, asset_id, variant)
 }
 
 /// 清理某个素材的全部代理（不影响原文件）。清除 DB 记录与磁盘文件。
-pub fn delete_proxy_for_asset(db: &Arc<Mutex<Connection>>, proxy_dir: &Path, asset_id: i64) -> AppResult<()> {
+pub fn delete_proxy_for_asset(
+    db: &Arc<Mutex<Connection>>,
+    proxy_dir: &Path,
+    asset_id: i64,
+) -> AppResult<()> {
     if let Ok(rd) = fs::read_dir(proxy_dir) {
         let prefix = format!("{asset_id}_");
         for e in rd.flatten() {
@@ -282,7 +333,10 @@ pub fn clear_all_proxies(db: &Arc<Mutex<Connection>>, proxy_dir: &Path) -> AppRe
         }
     }
     let conn = db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
-    conn.execute("DELETE FROM video_proxies WHERE status IN ('ready','failed','canceled')", [])?;
+    conn.execute(
+        "DELETE FROM video_proxies WHERE status IN ('ready','failed','canceled')",
+        [],
+    )?;
     Ok(removed)
 }
 
@@ -306,7 +360,8 @@ mod tests {
             [],
         )
         .unwrap();
-        c.query_row("SELECT id FROM assets", [], |r| r.get(0)).unwrap()
+        c.query_row("SELECT id FROM assets", [], |r| r.get(0))
+            .unwrap()
     }
 
     #[test]
@@ -381,7 +436,8 @@ mod tests {
                 [],
             )
             .unwrap();
-            c.query_row("SELECT id FROM assets", [], |r| r.get(0)).unwrap()
+            c.query_row("SELECT id FROM assets", [], |r| r.get(0))
+                .unwrap()
         };
         drop(c);
         let dir = std::env::temp_dir().join(format!("bg_proxy_nonv_{}", std::process::id()));
@@ -444,7 +500,10 @@ mod tests {
             .map(|h| h.join().unwrap())
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
-        assert!(statuses.iter().all(|s| s == "ready"), "全部应 ready: {statuses:?}");
+        assert!(
+            statuses.iter().all(|s| s == "ready"),
+            "全部应 ready: {statuses:?}"
+        );
         assert!(
             max_observed.load(Ordering::SeqCst) <= 1,
             "并发转码不得超过 1，实测峰值 {}",
@@ -486,7 +545,9 @@ mod tests {
             rusqlite::params![format!("/src/{name}"), name],
         )
         .unwrap();
-        c.query_row("SELECT id FROM assets ORDER BY id DESC LIMIT 1", [], |r| r.get(0))
-            .unwrap()
+        c.query_row("SELECT id FROM assets ORDER BY id DESC LIMIT 1", [], |r| {
+            r.get(0)
+        })
+        .unwrap()
     }
 }

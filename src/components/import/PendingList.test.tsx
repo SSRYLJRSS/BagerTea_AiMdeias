@@ -8,6 +8,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, fireEvent, render, screen } from "@testing-library/react";
 import PendingList from "@/components/import/PendingList";
+import { useSettingsStore, DEFAULT_APPEARANCE } from "@/stores/settingsStore";
 import type { ImportPlanItem } from "@/api/import";
 
 vi.mock("@/api/preview", () => ({
@@ -16,6 +17,13 @@ vi.mock("@/api/preview", () => ({
 vi.mock("@tauri-apps/api/core", () => ({
   convertFileSrc: (p: string) => `asset://${p}`,
 }));
+
+// 让 rAF 同步执行：FB6 需求二的切档提交/锚点恢复都走 rAF（jsdom 无真实帧时钟）
+vi.spyOn(global, "requestAnimationFrame").mockImplementation((cb) => {
+  cb(0);
+  return 0;
+});
+vi.spyOn(global, "cancelAnimationFrame").mockImplementation(() => {});
 
 // LazyThumb 依赖 IntersectionObserver（jsdom 无实现）
 vi.stubGlobal(
@@ -76,13 +84,27 @@ function advance(ms: number) {
   });
 }
 
+/** 可控的 performance.now（节流窗断言用；真实时钟在毫秒内连续 fireEvent 无法跨过 60ms） */
+let nowMs = 0;
+const nowSpy = vi.spyOn(performance, "now").mockImplementation(() => nowMs);
+
 beforeEach(() => {
-  vi.useFakeTimers();
+  // 只 fake 定时器（hover intent 用）；rAF 保持上方同步 mock（FB6 缩放依赖）
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
+  useSettingsStore.setState({ settings: null, previewAppearance: null });
+  nowMs = 0;
+  nowSpy.mockClear();
 });
 
 afterEach(() => {
   vi.useRealTimers();
 });
+
+/** 当前生效的入库格宽档位（previewAppearance 优先） */
+function currentImportCellStep(): number {
+  const s = useSettingsStore.getState();
+  return (s.previewAppearance ?? s.settings?.appearance ?? DEFAULT_APPEARANCE).grid.importCellStep;
+}
 
 describe("PendingList 固定动作头部", () => {
   it("清单非空时提供添加文件/添加文件夹/清空入口与数量/大小", () => {
@@ -209,3 +231,103 @@ describe("PendingList §10 卡片内视频播放（FB-04）", () => {
     expect(card.querySelector("video")).toBeNull();
   });
 });
+
+describe("PendingList 缩略图视图 Alt/Ctrl/Cmd + 滚轮缩放（FB6 需求二）", () => {
+  /** 渲染并切到指定视图，返回滚动容器 */
+  function setup(view: "grid" | "list" = "grid", running = false) {
+    render(<PendingList items={items} running={running} onRemove={() => {}} />);
+    if (view === "grid") fireEvent.click(screen.getByRole("button", { name: "缩略图视图" }));
+    return screen.getByTestId("pending-grid-scroll");
+  }
+
+  it("Alt + 滚轮向上增大卡片（档位 +1）、向下减小（档位 -1）", () => {
+    const scroll = setup();
+    fireEvent.wheel(scroll, { deltaY: -100, altKey: true });
+    expect(currentImportCellStep()).toBe(2);
+    act(() => {
+      nowMs += 80; // 跨过节流窗
+    });
+    fireEvent.wheel(scroll, { deltaY: 100, altKey: true });
+    expect(currentImportCellStep()).toBe(1);
+  });
+
+  it("Ctrl/Cmd + 滚轮兼容（与素材库习惯一致）", () => {
+    const scroll = setup();
+    fireEvent.wheel(scroll, { deltaY: -100, ctrlKey: true });
+    expect(currentImportCellStep()).toBe(2);
+    act(() => {
+      nowMs += 80; // 跨过节流窗
+    });
+    fireEvent.wheel(scroll, { deltaY: -100, metaKey: true });
+    expect(currentImportCellStep()).toBe(3);
+  });
+
+  it("普通滚轮不改档位（只滚动列表）", () => {
+    const scroll = setup();
+    fireEvent.wheel(scroll, { deltaY: -100 });
+    expect(currentImportCellStep()).toBe(1);
+  });
+
+  it("列表视图不触发网格缩放", () => {
+    const scroll = setup("list");
+    fireEvent.wheel(scroll, { deltaY: -100, altKey: true });
+    expect(currentImportCellStep()).toBe(1);
+  });
+
+  it("边界档位不再改变且不越界", () => {
+    useSettingsStore.setState({
+      previewAppearance: { ...DEFAULT_APPEARANCE, grid: { ...DEFAULT_APPEARANCE.grid, importCellStep: 0 } },
+    });
+    const scroll = setup();
+    fireEvent.wheel(scroll, { deltaY: 100, altKey: true });
+    expect(currentImportCellStep()).toBe(0);
+
+    act(() => {
+      useSettingsStore.setState({
+        previewAppearance: {
+          ...DEFAULT_APPEARANCE,
+          grid: { ...DEFAULT_APPEARANCE.grid, importCellStep: 7 /* CELL_STEPS.length - 1 */ },
+        },
+      });
+    });
+    fireEvent.wheel(scroll, { deltaY: -100, altKey: true });
+    expect(currentImportCellStep()).toBe(7);
+  });
+
+  it("触摸板连续事件最多按节流频率改变一档（60ms 内第二事件不生效）", () => {
+    const scroll = setup();
+    fireEvent.wheel(scroll, { deltaY: -100, altKey: true });
+    fireEvent.wheel(scroll, { deltaY: -100, altKey: true });
+    fireEvent.wheel(scroll, { deltaY: -100, altKey: true });
+    expect(currentImportCellStep()).toBe(2);
+    // 超过节流窗后可继续步进
+    act(() => {
+      nowMs += 80; // 跨过节流窗（performance.now 已 mock）
+    });
+    fireEvent.wheel(scroll, { deltaY: -100, altKey: true });
+    expect(currentImportCellStep()).toBe(3);
+  });
+
+  it("入库 running 中不改变档位（不干扰正式入库布局）", () => {
+    const scroll = setup("grid", true);
+    fireEvent.wheel(scroll, { deltaY: -100, altKey: true });
+    expect(currentImportCellStep()).toBe(1);
+  });
+
+  it("切档后滚动位置不被重置为 0（视口中心素材保持可见）", () => {
+    const scroll = setup() as HTMLElement;
+    Object.defineProperty(scroll, "scrollTop", { configurable: true, value: 120, writable: true });
+    fireEvent.wheel(scroll, { deltaY: -100, altKey: true });
+    expect(scroll.scrollTop).toBe(120);
+  });
+
+  it("视频 hover 预览逻辑不回归：缩放档位变化不影响 hover 播放", () => {
+    const scroll = setup();
+    fireEvent.wheel(scroll, { deltaY: -100, altKey: true });
+    const card = cardOf("d:/p/b.mp4");
+    fireEvent.mouseEnter(card);
+    advance(300);
+    expect(card.querySelector("video")).not.toBeNull();
+  });
+});
+

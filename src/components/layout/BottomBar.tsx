@@ -19,7 +19,8 @@ interface BottomBarProps {
 }
 
 /** 达芬奇式底栏：3 个纯文字按钮、整体居中、无图标无副标题（PRD R-13）
- *  M3-04：左侧追加全局任务条（入库/导出/AI 打标进度聚合，只读既有事件）
+ *  M3-04：左上全局任务层（入库/导出进度聚合）。FB6 需求一：AI 打标不再进全局任务条，
+ *  页内进度由 AiTaggingPage 唯一承担；taskStore 负责订阅事件，本组件只读渲染。
  *  P2.3：素材库按钮支持双击进入超级搜索（单击延时导航，双击取消） */
 export default function BottomBar({ current, onNavigate, onOpenSuperSearch }: BottomBarProps) {
   const tasks = useTaskStore((s) => s.tasks);

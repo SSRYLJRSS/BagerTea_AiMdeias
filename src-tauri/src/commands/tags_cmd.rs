@@ -63,7 +63,12 @@ pub fn update_tag_facet_display(
     description: Option<String>,
 ) -> AppResult<()> {
     let conn = lock_db(&state)?;
-    crate::db::tag_facets::update_display(&conn, &key, &display_name, description.as_deref().unwrap_or(""))
+    crate::db::tag_facets::update_display(
+        &conn,
+        &key,
+        &display_name,
+        description.as_deref().unwrap_or(""),
+    )
 }
 
 /// 修改规则（selection_mode / max_items / applies_to）。

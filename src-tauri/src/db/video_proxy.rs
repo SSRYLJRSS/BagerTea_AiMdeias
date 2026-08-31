@@ -38,7 +38,14 @@ pub fn get(conn: &Connection, asset_id: i64, variant: &str) -> AppResult<Option<
 }
 
 /// 更新某个素材 + 变体的代理状态（insert 或 replace）。只短锁调用。
-pub fn upsert(conn: &Connection, asset_id: i64, variant: &str, status: &str, path: Option<&str>, error: Option<&str>) -> AppResult<()> {
+pub fn upsert(
+    conn: &Connection,
+    asset_id: i64,
+    variant: &str,
+    status: &str,
+    path: Option<&str>,
+    error: Option<&str>,
+) -> AppResult<()> {
     let now = chrono::Utc::now().timestamp_millis();
     conn.execute(
         "INSERT INTO video_proxies (asset_id, variant, status, path, error, created_at, updated_at)
@@ -65,14 +72,24 @@ mod tests {
             [],
         )
         .unwrap();
-        let asset_id = c.query_row("SELECT id FROM assets", [], |r| r.get(0)).unwrap();
+        let asset_id = c
+            .query_row("SELECT id FROM assets", [], |r| r.get(0))
+            .unwrap();
 
         upsert(&c, asset_id, "h264_mp4", "running", None, None).unwrap();
         let p = get(&c, asset_id, "h264_mp4").unwrap().unwrap();
         assert_eq!(p.status, "running");
         assert_eq!(p.variant, "h264_mp4");
 
-        upsert(&c, asset_id, "h264_mp4", "ready", Some("/proxy/v.mp4"), None).unwrap();
+        upsert(
+            &c,
+            asset_id,
+            "h264_mp4",
+            "ready",
+            Some("/proxy/v.mp4"),
+            None,
+        )
+        .unwrap();
         let p = get(&c, asset_id, "h264_mp4").unwrap().unwrap();
         assert_eq!(p.status, "ready");
         assert_eq!(p.path.as_deref(), Some("/proxy/v.mp4"));

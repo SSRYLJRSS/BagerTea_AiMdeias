@@ -169,7 +169,15 @@ mod tests {
         #[cfg(windows)]
         {
             Command::new("cmd")
-                .args(["/C", "ping", "127.0.0.1", "-n", &(secs + 1).to_string(), ">", "nul"])
+                .args([
+                    "/C",
+                    "ping",
+                    "127.0.0.1",
+                    "-n",
+                    &(secs + 1).to_string(),
+                    ">",
+                    "nul",
+                ])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .spawn()
@@ -231,10 +239,13 @@ mod tests {
         let second_pid = second.id();
         s.register_app_owned(second);
         // 旧 child 已被停掉清理；ownership 只保留新 pid
-        assert_eq!(s.ownership().map(|o| match o {
-            ServiceOwnership::AppOwned { pid, .. } => *pid,
-            ServiceOwnership::External => 0,
-        }), Some(second_pid));
+        assert_eq!(
+            s.ownership().map(|o| match o {
+                ServiceOwnership::AppOwned { pid, .. } => *pid,
+                ServiceOwnership::External => 0,
+            }),
+            Some(second_pid)
+        );
     }
 
     #[test]
@@ -242,13 +253,20 @@ mod tests {
         let mut s = OllamaRuntimeState::new();
         s.mark_external();
         let snap = s.snapshot();
-        assert!(serde_json::to_string(&snap).unwrap().contains("\"kind\":\"external\""));
-        assert!(serde_json::to_string(&snap).unwrap().contains("\"lastActivityAt\""));
+        assert!(serde_json::to_string(&snap)
+            .unwrap()
+            .contains("\"kind\":\"external\""));
+        assert!(serde_json::to_string(&snap)
+            .unwrap()
+            .contains("\"lastActivityAt\""));
     }
 
     #[test]
     fn app_owned_serializes_with_pid() {
-        let a = ServiceOwnership::AppOwned { pid: 123, started_at: 456 };
+        let a = ServiceOwnership::AppOwned {
+            pid: 123,
+            started_at: 456,
+        };
         let out = serde_json::to_string(&a).unwrap();
         assert!(out.contains("\"kind\":\"appOwned\""));
         assert!(out.contains("\"pid\":123"));

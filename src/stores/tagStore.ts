@@ -15,6 +15,10 @@ interface TagState {
   refreshFacet: (facetKey: string) => Promise<void>;
   searchCandidates: (facetKey: string | null, query: string) => Promise<void>;
   toggleExpand: (id: number) => void;
+  /** FB6 需求四：全部展开（收集树中所有拥有子节点的节点，不只当前一层） */
+  expandAll: () => void;
+  /** FB6 需求四：全部收起 */
+  collapseAll: () => void;
 }
 
 export const useTagStore = create<TagState>((set) => ({
@@ -64,10 +68,30 @@ export const useTagStore = create<TagState>((set) => ({
       else next.add(id);
       return { expanded: next };
     }),
+
+  expandAll: () =>
+    set((s) => ({ expanded: collectExpandableIds(s.tree) })),
+
+  collapseAll: () => set({ expanded: new Set<number>() }),
 }));
 
 function collectDefaultExpanded(tree: TagNode[]): ReadonlySet<number> {
   return new Set(tree.filter((n) => n.children.length > 0).map((n) => n.tag.id));
+}
+
+/** 递归收集所有拥有子节点的节点 id（FB6 需求四：expandAll 覆盖全部层级，不只顶级） */
+function collectExpandableIds(nodes: TagNode[]): ReadonlySet<number> {
+  const ids = new Set<number>();
+  const walk = (list: TagNode[]) => {
+    for (const n of list) {
+      if (n.children.length > 0) {
+        ids.add(n.tag.id);
+        walk(n.children);
+      }
+    }
+  };
+  walk(nodes);
+  return ids;
 }
 
 /** 固定基础分面（指导书 §9.3）：即使当前素材无标签、AI 无建议、手动模式，也必须显示这些系统分面。 */

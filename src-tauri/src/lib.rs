@@ -192,6 +192,11 @@ pub fn run() {
             commands::cancel_media_refill,
             // FB2-08：算法色板回算（独立的 rescan_*）
             commands::rescan_asset_palette,
+            // V18：GPS 定位 + 视频拍摄时间存量回填（独立的 rescan_*）
+            commands::rescan_asset_geo_taken,
+            // FB4-03：色板状态查询 + 定向补丁（设置页状态行 / 局部同步）
+            commands::get_palette_status,
+            commands::get_asset_palette_patches,
             // 视频兼容代理（指导书 §8.3）
             commands::ensure_video_proxy,
             commands::get_video_proxy_status,
@@ -255,7 +260,6 @@ pub fn run() {
             commands::ai_reject_suggestion,
             commands::ai_restore_suggestion,
             commands::ai_confirm_all,
-            commands::ai_list_models,
             commands::ai_apply_tags,
             // Ollama 一键配置（方案 A2）+ 一键安装（方案 A3）
             commands::ollama_ping,
@@ -283,6 +287,7 @@ pub fn run() {
             commands::save_settings,
             commands::get_data_dir,
             commands::open_data_dir,
+            commands::reset_app_data,
             // AI 连接档案 + 用途绑定（指导书 §6.3/§4.4）
             commands::list_ai_connections,
             commands::save_ai_connection,
@@ -291,6 +296,7 @@ pub fn run() {
             commands::get_ai_usage_bindings,
             commands::get_legacy_active_profile,
             commands::test_ai_connection,
+            commands::discover_ai_models,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

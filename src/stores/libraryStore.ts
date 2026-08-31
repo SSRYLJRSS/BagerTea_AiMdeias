@@ -1,6 +1,6 @@
 /** 素材库数据与筛选状态（虚拟网格数据源） */
 import { create } from "zustand";
-import { listAssets, listAssetIds } from "@/api/assets";
+import { listAssets, listAssetIds, getAssetPalettePatches, type AssetPalettePatch } from "@/api/assets";
 import { useSelectionStore } from "@/stores/selectionStore";
 import { markStartup } from "@/utils/startupMarks";
 import type { Asset, AssetFilter, AssetType, FacetTagFilter, MetadataFilter } from "@/types/asset";
@@ -70,6 +70,14 @@ interface LibraryState {
   /** 删除/打标后局部摘除，避免整页重载 */
   removeLocal: (ids: number[]) => void;
   patchLocal: (ids: number[], patch: Partial<Asset>) => void;
+  /**
+   * FB4-03（§6.2）：色板字段定向同步 —— 色板回算/导入后置完成后只合并命中素材的
+   * 色板字段（palette / dominantHue / dominantSat / dominantLum），
+   * 不调用 listAssets / refresh()，绝不重置分页、排序、选择、Viewer 或滚动位置。
+   * 算法：去重 updatedIds → 与调用时当前 items 求交集（空交集立即返回，不发 IPC）→
+   * 每批 ≤1000 调 getAssetPalettePatches → 函数式 set 在提交瞬间基于最新 s.items 按 id 合并。
+   */
+  refreshPaletteFields: (updatedIds: number[]) => Promise<void>;
   /** 取当前筛选结果的全部 id（全选/反选/批量操作用；一次查询只取 id 数组） */
   fetchAllIds: () => Promise<number[]>;
   /** Viewer 是否打开（§7.3 方案 A：App 据此隐藏全局 BottomBar，与 Viewer 互斥） */
@@ -186,6 +194,42 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
   patchLocal: (ids, patch) => {
     const hit = new Set(ids);
     set((s) => ({ items: s.items.map((a) => (hit.has(a.id) ? { ...a, ...patch } : a)) }));
+  },
+
+  refreshPaletteFields: async (updatedIds) => {
+    // 1) 去重
+    const ids = Array.from(new Set(updatedIds));
+    if (ids.length === 0) return;
+    // 2) 与调用时当前 items 求交集；空交集立即返回，不发 IPC
+    const currentIds = new Set(get().items.map((a) => a.id));
+    const intersect = ids.filter((id) => currentIds.has(id));
+    if (intersect.length === 0) return;
+    // 3) 每批最多 1000 个 id 定向读取补丁
+    const patches: AssetPalettePatch[] = [];
+    for (let i = 0; i < intersect.length; i += 1000) {
+      const batch = await getAssetPalettePatches(intersect.slice(i, i + 1000));
+      patches.push(...batch);
+    }
+    if (patches.length === 0) return;
+    // 4) 提交瞬间基于最新 s.items 合并（期间翻页/过滤/删除只影响仍存在的 id）
+    set((s) => {
+      const byId = new Map(patches.map((p) => [p.id, p]));
+      if (byId.size === 0) return s;
+      return {
+        items: s.items.map((a) => {
+          const p = byId.get(a.id);
+          // 未命中保持原引用；命中只替换色板相关字段（不先清空再填充，避免色条闪烁）
+          if (!p) return a;
+          return {
+            ...a,
+            palette: p.palette,
+            dominantHue: p.dominantHue,
+            dominantSat: p.dominantSat,
+            dominantLum: p.dominantLum,
+          };
+        }),
+      };
+    });
   },
 
   viewerOpen: false,

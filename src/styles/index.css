@@ -131,15 +131,114 @@ button:disabled {
   }
 }
 
+/* FB6 需求一：AI 打标页 LED 滚动提示 —— 确定性文案动画（不伪造百分比）。
+   20px 固定高度单行；track 双份文案无缝循环；静态文案节点平时 sr-only（aria-live 播报），
+   prefers-reduced-motion 下转可见、滚动副本隐藏（保留完整文案）。 */
+.ai-marquee-track {
+  display: inline-flex;
+  height: 20px;
+  white-space: nowrap;
+  animation: ai-marquee-scroll 10s linear infinite;
+}
+
+@keyframes ai-marquee-scroll {
+  from {
+    transform: translateX(0);
+  }
+  to {
+    transform: translateX(-50%);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ai-marquee-track {
+    display: none;
+  }
+
+  .ai-marquee-static.sr-only {
+    position: static;
+    width: auto;
+    height: auto;
+    padding: 0;
+    margin: 0;
+    overflow: visible;
+    clip: auto;
+    white-space: nowrap;
+  }
+}
+
 /* FB2-08（§14.10）：色条。无缝分段色带 —— 段间不留缝、不加边框（有缝就变成图表，贴合才是色卡）。
-   整条一个 inset ring 解决浅色主题下米白段「消失」的问题。 */
+   FB6（白线修复）：inset ring 只画左/右/下三边 —— 顶边紧贴媒体框底沿，画线会在接缝处形成
+   1px 细线（深色主题下 hairline 是白 8%）；浅色段的辨识由左右底三边保证，顶部与媒体框贴合不加线。 */
 .ui-colorstrip {
   display: flex;
   width: 100%;
   overflow: hidden;
-  box-shadow: inset 0 0 0 1px var(--color-hairline);
+  box-shadow:
+    inset 1px 0 0 var(--color-hairline),
+    inset -1px 0 0 var(--color-hairline),
+    inset 0 -1px 0 var(--color-hairline);
 }
 .ui-colorstrip > * {
   height: 100%;
   flex-shrink: 0;
+}
+
+/* FB5-02（§3.4/§5.3）：视频播放器自定义 range —— 轨道透明（播放/缓冲层由组件内 div 绘制），
+   只保留 thumb 视觉。同时定义 WebKit 与 Moz 前缀，覆盖 WebView2 原生蓝色滑条。 */
+.video-range {
+  -webkit-appearance: none;
+  appearance: none;
+  background: transparent;
+  cursor: pointer;
+  outline: none;
+}
+
+.video-range::-webkit-slider-runnable-track {
+  background: transparent;
+  height: 20px;
+}
+
+.video-range::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 10px;
+  height: 10px;
+  margin-top: 5px; /* (20 - 10) / 2：垂直居中 */
+  border-radius: 9999px;
+  background: #ffffff;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.35);
+  transition: width 120ms ease, height 120ms ease;
+}
+
+.video-range:hover::-webkit-slider-thumb,
+.video-range:focus-visible::-webkit-slider-thumb {
+  width: 12px;
+  height: 12px;
+  margin-top: 4px;
+}
+
+.video-range::-moz-range-track {
+  background: transparent;
+  height: 20px;
+}
+
+.video-range::-moz-range-thumb {
+  width: 10px;
+  height: 10px;
+  border: none;
+  border-radius: 9999px;
+  background: #ffffff;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.35);
+}
+
+.video-range:hover::-moz-range-thumb,
+.video-range:focus-visible::-moz-range-thumb {
+  width: 12px;
+  height: 12px;
+}
+
+/* 窄屏垂直音量滑条：thumb 保持 10px 圆点 */
+.video-range[writing-mode="vertical-lr"]::-webkit-slider-thumb {
+  margin-top: 0;
 }

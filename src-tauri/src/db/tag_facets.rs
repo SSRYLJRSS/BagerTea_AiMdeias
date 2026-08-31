@@ -49,7 +49,8 @@ pub fn validate_key(key: &str) -> AppResult<String> {
     let k = key.trim().to_lowercase();
     let valid = k.len() >= 2
         && k.len() <= 64
-        && k.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        && k.chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
         && k.as_bytes()[0].is_ascii_lowercase();
     if !valid {
         return Err(AppError::msg(
@@ -77,6 +78,53 @@ fn facet_from_row(r: &rusqlite::Row) -> rusqlite::Result<TagFacet> {
 
 const FACET_COLS: &str =
     "key, display_name, description, selection_mode, max_items, sort_order, is_system, status, applies_to, created_at, updated_at";
+
+/// 系统分面种子清单（migrate_v8 与 reset 后重建共用；key 顺序即 sort_order）。
+/// color 已于 V16 停用（算法主色替代），补种时单独置 inactive。
+const SYSTEM_FACETS: &[(&str, &str, &str, i64, i64)] = &[
+    ("subject", "主体/对象", "画面中可观察到的主要对象", 5, 10),
+    ("scene", "场景/地点", "素材发生的环境或地点", 3, 20),
+    ("purpose", "用途", "稳定的发布或设计用途", 3, 30),
+    ("style", "风格/氛围", "视觉风格与整体情绪", 4, 40),
+    ("color", "色彩", "主色、色调与色彩关系", 3, 50),
+    ("composition", "构图/视角", "景别、视角和构图关系", 4, 60),
+    ("lighting", "光线/时间", "光线方向、质感和时间氛围", 3, 70),
+    ("people", "人物属性", "人物数量、年龄段和可观察动作", 4, 80),
+    ("technical", "可用性/技术特征", "透明背景、可裁切等非文件格式属性", 4, 90),
+    ("custom", "自定义", "用户自定义且暂未归入固定分面的标签", 0, 100),
+];
+
+/// 幂等补种系统分面（INSERT OR IGNORE：已存在行不动，包括用户改过的 display_name 与停用态）。
+/// 使用场景：① V8 迁移建库；② 重置标签数据后重建系统分面；③ 启动自愈兜底。
+pub fn seed_system_facets(conn: &Connection) -> AppResult<()> {
+    let now = chrono::Utc::now().timestamp_millis();
+    for (key, name, description, max_items, sort_order) in SYSTEM_FACETS {
+        conn.execute(
+            "INSERT OR IGNORE INTO tag_facets
+             (key, display_name, description, selection_mode, max_items, sort_order, is_system, status, created_at, updated_at)
+             VALUES (?1, ?2, ?3, 'multi', NULLIF(?4, 0), ?5, 1, 'active', ?6, ?6)",
+            params![key, name, description, max_items, sort_order, now],
+        )?;
+    }
+    Ok(())
+}
+
+/// 空表自愈：tag_facets 一行都没有（历史重置标签路径清空后未补种）时重建系统分面。
+/// color 补种后立即置回 inactive（V16 语义：颜色由算法主色呈现，AI 侧已摘除）。
+/// 只在完全空表时触发，不影响任何已有分面（含用户自建）。
+pub fn seed_system_facets_if_empty(conn: &Connection) -> AppResult<()> {
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM tag_facets", [], |r| r.get(0))?;
+    if count > 0 {
+        return Ok(());
+    }
+    seed_system_facets(conn)?;
+    let now = chrono::Utc::now().timestamp_millis();
+    conn.execute(
+        "UPDATE tag_facets SET status = 'inactive', updated_at = ?1 WHERE key = 'color'",
+        params![now],
+    )?;
+    Ok(())
+}
 
 pub fn list(conn: &Connection) -> AppResult<Vec<TagFacet>> {
     let mut stmt = conn.prepare(&format!(
@@ -139,26 +187,56 @@ pub fn create(
         return Err(AppError::msg("applies_to 只允许 all | image | video"));
     }
     let exists: Option<i64> = conn
-        .query_row("SELECT 1 FROM tag_facets WHERE key = ?1", [&key], |r| r.get(0))
+        .query_row("SELECT 1 FROM tag_facets WHERE key = ?1", [&key], |r| {
+            r.get(0)
+        })
         .optional()?;
     if exists.is_some() {
         return Err(AppError::msg("分面 key 已存在（创建后不可修改）"));
     }
     let now = chrono::Utc::now().timestamp_millis();
-    let sort_order: i64 = conn.query_row("SELECT COALESCE(MAX(sort_order), 0) + 10 FROM tag_facets", [], |r| {
-        r.get(0)
-    })?;
+    let sort_order: i64 = conn.query_row(
+        "SELECT COALESCE(MAX(sort_order), 0) + 10 FROM tag_facets",
+        [],
+        |r| r.get(0),
+    )?;
     conn.execute(
         "INSERT INTO tag_facets
          (key, display_name, description, selection_mode, max_items, sort_order, is_system, status, applies_to, created_at, updated_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, 'active', ?7, ?8, ?8)",
         params![key, display_name, description, selection_mode, max_items, sort_order, applies_to, now],
     )?;
+    seed_ai_config(conn, &key)?;
     get(conn, &key)
 }
 
+/// 新建分面后同步补建 AI 配置条目（默认参与 AI；已有条目不动）。
+/// build_prompt_context 只遍历 ai_facet_configs —— 缺条目的分面 AI 永远不产出，
+/// 设置页也没法对它勾选（patch 无处可落）。normalize_ai_facet_defaults 只在整份配置
+/// 为空时补默认，覆盖不到「后建分面」，这里补上。
+fn seed_ai_config(conn: &Connection, key: &str) -> AppResult<()> {
+    let mut s = crate::db::settings::get_settings(conn)?;
+    if s.ai_facet_configs.iter().any(|c| c.facet_key == key) {
+        return Ok(());
+    }
+    s.ai_facet_configs.push(AiFacetConfig {
+        facet_key: key.to_string(),
+        hint: String::new(),
+        // color 恒为系统分面且建库即存在，走不到这里；新建用户分面默认参与 AI
+        enabled_for_ai: true,
+        display_name: None,
+        visible_in_workbench: None,
+    });
+    crate::db::settings::save_settings(conn, &s)
+}
+
 /// 修改显示属性（显示名/描述）；key 不可改。
-pub fn update_display(conn: &Connection, key: &str, display_name: &str, description: &str) -> AppResult<()> {
+pub fn update_display(
+    conn: &Connection,
+    key: &str,
+    display_name: &str,
+    description: &str,
+) -> AppResult<()> {
     let display_name = display_name.trim().to_string();
     if display_name.is_empty() {
         return Err(AppError::msg("显示名不能为空"));
@@ -197,7 +275,10 @@ pub fn update_rules(
     Ok(())
 }
 
-fn normalize_selection_mode(selection_mode: &str, max_items: Option<i64>) -> AppResult<(String, Option<i64>)> {
+fn normalize_selection_mode(
+    selection_mode: &str,
+    max_items: Option<i64>,
+) -> AppResult<(String, Option<i64>)> {
     if selection_mode != "single" && selection_mode != "multi" {
         return Err(AppError::msg("selection_mode 只允许 single | multi"));
     }
@@ -218,7 +299,11 @@ pub fn reorder(conn: &Connection, ordered_keys: &[String]) -> AppResult<()> {
     for (i, k) in ordered_keys.iter().enumerate() {
         conn.execute(
             "UPDATE tag_facets SET sort_order=?1, updated_at=?2 WHERE key=?3",
-            params![(i + 1) as i64 * 10, chrono::Utc::now().timestamp_millis(), k],
+            params![
+                (i + 1) as i64 * 10,
+                chrono::Utc::now().timestamp_millis(),
+                k
+            ],
         )?;
     }
     Ok(())
@@ -289,6 +374,74 @@ mod tests {
     }
 
     #[test]
+    fn seed_system_facets_is_idempotent_and_preserves_existing() {
+        let c = conn();
+        // 全新库（V8 迁移已种）：再种一次不重复、不改已有行
+        seed_system_facets(&c).unwrap();
+        let n = list_all(&c).unwrap().len();
+        seed_system_facets(&c).unwrap();
+        assert_eq!(list_all(&c).unwrap().len(), n);
+        // 已存在的行（含用户改名）不被覆盖
+        update_display(&c, "subject", "我改过的名字", "").unwrap();
+        seed_system_facets(&c).unwrap();
+        assert_eq!(get(&c, "subject").unwrap().display_name, "我改过的名字");
+    }
+
+    #[test]
+    fn seed_if_empty_rebuilds_with_color_inactive() {
+        let c = conn();
+        // 模拟历史「重置标签」清空 tag_facets 且未补种的库
+        c.execute("DELETE FROM tag_facets", []).unwrap();
+        assert!(list(&c).unwrap().is_empty());
+        seed_system_facets_if_empty(&c).unwrap();
+        let keys: Vec<String> = list(&c)
+            .unwrap()
+            .into_iter()
+            .map(|f| f.key)
+            .collect();
+        assert!(keys.contains(&"subject".to_string()));
+        assert!(!keys.contains(&"color".to_string()), "color 应补种为 inactive，不出现在 active 列表");
+        assert_eq!(get(&c, "color").unwrap().status, "inactive");
+        // 非空表不触发（用户自建分面不被打扰）
+        seed_system_facets_if_empty(&c).unwrap();
+        assert_eq!(list_all(&c).unwrap().iter().filter(|f| !f.is_system).count(), 0);
+    }
+
+    #[test]
+    fn seed_if_empty_noop_when_facets_exist() {
+        let c = conn();
+        // 模拟用户只留自建分面的库：不清空、也不强插系统分面
+        c.execute("DELETE FROM tag_facets", []).unwrap();
+        create(&c, "my_facet", "我的分面", "", "multi", None, "all").unwrap();
+        seed_system_facets_if_empty(&c).unwrap();
+        let keys: Vec<String> = list_all(&c).unwrap().into_iter().map(|f| f.key).collect();
+        assert_eq!(keys, vec!["my_facet".to_string()]);
+    }
+
+    #[test]
+    fn create_seeds_ai_facet_config_entry() {
+        let c = conn();
+        let before = crate::db::settings::get_settings(&c)
+            .unwrap()
+            .ai_facet_configs
+            .len();
+        create(&c, "my_facet", "我的分面", "", "multi", None, "all").unwrap();
+        // 新建分面必须同步补建 AI 配置条目：缺条目 = build_prompt_context 排除 + 设置页无法勾选
+        let s = crate::db::settings::get_settings(&c).unwrap();
+        let cfg = s
+            .ai_facet_configs
+            .iter()
+            .find(|cfg| cfg.facet_key == "my_facet")
+            .expect("新建分面应补建 AI 配置条目");
+        assert!(cfg.enabled_for_ai, "新建用户分面默认参与 AI");
+        // 幂等：不会给已有条目的分面重复补
+        assert_eq!(s.ai_facet_configs.len(), before + 1);
+        create(&c, "another_facet", "另一个", "", "multi", None, "all").unwrap();
+        let s2 = crate::db::settings::get_settings(&c).unwrap();
+        assert_eq!(s2.ai_facet_configs.len(), before + 2);
+    }
+
+    #[test]
     fn validate_key_enforces_snake_case() {
         assert_eq!(validate_key("clothing_color").unwrap(), "clothing_color");
         assert!(validate_key("镜头语言").is_err());
@@ -301,7 +454,16 @@ mod tests {
     #[test]
     fn create_sets_user_facet_and_rejects_duplicate() {
         let c = conn();
-        let f = create(&c, "clothing_color", "衣服颜色", "描述", "multi", Some(3), "image").unwrap();
+        let f = create(
+            &c,
+            "clothing_color",
+            "衣服颜色",
+            "描述",
+            "multi",
+            Some(3),
+            "image",
+        )
+        .unwrap();
         assert_eq!(f.key, "clothing_color");
         assert!(!f.is_system);
         assert_eq!(f.applies_to, "image");

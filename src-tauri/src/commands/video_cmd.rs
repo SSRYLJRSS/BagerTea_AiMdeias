@@ -22,7 +22,10 @@ pub async fn ensure_video_proxy(
     variant: Option<String>,
 ) -> AppResult<VideoProxy> {
     let variant = variant.unwrap_or_else(|| "h264_mp4".into());
-    if !variant.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+    if !variant
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
         return Err(AppError::msg("非法代理变体"));
     }
     let db = Arc::clone(&state.db);
@@ -38,9 +41,14 @@ pub async fn ensure_video_proxy(
     }
 
     tauri::async_runtime::spawn_blocking(move || -> AppResult<VideoProxy> {
-        let r = video_proxy::get_or_create_proxy(&db, &proxy_dir, asset_id, &variant, &cancel, |src, tmp, c| {
-            video::transcode_to_h264(src, tmp, Some(c))
-        });
+        let r = video_proxy::get_or_create_proxy(
+            &db,
+            &proxy_dir,
+            asset_id,
+            &variant,
+            &cancel,
+            |src, tmp, c| video::transcode_to_h264(src, tmp, Some(c)),
+        );
         // 收尾清理取消标志
         if let Ok(mut m) = proxy_cancel_reg.lock() {
             m.remove(&key);
@@ -55,7 +63,11 @@ pub async fn ensure_video_proxy(
 
 /// 查询代理状态（不触发生成）。
 #[tauri::command]
-pub fn get_video_proxy_status(state: State<AppState>, asset_id: i64, variant: Option<String>) -> AppResult<Option<VideoProxy>> {
+pub fn get_video_proxy_status(
+    state: State<AppState>,
+    asset_id: i64,
+    variant: Option<String>,
+) -> AppResult<Option<VideoProxy>> {
     let conn = lock_db(&state)?;
     let variant = variant.unwrap_or_else(|| "h264_mp4".into());
     crate::db::video_proxy::get(&conn, asset_id, &variant)
@@ -63,7 +75,11 @@ pub fn get_video_proxy_status(state: State<AppState>, asset_id: i64, variant: Op
 
 /// 取消正在生成的代理。
 #[tauri::command]
-pub fn cancel_video_proxy(state: State<AppState>, asset_id: i64, variant: Option<String>) -> AppResult<()> {
+pub fn cancel_video_proxy(
+    state: State<AppState>,
+    asset_id: i64,
+    variant: Option<String>,
+) -> AppResult<()> {
     let variant = variant.unwrap_or_else(|| "h264_mp4".into());
     let key = format!("{asset_id}:{variant}");
     let m = state

@@ -34,3 +34,47 @@ export function pointerInStage(
     y: clientY - (top + height / 2),
   };
 }
+
+/** 沉浸模式平移时图像边缘最少保留在画布内的像素（§3.2：防止整张图丢到屏幕外无法找回） */
+export const IMMERSIVE_EDGE_MARGIN = 48;
+
+/**
+ * 沉浸模式的平移约束：把 offset 钳制在「图像至少保留 margin 像素在画布内」的范围内。
+ * 纯函数，不触碰 DOM。任一尺寸未知/非正/非有限时原样返回（jsdom 或图片加载前安全兜底）。
+ *
+ * 推导（图像以画布中心为原点 + offset 平移，缩放后半宽 half = imgW*scale/2）：
+ *   - 图像右缘 = center + offset + half ≥ margin  → offset ≥ margin - half；
+ *   - 图像左缘 = center + offset - half ≤ canvas - margin → offset ≤ canvas/2 + half - margin。
+ * 高轴同理。
+ */
+export function clampImmersiveOffset(
+  offsetX: number,
+  offsetY: number,
+  scale: number,
+  imgW: number,
+  imgH: number,
+  canvasW: number,
+  canvasH: number,
+  margin: number = IMMERSIVE_EDGE_MARGIN,
+): { x: number; y: number } {
+  if (!Number.isFinite(offsetX) || !Number.isFinite(offsetY)) return { x: offsetX, y: offsetY };
+  if (!Number.isFinite(scale) || scale <= 0) return { x: offsetX, y: offsetY };
+  if (
+    !Number.isFinite(imgW) ||
+    !Number.isFinite(imgH) ||
+    imgW <= 0 ||
+    imgH <= 0 ||
+    !Number.isFinite(canvasW) ||
+    !Number.isFinite(canvasH) ||
+    canvasW <= 0 ||
+    canvasH <= 0
+  ) {
+    return { x: offsetX, y: offsetY };
+  }
+  const halfW = (imgW * scale) / 2;
+  const halfH = (imgH * scale) / 2;
+  return {
+    x: Math.max(margin - halfW, Math.min(canvasW / 2 + halfW - margin, offsetX)),
+    y: Math.max(margin - halfH, Math.min(canvasH / 2 + halfH - margin, offsetY)),
+  };
+}

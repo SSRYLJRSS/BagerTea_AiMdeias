@@ -22,6 +22,9 @@ interface WorkbenchProps {
   facets: WorkbenchFacet[];
   tags: CategorizedTags;
   onTagsChange: (t: CategorizedTags) => void;
+  /** FB5-05（§7.6）：一句话描述（审核编辑区顶部；最多 20 字符） */
+  description: string;
+  onDescriptionChange: (v: string) => void;
   index: number; // 0 基
   total: number;
   filmstrip?: ReactNode;
@@ -49,6 +52,8 @@ export default function Workbench({
   facets,
   tags,
   onTagsChange,
+  description,
+  onDescriptionChange,
   index,
   total,
   filmstrip,
@@ -253,11 +258,38 @@ export default function Workbench({
         </div>
       )}
 
-      {/* ③ 分类标签面板：一排两个分类（v2.11） */}
+      {/* ③ 分类标签面板：一句话描述（顶部）+ 一排两个分类（v2.11） */}
       <div className="max-h-64 shrink-0 overflow-y-auto bg-[var(--color-bg)] px-4 pt-3 pb-2">
         <div className="mb-3 flex items-center justify-between">
           <h3 className="ui-section-title">标签</h3>
           <span className="text-[11px] text-[var(--color-text-tertiary)]">共 {totalTags} 个</span>
+        </div>
+        {/* FB5-05（§7.6）：一句话描述。单行 input、maxLength 20、字符计数用 JS 字符迭代；
+            位于标签分面滚动区顶部（分面滚动时描述保持在编辑区顶部）。 */}
+        <div className="mb-2 flex min-h-8 items-center gap-3 border-b border-[var(--color-border)]/70 pb-2">
+          <span className="w-16 shrink-0 text-xs font-medium text-[var(--color-text-secondary)]">一句话描述</span>
+          <div className="min-w-0 flex-1">
+            {readOnly ? (
+              <span className="block truncate text-sm text-[var(--color-text)]">
+                {description.trim() || "未生成描述"}
+              </span>
+            ) : (
+              <div className="flex items-center gap-2">
+                <input
+                  data-testid="suggestion-description"
+                  value={description}
+                  onChange={(e) => onDescriptionChange(e.target.value)}
+                  maxLength={20}
+                  placeholder="如「夜晚树下多人合影」（最多 20 字）"
+                  aria-label="一句话描述"
+                  className="ui-control h-7 min-w-0 flex-1 rounded-md px-2 text-sm outline-none focus:border-[var(--color-accent)]"
+                />
+                <span className="shrink-0 text-[11px] tabular-nums text-[var(--color-text-tertiary)]">
+                  {[...description].length}/20
+                </span>
+              </div>
+            )}
+          </div>
         </div>
         <div className="grid grid-cols-1 gap-x-6 gap-y-2 xl:grid-cols-2">
           {panelFacets.map((f) => {
@@ -310,7 +342,7 @@ export default function Workbench({
                 <Button disabled={busy} onClick={() => void onReject()}>
                   拒绝
                 </Button>
-                <Button variant="primary" disabled={busy || totalTags === 0} onClick={() => void handleConfirm()}>
+                <Button variant="primary" disabled={busy || (totalTags === 0 && description.trim().length === 0)} onClick={() => void handleConfirm()}>
                   {busy ? "写入中…" : "确认写入"}
                 </Button>
               </>

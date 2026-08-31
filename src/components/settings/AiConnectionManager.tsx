@@ -8,8 +8,10 @@
 import { useCallback, useEffect, useState } from "react";
 import clsx from "clsx";
 import Button from "@/components/common/Button";
+import ModelCombobox from "@/components/common/ModelCombobox";
 import {
   deleteAiConnection,
+  discoverAiModels,
   listAiConnections,
   saveAiConnection,
   testAiConnection,
@@ -165,7 +167,7 @@ export default function AiConnectionManager({ deployment, notify, fail, onChange
           {visible.map((c) =>
             editingId === c.id ? (
               <li key={c.id} className="flex flex-col gap-1.5 rounded-md border border-[var(--color-border)] bg-[var(--color-surface)] p-2">
-                <EditFields form={form} setForm={setForm} />
+                <EditFields form={form} setForm={setForm} connectionId={c.id} />
                 <div className="flex items-center gap-2">
                   <Button variant="primary" disabled={saving} onClick={() => void save()}>
                     {saving ? "保存中…" : "保存"}
@@ -228,7 +230,7 @@ export default function AiConnectionManager({ deployment, notify, fail, onChange
           )}
           {editingId === "__new__" && (
             <li className="flex flex-col gap-1.5 rounded-md border border-[var(--color-border)] bg-[var(--color-surface)] p-2">
-              <EditFields form={form} setForm={setForm} />
+              <EditFields form={form} setForm={setForm} connectionId={null} />
               <div className="flex items-center gap-2">
                 <Button variant="primary" disabled={saving} onClick={() => void save()}>
                   {saving ? "保存中…" : "创建"}
@@ -246,9 +248,12 @@ export default function AiConnectionManager({ deployment, notify, fail, onChange
 function EditFields({
   form,
   setForm,
+  connectionId,
 }: {
   form: typeof EMPTY_FORM;
   setForm: (f: typeof EMPTY_FORM) => void;
+  /** FB5-04：编辑中的连接档案 id（__new__ 为 null → legacy 显式字段路径） */
+  connectionId: string | null;
 }) {
   const inputCls = "ui-control rounded-md px-2 py-1.5 text-sm outline-none focus:border-[var(--color-accent)]";
   return (
@@ -272,9 +277,24 @@ function EditFields({
         <label className="w-16 shrink-0 text-xs text-[var(--color-text-secondary)]">服务地址</label>
         <input className={clsx(inputCls, "flex-1")} value={form.baseUrl} onChange={(e) => setForm({ ...form, baseUrl: e.target.value })} placeholder="https://api.example.com/v1" />
       </div>
+      {/* FB5-04（§3.6）：模型字段 = 可输入 combobox。草稿 key 优先于 keyring（连接已保存时），
+          新连接走 legacy 显式字段路径（无 connectionId）。 */}
       <div className="flex items-center gap-2">
         <label className="w-16 shrink-0 text-xs text-[var(--color-text-secondary)]">模型名称</label>
-        <input className={clsx(inputCls, "flex-1")} value={form.model} onChange={(e) => setForm({ ...form, model: e.target.value })} placeholder="qwen-vl-plus" />
+        <ModelCombobox
+          value={form.model}
+          onChange={(model) => setForm({ ...form, model })}
+          label="模型名称"
+          onDiscover={() =>
+            discoverAiModels({
+              connectionId: connectionId ?? undefined,
+              deployment: form.deployment,
+              protocol: form.protocol,
+              baseUrl: form.baseUrl,
+              apiKey: form.apiKey.trim() || undefined,
+            })
+          }
+        />
       </div>
       <div className="flex items-center gap-2">
         <label className="w-16 shrink-0 text-xs text-[var(--color-text-secondary)]">API 密钥</label>

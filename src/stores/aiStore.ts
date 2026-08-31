@@ -21,6 +21,8 @@ interface AiState {
   /** 取消已受理、当前请求尚未结束（P2-01：诚实告知用户取消语义） */
   cancelling: boolean;
   error: string | null;
+  /** 最近一次进度事件上报的当前素材 id（FB6 需求一：侧栏 LED 提示用它查当前素材名；无事件时为 null） */
+  lastProgressAssetId: number | null;
   /** 素材库「打标」带过来的选中素材与目标模式（跨页传递）；auto = 建批时按激活档案 kind 解析云端/本地（P3-01a） */
   pendingAssetIds: number[];
   pendingMode: "auto" | "manual";
@@ -35,10 +37,10 @@ interface AiState {
   restore: (id: number) => Promise<void>;
   createAndRun: (mode: "cloud" | "local" | "manual") => Promise<void>;
   cancel: () => Promise<void>;
-  confirm: (id: number, tags: CategorizedTags) => Promise<void>;
+  confirm: (id: number, tags: CategorizedTags, description?: string) => Promise<void>;
   reject: (id: number) => Promise<void>;
   confirmAll: () => Promise<void>;
-  patchProgress: (processed: number) => void;
+  patchProgress: (processed: number, currentAssetId?: number) => void;
 }
 
 export const useAiStore = create<AiState>((set, get) => ({
@@ -48,6 +50,7 @@ export const useAiStore = create<AiState>((set, get) => ({
   running: false,
   cancelling: false,
   error: null,
+  lastProgressAssetId: null,
   pendingAssetIds: [],
   pendingMode: "auto" as const,
 
@@ -76,7 +79,8 @@ export const useAiStore = create<AiState>((set, get) => ({
   startBatch: async (limit) => {
     const batchId = get().currentBatchId;
     if (!batchId) return;
-    set({ running: true, error: null });
+    // FB6 需求一：启动即进入 running（页面立即给视觉反馈），并清空上一次批次的进度素材 id
+    set({ running: true, error: null, cancelling: false, lastProgressAssetId: null });
     try {
       const batch = await aiStartBatch(batchId, limit);
       set((s) => ({ batches: s.batches.map((b) => (b.id === batch.id ? batch : b)) }));
@@ -117,7 +121,7 @@ export const useAiStore = create<AiState>((set, get) => ({
       return;
     }
     // 阶段 5 §8.1/§8.3：所选素材完整进入逻辑批次，不做静默截断。
-    set({ running: true, error: null });
+    set({ running: true, error: null, cancelling: false, lastProgressAssetId: null });
     try {
       const batch = await aiCreateBatch(ids, mode);
       set({ pendingAssetIds: [], currentBatchId: batch.id });
@@ -140,8 +144,8 @@ export const useAiStore = create<AiState>((set, get) => ({
     await aiCancelBatch(id);
   },
 
-  confirm: async (id, tags) => {
-    await aiConfirmSuggestion(id, tags);
+  confirm: async (id, tags, description?: string) => {
+    await aiConfirmSuggestion(id, tags, description);
     const batchId = get().currentBatchId;
     if (batchId != null) await get().openBatch(batchId);
   },
@@ -165,9 +169,11 @@ export const useAiStore = create<AiState>((set, get) => ({
     await Promise.all([get().refreshBatches(), get().openBatch(batchId)]);
   },
 
-  patchProgress: (processed) => {
+  patchProgress: (processed, currentAssetId) => {
     set((s) => ({
       batches: s.batches.map((b) => (b.id === s.currentBatchId ? { ...b, processed, status: "processing" } : b)),
+      // FB6 需求一：记录进度事件里的当前素材 id（供页面 LED 提示查素材名）；undefined 不覆盖
+      lastProgressAssetId: currentAssetId ?? s.lastProgressAssetId,
     }));
     // 执行中实时回载建议（1s 节流）：否则中间大图一直显示旧的空标签，进度动了却看不到结果
     const now = Date.now();

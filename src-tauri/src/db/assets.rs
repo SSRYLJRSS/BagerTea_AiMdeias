@@ -65,6 +65,16 @@ pub struct Asset {
     pub dominant_hue: Option<i64>,
     pub dominant_sat: Option<i64>,
     pub dominant_lum: Option<i64>,
+    // FB5-05（§7.3）：一句话描述（最多 20 字符；素材字段，不进标签树/统计）。
+    // 固定追加在 palette 字段之后，避免已有固定列索引错位。
+    #[serde(default)]
+    pub content_description: String,
+    // GPS 定位（V18）：有符号十进制度（北纬东经为正），无定位为 NULL。
+    // 追加在 content_description 之后，保持 from_row 既有列索引不变。
+    #[serde(default)]
+    pub latitude: Option<f64>,
+    #[serde(default)]
+    pub longitude: Option<f64>,
 }
 
 /// FB2-08：色板单段（与前端 PaletteSegmentDto 同形）。
@@ -77,6 +87,46 @@ pub struct PaletteSegmentDto {
     pub g: u8,
     pub b: u8,
     pub ratio: f32,
+}
+
+/// FB4-03（§5.1）：色板 JSON 单一解析函数 —— 状态统计 / missing 列表 / patch 查询 / from_row
+/// 全部复用同一解析语义，禁止各写一份：
+/// - `NULL` / 空字符串 / 全空白 / `[]` / 损坏 JSON / 合法但空数组 -> `None`
+/// - 合法且非空数组 -> `Some(Vec<PaletteSegmentDto>)`
+/// 避免「页面说已完成，但实际渲染为空」的语义分叉。
+pub(crate) fn parse_palette_json(raw: Option<String>) -> Option<Vec<PaletteSegmentDto>> {
+    let raw = raw?;
+    if raw.trim().is_empty() {
+        return None;
+    }
+    serde_json::from_str::<Vec<PaletteSegmentDto>>(&raw)
+        .ok()
+        .filter(|v| !v.is_empty())
+}
+
+/// FB4-03（§5.3）：色板状态 DTO。字段定义见指导书 5.3 节：
+/// totalAssets = deleted_at IS NULL 全部素材；eligible = 满足候选谓词；
+/// ready = 候选中经 parse_palette_json 得到非空色板的数量；missing = eligible - ready；
+/// unavailable = totalAssets - eligible。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PaletteStatus {
+    pub total_assets: i64,
+    pub eligible: i64,
+    pub ready: i64,
+    pub missing: i64,
+    pub unavailable: i64,
+}
+
+/// FB4-03（§5.5）：轻量色板补丁 —— 只同步色板相关字段，不返回文件路径/标签/缩略图等无关字段。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AssetPalettePatch {
+    pub id: i64,
+    pub palette: Option<Vec<PaletteSegmentDto>>,
+    pub dominant_hue: Option<i64>,
+    pub dominant_sat: Option<i64>,
+    pub dominant_lum: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -210,7 +260,8 @@ pub(crate) const COLUMNS: &str =
                        video_bit_rate, color_range, color_space, color_transfer, color_primaries, \
                        audio_sample_rate, audio_channels, audio_layout, rotation, \
                        media_metadata_json, metadata_version, metadata_scanned_at, metadata_error, \
-                       palette_json, dominant_hue, dominant_sat, dominant_lum";
+                       palette_json, dominant_hue, dominant_sat, dominant_lum, \
+                       content_description, latitude, longitude";
 
 pub(crate) fn from_row(row: &Row) -> rusqlite::Result<Asset> {
     Ok(Asset {
@@ -257,13 +308,13 @@ pub(crate) fn from_row(row: &Row) -> rusqlite::Result<Asset> {
         metadata_scanned_at: row.get(40)?,
         metadata_error: row.get(41)?,
         // palette_json（列 42）解析为 DTO；损坏/空 JSON → None（安静降级，不让一行坏数据毁掉整页查询）
-        palette: row
-            .get::<_, Option<String>>(42)?
-            .and_then(|s| serde_json::from_str::<Vec<PaletteSegmentDto>>(&s).ok())
-            .filter(|v| !v.is_empty()),
+        palette: parse_palette_json(row.get::<_, Option<String>>(42)?),
         dominant_hue: row.get(43)?,
         dominant_sat: row.get(44)?,
         dominant_lum: row.get(45)?,
+        content_description: row.get(46)?,
+        latitude: row.get(47)?,
+        longitude: row.get(48)?,
         tags: Vec::new(),
     })
 }
@@ -459,12 +510,15 @@ fn order_by(filter: &AssetFilter) -> String {
 }
 
 /// 编译筛选条件中的搜索谓词（库内组合）；无搜索返回 None。
+/// FB5-05（§8.3）：普通素材库搜索显式传 SearchScope::All（默认范围 = 三列）。
 fn build_search_predicate(
     conn: &Connection,
     filter: &AssetFilter,
 ) -> AppResult<Option<search::SearchPredicate>> {
     match &filter.search {
-        Some(q) if !q.trim().is_empty() => search::build_search_predicate(conn, q),
+        Some(q) if !q.trim().is_empty() => {
+            search::build_search_predicate(conn, q, super::query_expr::SearchScope::All)
+        }
         _ => Ok(None),
     }
 }
@@ -720,6 +774,30 @@ pub fn list_metadata_facets(
             description: "视频中的音频编码格式".into(),
             items: metadata_items(conn, "lower(a.audio_codec)", "upper(a.audio_codec)", "a.audio_codec IS NOT NULL AND trim(a.audio_codec) != ''")?,
         },
+        MetadataFacet {
+            key: "hue".into(),
+            display_name: "色调".into(),
+            description: "主导色相分桶（低饱和度判为灰度）".into(),
+            // 红色跨 0°：>=345 或 <15；灰度优先判（sat<=10 时色相无意义）。
+            // 前端点击桶 → bucketToFilter 翻译为 dominant_hue between / dominant_sat lte 条件。
+            items: metadata_items(
+                conn,
+                "CASE WHEN a.dominant_sat <= 10 THEN 'gray' WHEN a.dominant_hue >= 345 OR a.dominant_hue < 15 THEN 'red' WHEN a.dominant_hue < 45 THEN 'orange' WHEN a.dominant_hue < 70 THEN 'yellow' WHEN a.dominant_hue < 155 THEN 'green' WHEN a.dominant_hue < 225 THEN 'cyan' WHEN a.dominant_hue < 295 THEN 'blue' ELSE 'purple' END",
+                "CASE WHEN a.dominant_sat <= 10 THEN '灰度' WHEN a.dominant_hue >= 345 OR a.dominant_hue < 15 THEN '红' WHEN a.dominant_hue < 45 THEN '橙' WHEN a.dominant_hue < 70 THEN '黄' WHEN a.dominant_hue < 155 THEN '绿' WHEN a.dominant_hue < 225 THEN '青' WHEN a.dominant_hue < 295 THEN '蓝' ELSE '紫' END",
+                "a.dominant_hue IS NOT NULL AND a.dominant_sat IS NOT NULL",
+            )?,
+        },
+        MetadataFacet {
+            key: "has_location".into(),
+            display_name: "定位信息".into(),
+            description: "素材是否携带 GPS 定位".into(),
+            items: metadata_items(
+                conn,
+                "CASE WHEN a.latitude IS NOT NULL AND a.longitude IS NOT NULL THEN 'yes' ELSE 'no' END",
+                "CASE WHEN a.latitude IS NOT NULL AND a.longitude IS NOT NULL THEN '有定位' ELSE '无定位' END",
+                "1",
+            )?,
+        },
     ];
     facets.retain(|facet| !facet.items.is_empty());
     Ok(facets)
@@ -929,13 +1007,18 @@ pub struct ExifPatch<'a> {
     pub shutter: Option<&'a str>,
     pub focal: Option<f64>,
     pub taken_at: Option<i64>,
+    /// GPS 定位（带符号十进制度）：COALESCE 只补空，不覆盖已有值（重扫不丢存量定位）
+    pub latitude: Option<f64>,
+    pub longitude: Option<f64>,
 }
 
 /// EXIF 元信息回写（入库管线阶段二调用）
 pub fn set_exif(conn: &Connection, id: i64, ex: &ExifPatch<'_>) -> AppResult<()> {
     conn.execute(
         "UPDATE assets SET camera=?1, lens=?2, iso=?3, aperture=?4, shutter=?5, focal=?6,
-            taken_at = COALESCE(?7, taken_at) WHERE id=?8",
+            taken_at = COALESCE(taken_at, ?7),
+            latitude = COALESCE(latitude, ?8),
+            longitude = COALESCE(longitude, ?9) WHERE id=?10",
         rusqlite::params![
             ex.camera,
             ex.lens,
@@ -944,6 +1027,8 @@ pub fn set_exif(conn: &Connection, id: i64, ex: &ExifPatch<'_>) -> AppResult<()>
             ex.shutter,
             ex.focal,
             ex.taken_at,
+            ex.latitude,
+            ex.longitude,
             id
         ],
     )?;
@@ -1029,6 +1114,44 @@ pub fn list_video_ids(conn: &Connection) -> AppResult<Vec<i64>> {
     Ok(rows.filter_map(|r| r.ok()).collect())
 }
 
+/// 列出缺 GPS 定位 / 拍摄时间的素材 id（定位回填 scope=missing）：
+/// 图片缺 latitude；或视频缺 latitude / taken_at（两者任一缺失即需补）。
+pub fn list_ids_needing_geo_taken(conn: &Connection) -> AppResult<Vec<i64>> {
+    let mut stmt = conn.prepare(
+        "SELECT id FROM assets
+          WHERE deleted_at IS NULL
+            AND ((mime_type LIKE 'image/%' AND latitude IS NULL)
+              OR (mime_type LIKE 'video/%' AND (latitude IS NULL OR taken_at IS NULL)))",
+    )?;
+    let rows = stmt.query_map([], |r| r.get(0))?;
+    Ok(rows.filter_map(|r| r.ok()).collect())
+}
+
+/// 定位回填 scope=all：全部未删除素材（不复用色板候选谓词，避免漏掉无封面视频）。
+pub fn list_geo_taken_all_ids(conn: &Connection) -> AppResult<Vec<i64>> {
+    let mut stmt = conn.prepare("SELECT id FROM assets WHERE deleted_at IS NULL")?;
+    let rows = stmt.query_map([], |r| r.get(0))?;
+    Ok(rows.filter_map(|r| r.ok()).collect())
+}
+
+/// 回填 GPS 定位与拍摄时间（仅补空，不覆盖已有值；老素材无定位保持 NULL）。
+/// 注意 COALESCE 参数顺序：已有列值在前，新值在后 —— COALESCE(旧, 新) 才是「只补空」。
+pub fn set_geo_taken(
+    conn: &Connection,
+    id: i64,
+    latitude: Option<f64>,
+    longitude: Option<f64>,
+    taken_at: Option<i64>,
+) -> AppResult<()> {
+    conn.execute(
+        "UPDATE assets SET latitude = COALESCE(latitude, ?1),
+            longitude = COALESCE(longitude, ?2),
+            taken_at = COALESCE(taken_at, ?3)
+          WHERE id = ?4",
+        rusqlite::params![latitude, longitude, taken_at, id],
+    )?;
+    Ok(())
+}
 
 pub fn set_hash(conn: &Connection, id: i64, hash: &str) -> AppResult<()> {
     conn.execute(
@@ -1080,19 +1203,97 @@ const PALETTE_CANDIDATE_PRED: &str = "deleted_at IS NULL AND (\
        mime_type LIKE 'image/%' \
     OR (mime_type LIKE 'video/%' AND hd_thumbnail_path IS NOT NULL))";
 
-/// FB2-08：列出缺少色板（palette_json 为空）的素材 id（用于「仅缺色板」回填范围）。
+/// FB4-03（§5.3）：色板状态统计。只取计数所需字段（候选行仅查询 palette_json，
+/// 不构造完整 Asset）；ready 在 Rust 侧逐行调用 parse_palette_json 精确统计，
+/// 不能只用 `palette_json IS NOT NULL` 近似（损坏 JSON / 空数组会被误判为已生成）。
+pub fn get_palette_status(conn: &Connection) -> AppResult<PaletteStatus> {
+    let total_assets: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM assets WHERE deleted_at IS NULL",
+        [],
+        |r| r.get(0),
+    )?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT palette_json FROM assets WHERE {PALETTE_CANDIDATE_PRED}"
+    ))?;
+    let rows = stmt.query_map([], |r| r.get::<_, Option<String>>(0))?;
+    let mut eligible: i64 = 0;
+    let mut ready: i64 = 0;
+    for row in rows {
+        let raw = row?;
+        eligible += 1;
+        if parse_palette_json(raw).is_some() {
+            ready += 1;
+        }
+    }
+    Ok(PaletteStatus {
+        total_assets,
+        eligible,
+        ready,
+        missing: eligible - ready,
+        unavailable: total_assets - eligible,
+    })
+}
+
+/// FB4-03（§5.4）：列出缺少色板的素材 id（用于「仅缺色板」回填范围）。
+/// 修正前只判 `palette_json IS NULL`；现在查询候选行的 (id, palette_json) 后用
+/// parse_palette_json 过滤 —— NULL / 空字符串 / `[]` / 损坏 JSON 全部纳入 missing，
+/// 与状态统计共用同一 parser 与候选谓词，杜绝「状态说 missing>0，回算却 total=0」。
 pub fn list_ids_needing_palette(conn: &Connection) -> AppResult<Vec<i64>> {
     let mut stmt = conn.prepare(&format!(
-        "SELECT id FROM assets WHERE {PALETTE_CANDIDATE_PRED} AND palette_json IS NULL"
+        "SELECT id, palette_json FROM assets WHERE {PALETTE_CANDIDATE_PRED}"
     ))?;
-    let rows = stmt.query_map([], |r| r.get(0))?;
-    Ok(rows.filter_map(|r| r.ok()).collect())
+    let rows = stmt.query_map([], |r| {
+        Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?))
+    })?;
+    let mut ids = Vec::new();
+    for row in rows {
+        let (id, raw) = row?;
+        if parse_palette_json(raw).is_none() {
+            ids.push(id);
+        }
+    }
+    Ok(ids)
+}
+
+/// FB4-03（§5.5）：按 id 查询色板补丁（定向同步用，只返回色板相关字段）。
+/// 契约：空 ids 直接返回空数组；单次最多 1000 个 id（超限返回明确错误，前端负责分批）；
+/// SQL 参数化；只返回数据库中存在的 id；palette 使用 parse_palette_json；不修改任何记录。
+pub fn get_asset_palette_patches(
+    conn: &Connection,
+    ids: &[i64],
+) -> AppResult<Vec<AssetPalettePatch>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    if ids.len() > 1000 {
+        return Err(AppError::msg("一次最多查询 1000 个素材的色板，请分批"));
+    }
+    let placeholders = (1..=ids.len())
+        .map(|i| format!("?{i}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut stmt = conn.prepare(&format!(
+        "SELECT id, palette_json, dominant_hue, dominant_sat, dominant_lum
+           FROM assets WHERE id IN ({placeholders})"
+    ))?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(ids.iter()), |r| {
+        Ok(AssetPalettePatch {
+            id: r.get(0)?,
+            palette: parse_palette_json(r.get(1)?),
+            dominant_hue: r.get(2)?,
+            dominant_sat: r.get(3)?,
+            dominant_lum: r.get(4)?,
+        })
+    })?;
+    Ok(rows.collect::<Result<Vec<_>, _>>()?)
 }
 
 /// FB2-08：列出全部可算色板的素材 id（用于「全部」色板回算范围）。
 /// 语义是"全部可算色板的素材"而非"全部素材"：与 list_ids_needing_palette 同谓词（FX-13）。
 pub fn list_all_ids(conn: &Connection) -> AppResult<Vec<i64>> {
-    let mut stmt = conn.prepare(&format!("SELECT id FROM assets WHERE {PALETTE_CANDIDATE_PRED}"))?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT id FROM assets WHERE {PALETTE_CANDIDATE_PRED}"
+    ))?;
     let rows = stmt.query_map([], |r| r.get(0))?;
     Ok(rows.filter_map(|r| r.ok()).collect())
 }
@@ -1213,5 +1414,217 @@ mod tests {
         set_palette(&c, id, "[]", 1, 0, 0, 0).unwrap();
         let b = get(&c, id).unwrap();
         assert!(b.palette.is_none(), "空数组应归一为 None");
+    }
+
+    // ── FB4-03：色板单一解析函数（§10.4）──
+
+    #[test]
+    fn parse_palette_json_returns_none_for_empty_or_broken() {
+        let valid = r##"[{"hex":"#000000","r":0,"g":0,"b":0,"ratio":1.0}]"##;
+        assert!(parse_palette_json(None).is_none(), "NULL -> None");
+        assert!(
+            parse_palette_json(Some(String::new())).is_none(),
+            "空串 -> None"
+        );
+        assert!(
+            parse_palette_json(Some("   \n\t  ".into())).is_none(),
+            "全空白 -> None"
+        );
+        assert!(
+            parse_palette_json(Some("[]".into())).is_none(),
+            "[] -> None"
+        );
+        assert!(
+            parse_palette_json(Some("{not json".into())).is_none(),
+            "损坏 JSON -> None"
+        );
+        let some = parse_palette_json(Some(valid.to_string()));
+        assert!(some.is_some(), "合法非空数组 -> Some");
+        assert_eq!(some.unwrap().len(), 1);
+    }
+
+    /// 状态五个字段计算正确；非候选素材计入 total/unavailable 不计入 eligible。
+    #[test]
+    fn palette_status_counts_exactly() {
+        let c = mem();
+        let img1 = ins(&c, "/a.jpg", "image/jpeg");
+        let _img2 = ins(&c, "/b.jpg", "image/jpeg"); // NULL 色板：missing
+        let vid_ok = ins(&c, "/c.mp4", "video/mp4");
+        set_hd_thumbnail_path(&c, vid_ok, "/hd/c.jpg").unwrap();
+        let _vid_no = ins(&c, "/d.mp4", "video/mp4"); // 无封面：非候选
+        let _other = ins(&c, "/e.psd", "application/octet-stream"); // 非图非视频：非候选
+                                                                    // 删除素材不计入 total（total 只算 deleted_at IS NULL）
+        let deleted = ins(&c, "/f.jpg", "image/jpeg");
+        soft_delete(&c, &[deleted]).unwrap();
+
+        // img1 已生成；img2 空（NULL）；vid_ok 损坏 JSON
+        set_palette(
+            &c,
+            img1,
+            r##"[{"hex":"#000000","r":0,"g":0,"b":0,"ratio":1.0}]"##,
+            1,
+            0,
+            0,
+            0,
+        )
+        .unwrap();
+        set_palette(&c, vid_ok, "{broken", 1, 0, 0, 0).unwrap();
+
+        let st = get_palette_status(&c).unwrap();
+        // total = 全部未删除 = 5（img1, img2, vid_ok, vid_no, other）
+        assert_eq!(st.total_assets, 5);
+        // eligible = 候选（img1, img2, vid_ok）= 3
+        assert_eq!(st.eligible, 3);
+        // ready = 只有 img1 的合法色板 = 1（vid_ok 是损坏 JSON，不算 ready）
+        assert_eq!(st.ready, 1);
+        assert_eq!(st.missing, 2);
+        assert_eq!(st.unavailable, 2);
+    }
+
+    /// 损坏 JSON 计入 missing：list_ids_needing_palette 包含 NULL、空串、空数组、损坏 JSON。
+    #[test]
+    fn missing_includes_broken_and_empty_palette_json() {
+        let c = mem();
+        let null_id = ins(&c, "/a.jpg", "image/jpeg");
+        let empty_id = ins(&c, "/b.jpg", "image/jpeg");
+        let arr_id = ins(&c, "/c.jpg", "image/jpeg");
+        let broken_id = ins(&c, "/d.jpg", "image/jpeg");
+        let ok_id = ins(&c, "/e.jpg", "image/jpeg");
+        set_palette(&c, empty_id, "", 1, 0, 0, 0).unwrap();
+        set_palette(&c, arr_id, "[]", 1, 0, 0, 0).unwrap();
+        set_palette(&c, broken_id, "{nope", 1, 0, 0, 0).unwrap();
+        set_palette(
+            &c,
+            ok_id,
+            r##"[{"hex":"#000000","r":0,"g":0,"b":0,"ratio":1.0}]"##,
+            1,
+            0,
+            0,
+            0,
+        )
+        .unwrap();
+
+        let missing = list_ids_needing_palette(&c).unwrap();
+        assert!(missing.contains(&null_id), "NULL 应进 missing");
+        assert!(missing.contains(&empty_id), "空串应进 missing");
+        assert!(missing.contains(&arr_id), "空数组应进 missing");
+        assert!(missing.contains(&broken_id), "损坏 JSON 应进 missing");
+        assert!(!missing.contains(&ok_id), "有效色板不在 missing");
+    }
+
+    /// patch 查询：只返回请求且存在的 id，并正确解析 palette。
+    #[test]
+    fn palette_patch_returns_only_existing_ids_with_parsed_palette() {
+        let c = mem();
+        let a = ins(&c, "/a.jpg", "image/jpeg");
+        let b = ins(&c, "/b.jpg", "image/jpeg");
+        set_palette(
+            &c,
+            a,
+            r##"[{"hex":"#111111","r":17,"g":17,"b":17,"ratio":1.0}]"##,
+            1,
+            10,
+            20,
+            30,
+        )
+        .unwrap();
+        // b 保持 NULL
+        let patches = get_asset_palette_patches(&c, &[a, 9999, b]).unwrap();
+        assert_eq!(patches.len(), 2, "不存在的 id 不返回");
+        let pa = patches.iter().find(|p| p.id == a).unwrap();
+        assert_eq!(pa.palette.as_ref().unwrap()[0].hex, "#111111");
+        assert_eq!(pa.dominant_hue, Some(10));
+        assert_eq!(pa.dominant_sat, Some(20));
+        assert_eq!(pa.dominant_lum, Some(30));
+        let pb = patches.iter().find(|p| p.id == b).unwrap();
+        assert!(pb.palette.is_none());
+        // 空 ids → 空数组
+        assert!(get_asset_palette_patches(&c, &[]).unwrap().is_empty());
+    }
+
+    /// patch 查询超过 1000 id 返回错误。
+    #[test]
+    fn palette_patch_rejects_over_1000_ids() {
+        let c = mem();
+        let ids: Vec<i64> = (1..=1001).collect();
+        let err = get_asset_palette_patches(&c, &ids).unwrap_err();
+        assert!(err.to_string().contains("1000"));
+    }
+
+    // ── GPS 定位 / 拍摄时间回填辅助 ──
+
+    /// list_ids_needing_geo_taken：图片缺定位 / 视频缺定位或缺 taken_at 才入选。
+    #[test]
+    fn list_ids_needing_geo_taken_selection() {
+        let c = mem();
+        let img_no_geo = ins(&c, "/i1.jpg", "image/jpeg");
+        let img_geo = ins(&c, "/i2.jpg", "image/jpeg");
+        let vid_no_taken = ins(&c, "/v1.mp4", "video/mp4");
+        let vid_full = ins(&c, "/v2.mp4", "video/mp4");
+        set_geo_taken(&c, img_geo, Some(30.25), Some(120.16), None).unwrap();
+        set_geo_taken(&c, vid_no_taken, Some(30.25), Some(120.16), None).unwrap();
+        set_geo_taken(&c, vid_full, Some(30.25), Some(120.16), Some(1_710_484_200_000)).unwrap();
+
+        let ids = list_ids_needing_geo_taken(&c).unwrap();
+        assert!(ids.contains(&img_no_geo), "图片缺定位应入选");
+        assert!(!ids.contains(&img_geo), "图片已有定位不入选");
+        assert!(ids.contains(&vid_no_taken), "视频缺 taken_at 应入选");
+        assert!(!ids.contains(&vid_full), "视频定位+时间齐全不入选");
+    }
+
+    /// set_geo_taken 只补空不覆盖：已有值传新值也不变，空值被补上。
+    #[test]
+    fn set_geo_taken_fills_only_nulls() {
+        let c = mem();
+        let id = ins(&c, "/a.jpg", "image/jpeg");
+        set_geo_taken(&c, id, Some(30.25), Some(120.16), None).unwrap();
+        // 再次传入不同值：已有经纬度不得被覆盖；taken_at 仍为空可补。
+        set_geo_taken(&c, id, Some(99.0), Some(99.0), Some(1_710_484_200_000)).unwrap();
+        let a = get(&c, id).unwrap();
+        assert_eq!(a.latitude, Some(30.25), "已有纬度不得被覆盖");
+        assert_eq!(a.longitude, Some(120.16), "已有经度不得被覆盖");
+        assert_eq!(a.taken_at, Some(1_710_484_200_000), "空 taken_at 应被补上");
+    }
+
+    /// 分面：色相分桶（红色跨 0° 合并 350 与 10；低饱和度判灰度）+ 定位有无计数。
+    #[test]
+    fn metadata_facets_include_hue_buckets_and_location() {
+        let c = mem();
+        let red_a = ins(&c, "/r1.jpg", "image/jpeg");
+        let red_b = ins(&c, "/r2.jpg", "image/jpeg");
+        let green = ins(&c, "/g.jpg", "image/jpeg");
+        let gray = ins(&c, "/w.jpg", "image/jpeg");
+        set_palette(&c, red_a, "{}", 1, 350, 80, 50).unwrap();
+        set_palette(&c, red_b, "{}", 1, 10, 80, 50).unwrap(); // 跨 0° 也应归入红色桶
+        set_palette(&c, green, "{}", 1, 120, 80, 50).unwrap();
+        set_palette(&c, gray, "{}", 1, 120, 5, 50).unwrap(); // sat<=10 → 灰度（色相不参与）
+        set_geo_taken(&c, red_a, Some(30.25), Some(120.16), None).unwrap();
+
+        let facets = list_metadata_facets(&c, None).unwrap();
+        let hue = facets.iter().find(|f| f.key == "hue").expect("应有色调分面");
+        let get_count = |v: &str| {
+            hue.items
+                .iter()
+                .find(|i| i.value == v)
+                .map(|i| i.count)
+                .unwrap_or(0)
+        };
+        assert_eq!(get_count("red"), 2, "350° 与 10° 都应进红色桶");
+        assert_eq!(get_count("green"), 1);
+        assert_eq!(get_count("gray"), 1, "低饱和度应判灰度而非绿色");
+
+        let loc = facets
+            .iter()
+            .find(|f| f.key == "has_location")
+            .expect("应有定位分面");
+        let loc_count = |v: &str| {
+            loc.items
+                .iter()
+                .find(|i| i.value == v)
+                .map(|i| i.count)
+                .unwrap_or(0)
+        };
+        assert_eq!(loc_count("yes"), 1);
+        assert_eq!(loc_count("no"), 3);
     }
 }

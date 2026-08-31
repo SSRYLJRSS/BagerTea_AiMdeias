@@ -1,4 +1,4 @@
-/** FB3-02（§4.3）：胶片条布局语义 —— 双行网格、只横向滚动、点击定位 */
+/** FB4-01（§4.3/§10.2）：胶片条布局语义 —— 单行、80px 外层、56px 缩略图、只横向滚动、点击定位 */
 import { describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen } from "@testing-library/react";
 import ViewerFilmstrip from "@/components/viewer/ViewerFilmstrip";
@@ -37,40 +37,72 @@ function mkAsset(id: number): Asset {
   };
 }
 
-function getGrid(container: HTMLElement): HTMLElement {
-  const strip = container.querySelector("[data-filmstrip]") as HTMLElement;
-  // 缩略图区是 filmstrip 内第二个子节点（prev 按钮 → grid → next 按钮）
-  return strip.children[1] as HTMLElement;
+function getStrip(container: HTMLElement): HTMLElement {
+  return container.querySelector("[data-filmstrip]") as HTMLElement;
 }
 
-describe("ViewerFilmstrip（FB3-02 双排胶片条）", () => {
-  it("缩略图区是两行网格（grid-template-rows repeat(2, minmax(0,1fr)) + 纵向列流）", () => {
+/** 缩略图区是 filmstrip 内第二个子节点（prev 按钮 → 缩略图区 → next 按钮） */
+function getThumbArea(container: HTMLElement): HTMLElement {
+  return getStrip(container).children[1] as HTMLElement;
+}
+
+describe("ViewerFilmstrip（FB4-01 单行胶片条）", () => {
+  it("外层固定 h-20（80px）", () => {
     const { container } = render(
-      <ViewerFilmstrip items={[mkAsset(1), mkAsset(2), mkAsset(3), mkAsset(4), mkAsset(5)]} currentId={1} onJump={vi.fn()} onPrev={vi.fn()} onNext={vi.fn()} />,
+      <ViewerFilmstrip items={[mkAsset(1)]} currentId={1} onJump={vi.fn()} onPrev={vi.fn()} onNext={vi.fn()} />,
     );
-    const grid = getGrid(container);
-    expect(grid.style.gridTemplateRows).toBe("repeat(2, minmax(0, 1fr))");
-    expect(grid.style.gridAutoFlow).toBe("column");
-    expect(grid.style.gridAutoColumns).toBe("56px");
+    expect(getStrip(container).className).toContain("h-20");
   });
 
-  it("只横向滚动：overflow-x auto、overflow-y hidden（无纵向滚动）", () => {
+  it("缩略图区为单行 flex，不存在双行 grid 结构", () => {
+    const { container } = render(
+      <ViewerFilmstrip items={[mkAsset(1), mkAsset(2), mkAsset(3)]} currentId={1} onJump={vi.fn()} onPrev={vi.fn()} onNext={vi.fn()} />,
+    );
+    const area = getThumbArea(container);
+    expect(area.className).toContain("flex");
+    expect(area.style.gridTemplateRows).not.toBe("repeat(2, minmax(0, 1fr))");
+    expect(area.style.gridAutoFlow).not.toBe("column");
+  });
+
+  it("缩略图固定 56x56px（size-14）", () => {
+    const { container } = render(
+      <ViewerFilmstrip items={[mkAsset(1), mkAsset(2)]} currentId={1} onJump={vi.fn()} onPrev={vi.fn()} onNext={vi.fn()} />,
+    );
+    const thumbs = getThumbArea(container).querySelectorAll("button");
+    expect(thumbs).toHaveLength(2);
+    for (const t of thumbs) {
+      expect(t.className).toContain("size-14");
+      expect((t as HTMLElement).style.width).toBe("56px");
+      expect((t as HTMLElement).style.height).toBe("56px");
+    }
+  });
+
+  it("左右导航按钮保持 size-9", () => {
+    const { container } = render(
+      <ViewerFilmstrip items={[mkAsset(1)]} currentId={1} onJump={vi.fn()} onPrev={vi.fn()} onNext={vi.fn()} />,
+    );
+    const strip = getStrip(container);
+    expect(strip.children[0].className).toContain("size-9");
+    expect(strip.children[2].className).toContain("size-9");
+  });
+
+  it("中间区 overflow-x-auto 且 overflow-y-hidden（只横向滚动）", () => {
     const { container } = render(
       <ViewerFilmstrip items={Array.from({ length: 20 }, (_, i) => mkAsset(i + 1))} currentId={1} onJump={vi.fn()} onPrev={vi.fn()} onNext={vi.fn()} />,
     );
-    const grid = getGrid(container);
-    expect(grid.className).toContain("overflow-x-auto");
-    expect(grid.className).toContain("overflow-y-hidden");
+    const area = getThumbArea(container);
+    expect(area.className).toContain("overflow-x-auto");
+    expect(area.className).toContain("overflow-y-hidden");
+    expect(area.className).toContain("min-w-0");
+    expect(area.className).toContain("flex-1");
   });
 
-  it("1 / 2 / 3 个素材都保持两行结构（少量素材不塌成单行）", () => {
+  it("1 / 2 / 3 个素材都保持单行结构（缩略图数量正确）", () => {
     for (const n of [1, 2, 3]) {
       const { container } = render(
         <ViewerFilmstrip items={Array.from({ length: n }, (_, i) => mkAsset(i + 1))} currentId={1} onJump={vi.fn()} onPrev={vi.fn()} onNext={vi.fn()} />,
       );
-      const grid = getGrid(container);
-      expect(grid.style.gridTemplateRows).toBe("repeat(2, minmax(0, 1fr))");
-      expect(grid.querySelectorAll("button")).toHaveLength(n);
+      expect(getThumbArea(container).querySelectorAll("button")).toHaveLength(n);
     }
   });
 
@@ -89,13 +121,10 @@ describe("ViewerFilmstrip（FB3-02 双排胶片条）", () => {
     expect(onNext).toHaveBeenCalledTimes(1);
   });
 
-  it("当前素材高亮（accent 边框）；缩略图区 min-w-0 防按钮挤压", () => {
-    const { container } = render(
+  it("当前素材高亮（accent 边框）", () => {
+    render(
       <ViewerFilmstrip items={[mkAsset(1), mkAsset(2)]} currentId={2} onJump={vi.fn()} onPrev={vi.fn()} onNext={vi.fn()} />,
     );
-    const grid = getGrid(container);
-    expect(grid.className).toContain("min-w-0");
-    // aria-label 含当前文件名（第 2 张）的按钮带 accent 类
     const current = screen.getByRole("button", { name: "第 2 张：a2.jpg" });
     expect(current.className).toContain("border-[var(--color-accent)]");
   });

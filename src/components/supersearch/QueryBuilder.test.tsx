@@ -4,6 +4,7 @@ import QueryBuilder from "@/components/supersearch/QueryBuilder";
 import { useSuperSearchStore } from "@/stores/superSearchStore";
 import { useTagStore } from "@/stores/tagStore";
 import { listSuperAssets } from "@/api/superSearch";
+import type { QueryExpr } from "@/types/queryExpr";
 
 vi.mock("@/api/assets", () => ({
   listAssets: vi.fn().mockResolvedValue({ items: [], total: 0, hasMore: false }),
@@ -25,16 +26,18 @@ beforeEach(() => {
   vi.clearAllMocks();
   useTagStore.setState({ tree: [], loading: false, treesByFacet: {}, expanded: new Set() });
   useSuperSearchStore.setState({
-    query: { search: "", assetType: "all", untaggedOnly: false, facetFilters: [], excludeTagIds: [], missingFacetKeys: [], metadataFilters: [], sortBy: "created_at", sortDir: "desc" },
+    query: { search: "", assetType: "all", untaggedOnly: false, facetFilters: [], excludeTagIds: [], metadataFilters: [], sortBy: "created_at", sortDir: "desc" },
     expr: undefined,
     items: [],
     total: 0,
     loading: false,
     error: null,
+    aiError: null,
     aiInput: "",
     aiLoading: false,
     aiExplanation: null,
     warnings: [],
+    resolvedTags: [],
   });
 });
 
@@ -170,5 +173,56 @@ describe("QueryBuilder", () => {
     expect(useSuperSearchStore.getState().expr).toBeTruthy();
     fireEvent.change(input, { target: { value: "" } });
     expect(useSuperSearchStore.getState().expr).toBeUndefined();
+  });
+
+  it("嵌套树（OR）显示「复杂条件（N 项）」摘要；新增条件以 AND 合并到整棵现有 expr（§9.6.1）", () => {
+    const orTree: QueryExpr = {
+      op: "or",
+      children: [
+        { op: "and", children: [{ op: "leaf", cond: { type: "search", value: "海边", scope: "all" } }] },
+        { op: "and", children: [{ op: "leaf", cond: { type: "search", value: "日落", scope: "all" } }] },
+      ],
+    };
+    useSuperSearchStore.setState({ expr: orTree });
+    render(<QueryBuilder />);
+    // 只读摘要：复杂条件（2 项），不渲染可编辑行
+    expect(screen.getByText(/复杂条件（2 项）/)).toBeInTheDocument();
+    expect(screen.queryByPlaceholderText("输入关键词")).not.toBeInTheDocument();
+    // 新增条件入口仍可用（不静默禁用）
+    const addBtn = screen.getByRole("button", { name: "+ 添加第一个条件" });
+    expect(addBtn).toBeEnabled();
+    fireEvent.click(addBtn);
+    fireEvent.change(screen.getByLabelText("条件字段"), { target: { value: "search" } });
+    const input = screen.getByPlaceholderText("输入关键词");
+    fireEvent.change(input, { target: { value: "夜景" } });
+    fireEvent.blur(input);
+    const expr = useSuperSearchStore.getState().expr;
+    expect(expr?.op).toBe("and");
+    const children = expr && expr.op === "and" ? expr.children : [];
+    // 手动条件 leaf 已与整棵 OR 树 AND 合并（DraftInput 提交的 search cond 无 scope 字段 = 默认 all）
+    expect(children).toContainEqual({ op: "leaf", cond: { type: "search", value: "夜景" } });
+    // OR 子树仍在（未被扁平化）
+    const orChild = children.find((c) => c.op === "or") as QueryExpr | undefined;
+    expect(orChild).toBeTruthy();
+  });
+
+  it("tagId 不在 tagStore 时从 resolvedTags 生成 synthetic option（§9.8）", () => {
+    useSuperSearchStore.setState({ resolvedTags: [{ facetKey: "subject", text: "银杏", tagId: 99, path: "" }] });
+    render(<QueryBuilder />);
+    fireEvent.click(screen.getByRole("button", { name: "+ 添加第一个条件" }));
+    // 默认 tag 条件：synthetic option 可选项（名称来自 resolvedTags，绝无空「选择标签」之外裸奔）
+    const select = screen.getByLabelText("条件值") as HTMLSelectElement;
+    expect(Array.from(select.options).some((o) => o.textContent?.startsWith("银杏"))).toBe(true);
+  });
+
+  it("expr 中已含未知 tagId：下拉显示「标签 #id」占位而非退回空（§9.8）", () => {
+    useSuperSearchStore.setState({
+      expr: { op: "leaf", cond: { type: "tag", facetKey: "custom", tagIds: [123], mode: "any", includeDescendants: false } },
+      resolvedTags: [],
+    });
+    render(<QueryBuilder />);
+    const select = screen.getByLabelText("条件值") as HTMLSelectElement;
+    expect(select.value).toBe("123");
+    expect(Array.from(select.options).some((o) => o.textContent?.startsWith("标签 #123"))).toBe(true);
   });
 });

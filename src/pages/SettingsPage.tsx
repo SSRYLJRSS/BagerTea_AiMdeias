@@ -3,19 +3,27 @@
  *  IA：入库与总库 → AI 设置（超级搜索 AI/打标 AI）→ 标签与分类 → 通用外观 → 数据与缓存 → 关于。
  *  AI 子页内使用「在线服务/本地服务」二选一，只渲染当前模式字段。
  */
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import clsx from "clsx";
 import { useShallow } from "zustand/react/shallow";
 import { open as pickDir } from "@tauri-apps/plugin-dialog";
 import { on } from "@/api/client";
 import Button from "@/components/common/Button";
 import { ollamaInstallStatus, ollamaRemoveInstaller } from "@/api/ollama";
-import { clearThumbnailCache, getDataDir, openDataDir } from "@/api/settings";
-import { rescanAssetMetadata, rescanAssetPalette, cancelMediaRefill, type RefillProgress } from "@/api/assets";
+import { clearThumbnailCache, getDataDir, openDataDir, resetAppData, type ResetDataSelection } from "@/api/settings";
+import {
+  rescanAssetMetadata,
+  rescanAssetPalette,
+  cancelMediaRefill,
+  getPaletteStatus,
+  type RefillProgress,
+  type PaletteStatus,
+} from "@/api/assets";
 import { listAiConnections, getAiUsageBindings, setAiUsageBinding } from "@/api/connections";
 import { videoProxyCacheStats, clearAllVideoProxies } from "@/api/video";
 import FacetManagePanel from "@/components/settings/FacetManagePanel";
 import ServiceManagement from "@/components/settings/ServiceManagement";
+import { useLibraryStore } from "@/stores/libraryStore";
 import { applyTheme, useSettingsStore, DEFAULT_APPEARANCE } from "@/stores/settingsStore";
 import { CELL_STEPS } from "@/types/settings";
 import type { CellAspect, CellFit, Settings } from "@/types/settings";
@@ -151,6 +159,75 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
       paletteUnsub.current?.();
       paletteUnsub.current = null;
       setPaletteProgress(null);
+    }
+  };
+
+  // ── FB4-03（§4.5/§6.3）：色板状态行 + 「生成缺失色条」手动流程 ──
+  const [paletteStatus, setPaletteStatus] = useState<PaletteStatus | null>(null);
+  const [paletteStatusError, setPaletteStatusError] = useState<string | null>(null);
+  const [generatingMissing, setGeneratingMissing] = useState(false);
+  const [generateProgress, setGenerateProgress] = useState<RefillProgress | null>(null);
+  const [generateResult, setGenerateResult] = useState<string | null>(null);
+  const generateUnsub = useRef<(() => void) | null>(null);
+  useEffect(() => () => generateUnsub.current?.(), []);
+
+  /** FB4-03：重新读取色板状态（进入通用外观路由时调用；失败保留错误文案 + 重试入口）。 */
+  const refreshPaletteStatus = useCallback(async () => {
+    try {
+      const st = await getPaletteStatus();
+      setPaletteStatus(st);
+      setPaletteStatusError(null);
+    } catch (e) {
+      setPaletteStatusError(e instanceof Error ? e.message : String(e));
+    }
+  }, []);
+
+  // 进入通用外观路由时读取状态；总开关开关变化不需要重复触发扫描（§6.3）
+  useEffect(() => {
+    if (route !== "general") return;
+    void refreshPaletteStatus();
+  }, [route, refreshPaletteStatus]);
+
+  /** FB4-03：生成缺失色条 —— 手动回算不发 palette://updated 全局事件；
+   *  resolve 后不得调用 libraryStore.refresh()；状态刷新与局部同步即使失败也保留摘要并显示具体错误。 */
+  const onGenerateMissingPalette = async () => {
+    if (generatingMissing || paletteRunning || refilling) return;
+    setGeneratingMissing(true);
+    setGenerateResult(null);
+    setGenerateProgress(null);
+    on<RefillProgress>("media_refill://progress", (p) => setGenerateProgress(p))
+      .then((unsub) => {
+        generateUnsub.current = unsub;
+      })
+      .catch(() => undefined);
+    try {
+      const r = await rescanAssetPalette([], "missing");
+      setGenerateResult(
+        `生成完成：成功 ${r.success}，跳过 ${r.skipped}，失败 ${r.failed}（共处理 ${r.total}）`,
+      );
+      // 随后重新读取状态 + 定向同步色板字段；任一失败也要保留摘要并给出具体错误
+      const errors: string[] = [];
+      try {
+        await refreshPaletteStatus();
+      } catch (e) {
+        errors.push(`状态刷新失败：${e instanceof Error ? e.message : String(e)}`);
+      }
+      try {
+        await useLibraryStore.getState().refreshPaletteFields(r.updatedIds);
+      } catch (e) {
+        errors.push(`素材色条同步失败：${e instanceof Error ? e.message : String(e)}`);
+      }
+      if (errors.length > 0) {
+        setPaletteStatusError(errors.join("；"));
+      }
+    } catch (e) {
+      // 互斥闸被占用（FX-12）/ 一般错误：明确展示，不轮询不自动重试
+      setGenerateResult(e instanceof Error ? e.message : String(e));
+    } finally {
+      setGeneratingMissing(false);
+      generateUnsub.current?.();
+      generateUnsub.current = null;
+      setGenerateProgress(null);
     }
   };
 
@@ -407,7 +484,16 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
                   }))}
                   onPatchAiConfig={(facetKey, patch) => {
                     const idx = draft.aiFacetConfigs.findIndex((c) => c.facetKey === facetKey);
-                    if (idx >= 0) patchFacet(idx, patch);
+                    if (idx >= 0) {
+                      patchFacet(idx, patch);
+                      return;
+                    }
+                    // 历史库可能缺条目（迁移只补过 subject/scene/color 等）：补建默认条目再合并，
+                    // 否则勾选/输入会被静默丢弃（无条目 = AI 提示词排除该分面，见 build_prompt_context）
+                    dirty({
+                      ...draft,
+                      aiFacetConfigs: [...draft.aiFacetConfigs, { facetKey, hint: "", enabledForAi: false, ...patch }],
+                    });
                   }}
                 />
               </div>
@@ -532,15 +618,71 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
                   />
                 </Field>
               )}
-              {/* FB2-08（§14.11）+ FB3-10（§12.2）：算法主色色条设置。总开关关闭时下面各行整体不渲染 */}
-              <Field label="显示算法主色色条" hint="由本地算法从缩略图/封面估算主色，不调用 AI，也不代表摄影师手工调色；关闭后所有位置都不渲染，也不解析色板数据">
+              {/* FB2-08（§14.11）+ FB3-10（§12.2）+ FB4-03（§4.5）：算法主色色条设置。
+                  总开关关闭时位置/样式行不渲染；状态行（色条数据）即使总开关关闭也显示。 */}
+              <Field label="显示算法主色色条" hint="从图片或视频封面中提取几种主要颜色，仅在本机计算，不调用 AI">
                 <Toggle
                   checked={draftAppearance.colorStrip.enabled}
                   onChange={(v) => patchColorStrip({ enabled: v })}
                 />
               </Field>
+              {/* FB4-03：色板状态行 + 生成缺失色条（不随总开关隐藏；让用户先知道库里是否有可用色板） */}
+              <Field label="色条数据" hint="只处理尚未生成或数据损坏的素材，不重复计算已有有效色板">
+                <div className="flex min-w-0 flex-wrap items-center gap-2">
+                  {paletteStatusError ? (
+                    <span className="text-xs text-[var(--color-danger)]">
+                      {paletteStatusError}
+                      <button
+                        type="button"
+                        onClick={() => void refreshPaletteStatus()}
+                        className="ml-2 underline decoration-dotted underline-offset-2"
+                      >
+                        重试
+                      </button>
+                    </span>
+                  ) : paletteStatus === null ? (
+                    <span className="text-xs text-[var(--color-text-secondary)]">正在检查色条数据…</span>
+                  ) : (
+                    <>
+                      <span className="text-xs text-[var(--color-text-secondary)]">
+                        {paletteStatus.missing > 0
+                          ? `已生成 ${paletteStatus.ready} / 可生成 ${paletteStatus.eligible}；另有 ${paletteStatus.unavailable} 项暂不可生成`
+                          : paletteStatus.eligible === 0
+                            ? "当前没有可生成色条的图片或视频封面"
+                            : `已生成 ${paletteStatus.ready} / 可生成 ${paletteStatus.eligible}；所有可生成素材均已完成`}
+                      </span>
+                      {paletteStatus.missing > 0 && !generatingMissing && (
+                        <Button
+                          disabled={paletteRunning || refilling}
+                          onClick={() => void onGenerateMissingPalette()}
+                        >
+                          生成缺失色条（{paletteStatus.missing}）
+                        </Button>
+                      )}
+                      {generatingMissing && (
+                        <Button
+                          onClick={() => {
+                            void cancelMediaRefill().catch(() => undefined);
+                            setGenerateResult("正在取消…");
+                          }}
+                        >
+                          取消
+                        </Button>
+                      )}
+                    </>
+                  )}
+                </div>
+              </Field>
+              {generateProgress && generatingMissing && (
+                <p className="px-4 py-2 text-xs text-[var(--color-text-secondary)]">
+                  生成中 {generateProgress.done}/{generateProgress.total}（成功 {generateProgress.success} · 跳过 {generateProgress.skipped} · 失败 {generateProgress.failed}）
+                </p>
+              )}
+              {generateResult && (
+                <p className="px-4 py-2 text-xs text-[var(--color-text-secondary)]">{generateResult}</p>
+              )}
               {draftAppearance.colorStrip.enabled && (
-                <Field label="素材库网格显示" hint="已入库素材卡片下方显示主色色条；未计算出色板的素材留空槽位">
+                <Field label="素材库卡片显示" hint="在素材缩略图卡片底部显示色条">
                   <Toggle
                     checked={draftAppearance.colorStrip.showInLibraryGrid}
                     onChange={(v) => patchColorStrip({ showInLibraryGrid: v })}
@@ -548,7 +690,7 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
                 </Field>
               )}
               {draftAppearance.colorStrip.enabled && (
-                <Field label="查看器显示" hint="大图浏览时在标签栏上方显示主色色条；全屏浏览时自动隐藏">
+                <Field label="大图浏览显示" hint="在大图浏览的标签栏上方显示色条；全屏时隐藏">
                   <Toggle
                     checked={draftAppearance.colorStrip.showInViewer}
                     onChange={(v) => patchColorStrip({ showInViewer: v })}
@@ -709,6 +851,22 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
                   {clearingProxies ? "清理中…" : "清理全部"}
                 </Button>
               </Field>
+              <ResetDataPanel
+                notify={setNotice}
+                fail={setError}
+                onDataReset={async (sel) => {
+                  // 偏好设置被重置：重新拉取设置并替换 draft（draft 已存在，load 后需手动同步）
+                  if (sel.preferences) {
+                    await load();
+                    const fresh = useSettingsStore.getState().settings;
+                    if (fresh) setDraft(structuredClone(fresh));
+                  }
+                  // 素材/标签变化：刷新素材库列表
+                  if (sel.assets || sel.tags) {
+                    await useLibraryStore.getState().refresh();
+                  }
+                }}
+              />
             </Group>
           )}
 
@@ -978,6 +1136,120 @@ function Toggle({
         className={`block h-4 w-4 translate-x-0.5 rounded-full bg-white transition-transform ${checked ? "translate-x-[18px]" : ""}`}
       />
     </button>
+  );
+}
+
+/** 重置数据面板（数据与缓存）：勾选分类 → 两步确认 → resetAppData。
+ *  只清数据库记录与本软件派生缓存，绝不触碰素材原文件。 */
+const RESET_ITEMS: { key: keyof ResetDataSelection; label: string; hint: string }[] = [
+  { key: "assets", label: "素材库记录", hint: "所有素材记录、搜索索引、导出任务；会同时清掉缩略图/预览/代理缓存文件" },
+  { key: "tags", label: "标签与分类", hint: "所有标签、分面结构、别名、打标流水" },
+  { key: "aiTasks", label: "AI 打标任务", hint: "打标批次与建议记录" },
+  { key: "aiConnections", label: "AI 服务配置", hint: "连接档案、用途绑定，以及系统里保存的 API 密钥" },
+  { key: "preferences", label: "偏好设置", hint: "恢复全部默认设置（主题、外观、总库位置、缓存上限等）" },
+  { key: "caches", label: "缓存文件", hint: "缩略图/预览/视频代理缓存文件（不影响素材记录）" },
+];
+const RESET_NONE: ResetDataSelection = {
+  assets: false,
+  tags: false,
+  aiTasks: false,
+  aiConnections: false,
+  preferences: false,
+  caches: false,
+};
+
+function ResetDataPanel({
+  notify,
+  fail,
+  onDataReset,
+}: {
+  notify: (msg: string) => void;
+  fail: (msg: string) => void;
+  onDataReset: (sel: ResetDataSelection) => Promise<void>;
+}) {
+  const [sel, setSel] = useState<ResetDataSelection>(RESET_NONE);
+  const [confirming, setConfirming] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [result, setResult] = useState<string | null>(null);
+  const any = Object.values(sel).some(Boolean);
+
+  const onReset = async () => {
+    const done = sel;
+    setBusy(true);
+    setResult(null);
+    try {
+      const r = await resetAppData(done);
+      const parts: string[] = [];
+      if (r.assetsDeleted > 0) parts.push(`素材 ${r.assetsDeleted} 条`);
+      if (r.tagsDeleted > 0) parts.push(`标签 ${r.tagsDeleted} 条`);
+      if (r.aiTasksDeleted > 0) parts.push(`AI 任务记录 ${r.aiTasksDeleted} 条`);
+      if (r.connectionsDeleted > 0) parts.push(`AI 服务配置 ${r.connectionsDeleted} 个`);
+      if (r.preferencesReset) parts.push("设置已恢复默认");
+      if (r.cacheFilesDeleted > 0) parts.push(`缓存文件 ${r.cacheFilesDeleted} 个`);
+      const msg = parts.length > 0 ? `重置完成：已清除${parts.join("，")}` : "重置完成：所选数据本来就是空的";
+      setResult(msg);
+      notify(msg);
+      setSel(RESET_NONE);
+      setConfirming(false);
+      await onDataReset(done);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setResult(msg);
+      fail(msg);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="flex flex-col gap-2 px-4 py-3">
+      <div>
+        <p className="text-sm text-[var(--color-text)]">重置数据</p>
+        <p className="mt-0.5 text-xs leading-5 text-[var(--color-text-secondary)]">
+          勾选要清空的数据后点「重置所选数据」。只清软件数据库里的记录和本软件生成的缓存文件，不会删除你的图片、视频原文件
+        </p>
+      </div>
+      <div className="grid gap-1.5 sm:grid-cols-2">
+        {RESET_ITEMS.map((item) => (
+          <label key={item.key} className="flex items-start gap-2 text-sm">
+            <input
+              type="checkbox"
+              className="mt-1 accent-[var(--color-accent)]"
+              checked={sel[item.key]}
+              disabled={busy}
+              onChange={(e) => {
+                setSel((s) => ({ ...s, [item.key]: e.target.checked }));
+                setConfirming(false);
+              }}
+            />
+            <span className="min-w-0">
+              {item.label}
+              <span className="block text-xs leading-4 text-[var(--color-text-secondary)]">{item.hint}</span>
+            </span>
+          </label>
+        ))}
+      </div>
+      <div className="flex flex-wrap items-center gap-2">
+        {confirming ? (
+          <>
+            <span className="text-xs font-medium text-[var(--color-danger)]">
+              确认清空所选数据？此操作不可撤销，请先确认没有需要备份的内容
+            </span>
+            <Button variant="danger" disabled={busy || !any} onClick={() => void onReset()}>
+              {busy ? "重置中…" : "确认重置"}
+            </Button>
+            <Button disabled={busy} onClick={() => setConfirming(false)}>
+              取消
+            </Button>
+          </>
+        ) : (
+          <Button variant="danger" disabled={busy || !any} onClick={() => setConfirming(true)}>
+            重置所选数据
+          </Button>
+        )}
+        {result && <span className="text-xs text-[var(--color-text-secondary)]">{result}</span>}
+      </div>
+    </div>
   );
 }
 

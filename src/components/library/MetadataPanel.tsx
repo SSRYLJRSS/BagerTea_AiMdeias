@@ -11,6 +11,20 @@ import type { MetadataFilter } from "@/types/asset";
  *  离散分面按 key 的 in/eq 值判断；范围分面按是否已存在等价条件判断。
  */
 function isValueActive(filters: MetadataFilter[], key: string, value: string): boolean {
+  // V18 色调分面：点选产出的是 dominant_hue / dominant_sat 条件（而非 hue key），
+  // 逆映射按与 bucketToFilter 输出等价判断高亮。
+  if (key === "hue") {
+    const bucket = bucketToFilter(key, value);
+    if (!bucket) return false;
+    return filters.some(
+      (f) =>
+        f.key === bucket.key &&
+        f.op === bucket.op &&
+        String(f.value ?? "") === String(bucket.value ?? "") &&
+        String(f.min ?? "") === String(bucket.min ?? "") &&
+        String(f.max ?? "") === String(bucket.max ?? ""),
+    );
+  }
   const relevant = filters.filter((f) => f.key === key);
   const filter = bucketToFilter(key, value);
   if (!filter) return false;
@@ -118,17 +132,22 @@ export default function MetadataPanel() {
 
   return (
     <div className="flex flex-col pb-3 text-sm">
-      <div className="flex items-center justify-end gap-1 px-2 pt-1">
+      {/* FB6 需求四：统一标题行——左「文件属性」标题、右「全部展开/全部收起」。
+          折叠状态由本面板自持，不与智能标签（tagStore.expanded）共用。 */}
+      <div className="flex min-h-8 items-center justify-between px-2 pt-1">
+        <h4 className="text-[11px] font-semibold text-[var(--color-text)]">文件属性</h4>
         <button
           type="button"
           onClick={toggleAll}
-          className="px-1.5 py-1 text-[10px] text-[var(--color-text-secondary)] hover:text-[var(--color-text)]"
+          aria-label={allCollapsed ? "全部展开" : "全部收起"}
+          title={allCollapsed ? "展开所有文件属性分组" : "收起所有文件属性分组"}
+          className="px-1.5 py-1 text-[10px] text-[var(--color-text-secondary)] transition-colors hover:text-[var(--color-text)]"
         >
           {allCollapsed ? "全部展开" : "全部收起"}
         </button>
       </div>
       {visibleFacets.map((facet) => {
-        const isRange = ["file_size", "duration", "resolution", "taken_month"].includes(facet.key);
+        const isRange = ["file_size", "duration", "resolution", "taken_month", "hue"].includes(facet.key);
         return (
         <section key={facet.key} className="pt-2">
           <button

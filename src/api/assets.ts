@@ -78,14 +78,51 @@ export function rescanAssetMetadata(ids: number[], scope: "all" | "missing" | "i
   return invoke<RescanResult>("rescan_asset_metadata", { ids, scope });
 }
 
-/** FB2-08：算法色板回算（不调用 AI）。范围：all=全部可算素材 | missing=仅缺色板 | ids=选中素材 */
+/** FB2-08：算法色板回算（不调用 AI）。范围：all=全部可算素材 | missing=仅缺色板 | ids=选中素材
+ *  FB4-03：返回 PaletteRescanResult（含 updatedIds —— 本轮真实写库成功的素材 id）。 */
 export function rescanAssetPalette(
   ids: number[],
   scope: "all" | "missing" | "ids",
-): Promise<RescanResult> {
-  return invoke<RescanResult>("rescan_asset_palette", { ids, scope });
+): Promise<PaletteRescanResult> {
+  return invoke<PaletteRescanResult>("rescan_asset_palette", { ids, scope });
 }
 
 export function cancelMediaRefill(): Promise<void> {
   return invoke<void>("cancel_media_refill");
+}
+
+// ── FB4-03：色板状态与定向同步（§6.1）──
+
+/** 色板状态：totalAssets = 全部未删除素材；eligible = 可生成（候选）；ready = 已有有效色板；
+ *  missing = 缺/损坏（可生成但未完成）；unavailable = 暂不可生成。 */
+export interface PaletteStatus {
+  totalAssets: number;
+  eligible: number;
+  ready: number;
+  missing: number;
+  unavailable: number;
+}
+
+/** 色板补丁：只同步色板相关字段（id + palette + dominant_*），不携带其他素材字段。 */
+export interface AssetPalettePatch {
+  id: number;
+  palette: Asset["palette"];
+  dominantHue: number | null;
+  dominantSat: number | null;
+  dominantLum: number | null;
+}
+
+/** 色板回算结果：在 RescanResult 之上增加 updatedIds（本轮真实写库成功的素材 id）。 */
+export interface PaletteRescanResult extends RescanResult {
+  updatedIds: number[];
+}
+
+/** 查询色板状态（设置页状态行 / 生成按钮状态）。 */
+export function getPaletteStatus(): Promise<PaletteStatus> {
+  return invoke<PaletteStatus>("get_palette_status");
+}
+
+/** 按 id 定向读取色板补丁（单次 ≤1000，前端负责分批；只返回存在的 id）。 */
+export function getAssetPalettePatches(ids: number[]): Promise<AssetPalettePatch[]> {
+  return invoke<AssetPalettePatch[]>("get_asset_palette_patches", { ids });
 }

@@ -1,10 +1,12 @@
-/** AI 打标页（PRD v2.5 工作台 2.0）：左数据栏 + 右侧四段式（大图/EXIF 行/胶片条/分类标签面板） */
-import { useCallback, useEffect, useMemo, useState } from "react";
+/** AI 打标页（PRD v2.5 工作台 2.0）：左数据栏 + 右侧四段式（大图/EXIF 行/胶片条/分类标签面板）
+ *  FB6 需求一：页内进度唯一化——「当前批次」区块的 AiTaggingProgress 是唯一 AI 进度 UI；
+ *  全局任务条中的「AI 打标中」胶囊已从 taskStore 移除（taskStore 只订阅入库/导出）。 */
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import clsx from "clsx";
 import { useShallow } from "zustand/react/shallow";
 import Button from "@/components/common/Button";
-import ModelSelect from "@/components/common/ModelSelect";
-import ProgressBar from "@/components/common/ProgressBar";
+import LegacyProfileModelField from "@/components/common/LegacyProfileModelField";
+import AiTaggingProgress, { assetFileLabel } from "@/components/ai/AiTaggingProgress";
 import Filmstrip from "@/components/ai/Filmstrip";
 import Workbench from "@/components/ai/Workbench";
 import { aiApplyTags, onAiProgress } from "@/api/ai";
@@ -15,12 +17,13 @@ import { useLibraryStore } from "@/stores/libraryStore";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { useTagStore, buildWorkbenchFacets, normalizeTagKeys } from "@/stores/tagStore";
 import { computeAiStats, estimateRequests } from "@/utils/aiStats";
-import type { AiSuggestion, CategorizedTags } from "@/types/ai";
+import { pickReviewDescription } from "@/utils/reviewDescription";
+import type { AiSuggestion, AiTaggingUiState, CategorizedTags } from "@/types/ai";
 import type { TagOp } from "@/types/asset";
 
 export default function AiTaggingPage() {
   const {
-    batches, currentBatchId, suggestions, running, cancelling, error, pendingAssetIds, pendingMode,
+    batches, currentBatchId, suggestions, running, cancelling, error, pendingAssetIds, pendingMode, lastProgressAssetId,
   } = useAiStore(
     useShallow((s) => ({
       batches: s.batches,
@@ -31,6 +34,7 @@ export default function AiTaggingPage() {
       error: s.error,
       pendingAssetIds: s.pendingAssetIds,
       pendingMode: s.pendingMode,
+      lastProgressAssetId: s.lastProgressAssetId,
     })),
   );
   const {
@@ -121,12 +125,62 @@ export default function AiTaggingPage() {
     void refreshBatches();
   }, [refreshBatches]);
 
-  useTauriEvent(() => onAiProgress((p) => patchProgress(p.processed)), []);
+  // FB6 需求一：进度事件唯一订阅入口（页面内），同时更新 aiStore 与「已收到进度」标记。
+  // startBatch 即置 running（starting 相位立即有视觉反馈），首条事件到达后进入 running 相位。
+  const [sawProgress, setSawProgress] = useState(false);
+  useTauriEvent(
+    () =>
+      onAiProgress((p) => {
+        patchProgress(p.processed, p.currentAssetId);
+        setSawProgress(true);
+      }),
+    [],
+  );
 
   const current = batches.find((b) => b.id === currentBatchId) ?? null;
   /** 当前批次是否走 AI 管线（云端或本地，P3-01a：开始打标按钮对两者常显） */
   const isAiBatch = current?.mode === "cloud" || current?.mode === "local";
   const aiLabel = current?.mode === "local" ? "本地" : "云端";
+
+  // FB6 需求一：派生页内进度 UI 状态（AiTaggingUiState）。
+  // 收尾快照只在 running 翻转为 false 的一刻记录（完成/取消/失败显示静态最终状态，不继续滚动）。
+  const [aiFinal, setAiFinal] = useState<{ status: string | null; error: string | null; processed: number; total: number } | null>(null);
+  const prevRunning = useRef(false);
+  useEffect(() => {
+    if (prevRunning.current && !running && current) {
+      setAiFinal({ status: current.status, error, processed: current.processed, total: current.total });
+    }
+    prevRunning.current = running;
+    // 收尾快照只取 running 翻转那次渲染的 current/error（已是最新值）
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [running]);
+  // 切批次：清空上一次的收尾快照与进度标记，避免旧批次的终态/素材名串台
+  useEffect(() => {
+    setAiFinal(null);
+    setSawProgress(false);
+  }, [currentBatchId]);
+
+  const batchProcessed = current?.processed ?? 0;
+  const batchTotal = current?.total ?? 0;
+  const aiState: AiTaggingUiState = running
+    ? cancelling
+      ? { phase: "cancelling", processed: batchProcessed, total: batchTotal }
+      : sawProgress
+        ? { phase: "running", processed: batchProcessed, total: batchTotal, currentAssetId: lastProgressAssetId ?? undefined }
+        : { phase: "starting", total: batchTotal }
+    : aiFinal?.error
+      ? { phase: "error", message: aiFinal.error, processed: aiFinal.processed, total: aiFinal.total }
+      : aiFinal && (aiFinal.status === "done" || aiFinal.status === "cancelled")
+        ? { phase: "done", processed: aiFinal.processed, total: aiFinal.total }
+        : { phase: "idle" };
+
+  /** LED 提示的当前素材名：按 lastProgressAssetId 从 suggestions 查；找不到只显示计数 */
+  const aiCurrentName = useMemo(() => {
+    if (lastProgressAssetId == null) return null;
+    const hit = suggestions.find((s) => s.assetId === lastProgressAssetId);
+    return hit ? assetFileLabel(hit.assetPath) : null;
+  }, [suggestions, lastProgressAssetId]);
+
   // B-3：当前批次是否含视频 + 视频 AI 打标是否开启（前端提示，后端仍保留最终校验）
   const batchHasVideo = useMemo(
     () => suggestions.some((s) => (s.mimeType ?? "").startsWith("video/") || s.assetPath.match(/\.(mp4|mov|avi|mkv|webm|m4v)$/i) != null),
@@ -189,6 +243,13 @@ export default function AiTaggingPage() {
     // 若只依赖 [id, status] 当前张会停在旧的空 draft，此时点确认会写入空标签
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [currentSuggestion?.id, currentSuggestion?.status, JSON.stringify(currentSuggestion?.suggestedTags)]);
+
+  // FB5-05（§7.6）：当前张审核中的一句话描述（切张重置：确认值 → 素材当前值 → 建议值）
+  const [draftDescription, setDraftDescription] = useState("");
+  useEffect(() => {
+    if (!currentSuggestion) return;
+    setDraftDescription(pickReviewDescription(currentSuggestion));
+  }, [currentSuggestion?.id, currentSuggestion?.status, currentSuggestion?.confirmedDescription, currentSuggestion?.suggestedDescription, currentSuggestion?.currentDescription]);
 
   // 胶片条多选（批量套用用，按 assetId）
   const [selectedAssets, setSelectedAssets] = useState<Set<number>>(new Set());
@@ -428,12 +489,13 @@ export default function AiTaggingPage() {
                   ))}
                 </select>
                 {activeProfile && (
-                  <ModelSelect
+                  <LegacyProfileModelField
                     apiMode={activeProfile.apiMode}
+                    kind={activeProfile.kind}
                     baseUrl={activeProfile.baseUrl}
                     apiKey={activeProfile.apiKey}
-                    value={activeProfile.model}
-                    onChange={changeModel}
+                    model={activeProfile.model}
+                    onModelChange={changeModel}
                   />
                 )}
               </div>
@@ -470,9 +532,10 @@ export default function AiTaggingPage() {
               <div><strong className="block text-base font-medium text-[var(--color-text)]">{stats.confirmed}</strong><span className="text-[10px] text-[var(--color-text-secondary)]">已确认</span></div>
               <div><strong className="block text-base font-medium text-[var(--color-danger)]">{stats.failed}</strong><span className="text-[10px] text-[var(--color-text-secondary)]">失败</span></div>
             </div>
-            {running && (
+            {/* FB6 需求一：唯一页内进度条 + LED 滚动提示（starting 立即出现，不等后端事件） */}
+            {aiState.phase !== "idle" && (
               <div className="mt-2">
-                <ProgressBar value={current.total ? current.processed / current.total : 0} />
+                <AiTaggingProgress state={aiState} currentAssetName={aiCurrentName} />
                 <p className="mt-1 text-[10px] text-[var(--color-text-secondary)]">
                   {current.mode === "manual" ? "手动模式：请逐张编辑标签" : `${aiLabel}生成建议 ${current.processed}/${current.total}`}
                 </p>
@@ -594,6 +657,8 @@ export default function AiTaggingPage() {
               facets={workbenchFacets}
               tags={draftTags}
               onTagsChange={setDraftTags}
+              description={draftDescription}
+              onDescriptionChange={setDraftDescription}
               index={idx}
               total={suggestions.length}
               filmstrip={
@@ -626,7 +691,8 @@ export default function AiTaggingPage() {
               }
               onGoto={goto}
               onConfirm={async () => {
-                await confirm(currentSuggestion.id, draftTags);
+                // FB5-05（§7.6）：确认时携带审核后的描述（同一事务写入素材）
+                await confirm(currentSuggestion.id, draftTags, draftDescription);
                 await afterWrite();
               }}
               onReject={async () => {

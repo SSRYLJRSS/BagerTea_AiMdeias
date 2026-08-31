@@ -26,7 +26,7 @@ fn fts_index_on_insert() -> AppResult<()> {
         "jpg",
         "image/jpeg",
     );
-    let ids = db::search::search_asset_ids(&conn, "海边日落")?;
+    let ids = db::search::search_asset_ids_all(&conn, "海边日落")?;
     assert_eq!(ids, vec![id]);
     Ok(())
 }
@@ -42,7 +42,7 @@ fn fts_substring_hit() -> AppResult<()> {
         "jpg",
         "image/jpeg",
     );
-    assert_eq!(db::search::search_asset_ids(&conn, "日落")?, vec![id]);
+    assert_eq!(db::search::search_asset_ids_all(&conn, "日落")?, vec![id]);
     Ok(())
 }
 
@@ -64,7 +64,7 @@ fn fts_phrase_no_false_positive() -> AppResult<()> {
         "jpg",
         "image/jpeg",
     );
-    assert_eq!(db::search::search_asset_ids(&conn, "海边")?, vec![hit]);
+    assert_eq!(db::search::search_asset_ids_all(&conn, "海边")?, vec![hit]);
     Ok(())
 }
 
@@ -82,9 +82,9 @@ fn like_fallback_and_tag_search() -> AppResult<()> {
     let tag = tags::create(&conn, "海边", None)?;
     asset_tags::assign(&conn, &[id], &[tag.id], "manual")?;
     // 按标签名（2 字 → LIKE 走 EXISTS 子查询）
-    assert_eq!(db::search::search_asset_ids(&conn, "海边")?, vec![id]);
+    assert_eq!(db::search::search_asset_ids_all(&conn, "海边")?, vec![id]);
     // 按文件名（2 字 ASCII）
-    assert_eq!(db::search::search_asset_ids(&conn, "01")?, vec![id]);
+    assert_eq!(db::search::search_asset_ids_all(&conn, "01")?, vec![id]);
     Ok(())
 }
 
@@ -101,10 +101,10 @@ fn no_phantom_after_tag_removal() -> AppResult<()> {
     );
     let tag = tags::create(&conn, "山野", None)?;
     asset_tags::assign(&conn, &[id], &[tag.id], "manual")?;
-    assert_eq!(db::search::search_asset_ids(&conn, "山野")?, vec![id]);
+    assert_eq!(db::search::search_asset_ids_all(&conn, "山野")?, vec![id]);
     asset_tags::remove(&conn, &[id], &[tag.id])?;
     assert!(
-        db::search::search_asset_ids(&conn, "山野")?.is_empty(),
+        db::search::search_asset_ids_all(&conn, "山野")?.is_empty(),
         "摘除标签后仍命中（幻影）"
     );
     Ok(())
@@ -119,8 +119,8 @@ fn rename_updates_index() -> AppResult<()> {
         "UPDATE assets SET file_name = '新名字.jpg' WHERE id = ?1",
         [id],
     )?;
-    assert_eq!(db::search::search_asset_ids(&conn, "新名字")?, vec![id]);
-    assert!(db::search::search_asset_ids(&conn, "old")?.is_empty());
+    assert_eq!(db::search::search_asset_ids_all(&conn, "新名字")?, vec![id]);
+    assert!(db::search::search_asset_ids_all(&conn, "old")?.is_empty());
     Ok(())
 }
 
@@ -136,7 +136,7 @@ fn delete_asset_clears_index() -> AppResult<()> {
         "image/jpeg",
     );
     assets::delete(&conn, &[id])?;
-    assert!(db::search::search_asset_ids(&conn, "海边日落")?.is_empty());
+    assert!(db::search::search_asset_ids_all(&conn, "海边日落")?.is_empty());
     Ok(())
 }
 
@@ -199,9 +199,9 @@ fn tag_merge_moves_assets_and_children() -> AppResult<()> {
     assert_eq!(d.children.len(), 1);
     assert_eq!(d.children[0].tag.id, src_child.id);
     // FTS 按目标标签名仍可搜
-    assert_eq!(db::search::search_asset_ids(&conn, "风景")?.len(), 2);
+    assert_eq!(db::search::search_asset_ids_all(&conn, "风景")?.len(), 2);
     assert!(
-        db::search::search_asset_ids(&conn, "海边")?.is_empty(),
+        db::search::search_asset_ids_all(&conn, "海边")?.is_empty(),
         "源标签名不应再命中"
     );
     Ok(())
@@ -401,7 +401,7 @@ fn ai_confirm_flow() -> AppResult<()> {
     )?;
     assert_eq!(after.total, 0);
     // 确认后新标签可被检索
-    assert_eq!(db::search::search_asset_ids(&conn, "夜景")?, vec![id]);
+    assert_eq!(db::search::search_asset_ids_all(&conn, "夜景")?, vec![id]);
     // 来源标记
     let src: String = conn.query_row(
         "SELECT source FROM asset_tags WHERE asset_id = ?1",
@@ -634,7 +634,10 @@ fn undo_ai_batch_keeps_manual_confirmed_tag() -> AppResult<()> {
         "AI 批次撤销不应删除手工确认的标签"
     );
     assert!(
-        assets::get(&conn, id)?.tags.iter().any(|tg| tg.name == "杯子"),
+        assets::get(&conn, id)?
+            .tags
+            .iter()
+            .any(|tg| tg.name == "杯子"),
         "手工确认的标签在撤销 AI 批次后应保留"
     );
     Ok(())
@@ -659,7 +662,10 @@ fn undo_ai_batch_keeps_manually_readded_tag() -> AppResult<()> {
         "撤销 AI 批次不应删除手工重新添加的标签"
     );
     assert!(
-        assets::get(&conn, id)?.tags.iter().any(|tg| tg.name == "杯子"),
+        assets::get(&conn, id)?
+            .tags
+            .iter()
+            .any(|tg| tg.name == "杯子"),
         "手工重新添加的标签在撤销 AI 批次后应保留"
     );
     Ok(())
@@ -686,12 +692,18 @@ fn cross_batch_single_ownership_undo_a_removes_tag_shared_with_b() -> AppResult<
     // 撤销批次 A → 删除该唯一关联（B 无自己的关联可恢复）
     assert!(tag_ops::undo_batch(&conn, batch_a.id)? >= 1);
     assert!(
-        !assets::get(&conn, id)?.tags.iter().any(|tg| tg.name == "杯子"),
+        !assets::get(&conn, id)?
+            .tags
+            .iter()
+            .any(|tg| tg.name == "杯子"),
         "单归属边界：撤销 A 删除共享的同一关联（B 已确认但无独立关联）"
     );
     // B 的确认计数不受影响（历史事实保留，不把 confused 计数伪装成 0）
     let b_after = ai::get_batch(&conn, batch_b.id)?;
-    assert_eq!(b_after.confirmed, 1, "撤销 A 不应改动 B 的 confirmed 历史计数");
+    assert_eq!(
+        b_after.confirmed, 1,
+        "撤销 A 不应改动 B 的 confirmed 历史计数"
+    );
     Ok(())
 }
 
@@ -836,13 +848,13 @@ fn tag_facets_aliases_and_canonical_search() -> AppResult<()> {
     let id = add_asset(&conn, "d:/p/tea.jpg", "tea.jpg", "jpg", "image/jpeg");
     asset_tags::assign(&conn, &[id], &[tea.id], "manual")?;
 
-    assert_eq!(db::search::search_asset_ids(&conn, "茶叶")?, vec![id]);
+    assert_eq!(db::search::search_asset_ids_all(&conn, "茶叶")?, vec![id]);
     let candidates = tags::search_candidates(&conn, Some("subject"), "茶叶")?;
     assert_eq!(candidates.len(), 1);
     assert_eq!(candidates[0].id, tea.id);
 
     tags::update_preserve_alias(&conn, tea.id, Some("茶饮"), None)?;
-    assert_eq!(db::search::search_asset_ids(&conn, "茶")?, vec![id]);
+    assert_eq!(db::search::search_asset_ids_all(&conn, "茶")?, vec![id]);
     assert!(tags::aliases(&conn, tea.id)?.iter().any(|a| a == "茶"));
     Ok(())
 }
@@ -1290,7 +1302,10 @@ fn metadata_numeric_in_facet() -> AppResult<()> {
     let r = assets::list(
         &conn,
         &AssetFilter {
-            metadata_filters: vec![in_filter("iso", iso_vals.into_iter().map(|v| v.into()).collect())],
+            metadata_filters: vec![in_filter(
+                "iso",
+                iso_vals.into_iter().map(|v| v.into()).collect(),
+            )],
             ..Default::default()
         },
     )?;
@@ -1370,11 +1385,18 @@ fn v11_adds_color_facet_to_existing_settings() -> AppResult<()> {
     // tag_facets 补齐 color（FB2-08/V16 起 color 为 inactive，list() 只回 active，
     // 改用 list_all() 断言行存在且状态 inactive；旧行为断言 color ∈ list() 已随 V16 失效）
     let facets = db::tag_facets::list_all(&conn)?;
-    let color = facets.iter().find(|f| f.key == "color").expect("tag_facets 应补齐 color 分面");
+    let color = facets
+        .iter()
+        .find(|f| f.key == "color")
+        .expect("tag_facets 应补齐 color 分面");
     assert_eq!(color.status, "inactive", "V16 起 color 分面应为 inactive");
     // settings 的 ai_facet_configs 补齐 color（不覆盖已有 scene）
     let s = settings::get_settings(&conn)?;
-    let scene = s.ai_facet_configs.iter().find(|c| c.facet_key == "scene").expect("scene 保留");
+    let scene = s
+        .ai_facet_configs
+        .iter()
+        .find(|c| c.facet_key == "scene")
+        .expect("scene 保留");
     assert_eq!(scene.hint, "如房间");
     assert!(
         s.ai_facet_configs.iter().any(|c| c.facet_key == "color"),
@@ -1402,7 +1424,10 @@ fn prompt_context_reflects_facet_config_overrides() -> AppResult<()> {
         visible_in_workbench: None,
     }];
     let ctx = db::tag_facets::build_prompt_context(&conn, &cfg)?;
-    let scene = ctx.iter().find(|c| c.key == "scene").expect("存在 scene 分面");
+    let scene = ctx
+        .iter()
+        .find(|c| c.key == "scene")
+        .expect("存在 scene 分面");
     assert_eq!(scene.hint, "识别拍摄场景");
     assert_eq!(scene.display_name, "场景", "显示名覆盖生效");
     assert_eq!(scene.key, "scene", "显示名改变不影响 facetKey");
@@ -1547,5 +1572,87 @@ fn expr_invalid_rejected_by_validate() -> AppResult<()> {
         ..Default::default()
     };
     assert!(assets::list(&conn, &bad2).is_err());
+    Ok(())
+}
+
+// ── FB5-05（§7.6）：一句话描述 确认链 ──
+
+/// 单条确认：确认标签同一事务内写入非空描述；suggested_description 由 set_suggestion_result 写入。
+#[test]
+fn fb5_confirm_writes_description_with_tags() -> AppResult<()> {
+    let conn = setup();
+    let id = add_asset(&conn, "d:/p/p1.jpg", "p1.jpg", "jpg", "image/jpeg");
+    let batch = ai::create_batch(&conn, &[id], "cloud")?;
+    let sugg = ai::list_suggestions(&conn, batch.id)?.remove(0);
+
+    let tags_map = ai::CategorizedTags::from([("场景".to_string(), vec!["夜景".to_string()])]);
+    ai::set_suggestion_result(&conn, sugg.id, &tags_map, "夜晚树下多人合影")?;
+
+    let sugg2 = ai::list_suggestions(&conn, batch.id)?.remove(0);
+    assert_eq!(sugg2.suggested_description, "夜晚树下多人合影");
+    assert_eq!(sugg2.current_description, "");
+
+    // 确认时带描述：同一事务写入 assets.content_description + confirmed_description
+    ai::confirm_suggestion_with_description(&conn, sugg.id, &tags_map, Some("夜晚树下多人合影"))?;
+    let (desc, confirmed): (String, Option<String>) = conn.query_row(
+        "SELECT content_description, confirmed_description FROM assets a
+          JOIN ai_suggestions s ON s.asset_id = a.id WHERE a.id = ?1",
+        [id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    assert_eq!(desc, "夜晚树下多人合影");
+    assert_eq!(confirmed.as_deref(), Some("夜晚树下多人合影"));
+    // 描述可被普通搜索命中（§8.1 全局行为）
+    assert_eq!(db::search::search_asset_ids_all(&conn, "合影")?, vec![id]);
+    Ok(())
+}
+
+/// 确认时描述为空：保留素材已有描述，不覆盖为空（§7.6）。
+#[test]
+fn fb5_confirm_empty_description_keeps_existing() -> AppResult<()> {
+    let conn = setup();
+    let id = add_asset(&conn, "d:/p/p2.jpg", "p2.jpg", "jpg", "image/jpeg");
+    conn.execute(
+        "UPDATE assets SET content_description = '已有描述' WHERE id = ?1",
+        [id],
+    )?;
+    let batch = ai::create_batch(&conn, &[id], "cloud")?;
+    let sugg = ai::list_suggestions(&conn, batch.id)?.remove(0);
+    let tags_map = ai::CategorizedTags::from([("场景".to_string(), vec!["夜景".to_string()])]);
+    ai::set_suggestion_result(&conn, sugg.id, &tags_map, "")?;
+    ai::confirm_suggestion_with_description(&conn, sugg.id, &tags_map, Some(""))?;
+    let desc: String = conn.query_row(
+        "SELECT content_description FROM assets WHERE id = ?1",
+        [id],
+        |r| r.get(0),
+    )?;
+    assert_eq!(desc, "已有描述", "空描述不得覆盖已有描述");
+    Ok(())
+}
+
+/// 批量确认：逐条应用各自描述，不得把第一张描述套给整批（§7.6）。
+#[test]
+fn fb5_confirm_all_applies_per_suggestion_description() -> AppResult<()> {
+    let conn = setup();
+    let a1 = add_asset(&conn, "d:/p/a1.jpg", "a1.jpg", "jpg", "image/jpeg");
+    let a2 = add_asset(&conn, "d:/p/a2.jpg", "a2.jpg", "jpg", "image/jpeg");
+    let batch = ai::create_batch(&conn, &[a1, a2], "cloud")?;
+    let suggs = ai::list_suggestions(&conn, batch.id)?;
+    let t1 = ai::CategorizedTags::from([("场景".to_string(), vec!["夜景".to_string()])]);
+    let t2 = ai::CategorizedTags::from([("场景".to_string(), vec!["白天".to_string()])]);
+    ai::set_suggestion_result(&conn, suggs[0].id, &t1, "夜景街道")?;
+    ai::set_suggestion_result(&conn, suggs[1].id, &t2, "白天公园")?;
+    ai::confirm_all_pending(&conn, batch.id)?;
+    let rows: Vec<(i64, String)> = conn
+        .prepare("SELECT id, content_description FROM assets ORDER BY id")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().any(|(i, d)| *i == a1 && d == "夜景街道"));
+    assert!(rows.iter().any(|(i, d)| *i == a2 && d == "白天公园"));
+    // 描述空的那条不覆盖：a1/a2 之外的素材保留原值
     Ok(())
 }
