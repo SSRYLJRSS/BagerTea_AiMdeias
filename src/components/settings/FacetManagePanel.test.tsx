@@ -1,24 +1,23 @@
 /**
- * FacetManagePanel 测试（指导书 §9.2/§9.5/§12.4）：
- * - 分面列表显示 key/状态/适用媒体；展开详情同一上下文包含 基本规则 + AI 行为 + 分类词条入口；
- * - 新增分类调用 createTagFacet；
- * - AI 行为通过 onPatchAiConfig 更新设置草稿（不重复存储结构，§12.4）；
- * - 展开 AI 行为不影响「恢复」按钮可用性（词条入口标题体现上下文）。
+ * W4 FacetManagePanel 测试：两组列表 + 弹窗化编辑/新建/删除。
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { render, screen, waitFor, fireEvent } from "@testing-library/react";
 import FacetManagePanel from "@/components/settings/FacetManagePanel";
-import { listAllTagFacets, createTagFacet, updateTagFacetDisplay } from "@/api/tags";
+import { listAllTagFacets, createTagFacet, updateTagFacet, deleteTagFacet, getTagFacetImpact, restoreTagFacet } from "@/api/tags";
 import type { TagFacet } from "@/types/tag";
 
 vi.mock("@/api/tags", () => ({
   listAllTagFacets: vi.fn(),
   createTagFacet: vi.fn(),
+  updateTagFacet: vi.fn().mockResolvedValue(undefined),
   updateTagFacetDisplay: vi.fn().mockResolvedValue(undefined),
   updateTagFacetRules: vi.fn().mockResolvedValue(undefined),
+  reorderTagFacets: vi.fn().mockResolvedValue(undefined),
+  deleteTagFacet: vi.fn().mockResolvedValue({ tagsDeleted: 2, unlinked: 3, opsDeleted: 0, itemsDeleted: 0 }),
   deactivateTagFacet: vi.fn().mockResolvedValue(undefined),
   restoreTagFacet: vi.fn().mockResolvedValue(undefined),
-  getTagFacetImpact: vi.fn().mockResolvedValue({ tagCount: 0, assetCount: 0, aiConfigCount: 0 }),
+  getTagFacetImpact: vi.fn().mockResolvedValue({ tagCount: 2, assetCount: 3, aiSuggestionItemCount: 0, tagOpCount: 0 }),
 }));
 
 const facet = (over: Partial<TagFacet> = {}): TagFacet => ({
@@ -41,114 +40,102 @@ beforeEach(() => {
   vi.clearAllMocks();
 });
 
-describe("FacetManagePanel 分面生命周期（§9.2）", () => {
-  it("列出分面（含 key、状态、适用媒体）", async () => {
+describe("W4 facetManagePanel_two_groups", () => {
+  it("两组列表：ai_and_manual 进 AI 组、manual_only 进手工组、inactive 折叠", async () => {
     vi.mocked(listAllTagFacets).mockResolvedValue([
       facet(),
-      facet({ key: "scene", displayName: "场景", isSystem: true, status: "inactive" }),
+      facet({ key: "auth_state", displayName: "授权状态", inputMode: "manual_only" }),
+      facet({ key: "color", displayName: "色彩", status: "inactive", isSystem: true }),
     ]);
     render(<FacetManagePanel />);
     await waitFor(() => expect(screen.getByText("衣服颜色")).toBeInTheDocument());
-    expect(screen.getByText("场景")).toBeInTheDocument();
-    expect(screen.getByText("clothing_color")).toBeInTheDocument();
+    // 两个组标题都在
+    expect(screen.getByText("AI 自动打标的分类")).toBeInTheDocument();
+    expect(screen.getByText("只手工填写的分类")).toBeInTheDocument();
+    // 停用的折叠（默认收起，只显示计数）
+    expect(screen.getByText(/已停用的分类（1）/)).toBeInTheDocument();
+    expect(screen.queryByText("色彩")).not.toBeInTheDocument();
+    // 展开停用区后出现 + 有恢复按钮
+    fireEvent.click(screen.getByText(/已停用的分类/));
+    expect(screen.getByText("色彩")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "恢复" })).toBeInTheDocument();
   });
 
-  it("点击「新增分类」打开表单并提交调用 createTagFacet", async () => {
+  it("编辑弹窗：6 字段一个保存按钮（update_tag_facet 单事务）", async () => {
+    vi.mocked(listAllTagFacets).mockResolvedValue([facet()]);
+    render(<FacetManagePanel />);
+    await waitFor(() => expect(screen.getByText("衣服颜色")).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: "编辑" }));
+    // 弹窗字段
+    expect(screen.getByLabelText("分类名称")).toBeInTheDocument();
+    expect(screen.getByLabelText("这类标签是什么")).toBeInTheDocument();
+    // 改名 + 改归类 → 一次保存
+    fireEvent.change(screen.getByLabelText("分类名称"), { target: { value: "服装颜色" } });
+    fireEvent.click(screen.getByLabelText("只手工填写"));
+    fireEvent.click(screen.getByRole("button", { name: "保存" }));
+    await waitFor(() =>
+      expect(updateTagFacet).toHaveBeenCalledWith(expect.objectContaining({
+        key: "clothing_color",
+        displayName: "服装颜色",
+        inputMode: "manual_only",
+      })),
+    );
+  });
+
+  it("新建弹窗：2 个必填；CJK 名称自动 key 为空时提示输入英文标识", async () => {
     vi.mocked(listAllTagFacets).mockResolvedValue([facet()]);
     vi.mocked(createTagFacet).mockResolvedValue(facet());
     render(<FacetManagePanel />);
     await waitFor(() => expect(screen.getByText("衣服颜色")).toBeInTheDocument());
-
-    fireEvent.click(screen.getByRole("button", { name: "+ 新增分类" }));
-    fireEvent.change(screen.getByPlaceholderText("显示名称（必填）"), { target: { value: "Clothing Color" } });
-    fireEvent.click(screen.getByRole("button", { name: "创建分类" }));
-
+    fireEvent.click(screen.getAllByRole("button", { name: "+ 新增分类" })[0]);
+    // 中文名（slugify 产出空）+ 描述都填 → 报错要求英文标识
+    fireEvent.change(screen.getByLabelText("分类名称"), { target: { value: "人物服装颜色" } });
+    fireEvent.change(screen.getByLabelText("这类标签是什么"), { target: { value: "人物服装的主色调" } });
+    fireEvent.click(screen.getByRole("button", { name: "创建" }));
+    expect(await screen.findByText(/请填写英文标识/)).toBeInTheDocument();
+    // 补英文标识 → 创建成功
+    fireEvent.change(screen.getByLabelText("英文标识"), { target: { value: "clothing_color" } });
+    fireEvent.click(screen.getByRole("button", { name: "创建" }));
     await waitFor(() =>
-      expect(createTagFacet).toHaveBeenCalledWith(
-        expect.objectContaining({ displayName: "Clothing Color", key: "clothing_color" }),
-      ),
+      expect(createTagFacet).toHaveBeenCalledWith(expect.objectContaining({ key: "clothing_color", displayName: "人物服装颜色" })),
     );
   });
 
-  it("展开分面详情：同一上下文包含 基本规则 / AI 行为 / 分类词条入口（§9.2/§9.5）", async () => {
-    vi.mocked(listAllTagFacets).mockResolvedValue([facet()]);
-    const onPatchAiConfig = vi.fn();
-    render(
-      <FacetManagePanel
-        aiConfigs={[{ facetKey: "clothing_color", enabledForAi: true, hint: "主色参考", visibleInWorkbench: true }]}
-        onPatchAiConfig={onPatchAiConfig}
-      />,
-    );
-    await waitFor(() => expect(screen.getByText("衣服颜色")).toBeInTheDocument());
-
-    // 展开详情
-    fireEvent.click(screen.getByText("衣服颜色"));
-    // 三段式标题出现
-    expect(screen.getByText("基本规则")).toBeInTheDocument();
-    expect(screen.getByText("AI 行为")).toBeInTheDocument();
-    expect(screen.getByText("分类词条")).toBeInTheDocument();
-    // AI 行为已有草稿值回显（hint 不重复存储结构，仅 AI 覆盖）
-    expect(screen.getByDisplayValue("主色参考")).toBeInTheDocument();
-
-    // 修改 hint → 回调设置草稿（不另存一份结构）
-    fireEvent.change(screen.getByDisplayValue("主色参考"), { target: { value: "新的说明" } });
-    expect(onPatchAiConfig).toHaveBeenCalledWith("clothing_color", { hint: "新的说明" });
-
-    // 分类词条入口打开二级编辑器（标题带分面上下文，§9.3）
-    fireEvent.click(screen.getByRole("button", { name: "管理词条" }));
-    await waitFor(() => expect(screen.getByText("分类词条：衣服颜色")).toBeInTheDocument());
-  });
-
-  it("展开详情后停用/恢复按钮可用（同一上下文治理）", async () => {
-    vi.mocked(listAllTagFacets).mockResolvedValue([facet({ status: "inactive" })]);
-    render(<FacetManagePanel />);
-    await waitFor(() => expect(screen.getByText("衣服颜色")).toBeInTheDocument());
-    fireEvent.click(screen.getByText("衣服颜色"));
-    expect(screen.getByRole("button", { name: "恢复分类" })).toBeInTheDocument();
-  });
-
-  it("名称失焦自动保存（无需点「保存规则」）", async () => {
+  it("删除确认：显示精确影响数字；输入分类名后才能确认删除", async () => {
     vi.mocked(listAllTagFacets).mockResolvedValue([facet()]);
     render(<FacetManagePanel />);
     await waitFor(() => expect(screen.getByText("衣服颜色")).toBeInTheDocument());
-    fireEvent.click(screen.getByText("衣服颜色"));
-
-    const name = screen.getByLabelText("分类名称");
-    fireEvent.change(name, { target: { value: "新名字" } });
-    fireEvent.blur(name);
-    await waitFor(() =>
-      expect(updateTagFacetDisplay).toHaveBeenCalledWith("clothing_color", "新名字", "描述"),
-    );
+    fireEvent.click(screen.getByRole("button", { name: "删除" }));
+    // 影响数字（getTagFacetImpact 返回 tagCount=2 assetCount=3）
+    expect(await screen.findByText(/将删除 2 个标签/)).toBeInTheDocument();
+    expect(screen.getByText(/解除 3 个素材的关联/)).toBeInTheDocument();
+    // 未输入名字 → 确认删除禁用
+    expect(screen.getByRole("button", { name: "确认删除" })).toBeDisabled();
+    // 输入名字 → 启用并调用
+    fireEvent.change(screen.getByPlaceholderText("衣服颜色"), { target: { value: "衣服颜色" } });
+    expect(screen.getByRole("button", { name: "确认删除" })).toBeEnabled();
+    fireEvent.click(screen.getByRole("button", { name: "确认删除" }));
+    await waitFor(() => expect(deleteTagFacet).toHaveBeenCalledWith("clothing_color"));
   });
 
-  it("名称/说明无变化时失焦不写库", async () => {
-    vi.mocked(listAllTagFacets).mockResolvedValue([facet()]);
+  it("停用区恢复按钮调用 restoreTagFacet", async () => {
+    vi.mocked(listAllTagFacets).mockResolvedValue([
+      facet({ key: "color", displayName: "色彩", status: "inactive", isSystem: true }),
+    ]);
     render(<FacetManagePanel />);
-    await waitFor(() => expect(screen.getByText("衣服颜色")).toBeInTheDocument());
-    fireEvent.click(screen.getByText("衣服颜色"));
-
-    fireEvent.blur(screen.getByLabelText("分类名称"));
-    fireEvent.blur(screen.getByLabelText("给人的说明"));
-    expect(updateTagFacetDisplay).not.toHaveBeenCalled();
+    await waitFor(() => expect(screen.getByText(/已停用的分类（1）/)).toBeInTheDocument());
+    fireEvent.click(screen.getByText(/已停用的分类/));
+    fireEvent.click(screen.getByRole("button", { name: "恢复" }));
+    await waitFor(() => expect(restoreTagFacet).toHaveBeenCalledWith("color"));
   });
 
-  it("无配置条目的分面：「参与 AI」如实显示为关（缺条目 = AI 不产出）", async () => {
-    vi.mocked(listAllTagFacets).mockResolvedValue([facet()]);
+  it("系统分面不显示删除按钮（Q2：只允许停用）", async () => {
+    vi.mocked(listAllTagFacets).mockResolvedValue([
+      facet({ key: "scene", displayName: "场景", isSystem: true }),
+    ]);
     render(<FacetManagePanel />);
-    await waitFor(() => expect(screen.getByText("衣服颜色")).toBeInTheDocument());
-    fireEvent.click(screen.getByText("衣服颜色"));
-    expect(screen.getByRole("checkbox", { name: /参与 AI 打标与搜索/ })).not.toBeChecked();
-  });
-
-  it("停用分面的 AI 行为开关禁用并说明原因（后端只收 active 分面）", async () => {
-    vi.mocked(listAllTagFacets).mockResolvedValue([facet({ status: "inactive" })]);
-    render(<FacetManagePanel />);
-    await waitFor(() => expect(screen.getByText("衣服颜色")).toBeInTheDocument());
-    fireEvent.click(screen.getByText("衣服颜色"));
-
-    expect(screen.getByRole("checkbox", { name: /参与 AI 打标与搜索/ })).toBeDisabled();
-    expect(screen.getByLabelText("给 AI 的识别规则")).toBeDisabled();
-    expect(screen.getByRole("checkbox", { name: /在打标工作台显示/ })).toBeDisabled();
-    expect(screen.getByText(/恢复分类」后这些开关才生效/)).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByText("场景")).toBeInTheDocument());
+    expect(screen.queryByRole("button", { name: "删除" })).not.toBeInTheDocument();
+    expect(getTagFacetImpact).not.toHaveBeenCalled();
   });
 });

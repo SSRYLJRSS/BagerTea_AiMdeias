@@ -223,8 +223,9 @@ describe("SettingsPage §6.1 信息架构", () => {
     fireEvent.click(screen.getByText("通用外观"));
     await waitFor(() => expect(screen.getByText("素材框")).toBeInTheDocument());
 
-    // 默认 colorStrip.enabled=true → 位置/样式行都在（入库网格显示已按真实能力隐藏）
+    // 默认 colorStrip.enabled=true → 细节折叠在（W4-5）；展开后位置/样式行都在
     expect(screen.getByText("显示算法主色色条")).toBeInTheDocument();
+    fireEvent.click(screen.getByText("▸ 色条细节"));
     expect(screen.getByText("素材库卡片显示")).toBeInTheDocument();
     expect(screen.getByText("大图浏览显示")).toBeInTheDocument();
     expect(screen.queryByText("入库网格显示")).toBeNull();
@@ -240,7 +241,7 @@ describe("SettingsPage §6.1 信息架构", () => {
     expect(screen.queryByText("大图浏览显示")).toBeNull();
     expect(screen.queryByText("色条高度")).toBeNull();
     expect(screen.getByText("色条数据")).toBeInTheDocument();
-    // 再打开恢复渲染
+    // 再打开恢复渲染（折叠保持展开状态）
     fireEvent.click(fieldSwitch("显示算法主色色条"));
     await waitFor(() => expect(screen.getByText("素材库卡片显示")).toBeInTheDocument());
   });

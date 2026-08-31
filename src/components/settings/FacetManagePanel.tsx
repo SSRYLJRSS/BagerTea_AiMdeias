@@ -1,31 +1,33 @@
-/**
- * 分面管理面板（指导书 §9.2/§9.5/§12.4）：分类大类的唯一管理入口。
- *  - 分面 = tag_facets 唯一事实源；key 创建后锁定；
- *  - 每个分面详情同一上下文内完成三块：
- *      ① 基本规则（显示名/描述/单选多选/上限/适用媒体）→ 后端即时事务；
- *      ② AI 行为（是否参与 AI / 给 AI 的说明 / 工作台显示）→ 设置草稿（随页面保存统一落库）；
- *      ③ 分类词条（TagManageDialog 二级编辑器，标题体现当前分面上下文）。
- *  - 停用前展示影响范围（标签数 / 素材数 / AI 配置数）。
+/** W4 分面管理面板（整体重写）：两组列表 + 弹窗化编辑/新建/删除。
+ *  - 两组列表：「AI 自动打标的分类」/「只手工填写的分类」+ 底部折叠「已停用的分类」（Q2：系统分面不可删，停用的折叠只给恢复）
+ *  - 拖拽手柄跨组拖动 = 改 input_mode；组内拖动 = reorder
+ *  - 列表行只显示 4 项：名称 / key（小字）/ 规则摘要 / 操作按钮；详情进弹窗
+ *  - 编辑弹窗 6 字段一个保存通道（update_tag_facet 单事务；替代旧的「基本规则即时写 + AI 行为进草稿」双通道）
+ *  - 新建弹窗 2 个必填（名称 + 这类标签是什么）；key 自动 slugify，CJK 生成空串时明确提示
+ *  - 删除确认弹窗：精确影响数字 + 输入分类名确认 + 三按钮（取消 / 停用替代 / 确认删除）
  */
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import clsx from "clsx";
 import Button from "@/components/common/Button";
+import Modal from "@/components/common/Modal";
 import TagManageDialog from "@/components/dialogs/TagManageDialog";
 import {
   createTagFacet,
   deactivateTagFacet,
+  deleteTagFacet,
   getTagFacetImpact,
   listAllTagFacets,
+  reorderTagFacets,
   restoreTagFacet,
-  updateTagFacetDisplay,
-  updateTagFacetRules,
+  updateTagFacet,
+  type FacetDeleteReport,
 } from "@/api/tags";
-import type { TagFacet } from "@/types/tag";
+import type { TagFacet, TagFacetImpact } from "@/types/tag";
 
 const APP_TO_OPTIONS: { value: "all" | "image" | "video"; label: string }[] = [
-  { value: "all", label: "全部" },
-  { value: "image", label: "图片" },
-  { value: "video", label: "视频" },
+  { value: "all", label: "全部素材" },
+  { value: "image", label: "只图片" },
+  { value: "video", label: "只视频" },
 ];
 
 function slugify(s: string): string {
@@ -33,43 +35,33 @@ function slugify(s: string): string {
     .trim()
     .toLowerCase()
     .replace(/[^a-z0-9_]+/g, "_")
-    .replace(/^[0-9]+/, "") // 不以数字开头
+    .replace(/^[0-9]+/, "")
     .replace(/^_+|_+$/g, "")
     .slice(0, 64);
 }
 
-/** 该分面的 AI 行为覆盖字段（来自设置草稿 aiFacetConfigs，随页面保存统一落库） */
-export interface AiFacetConfigView {
-  facetKey: string;
-  enabledForAi: boolean;
-  hint: string;
-  visibleInWorkbench: boolean;
+function ruleSummary(f: TagFacet): string {
+  const mode = f.selectionMode === "single" ? "单选" : f.maxItems ? `可多选 ≤${f.maxItems}` : "可多选不限";
+  const applies = APP_TO_OPTIONS.find((o) => o.value === f.appliesTo)?.label ?? "全部";
+  return f.appliesTo === "all" ? mode : `${mode} · ${applies}`;
 }
 
-interface Props {
-  /** 设置草稿中的 AI 行为覆盖（按 facetKey 查找；缺省用默认值） */
-  aiConfigs?: AiFacetConfigView[];
-  onPatchAiConfig?: (facetKey: string, patch: Partial<Omit<AiFacetConfigView, "facetKey">>) => void;
-}
-
-export default function FacetManagePanel({ aiConfigs = [], onPatchAiConfig }: Props) {
+export default function FacetManagePanel() {
   const [facets, setFacets] = useState<TagFacet[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [creating, setCreating] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
-  /** 分类词条二级编辑器：记录「从哪个分面打开」，标题体现上下文（§9.3） */
+  const [showInactive, setShowInactive] = useState(false);
+  /** W4 弹窗状态：编辑 / 新建（默认落哪组）/ 删除 / 分类词条 */
+  const [editing, setEditing] = useState<TagFacet | null>(null);
+  const [creatingGroup, setCreatingGroup] = useState<"ai" | "manual" | null>(null);
+  const [deleting, setDeleting] = useState<TagFacet | null>(null);
+  const [deleteImpact, setDeleteImpact] = useState<TagFacetImpact | null>(null);
+  const [deleteReport, setDeleteReport] = useState<FacetDeleteReport | null>(null);
+  const [deleteConfirmName, setDeleteConfirmName] = useState("");
   const [termsFacet, setTermsFacet] = useState<TagFacet | null>(null);
-
-  // 无条目分面的兜底显示必须与后端一致：build_prompt_context 只遍历 aiFacetConfigs，
-  // 缺条目 = 该分面不参与 AI 打标/搜索，所以 enabledForAi 如实显示为关（勾选后由页面补建条目）。
-  const configFor = (key: string): AiFacetConfigView =>
-    aiConfigs.find((c) => c.facetKey === key) ?? {
-      facetKey: key,
-      enabledForAi: false,
-      hint: "",
-      visibleInWorkbench: true,
-    };
+  /** 拖拽中：跨组 = 改 input_mode；组内 = reorder */
+  const [dragKey, setDragKey] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -99,50 +91,254 @@ export default function FacetManagePanel({ aiConfigs = [], onPatchAiConfig }: Pr
     }
   };
 
+  const active = useMemo(() => facets.filter((f) => f.status === "active"), [facets]);
+  const aiGroup = useMemo(() => active.filter((f) => f.inputMode === "ai_and_manual"), [active]);
+  const manualGroup = useMemo(() => active.filter((f) => f.inputMode === "manual_only"), [active]);
+  const inactive = useMemo(() => facets.filter((f) => f.status !== "active"), [facets]);
+
+  /** 跨组拖动 = 改 input_mode（走 update_tag_facet 单事务） */
+  const moveToGroup = (facet: TagFacet, group: "ai" | "manual") => {
+    const nextMode = group === "ai" ? "ai_and_manual" : "manual_only";
+    if (facet.inputMode === nextMode) return;
+    void run(
+      () => updateTagFacet({
+        key: facet.key,
+        displayName: facet.displayName,
+        description: facet.description,
+        inputMode: nextMode,
+        selectionMode: facet.selectionMode,
+        maxItems: facet.maxItems,
+        appliesTo: facet.appliesTo,
+      }),
+      `「${facet.displayName}」已移到${group === "ai" ? " AI 自动打标" : "只手工填写"}组`,
+    );
+  };
+
+  /** 组内拖动 = reorder（本组按新序插入，其它组保持不变） */
+  const reorderInGroup = async (draggedKey: string, targetKey: string, groupKeys: string[]) => {
+    if (draggedKey === targetKey) return;
+    const keys = [...groupKeys];
+    const from = keys.indexOf(draggedKey);
+    const to = keys.indexOf(targetKey);
+    if (from < 0 || to < 0) return;
+    keys.splice(to, 0, keys.splice(from, 1)[0]);
+    // 全量顺序：遍历原 facets，遇到本组第一个成员时替换为整组新序
+    const merged: string[] = [];
+    let inserted = false;
+    for (const f of facets) {
+      if (keys.includes(f.key)) {
+        if (!inserted) {
+          merged.push(...keys);
+          inserted = true;
+        }
+      } else {
+        merged.push(f.key);
+      }
+    }
+    await run(() => reorderTagFacets(merged));
+  };
+
+  const onDropToGroup = (group: "ai" | "manual", targetKey?: string) => {
+    if (!dragKey) return;
+    const facet = facets.find((f) => f.key === dragKey);
+    setDragKey(null);
+    if (!facet || facet.status !== "active") return;
+    const groupList = group === "ai" ? aiGroup : manualGroup;
+    if (targetKey && groupList.some((f) => f.key === dragKey)) {
+      void reorderInGroup(dragKey, targetKey, groupList.map((f) => f.key));
+    } else {
+      moveToGroup(facet, group);
+    }
+  };
+
+  /** 打开删除确认：先取精确影响数字 */
+  const openDelete = async (facet: TagFacet) => {
+    setDeleting(facet);
+    setDeleteConfirmName("");
+    setDeleteReport(null);
+    try {
+      setDeleteImpact(await getTagFacetImpact(facet.key));
+    } catch {
+      setDeleteImpact(null);
+    }
+  };
+
+  const confirmDelete = async () => {
+    if (!deleting) return;
+    try {
+      const report = await deleteTagFacet(deleting.key);
+      setDeleteReport(report);
+      setDeleting(null);
+      await refresh();
+      setNotice(`已删除「${facetName(deleting)}」`);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  const facetName = (f: TagFacet) => f.displayName;
+
+  const renderRow = (f: TagFacet, group: "ai" | "manual") => (
+    <li
+      key={f.key}
+      draggable
+      onDragStart={() => setDragKey(f.key)}
+      onDragEnd={() => setDragKey(null)}
+      onDragOver={(e) => e.preventDefault()}
+      onDrop={() => onDropToGroup(group, f.key)}
+      className={clsx(
+        "flex items-center gap-2 rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] px-2 py-1.5",
+        dragKey === f.key && "opacity-50",
+      )}
+    >
+      <span className="cursor-grab select-none text-[var(--color-text-tertiary)]" title="拖动排序；拖到另一组 = 改归类">⠿</span>
+      <span className="min-w-0 flex-1 truncate text-xs font-medium text-[var(--color-text)]" title={f.description}>{f.displayName}</span>
+      <span className="shrink-0 rounded bg-[var(--color-surface-hover)] px-1 text-[10px] text-[var(--color-text-secondary)]" title={f.key}>{f.key}</span>
+      {f.isSystem && <span className="shrink-0 rounded bg-[var(--color-surface-hover)] px-1 text-[10px] text-[var(--color-text-secondary)]">系统</span>}
+      <span className="shrink-0 text-[10px] text-[var(--color-text-tertiary)]">{ruleSummary(f)}</span>
+      <span className="flex shrink-0 items-center gap-1">
+        <button type="button" onClick={() => setEditing(f)} className="rounded px-1.5 py-0.5 text-[11px] text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-hover)] hover:text-[var(--color-text)]">编辑</button>
+        <button type="button" onClick={() => setTermsFacet(f)} className="rounded px-1.5 py-0.5 text-[11px] text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-hover)] hover:text-[var(--color-text)]">词条</button>
+        {!f.isSystem && (
+          <button type="button" onClick={() => void openDelete(f)} className="rounded px-1.5 py-0.5 text-[11px] text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-hover)] hover:text-[var(--color-danger)]">删除</button>
+        )}
+      </span>
+    </li>
+  );
+
+  const renderGroup = (title: string, hint: string, group: "ai" | "manual", list: TagFacet[]) => (
+    <section
+      onDragOver={(e) => e.preventDefault()}
+      onDrop={() => onDropToGroup(group)}
+      className="flex flex-col gap-1.5"
+    >
+      <div className="flex items-center justify-between">
+        <div>
+          <h5 className="text-[11px] font-semibold text-[var(--color-text)]">{title}</h5>
+          <p className="text-[10px] text-[var(--color-text-tertiary)]">{hint}</p>
+        </div>
+        <Button onClick={() => setCreatingGroup(group)}>+ 新增分类</Button>
+      </div>
+      <ul className="flex flex-col gap-1.5">
+        {list.map((f) => renderRow(f, group))}
+        {list.length === 0 && (
+          <li className="rounded-md border border-dashed border-[var(--color-border)] px-2 py-3 text-center text-[11px] text-[var(--color-text-tertiary)]">
+            拖分类到这里，或点上方「+ 新增分类」
+          </li>
+        )}
+      </ul>
+    </section>
+  );
+
   return (
     <div className="flex flex-col gap-3 rounded-md border border-[var(--color-border)] bg-[var(--color-surface)] p-3">
-      <div className="flex items-center justify-between">
-        <h4 className="text-xs font-medium text-[var(--color-text)]">分类大类（分面）</h4>
-        <Button onClick={() => setCreating((v) => !v)}>{creating ? "取消" : "+ 新增分类"}</Button>
-      </div>
+      <h4 className="text-xs font-medium text-[var(--color-text)]">分类大类（分面）</h4>
       <p className="text-[11px] leading-4 text-[var(--color-text-secondary)]">
-        分类大类 = 标签大类（如「人物服装颜色」）。创建后 key 锁定不可改；停用保留历史标签与查询。每个分类的规则、AI 行为与词条在同一个详情中维护。
+        拖动分类跨组 = 改归类（AI 自动打标 ↔ 只手工填写）；组内拖动 = 调整顺序。创建后英文标识锁定不可改。
       </p>
 
       {error && <p className="text-xs text-[var(--color-danger)]">{error}</p>}
       {notice && <p className="text-xs text-[var(--color-text-secondary)]">{notice}</p>}
 
-      {creating && <CreateForm onCreated={() => { setCreating(false); void refresh(); }} onCancel={() => setCreating(false)} />}
-
       {loading ? (
         <p className="text-xs text-[var(--color-text-secondary)]">加载分类…</p>
       ) : (
-        <ul className="flex flex-col gap-1.5">
-          {facets.map((f) => (
-            <FacetDetail
-              key={f.key}
-              facet={f}
-              config={configFor(f.key)}
-              onPatchAiConfig={(patch) => onPatchAiConfig?.(f.key, patch)}
-              onSaveStructure={(m) => { setNotice(m); void refresh(); }}
-              onError={setError}
-              onDeactivate={() =>
-                run(async () => {
-                  const impact = await getTagFacetImpact(f.key);
-                  const more = impact.tagCount > 0 || impact.assetCount > 0;
-                  const msg = `该分类下有 ${impact.tagCount} 个标签、被 ${impact.assetCount} 个素材引用。`;
-                  if (more && !window.confirm(`停用后保留历史标签与查询。${msg}仍要停用？`)) return;
-                  await deactivateTagFacet(f.key);
-                }, "已停用")
-              }
-              onRestore={() => run(() => restoreTagFacet(f.key), "已恢复")}
-              onOpenTerms={() => setTermsFacet(f)}
-            />
-          ))}
-        </ul>
+        <>
+          {renderGroup("AI 自动打标的分类", "AI 打标会产出这些分类的标签；也可手工填写", "ai", aiGroup)}
+          {renderGroup("只手工填写的分类", "AI 不会产出；只出现在打标工作台「需要你填」组", "manual", manualGroup)}
+
+          {/* Q2：已停用分面折叠区（系统分面不可删，只给恢复） */}
+          {inactive.length > 0 && (
+            <section className="mt-1">
+              <button
+                type="button"
+                onClick={() => setShowInactive((v) => !v)}
+                className="flex items-center gap-1 text-[11px] text-[var(--color-text-tertiary)] hover:text-[var(--color-text-secondary)]"
+              >
+                已停用的分类（{inactive.length}）{showInactive ? "▾" : "▸"}
+              </button>
+              {showInactive && (
+                <ul className="mt-1.5 flex flex-col gap-1.5">
+                  {inactive.map((f) => (
+                    <li key={f.key} className="flex items-center gap-2 rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] px-2 py-1.5 opacity-75">
+                      <span className="min-w-0 flex-1 truncate text-xs text-[var(--color-text-secondary)] line-through">{f.displayName}</span>
+                      <span className="shrink-0 rounded bg-[var(--color-surface-hover)] px-1 text-[10px] text-[var(--color-text-secondary)]">{f.key}</span>
+                      <span className="shrink-0 text-[10px] text-[var(--color-text-tertiary)]">{ruleSummary(f)}</span>
+                      <button type="button" onClick={() => run(() => restoreTagFacet(f.key), `已恢复「${f.displayName}」`)} className="rounded px-1.5 py-0.5 text-[11px] text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-hover)] hover:text-[var(--color-text)]">恢复</button>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </section>
+          )}
+        </>
       )}
 
-      {/* §9.3：分类词条只作为分面详情内的二级编辑器，标题体现上下文 */}
+      {/* W4-2 编辑弹窗（6 字段一个保存通道） */}
+      <EditFacetDialog
+        facet={editing}
+        onClose={() => setEditing(null)}
+        onSaved={(msg) => { setNotice(msg); void refresh(); }}
+        onError={setError}
+      />
+
+      {/* W4-3 新建弹窗（2 个必填；默认落点组） */}
+      <CreateFacetDialog
+        group={creatingGroup}
+        onClose={() => setCreatingGroup(null)}
+        onCreated={(msg) => { setNotice(msg); setCreatingGroup(null); void refresh(); }}
+      />
+
+      {/* W4-4 删除确认弹窗 */}
+      <Modal
+        open={deleting != null}
+        title={deleting ? `删除分类「${deleting.displayName}」` : "删除分类"}
+        onClose={() => setDeleting(null)}
+        footer={
+          <>
+            <Button onClick={() => setDeleting(null)}>取消</Button>
+            {deleting && (
+              <Button
+                onClick={() => { const f = deleting; setDeleting(null); void run(() => deactivateTagFacet(f.key), `已停用「${f.displayName}」（历史标签保留）`); }}
+              >
+                停用替代
+              </Button>
+            )}
+            <Button
+              variant="danger"
+              disabled={!deleting || deleteConfirmName.trim() !== deleting.displayName}
+              onClick={() => void confirmDelete()}
+            >
+              确认删除
+            </Button>
+          </>
+        }
+      >
+        <div className="flex flex-col gap-2 text-sm">
+          <p className="text-[var(--color-danger)]">此操作不可恢复。素材文件本身不会被删除。</p>
+          {deleteImpact && (
+            <ul className="rounded-md bg-[var(--color-surface)] p-2 text-xs text-[var(--color-text-secondary)]">
+              <li>将删除 {deleteImpact.tagCount} 个标签</li>
+              <li>解除 {deleteImpact.assetCount} 个素材的关联</li>
+              <li>清除 {deleteImpact.aiSuggestionItemCount} 条 AI 候选记录、{deleteImpact.tagOpCount} 条操作流水</li>
+            </ul>
+          )}
+          <p className="text-xs text-[var(--color-text-secondary)]">建议改用「停用」：历史标签与查询保留，随时可恢复。</p>
+          {deleting && (
+            <label className="flex flex-col gap-1 text-xs">
+              输入分类名「{deleting.displayName}」确认：
+              <input className="ui-control px-2 py-1 text-sm" value={deleteConfirmName} onChange={(e) => setDeleteConfirmName(e.target.value)} placeholder={deleting.displayName} />
+            </label>
+          )}
+          {deleteReport && (
+            <p className="text-xs text-[var(--color-success)]">
+              已删除：{deleteReport.tagsDeleted} 个标签、{deleteReport.unlinked} 条素材关联。
+            </p>
+          )}
+        </div>
+      </Modal>
+
+      {/* 分类词条二级编辑器（保留） */}
       <TagManageDialog
         open={termsFacet != null}
         onClose={() => setTermsFacet(null)}
@@ -152,41 +348,49 @@ export default function FacetManagePanel({ aiConfigs = [], onPatchAiConfig }: Pr
   );
 }
 
-/** 单个分面详情：基本规则 + AI 行为 + 分类词条入口（同一上下文，§9.2） */
-function FacetDetail({
-  facet,
-  config,
-  onPatchAiConfig,
-  onSaveStructure,
-  onError,
-  onDeactivate,
-  onRestore,
-  onOpenTerms,
-}: {
-  facet: TagFacet;
-  config: AiFacetConfigView;
-  onPatchAiConfig: (patch: Partial<Omit<AiFacetConfigView, "facetKey">>) => void;
-  onSaveStructure: (msg: string) => void;
+/** W4-2 编辑弹窗：6 字段一个保存按钮一个事务（update_tag_facet） */
+function EditFacetDialog({ facet, onClose, onSaved, onError }: {
+  facet: TagFacet | null;
+  onClose: () => void;
+  onSaved: (msg: string) => void;
   onError: (msg: string) => void;
-  onDeactivate: () => void;
-  onRestore: () => void;
-  onOpenTerms: () => void;
 }) {
-  const active = facet.status === "active";
-  const [open, setOpen] = useState(false);
-  const [displayName, setDisplayName] = useState(facet.displayName);
-  const [description, setDescription] = useState(facet.description);
-  const [selectionMode, setSelectionMode] = useState<"single" | "multi">(facet.selectionMode as "single" | "multi");
-  const [maxItems, setMaxItems] = useState<string>(facet.maxItems ? String(facet.maxItems) : "");
-  const [appliesTo, setAppliesTo] = useState<"all" | "image" | "video">(facet.appliesTo as "all" | "image" | "video");
+  const [displayName, setDisplayName] = useState("");
+  const [description, setDescription] = useState("");
+  const [inputMode, setInputMode] = useState<"ai_and_manual" | "manual_only">("ai_and_manual");
+  const [selectionMode, setSelectionMode] = useState<"single" | "multi">("multi");
+  const [maxItems, setMaxItems] = useState("");
+  const [appliesTo, setAppliesTo] = useState<"all" | "image" | "video">("all");
   const [saving, setSaving] = useState(false);
+  const [showAdvanced, setShowAdvanced] = useState(false);
 
-  const submitStructure = async () => {
+  useEffect(() => {
+    if (facet) {
+      setDisplayName(facet.displayName);
+      setDescription(facet.description);
+      setInputMode(facet.inputMode);
+      setSelectionMode(facet.selectionMode);
+      setMaxItems(facet.maxItems ? String(facet.maxItems) : "");
+      setAppliesTo(facet.appliesTo);
+      setShowAdvanced(false);
+    }
+  }, [facet]);
+
+  const submit = async () => {
+    if (!facet) return;
     setSaving(true);
     try {
-      await updateTagFacetDisplay(facet.key, displayName, description);
-      await updateTagFacetRules(facet.key, selectionMode, selectionMode === "single" ? 1 : maxItems ? Number(maxItems) || null : null, appliesTo);
-      onSaveStructure("已保存（历史标签与查询不受影响）");
+      await updateTagFacet({
+        key: facet.key,
+        displayName: displayName.trim(),
+        description,
+        inputMode,
+        selectionMode,
+        maxItems: selectionMode === "single" ? 1 : maxItems ? Number(maxItems) || null : null,
+        appliesTo,
+      });
+      onSaved(`已保存「${displayName.trim()}」`);
+      onClose();
     } catch (e) {
       onError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -194,165 +398,129 @@ function FacetDetail({
     }
   };
 
-  // 名称/说明失焦自动保存（与「保存规则」同通道），避免改完没点按钮切走就丢
-  const saveInfoIfChanged = async () => {
-    if (displayName.trim() === facet.displayName && description === facet.description) return;
-    try {
-      await updateTagFacetDisplay(facet.key, displayName, description);
-      onSaveStructure("分类名称/说明已保存");
-    } catch (e) {
-      onError(e instanceof Error ? e.message : String(e));
-    }
-  };
-
   return (
-    <li className="rounded-md border border-[var(--color-border)] bg-[var(--color-bg)]">
-      <button
-        type="button"
-        onClick={() => setOpen((v) => !v)}
-        aria-expanded={open}
-        className="flex w-full items-center gap-2 px-2 py-1.5 text-left"
-      >
-        <span className={clsx("text-xs", !active && "text-[var(--color-text-secondary)] line-through")}>
-          {facet.displayName}
-        </span>
-        <span className="shrink-0 rounded bg-[var(--color-surface-hover)] px-1 text-[10px] text-[var(--color-text-secondary)]" title={facet.key}>
-          {facet.key}
-        </span>
-        {facet.isSystem && <span className="shrink-0 rounded bg-[var(--color-surface-hover)] px-1 text-[10px] text-[var(--color-text-secondary)]">系统</span>}
-        <span className="ml-auto shrink-0 text-[10px] text-[var(--color-text-secondary)]">
-          {APP_TO_OPTIONS.find((o) => o.value === facet.appliesTo)?.label ?? "全部"} ·{" "}
-          {facet.selectionMode === "single" ? "单选" : `多选${facet.maxItems ? `（≤${facet.maxItems}）` : ""}`} ·{" "}
-          {active ? "启用" : "停用"}
-          <span className="ml-1 inline-block">{open ? "▲" : "▼"}</span>
-        </span>
-      </button>
-
-      {open && (
-        <div className="flex flex-col gap-2 border-t border-[var(--color-border)] p-2">
-          {/* ① 分类名称（FB3-09 §11.2：显示名给人和 AI；稳定 key 只读展示为高级信息） */}
-          <div className="flex flex-col gap-1.5">
-            <p className="text-[10px] font-medium tracking-wide text-[var(--color-text-secondary)] uppercase">分类名称</p>
-            <input className="ui-control px-2 py-1 text-sm" value={displayName} onChange={(e) => setDisplayName(e.target.value)} onBlur={() => void saveInfoIfChanged()} aria-label="分类名称" placeholder="如「物体」" />
-            <p className="text-[10px] text-[var(--color-text-tertiary)]">
-              名称与说明失焦后自动保存。稳定标识（只读，创建后锁定）：<code>{facet.key}</code>
-            </p>
-          </div>
-
-          {/* ② 给人的说明（FB3-09：description 是给人看的背景说明，如「识别画面中可辨认的主体物件」） */}
-          <div className="flex flex-col gap-1.5">
-            <p className="text-[10px] font-medium tracking-wide text-[var(--color-text-secondary)] uppercase">给人的说明</p>
-            <input
-              className="ui-control px-2 py-1 text-sm"
-              placeholder="这类标签描述什么（给人看的说明，如「识别画面中可辨认的主体物件」）"
+    <Modal
+      open={facet != null}
+      title={facet ? `编辑分类：${facet.displayName}` : "编辑分类"}
+      onClose={onClose}
+      footer={
+        <>
+          <Button onClick={onClose}>取消</Button>
+          <Button variant="primary" disabled={saving || !displayName.trim()} onClick={() => void submit()}>
+            {saving ? "保存中…" : "保存"}
+          </Button>
+        </>
+      }
+    >
+      {facet && (
+        <div className="flex flex-col gap-3">
+          <label className="flex flex-col gap-1 text-xs">
+            分类名称
+            <input className="ui-control px-2 py-1.5 text-sm" value={displayName} onChange={(e) => setDisplayName(e.target.value)} aria-label="分类名称" />
+          </label>
+          <label className="flex flex-col gap-1 text-xs">
+            这类标签是什么
+            <textarea
+              className="ui-control min-h-20 px-2 py-1.5 text-sm"
               value={description}
               onChange={(e) => setDescription(e.target.value)}
-              onBlur={() => void saveInfoIfChanged()}
-              aria-label="给人的说明"
+              aria-label="这类标签是什么"
+              placeholder="如「人物服装的主色调」（这段话会原样给 AI 看，写得越具体标得越准）"
             />
-          </div>
-
-          {/* ③ 基本规则（即时保存）：单选/多选、数量上限、适用媒体 */}
-          <div className="flex flex-col gap-1.5">
-            <p className="text-[10px] font-medium tracking-wide text-[var(--color-text-secondary)] uppercase">基本规则</p>
-            <div className="flex items-center gap-2 text-xs text-[var(--color-text-secondary)]">
-              <label className="flex items-center gap-1"><input type="radio" checked={selectionMode === "single"} onChange={() => setSelectionMode("single")} />单选</label>
-              <label className="flex items-center gap-1"><input type="radio" checked={selectionMode === "multi"} onChange={() => setSelectionMode("multi")} />多选</label>
-              {selectionMode === "multi" && (
-                <input className="ui-control w-16 px-1 py-0.5 text-xs" type="number" min={1} value={maxItems} onChange={(e) => setMaxItems(e.target.value)} placeholder="上限" aria-label="最大数量" />
-              )}
-              <select className="ui-control rounded px-1 py-0.5 text-xs" value={appliesTo} onChange={(e) => setAppliesTo(e.target.value as typeof appliesTo)} aria-label="适用媒体">
-                {APP_TO_OPTIONS.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
-              </select>
-            </div>
-            <p className="text-[10px] text-[var(--color-text-tertiary)]">基本规则点击「保存规则」立即生效（历史标签与查询不受影响）。</p>
-            <div>
-              <Button variant="primary" disabled={saving} onClick={() => void submitStructure()}>
-                {saving ? "保存中…" : "保存规则"}
-              </Button>
-            </div>
-          </div>
-
-          {/* ④ AI 行为（FB3-09：是否参与打标/给 AI 的识别规则/工作台显示；随设置草稿保存）
-              停用分面锁定：后端 build_prompt_context 只收 active 分面，工作台也只列 active，
-              这三个开关对停用分面不生效，禁用并说明而不是让用户白点。 */}
-          <div className="flex flex-col gap-1.5">
-            <p className="text-[10px] font-medium tracking-wide text-[var(--color-text-secondary)] uppercase">AI 行为</p>
-            <label className="flex items-center gap-1.5 text-xs text-[var(--color-text-secondary)]">
-              <input type="checkbox" checked={config.enabledForAi} disabled={!active} onChange={(e) => onPatchAiConfig({ enabledForAi: e.target.checked })} />
-              参与 AI 打标与搜索（关闭后 AI 不再产出此类标签）
+            <span className="text-[10px] text-[var(--color-text-tertiary)]">这段话会原样给 AI 看，写得越具体标得越准</span>
+          </label>
+          <fieldset className="flex flex-col gap-1 text-xs">
+            <legend className="mb-0.5">归类</legend>
+            <label className="flex items-center gap-1.5"><input type="radio" checked={inputMode === "ai_and_manual"} onChange={() => setInputMode("ai_and_manual")} />AI 自动打标（也可手工填写）</label>
+            <label className="flex items-center gap-1.5"><input type="radio" checked={inputMode === "manual_only"} onChange={() => setInputMode("manual_only")} />只手工填写</label>
+          </fieldset>
+          <fieldset className="flex flex-col gap-1 text-xs">
+            <legend className="mb-0.5">可选几个</legend>
+            <label className="flex items-center gap-1.5"><input type="radio" checked={selectionMode === "single"} onChange={() => setSelectionMode("single")} />只能选 1 个</label>
+            <label className="flex items-center gap-1.5">
+              <input type="radio" checked={selectionMode === "multi"} onChange={() => setSelectionMode("multi")} />可多选，上限
+              <input className="ui-control w-16 px-1 py-0.5" type="number" min={1} disabled={selectionMode === "single"} value={maxItems} onChange={(e) => setMaxItems(e.target.value)} placeholder="不限" aria-label="多选上限" />
+              （留空 = 不限）
             </label>
-            <input
-              className="ui-control px-2 py-1 text-xs"
-              value={config.hint}
-              disabled={!active}
-              onChange={(e) => onPatchAiConfig({ hint: e.target.value })}
-              placeholder="给 AI 的识别规则（约束 AI 怎么打标，如「只写可观察到的主要物体，不写推测身份」）"
-              aria-label="给 AI 的识别规则"
-            />
-            <label className="flex items-center gap-1.5 text-xs text-[var(--color-text-secondary)]">
-              <input type="checkbox" checked={config.visibleInWorkbench} disabled={!active} onChange={(e) => onPatchAiConfig({ visibleInWorkbench: e.target.checked })} />
-              在打标工作台显示
-            </label>
-            {!active && (
-              <p className="text-[10px] text-[var(--color-text-tertiary)]">
-                分面已停用：AI 与打标工作台都不再使用它，「恢复分类」后这些开关才生效。
-              </p>
+          </fieldset>
+          <div>
+            <button type="button" onClick={() => setShowAdvanced((v) => !v)} className="text-[11px] text-[var(--color-text-secondary)] hover:text-[var(--color-text)]">
+              ▸ 高级{showAdvanced ? "（收起）" : ""}
+            </button>
+            {showAdvanced && (
+              <div className="mt-2 flex flex-col gap-2">
+                <label className="flex items-center gap-2 text-xs">
+                  适用于
+                  <select className="ui-control rounded px-1 py-0.5 text-xs" value={appliesTo} onChange={(e) => setAppliesTo(e.target.value as typeof appliesTo)} aria-label="适用于">
+                    {APP_TO_OPTIONS.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
+                  </select>
+                </label>
+                <label className="flex items-center gap-2 text-xs text-[var(--color-text-tertiary)]">
+                  英文标识（只读）：<code>{facet.key}</code>
+                </label>
+              </div>
             )}
-            <p className="text-[10px] text-[var(--color-text-tertiary)]">AI 行为随「保存设置」按钮统一落库（与本页其他设置一致）。</p>
           </div>
-
-          {/* ⑤ 分类词条（二级编辑器，标题体现上下文） */}
-          <div className="flex items-center justify-between">
-            <p className="text-[10px] font-medium tracking-wide text-[var(--color-text-secondary)] uppercase">分类词条</p>
-            <Button onClick={onOpenTerms}>管理词条</Button>
-          </div>
-
-          {/* 停用/恢复 */}
-          {active ? (
-            <button onClick={onDeactivate} className="self-start rounded px-1.5 py-1 text-xs text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-hover)] hover:text-red-500">
-              停用分类
-            </button>
-          ) : (
-            <button onClick={onRestore} className="self-start rounded px-1.5 py-1 text-xs text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-hover)] hover:text-[var(--color-text)]">
-              恢复分类
-            </button>
-          )}
         </div>
       )}
-    </li>
+    </Modal>
   );
 }
 
-function CreateForm({ onCreated, onCancel }: { onCreated: () => void; onCancel: () => void }) {
+/** W4-3 新建弹窗：2 个必填（名称 + 这类标签是什么）；key 自动生成，CJK 空串时明确提示 */
+function CreateFacetDialog({ group, onClose, onCreated }: {
+  group: "ai" | "manual" | null;
+  onClose: () => void;
+  onCreated: (msg: string) => void;
+}) {
   const [displayName, setDisplayName] = useState("");
   const [key, setKey] = useState("");
   const [keyTouched, setKeyTouched] = useState(false);
   const [description, setDescription] = useState("");
-  const [selectionMode, setSelectionMode] = useState<"single" | "multi">("multi");
-  const [maxItems, setMaxItems] = useState<string>("3");
-  const [appliesTo, setAppliesTo] = useState<"all" | "image" | "video">("all");
   const [saving, setSaving] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
-  // 自动生成 key（仅当用户未手动编辑时）；创建后锁定
+  useEffect(() => {
+    if (group != null) {
+      setDisplayName("");
+      setKey("");
+      setKeyTouched(false);
+      setDescription("");
+      setErr(null);
+    }
+  }, [group]);
+
   const effectiveKey = keyTouched ? key : slugify(displayName);
+  const keyEmpty = effectiveKey.trim() === "";
 
   const submit = async () => {
     setErr(null);
-    if (!displayName.trim()) return setErr("请填写显示名");
-    if (!effectiveKey.trim()) return setErr("请填写或生成稳定 key");
+    if (!displayName.trim()) return setErr("请填写分类名称");
+    if (!description.trim()) return setErr("请填写「这类标签是什么」（它会成为给 AI 的提示词）");
+    if (keyEmpty) return setErr("请填写英文标识（中文名无法自动生成）");
     setSaving(true);
     try {
       await createTagFacet({
         key: effectiveKey,
         displayName: displayName.trim(),
-        description,
-        selectionMode,
-        maxItems: selectionMode === "single" ? 1 : maxItems ? Number(maxItems) || null : null,
-        appliesTo,
+        description: description.trim(),
+        selectionMode: "multi",
+        maxItems: null,
+        appliesTo: "all",
       });
-      onCreated();
+      // 新建默认 ai_and_manual；「只手工填写」组的按钮需要再改一次 input_mode
+      if (group === "manual") {
+        await updateTagFacet({
+          key: effectiveKey,
+          displayName: displayName.trim(),
+          description: description.trim(),
+          inputMode: "manual_only",
+          selectionMode: "multi",
+          maxItems: null,
+          appliesTo: "all",
+        });
+      }
+      onCreated(`已创建「${displayName.trim()}」`);
     } catch (e) {
       setErr(e instanceof Error ? e.message : String(e));
     } finally {
@@ -361,28 +529,39 @@ function CreateForm({ onCreated, onCancel }: { onCreated: () => void; onCancel: 
   };
 
   return (
-    <div className="flex flex-col gap-2 rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] p-2">
-      <input className="ui-control px-2 py-1 text-sm" placeholder="显示名称（必填）" value={displayName} onChange={(e) => setDisplayName(e.target.value)} />
-      <div className="flex items-center gap-2">
-        <input className="ui-control w-1/2 px-2 py-1 text-sm" placeholder="稳定 key（自动生成，可改）" value={effectiveKey} onChange={(e) => { setKey(slugify(e.target.value)); setKeyTouched(true); }} />
-        <span className="text-[10px] text-[var(--color-text-secondary)]">创建后锁定</span>
+    <Modal
+      open={group != null}
+      title={`新增分类${group === "ai" ? "（AI 自动打标）" : group === "manual" ? "（只手工填写）" : ""}`}
+      onClose={onClose}
+      footer={
+        <>
+          <Button onClick={onClose}>取消</Button>
+          <Button variant="primary" disabled={saving} onClick={() => void submit()}>{saving ? "创建中…" : "创建"}</Button>
+        </>
+      }
+    >
+      <div className="flex flex-col gap-3">
+        <label className="flex flex-col gap-1 text-xs">
+          分类名称（必填）
+          <input className="ui-control px-2 py-1.5 text-sm" placeholder="如「人物服装颜色」" value={displayName} onChange={(e) => setDisplayName(e.target.value)} aria-label="分类名称" />
+        </label>
+        <label className="flex flex-col gap-1 text-xs">
+          这类标签是什么（必填）
+          <textarea className="ui-control min-h-20 px-2 py-1.5 text-sm" placeholder="如「人物服装的主色调」（这段话会原样给 AI 看）" value={description} onChange={(e) => setDescription(e.target.value)} aria-label="这类标签是什么" />
+        </label>
+        <label className="flex flex-col gap-1 text-xs">
+          英文标识
+          <input
+            className="ui-control px-2 py-1.5 text-sm"
+            placeholder={keyEmpty ? "请输入英文标识，如 clothing_color" : effectiveKey}
+            value={effectiveKey}
+            onChange={(e) => { setKey(slugify(e.target.value)); setKeyTouched(true); }}
+            aria-label="英文标识"
+          />
+          <span className="text-[10px] text-[var(--color-text-tertiary)]">⚠ 创建后不可修改，只能删除</span>
+        </label>
+        {err && <p className="text-xs text-[var(--color-danger)]">{err}</p>}
       </div>
-      <input className="ui-control px-2 py-1 text-sm" placeholder="描述（可选）" value={description} onChange={(e) => setDescription(e.target.value)} />
-      <div className="flex items-center gap-2 text-xs text-[var(--color-text-secondary)]">
-        <label className="flex items-center gap-1"><input type="radio" checked={selectionMode === "single"} onChange={() => setSelectionMode("single")} />单选</label>
-        <label className="flex items-center gap-1"><input type="radio" checked={selectionMode === "multi"} onChange={() => setSelectionMode("multi")} />多选</label>
-        {selectionMode === "multi" && (
-          <input className="ui-control w-16 px-1 py-0.5 text-xs" type="number" min={1} value={maxItems} onChange={(e) => setMaxItems(e.target.value)} placeholder="上限" />
-        )}
-        <select className="ui-control rounded px-1 py-0.5 text-xs" value={appliesTo} onChange={(e) => setAppliesTo(e.target.value as typeof appliesTo)}>
-          {APP_TO_OPTIONS.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
-        </select>
-      </div>
-      {err && <p className="text-xs text-[var(--color-danger)]">{err}</p>}
-      <div className="flex gap-2">
-        <Button variant="primary" disabled={saving} onClick={() => void submit()}>{saving ? "创建中…" : "创建分类"}</Button>
-        <Button onClick={onCancel}>取消</Button>
-      </div>
-    </div>
+    </Modal>
   );
 }

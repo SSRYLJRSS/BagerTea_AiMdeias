@@ -168,6 +168,8 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
   const [generatingMissing, setGeneratingMissing] = useState(false);
   const [generateProgress, setGenerateProgress] = useState<RefillProgress | null>(null);
   const [generateResult, setGenerateResult] = useState<string | null>(null);
+  /** W4-5：色条细节折叠（默认收起） */
+  const [showColorDetails, setShowColorDetails] = useState(false);
   const generateUnsub = useRef<(() => void) | null>(null);
   useEffect(() => () => generateUnsub.current?.(), []);
 
@@ -440,9 +442,7 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
                   )}
                 </div>
               </Field>
-              <Field label="分库与改名" hint="入库页可填分库名称（总库下新建子文件夹）并开启批量改名（分库名_序号）">
-                <span className="text-xs text-[var(--color-text-secondary)]">在入库页操作</span>
-              </Field>
+              {/* W4-5：删「分库与改名」说明行（那是入库页的操作说明，不是设置） */}
             </Group>
           )}
 
@@ -660,59 +660,65 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
               {generateResult && (
                 <p className="px-4 py-2 text-xs text-[var(--color-text-secondary)]">{generateResult}</p>
               )}
+              {/* W4-5：色条细节折叠（7 控件压成 1 开关 + 折叠，通用外观可见控件 ≤12） */}
               {draftAppearance.colorStrip.enabled && (
+                <div className="px-4 py-1">
+                  <button
+                    type="button"
+                    onClick={() => setShowColorDetails((v) => !v)}
+                    className="text-xs text-[var(--color-text-secondary)] hover:text-[var(--color-text)]"
+                  >
+                    ▸ 色条细节{showColorDetails ? "（收起）" : ""}
+                  </button>
+                  {showColorDetails && (
+                    <div className="mt-1 flex flex-col gap-1">
                 <Field label="素材库卡片显示" hint="在素材缩略图卡片底部显示色条">
-                  <Toggle
-                    checked={draftAppearance.colorStrip.showInLibraryGrid}
-                    onChange={(v) => patchColorStrip({ showInLibraryGrid: v })}
-                  />
-                </Field>
-              )}
-              {draftAppearance.colorStrip.enabled && (
+                    <Toggle
+                      checked={draftAppearance.colorStrip.showInLibraryGrid}
+                      onChange={(v) => patchColorStrip({ showInLibraryGrid: v })}
+                    />
+                  </Field>
                 <Field label="大图浏览显示" hint="在大图浏览的标签栏上方显示色条；全屏时隐藏">
-                  <Toggle
-                    checked={draftAppearance.colorStrip.showInViewer}
-                    onChange={(v) => patchColorStrip({ showInViewer: v })}
-                  />
-                </Field>
-              )}
-              {draftAppearance.colorStrip.enabled && (
+                    <Toggle
+                      checked={draftAppearance.colorStrip.showInViewer}
+                      onChange={(v) => patchColorStrip({ showInViewer: v })}
+                    />
+                  </Field>
                 <Field label="色条高度" hint="网格用细、大图用厚">
-                  <select
-                    value={draftAppearance.colorStrip.height}
-                    onChange={(e) => patchColorStrip({ height: e.target.value as Settings["appearance"]["colorStrip"]["height"] })}
-                    className="ui-control rounded-md px-2 py-1.5 text-sm outline-none"
-                  >
-                    <option value="thin">细 6px</option>
-                    <option value="normal">标准 10px</option>
-                    <option value="thick">厚 16px</option>
-                  </select>
-                </Field>
-              )}
-              {draftAppearance.colorStrip.enabled && (
+                    <select
+                      value={draftAppearance.colorStrip.height}
+                      onChange={(e) => patchColorStrip({ height: e.target.value as Settings["appearance"]["colorStrip"]["height"] })}
+                      className="ui-control rounded-md px-2 py-1.5 text-sm outline-none"
+                    >
+                      <option value="thin">细 6px</option>
+                      <option value="normal">标准 10px</option>
+                      <option value="thick">厚 16px</option>
+                    </select>
+                  </Field>
                 <Field label="分段方式" hint="按占比更能体现调性；等宽接近调色参考站的观感">
-                  <select
-                    value={draftAppearance.colorStrip.mode}
-                    onChange={(e) => patchColorStrip({ mode: e.target.value as Settings["appearance"]["colorStrip"]["mode"] })}
-                    className="ui-control rounded-md px-2 py-1.5 text-sm outline-none"
-                  >
-                    <option value="ratio">按占比</option>
-                    <option value="equal">等宽</option>
-                  </select>
-                </Field>
-              )}
-              {draftAppearance.colorStrip.enabled && (
+                    <select
+                      value={draftAppearance.colorStrip.mode}
+                      onChange={(e) => patchColorStrip({ mode: e.target.value as Settings["appearance"]["colorStrip"]["mode"] })}
+                      className="ui-control rounded-md px-2 py-1.5 text-sm outline-none"
+                    >
+                      <option value="ratio">按占比</option>
+                      <option value="equal">等宽</option>
+                    </select>
+                  </Field>
                 <Field label="显示条数" hint="色条最多显示前 N 个主色">
-                  <select
-                    value={String(draftAppearance.colorStrip.count)}
-                    onChange={(e) => patchColorStrip({ count: Number(e.target.value) as Settings["appearance"]["colorStrip"]["count"] })}
-                    className="ui-control rounded-md px-2 py-1.5 text-sm outline-none"
-                  >
-                    <option value="4">4</option>
-                    <option value="6">6</option>
-                    <option value="8">8</option>
-                  </select>
-                </Field>
+                    <select
+                      value={String(draftAppearance.colorStrip.count)}
+                      onChange={(e) => patchColorStrip({ count: Number(e.target.value) as Settings["appearance"]["colorStrip"]["count"] })}
+                      className="ui-control rounded-md px-2 py-1.5 text-sm outline-none"
+                    >
+                      <option value="4">4</option>
+                      <option value="6">6</option>
+                      <option value="8">8</option>
+                    </select>
+                  </Field>
+                    </div>
+                  )}
+                </div>
               )}
             </Group>
             </>

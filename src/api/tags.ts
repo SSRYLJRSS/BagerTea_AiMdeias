@@ -30,6 +30,40 @@ export function createTagFacet(input: {
   });
 }
 
+/** W2-2/W4：合并编辑命令（6 字段一个事务；替代 display/rules 两个旧命令） */
+export function updateTagFacet(input: {
+  key: string;
+  displayName: string;
+  description: string;
+  inputMode: "ai_and_manual" | "manual_only";
+  selectionMode: "single" | "multi";
+  maxItems?: number | null;
+  appliesTo: "all" | "image" | "video";
+}): Promise<void> {
+  return invoke<void>("update_tag_facet", {
+    key: input.key,
+    displayName: input.displayName,
+    description: input.description,
+    inputMode: input.inputMode,
+    selectionMode: input.selectionMode,
+    maxItems: input.maxItems ?? null,
+    appliesTo: input.appliesTo,
+  });
+}
+
+/** W2-3/W4：删除报告（与确认弹窗的数字对账） */
+export interface FacetDeleteReport {
+  tagsDeleted: number;
+  unlinked: number;
+  opsDeleted: number;
+  itemsDeleted: number;
+}
+
+/** W2-3/W4：物理删除分面 + 全级联（系统分面拒绝） */
+export function deleteTagFacet(key: string): Promise<FacetDeleteReport> {
+  return invoke<FacetDeleteReport>("delete_tag_facet", { key });
+}
+
 export function updateTagFacetDisplay(key: string, displayName: string, description?: string): Promise<void> {
   return invoke<void>("update_tag_facet_display", { key, displayName, description: description ?? "" });
 }
