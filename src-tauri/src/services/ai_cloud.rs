@@ -1215,7 +1215,7 @@ fn analyze_video_frames(
     }
     let mut results: Vec<MediaAnalysis> = Vec::new();
     for f in &frames {
-        if let Ok(a) = request_analysis(client, cfg, facets, &[], &[], f) {
+        if let Ok(a) = request_analysis(client, cfg, facets, top_tags, manual_keys, f) {
             results.push(a);
         }
     }

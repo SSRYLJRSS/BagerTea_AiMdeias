@@ -58,13 +58,15 @@ pub async fn import_files(
         return Err(AppError::msg("未选择任何文件"));
     }
     state.import_cancel.store(false, Ordering::Relaxed);
+    // W5c：入库进行中标志（restore_db 阻断依据）
+    state.import_running.store(true, Ordering::Relaxed);
     let db = std::sync::Arc::clone(&state.db);
     let data_dir = state.data_dir.clone();
     let cancel = std::sync::Arc::clone(&state.import_cancel);
     // 后置色板任务也需要 emit：AppHandle 是 Clone，先克隆一份供第二个 spawn_blocking 使用
     let post_app = app.clone();
 
-    let result = tauri::async_runtime::spawn_blocking(move || {
+    let result = match tauri::async_runtime::spawn_blocking(move || {
         let thumbs = ThumbnailService::new(&data_dir)?;
         let library_root = {
             let conn = db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
@@ -84,7 +86,15 @@ pub async fn import_files(
         })
     })
     .await
-    .map_err(|e| AppError::msg(format!("入库线程异常: {e}")))??;
+    {
+        Ok(r) => r,
+        Err(e) => {
+            state.import_running.store(false, Ordering::Relaxed);
+            return Err(AppError::msg(format!("入库线程异常: {e}")));
+        }
+    };
+    state.import_running.store(false, Ordering::Relaxed);
+    let result = result?;
 
     // FB2-08（§14.7）：入库完成后自动补算色板。
     // 不塞进 importer 热路径：placeholder 生成是 par_iter 并行块，图像不驻留内存，

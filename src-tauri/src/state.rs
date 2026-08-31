@@ -17,6 +17,8 @@ pub struct AppState {
     pub data_dir: PathBuf,
     /// 入库取消标志
     pub import_cancel: Arc<AtomicBool>,
+    /// W5c：入库进行中标志（restore_db 用它阻断恢复；取消标志语义不同，不能复用）
+    pub import_running: Arc<AtomicBool>,
     /// 导出任务取消标志注册表（task_id → flag）
     pub export_cancel: Arc<Mutex<HashMap<i64, Arc<AtomicBool>>>>,
     /// AI 批次取消标志注册表（batch_id → flag）
@@ -38,6 +40,7 @@ impl AppState {
             db: Arc::new(Mutex::new(conn)),
             data_dir,
             import_cancel: Arc::new(AtomicBool::new(false)),
+            import_running: Arc::new(AtomicBool::new(false)),
             export_cancel: Arc::new(Mutex::new(HashMap::new())),
             ai_cancel: Arc::new(Mutex::new(HashMap::new())),
             media_refill_cancel: Arc::new(AtomicBool::new(false)),

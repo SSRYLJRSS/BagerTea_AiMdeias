@@ -69,3 +69,116 @@ pub async fn reset_app_data(
     .await
     .map_err(|e| AppError::msg(format!("重置线程异常: {e}")))?
 }
+
+/// W5c：备份数据库（指导书 §W5c）。短锁内 `VACUUM INTO` 生成单文件快照。
+#[tauri::command]
+pub async fn backup_db(state: State<'_, AppState>, target: String) -> AppResult<()> {
+    let db = std::sync::Arc::clone(&state.db);
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
+        crate::db::backup::backup_to(&conn, std::path::Path::new(&target))
+    })
+    .await
+    .map_err(|e| AppError::msg(format!("备份线程异常: {e}")))?
+}
+
+/// W5c：恢复数据库（指导书 §W5c）。
+/// 校验（quick_check + user_version 只拒高版本 + 关键表）→ 运行中任务阻断
+/// → 现库 `.old` 保底 → 覆盖 → 迁移升级 → 热替换连接 → `app.restart()`（不返回）。
+#[tauri::command]
+pub async fn restore_db(app: tauri::AppHandle, state: State<'_, AppState>, source: String) -> AppResult<()> {
+    let source = std::path::PathBuf::from(&source);
+    // ① 校验备份（锁外；失败直接给用户可读原因）
+    crate::db::backup::validate_backup(&source)?;
+    // ② 运行中任务阻断（含冷启动自愈后仍可靠的 ai_batches 检查：启动时 processing 已被标记 interrupted）
+    {
+        let conn = state.db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
+        guard_no_running_tasks(&state, &conn)?;
+    }
+    // ③ 换文件 + 换连接（持锁；复制与迁移是文件 IO 重活，spawn_blocking）
+    let db = std::sync::Arc::clone(&state.db);
+    let data_dir = state.data_dir.clone();
+    tauri::async_runtime::spawn_blocking(move || -> AppResult<()> {
+        let db_path = data_dir.join("library.db");
+        let old_path = data_dir.join("library.db.old");
+        let mut guard = db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
+        // 旧连接收尾：checkpoint 截断 WAL → 换入内存占位连接 → 关闭旧连接释放文件句柄
+        //（Windows 上文件被占用时 rename/copy 会失败，必须先关）
+        let old = std::mem::replace(
+            &mut *guard,
+            rusqlite::Connection::open_in_memory()
+                .map_err(|e| AppError::msg(format!("占位连接创建失败: {e}")))?,
+        );
+        let _ = old.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+        let _ = old.close();
+        // ④ .old 保底：覆盖失败/新库打不开时能回滚回现库
+        if old_path.exists() {
+            let _ = std::fs::remove_file(&old_path);
+        }
+        std::fs::rename(&db_path, &old_path)
+            .map_err(|e| AppError::msg(format!("现库改名保底失败: {e}")))?;
+        if let Err(e) = std::fs::copy(&source, &db_path) {
+            let _ = std::fs::rename(&old_path, &db_path);
+            return Err(AppError::msg(format!("覆盖库文件失败: {e}")));
+        }
+        // ⑤ 打开新库（老版本备份在此自动迁移升级）
+        match crate::db::init(&db_path) {
+            Ok(new_conn) => {
+                *guard = new_conn;
+            }
+            Err(e) => {
+                // 回滚：新库打不开 → 还原 .old（保证应用重启后仍是原库）
+                let _ = std::fs::remove_file(&db_path);
+                let _ = std::fs::rename(&old_path, &db_path);
+                if let Ok(recovered) = crate::db::init(&db_path) {
+                    *guard = recovered;
+                }
+                return Err(AppError::msg(format!(
+                    "恢复后的库无法打开（已还原原库）：{e}"
+                )));
+            }
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| AppError::msg(format!("恢复线程异常: {e}")))??;
+    // ⑥ 冷启动衔接：恢复成功即重启进程加载新库（restart 不返回）
+    app.restart()
+}
+
+/// 恢复前运行中任务守卫：入库 / 回填类 / 导出 / AI 批次任一进行中即拒绝
+fn guard_no_running_tasks(state: &AppState, conn: &rusqlite::Connection) -> AppResult<()> {
+    if state.import_running.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err(AppError::msg("文件入库进行中，请等它结束或取消后再恢复备份"));
+    }
+    if state.refill_running.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err(AppError::msg("回填/色板任务进行中，请等它结束或取消后再恢复备份"));
+    }
+    if !state
+        .export_cancel
+        .lock()
+        .map_err(|_| AppError::msg("锁中毒"))?
+        .is_empty()
+    {
+        return Err(AppError::msg("导出任务进行中，请等它结束或取消后再恢复备份"));
+    }
+    if !state
+        .ai_cancel
+        .lock()
+        .map_err(|_| AppError::msg("锁中毒"))?
+        .is_empty()
+    {
+        return Err(AppError::msg("AI 打标批次进行中，请等它结束或取消后再恢复备份"));
+    }
+    let n: i64 = conn.query_row(
+        "SELECT count(*) FROM ai_batches WHERE status IN ('pending', 'processing')",
+        [],
+        |r| r.get(0),
+    )?;
+    if n > 0 {
+        return Err(AppError::msg(
+            "有待处理的 AI 打标批次，请先取消批次后再恢复备份",
+        ));
+    }
+    Ok(())
+}

@@ -369,6 +369,9 @@ pub fn run() {
             // W0-9：设置页「关于」打开日志目录（tracing-appender 滚动文件）
             commands::open_logs_dir,
             commands::reset_app_data,
+            // W5c：数据库备份/恢复
+            commands::backup_db,
+            commands::restore_db,
             // AI 连接档案 + 用途绑定（指导书 §6.3/§4.4）
             commands::list_ai_connections,
             commands::save_ai_connection,

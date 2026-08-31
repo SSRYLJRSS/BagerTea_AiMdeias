@@ -5,6 +5,7 @@ import clsx from "clsx";
 import { useShallow } from "zustand/react/shallow";
 import { flattenVisible, useTagStore } from "@/stores/tagStore";
 import { useLibraryStore } from "@/stores/libraryStore";
+import { useAiStore } from "@/stores/aiStore";
 import type { TagNode } from "@/types/tag";
 
 interface TagTreeProps {
@@ -24,6 +25,23 @@ export default function TagTree({ onManage }: TagTreeProps) {
     })),
   );
   const { filter, setFilter } = useLibraryStore(useShallow((s) => ({ filter: s.filter, setFilter: s.setFilter })));
+  const { total, fetchAllIds } = useLibraryStore(useShallow((s) => ({ total: s.total, fetchAllIds: s.fetchAllIds })));
+
+  // W5g（指导书 §W5g）：一键送打标——把当前「未打标」筛选结果全部送进 AI 打标页。
+  // 全部是既有能力组合：fetchAllIds（当前筛选全量 id）→ aiStore.setPendingAssets → app:navigate。
+  const [sending, setSending] = useState(false);
+  const onSendUntagged = async () => {
+    if (sending) return;
+    setSending(true);
+    try {
+      const ids = await fetchAllIds();
+      if (ids.length === 0) return;
+      useAiStore.getState().setPendingAssets(ids, "auto");
+      window.dispatchEvent(new CustomEvent("app:navigate", { detail: "ai" }));
+    } finally {
+      setSending(false);
+    }
+  };
 
   useEffect(() => {
     if (tree.length === 0) void refresh();
@@ -91,12 +109,26 @@ export default function TagTree({ onManage }: TagTreeProps) {
           </button>
         )}
       </div>
-      {/* 「未打标」归标签区（v2.7 修订）；点标签行筛选，再点已激活标签取消 */}
-      <TreeRow
-        label="未打标"
-        active={filter.untaggedOnly}
-        onClick={() => setFilter({ tagId: null, facetFilters: [], excludeTagIds: [], untaggedOnly: true, trashOnly: false })}
-      />
+      {/* 「未打标」归标签区（v2.7 修订）；点标签行筛选，再点已激活标签取消。
+          W5g：激活未打标筛选时行尾出现「送去打标」按钮，一键把结果送进 AI 打标页 */}
+      <div className="flex items-center gap-1 pr-2">
+        <TreeRow
+          label="未打标"
+          active={filter.untaggedOnly}
+          onClick={() => setFilter({ tagId: null, facetFilters: [], excludeTagIds: [], untaggedOnly: true, trashOnly: false })}
+        />
+        {filter.untaggedOnly && (
+          <button
+            type="button"
+            disabled={sending || total === 0}
+            onClick={() => void onSendUntagged()}
+            title="把当前未打标的素材全部送进 AI 打标页"
+            className="shrink-0 rounded-md px-1.5 py-1 text-[10px] font-medium text-[var(--color-accent)] transition-colors hover:bg-[var(--color-surface)] disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {sending ? "整理中…" : `送去打标（${total} 张）`}
+          </button>
+        )}
+      </div>
 
       {groups.map(({ facet, rows }) => (
         <div key={facet?.key ?? "legacy"}>

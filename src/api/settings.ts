@@ -58,3 +58,16 @@ export interface ResetDataReport {
 export function resetAppData(selection: ResetDataSelection): Promise<ResetDataReport> {
   return invoke<ResetDataReport>("reset_app_data", { selection });
 }
+
+/** W5c：备份数据库到指定路径（VACUUM INTO 单文件快照） */
+export function backupDb(target: string): Promise<void> {
+  return invoke<void>("backup_db", { target });
+}
+
+/**
+ * W5c：从备份恢复数据库。成功时应用会自动重启（本 Promise 不会 resolve）；
+ * 失败时抛出带原因的错误（原库已还原）。
+ */
+export function restoreDb(source: string): Promise<void> {
+  return invoke<void>("restore_db", { source });
+}

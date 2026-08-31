@@ -6,11 +6,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import clsx from "clsx";
 import { useShallow } from "zustand/react/shallow";
-import { open as pickDir } from "@tauri-apps/plugin-dialog";
+import { open as pickDir, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { on } from "@/api/client";
 import Button from "@/components/common/Button";
 import { ollamaInstallStatus, ollamaRemoveInstaller } from "@/api/ollama";
-import { clearThumbnailCache, getDataDir, openDataDir, openLogsDir, resetAppData, type ResetDataSelection } from "@/api/settings";
+import { backupDb, clearThumbnailCache, getDataDir, openDataDir, openLogsDir, resetAppData, restoreDb, type ResetDataSelection } from "@/api/settings";
 import {
   rescanAssetMetadata,
   rescanAssetPalette,
@@ -869,6 +869,13 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
                   {clearingProxies ? "清理中…" : "清理全部"}
                 </Button>
               </Field>
+              {/* W5c：数据库备份/恢复（指导书 §W5c）——你的库唯一的副本入口 */}
+              <Field
+                label="数据库备份与恢复"
+                hint="备份把整个素材库导出成一个 .db 文件（含素材记录、标签、AI 配置），建议存到移动硬盘或网盘；恢复会用备份文件整体替换当前库，恢复后软件自动重启"
+              >
+                <BackupRestorePanel notify={setNotice} fail={setError} />
+              </Field>
               <ResetDataPanel
                 notify={setNotice}
                 fail={setError}
@@ -1149,6 +1156,117 @@ function Toggle({
         className={`block h-4 w-4 translate-x-0.5 rounded-full bg-white transition-transform ${checked ? "translate-x-[18px]" : ""}`}
       />
     </button>
+  );
+}
+
+/** W5c 备份/恢复面板（数据与缓存）：备份 = save 对话框 → backupDb；
+ *  恢复 = open 对话框 → 两步强警告确认 → restoreDb（成功后应用自动重启，Promise 不返回）。
+ *  运行中任务阻断在 后端命令层（入库/回填/导出/AI 批次）。 */
+function BackupRestorePanel({ notify, fail }: { notify: (m: string) => void; fail: (m: string) => void }) {
+  const [backing, setBacking] = useState(false);
+  const [confirmStep, setConfirmStep] = useState<0 | 1 | 2>(0);
+  const [picked, setPicked] = useState<string | null>(null);
+  const [restoring, setRestoring] = useState(false);
+
+  const onBackup = async () => {
+    const target = await saveDialog({
+      title: "备份数据库",
+      defaultPath: `library-backup-${new Date().toISOString().slice(0, 10)}.db`,
+      filters: [{ name: "SQLite 数据库", extensions: ["db"] }],
+    });
+    if (!target) return;
+    setBacking(true);
+    try {
+      await backupDb(target);
+      notify("备份完成");
+    } catch (e) {
+      fail(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBacking(false);
+    }
+  };
+
+  const onPick = async () => {
+    const source = await pickDir({
+      title: "选择备份文件",
+      multiple: false,
+      directory: false,
+      filters: [{ name: "SQLite 数据库", extensions: ["db"] }],
+    });
+    if (!source || Array.isArray(source)) return;
+    setPicked(source);
+    setConfirmStep(1);
+  };
+
+  const onRestore = async () => {
+    if (!picked) return;
+    setRestoring(true);
+    try {
+      await restoreDb(picked); // 成功 → 后端 app.restart()，本 Promise 永不 resolve
+      notify("恢复完成");
+    } catch (e) {
+      fail(e instanceof Error ? e.message : String(e));
+    } finally {
+      setRestoring(false);
+      setConfirmStep(0);
+      setPicked(null);
+    }
+  };
+
+  return (
+    <div className="flex flex-col gap-2">
+      <div className="flex items-center gap-2">
+        <Button disabled={backing || restoring} onClick={() => void onBackup()}>
+          {backing ? "备份中…" : "备份数据库…"}
+        </Button>
+        <Button variant="danger" disabled={backing || restoring} onClick={() => void onPick()}>
+          从备份恢复…
+        </Button>
+      </div>
+      {confirmStep === 1 && picked && (
+        <div className="rounded-md border border-[var(--color-danger)] px-3 py-2 text-xs leading-5">
+          <p className="font-medium text-[var(--color-danger)]">
+            即将用备份文件覆盖当前素材库：{picked.split(/[\\/]/).pop()}
+          </p>
+          <p className="mt-1 text-[var(--color-text-secondary)]">
+            当前库里「备份之后」新做的入库、打标、收藏评级等改动会全部丢失。有运行中的入库/导出/打标任务时恢复会被拒绝。建议先点「备份数据库」存一份当前状态。
+          </p>
+          <div className="mt-2 flex items-center gap-2">
+            <Button variant="danger" onClick={() => setConfirmStep(2)}>
+              我已了解，继续
+            </Button>
+            <Button
+              onClick={() => {
+                setConfirmStep(0);
+                setPicked(null);
+              }}
+            >
+              取消
+            </Button>
+          </div>
+        </div>
+      )}
+      {confirmStep === 2 && picked && (
+        <div className="rounded-md border border-[var(--color-danger)] px-3 py-2 text-xs leading-5">
+          <p className="font-medium text-[var(--color-danger)]">最后确认：恢复后软件会立即自动重启</p>
+          <p className="mt-1 text-[var(--color-text-secondary)]">此操作不可撤销（当前库会先存为 library.db.old 保底，但请勿依赖）。</p>
+          <div className="mt-2 flex items-center gap-2">
+            <Button variant="danger" disabled={restoring} onClick={() => void onRestore()}>
+              {restoring ? "恢复中…" : "开始恢复并重启"}
+            </Button>
+            <Button
+              disabled={restoring}
+              onClick={() => {
+                setConfirmStep(0);
+                setPicked(null);
+              }}
+            >
+              取消
+            </Button>
+          </div>
+        </div>
+      )}
+    </div>
   );
 }
 

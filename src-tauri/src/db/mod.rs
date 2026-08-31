@@ -4,6 +4,7 @@ pub mod ai;
 pub mod ai_connections;
 pub mod asset_tags;
 pub mod assets;
+pub mod backup;
 pub mod dedup;
 pub mod export;
 pub mod migrations;
