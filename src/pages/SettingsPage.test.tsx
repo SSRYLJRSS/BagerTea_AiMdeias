@@ -7,6 +7,7 @@
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { render, screen, waitFor, fireEvent } from "@testing-library/react";
+import { StrictMode as ReactStrictMode } from "react";
 import SettingsPage from "@/pages/SettingsPage";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { getSettings, resetAppData } from "@/api/settings";
@@ -77,6 +78,7 @@ vi.mock("@/api/tags", async (importOriginal) => ({
 vi.mock("@/api/assets", () => ({
   rescanAssetMetadata: assetMocks.rescanAssetMetadata,
   rescanAssetPalette: assetMocks.rescanAssetPalette,
+  rescanAssetPhash: vi.fn().mockResolvedValue({ total: 0, success: 0, failed: 0, skipped: 0 }),
   cancelMediaRefill: assetMocks.cancelMediaRefill,
   getPaletteStatus: assetMocks.getPaletteStatus,
 }));
@@ -558,5 +560,34 @@ describe.skip("标签与分类 · 无配置条目分面的 AI 行为（回归：
 
     fireEvent.change(await screen.findByLabelText("给 AI 的识别规则"), { target: { value: "只写稳定用途" } });
     expect(screen.getByRole("button", { name: "保存设置" })).toBeEnabled();
+  });
+});
+
+// ── W7 真机复现：切换到「数据与缓存」路由不抛 hooks 错误 ──
+describe("数据与缓存路由（W5c 备份恢复 + W5d phash 行）", () => {
+  it("点击「数据与缓存」渲染备份/恢复与感知哈希回填，不抛 more-hooks 错误", async () => {
+    useSettingsStore.setState({ settings: mkSettings(), loaded: true, loading: false, saving: false });
+    render(<SettingsPage />);
+    fireEvent.click(screen.getByText("数据与缓存"));
+    await waitFor(() => {
+      expect(screen.getByText("数据库备份与恢复")).toBeTruthy();
+    });
+    expect(screen.getByText("感知哈希回填")).toBeTruthy();
+  });
+});
+
+// ── StrictMode + 全 route 序列切换（模拟真机双渲染）──
+describe("StrictMode 全路由遍历", () => {
+  it("按序切换全部 6 个分组不抛 hooks 错误", async () => {
+    useSettingsStore.setState({ settings: mkSettings(), loaded: true, loading: false, saving: false });
+    const { unmount } = render(
+      <ReactStrictMode><SettingsPage /></ReactStrictMode>,
+    );
+    const routes = ["AI 设置", "标签与分类", "通用外观", "数据与缓存", "关于", "入库与总库"];
+    for (const r of routes) {
+      fireEvent.click(screen.getByText(r));
+      await waitFor(() => expect(screen.queryByText("加载设置中…")).toBeNull());
+    }
+    unmount();
   });
 });

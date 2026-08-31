@@ -33,6 +33,9 @@ pub struct TagFacet {
     pub applies_to: String,
     pub created_at: i64,
     pub updated_at: i64,
+    /// V20 合表后：ai_and_manual = 参与 AI 打标；manual_only = 只手工填写。
+    /// 前端 FacetManagePanel / Workbench 按它分 AI / 手工两组（W4/W3-2）。
+    pub input_mode: String,
 }
 
 /// 停用/治理前的引用与影响范围（指导书 §12.3）。
@@ -75,11 +78,12 @@ fn facet_from_row(r: &rusqlite::Row) -> rusqlite::Result<TagFacet> {
         applies_to: r.get(8)?,
         created_at: r.get(9)?,
         updated_at: r.get(10)?,
+        input_mode: r.get(11)?,
     })
 }
 
 const FACET_COLS: &str =
-    "key, display_name, description, selection_mode, max_items, sort_order, is_system, status, applies_to, created_at, updated_at";
+    "key, display_name, description, selection_mode, max_items, sort_order, is_system, status, applies_to, created_at, updated_at, input_mode";
 
 /// 系统分面种子清单（migrate_v8 与 reset 后重建共用；key 顺序即 sort_order）。
 /// color 已于 V16 停用（算法主色替代），补种时单独置 inactive。
@@ -637,6 +641,27 @@ mod tests {
         assert_eq!(updated2.selection_mode, "single");
         assert_eq!(updated2.max_items, Some(1));
         assert_eq!(updated2.applies_to, "video");
+    }
+    /// 回归（真机：设置页标签与分类 AI/手工两组全空白）：
+    /// list_all 返回的 TagFacet 必须含 input_mode（FACET_COLS 漏列 → 前端 inputMode 恒 undefined → 两组全空）。
+    #[test]
+    fn list_all_includes_input_mode_for_ui_grouping() {
+        let c = conn();
+        // 自建一个分面并改成 manual_only（create 默认 ai_and_manual）
+        create(&c, "w7_manual", "手工专属", "仅手工填写", "multi", None, "all").unwrap();
+        update_facet(&c, "w7_manual", "手工专属", "仅手工填写", "manual_only", "multi", None, "all").unwrap();
+        let facets = list_all(&c).unwrap();
+        let manual = facets.iter().find(|f| f.key == "w7_manual").expect("自建分面应列出");
+        assert_eq!(manual.input_mode, "manual_only");
+        let scene = facets.iter().find(|f| f.key == "scene").expect("系统分面应列出");
+        assert_eq!(scene.input_mode, "ai_and_manual");
+        // 序列化给前端必须 camelCase inputMode（FacetManagePanel/Workbench 分组依据）
+        let json = serde_json::to_value(&facets).unwrap();
+        let first = json.as_array().unwrap()[0].as_object().unwrap();
+        assert!(
+            first.contains_key("inputMode"),
+            "序列化 JSON 必须含 inputMode（camelCase）"
+        );
     }
 }
 
