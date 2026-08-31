@@ -254,6 +254,48 @@ pub fn get_palette_status(state: State<AppState>) -> AppResult<assets::PaletteSt
     assets::get_palette_status(&conn)
 }
 
+/// W5d（§W5d）：感知哈希存量回填（scope = all | missing | ids；照抄色板回算骨架）。
+/// 入库新图时 phash 已在占位图生成路径搭车写入；此处只处理存量/升级前导入的图片。
+/// 手动触发入口在设置页「数据与缓存 → 媒体元数据回填」旁的感知哈希回填行。
+#[tauri::command]
+pub async fn rescan_asset_phash(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    ids: Option<Vec<i64>>,
+    scope: Option<String>,
+) -> AppResult<RescanResult> {
+    let scope = scope.unwrap_or_else(|| "missing".to_string());
+    if scope != "all" && scope != "missing" && scope != "ids" {
+        return Err(AppError::msg("scope 只允许 all | missing | ids"));
+    }
+    if scope == "ids" && ids.as_ref().map_or(true, |v| v.is_empty()) {
+        return Err(AppError::msg("未选择任何素材"));
+    }
+    let db = Arc::clone(&state.db);
+    let cancel = Arc::clone(&state.media_refill_cancel);
+    // 与其他回填互斥：先抢闸再重置取消标志（FX-12）。
+    let _gate = begin_refill(&state.refill_running, &cancel)?;
+
+    tauri::async_runtime::spawn_blocking(move || -> AppResult<RescanResult> {
+        let _gate = _gate;
+        let resolved: Vec<i64> = {
+            let conn = db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
+            assets::list_ids_needing_phash(&conn, &scope, ids.as_deref().unwrap_or_default())?
+        };
+        let summary = media_refill::rescan_assets_phash(&db, &resolved, &cancel, |p| {
+            let _ = app.emit("media_refill://progress", p);
+        })?;
+        Ok(RescanResult {
+            total: summary.total,
+            success: summary.success,
+            failed: summary.failed,
+            skipped: summary.skipped,
+        })
+    })
+    .await
+    .map_err(|e| AppError::msg(format!("感知哈希回填线程异常: {e}")))?
+}
+
 /// FB4-03（§5.5）：按 id 定向读取色板补丁（前端分批，单次 ≤1000；只返回存在的 id）。
 #[tauri::command]
 pub fn get_asset_palette_patches(

@@ -259,6 +259,7 @@ pub fn run() {
             commands::set_rating,
             commands::set_user_rotation,
             commands::dedup_scan,
+            commands::dedup_scan_similar,
             commands::get_asset_urls,
             commands::reveal_in_folder,
             // 媒体元数据回填（指导书 §7.5）
@@ -270,6 +271,8 @@ pub fn run() {
             commands::rescan_asset_geo_taken,
             // W1-4：图片宽高存量回填（RAW 分辨率修复）
             commands::rescan_image_dimensions,
+            // W5d：感知哈希存量回填
+            commands::rescan_asset_phash,
             // FB4-03：色板状态查询 + 定向补丁（设置页状态行 / 局部同步）
             commands::get_palette_status,
             commands::get_asset_palette_patches,

@@ -113,11 +113,6 @@ pub fn build_user_prompt(facets: &[FacetPromptContext], top_tags: &[(String, Str
     user
 }
 
-/// 兼容旧调用（单段 = system + user）
-fn build_prompt(facets: &[FacetPromptContext]) -> String {
-    format!("{}\n{}", build_system_prompt(), build_user_prompt(facets, &[]))
-}
-
 /// W5a（a7）：动态 max_tokens —— 固定 500 在分面多时会把 JSON 截断 → 解析失败 → 整条 rejected。
 fn dynamic_max_tokens(facet_count: usize) -> i64 {
     (300 + 120 * facet_count as i64).clamp(500, 1600)

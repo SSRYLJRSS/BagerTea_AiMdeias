@@ -56,6 +56,25 @@ pub fn dedup_scan(app: tauri::AppHandle, state: State<AppState>) -> AppResult<Ve
     Ok(groups)
 }
 
+/// W5d（§W5d）：感知相似扫描（dHash 汉明 ≤ threshold；exclude_kinship 排除同源 RAW+JPG）。
+/// threshold = 0 → 空（前端用 0 挡「相似图未启用/无 phash」）。全内存分桶，毫秒级，无需异步进度。
+#[tauri::command]
+pub fn dedup_scan_similar(
+    app: tauri::AppHandle,
+    state: State<AppState>,
+    threshold: u32,
+    exclude_kinship: bool,
+) -> AppResult<Vec<DupGroup>> {
+    let conn = lock_db(&state)?;
+    let groups = dedup::scan_similar_groups(&conn, threshold, exclude_kinship, &[])?;
+    for g in &groups {
+        for a in &g.assets {
+            allow_asset(&app, &a.file_path);
+        }
+    }
+    Ok(groups)
+}
+
 /// 取当前筛选结果的全部 id（BUG-E：全选/反选/批量操作用）。
 /// 只 SELECT id，不返回完整 Asset、不调 allow_asset——避免拉全量对象浪费 IPC/内存，
 /// 且不暴露原文件路径、消除 asset 协议 scope 随全选无界增长。

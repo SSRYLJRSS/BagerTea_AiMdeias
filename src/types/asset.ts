@@ -217,8 +217,13 @@ export interface ImportResult {
 }
 
 /** 重复素材分组（M3-02）：assets 按 created_at 升序，首项最早（保留候选） */
+/** 重复/相似分组类型：exact = 字节级相同（sha256）；similar = 感知相似（dHash） */
+export type DupGroupKind = "exact" | "similar";
+
 export interface DupGroup {
   hash: string;
+  /** W5d：精确重复 or 感知相似（前端据此切换文案） */
+  kind: DupGroupKind;
   assets: Asset[];
 }
 

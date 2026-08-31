@@ -874,4 +874,170 @@ mod tests {
         assert_eq!(p.longitude, Some(120.167));
         assert_eq!(p.taken_at, Some(1_710_484_200_000));
     }
+    /// W5d：phash 回填 —— 可解码图片写入 dHash，视频/坏文件失败或跳过。
+    #[test]
+    fn phash_rescan_writes_for_decodable_images() {
+        use image::{Rgb, RgbImage};
+        let dir = std::env::temp_dir().join(format!("bg_phash_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // 左黑右白的渐变图（dHash 应产出非 0 值）
+        let png = dir.join("grad.png");
+        let mut im = RgbImage::new(64, 32);
+        for (x, _y, p) in im.enumerate_pixels_mut() {
+            // 左白右黑：差分边界处 255>0 → dHash 置位（全黑/全白/左黑右白差分恒 false → hash 0 会被哨兵跳过）
+            *p = Rgb([255, 255, 255]);
+        }
+        for (x, _y, p) in im.enumerate_pixels_mut() {
+            if x >= 32 {
+                *p = Rgb([0, 0, 0]);
+            }
+        }
+        im.save(&png).unwrap();
+
+        let db = db();
+        let c = db.lock().unwrap();
+        let img_id = insert_asset(&c, png.to_str().unwrap(), "image/png", None);
+        let vid_id = insert_asset(&c, "/nope.mp4", "video/mp4", None);
+        // 存在但无法解码的坏文件 → failed（不存在=跳过，测不了 failed 分支）
+        let bad = dir.join("broken.jpg");
+        std::fs::write(&bad, b"this is not a jpeg").unwrap();
+        let bad_id = insert_asset(&c, bad.to_str().unwrap(), "image/jpeg", None);
+        drop(c);
+        let cancel = AtomicBool::new(false);
+        let summary = rescan_assets_phash(&db, &[img_id, vid_id, bad_id], &cancel, |_| {}).unwrap();
+        assert_eq!(summary.total, 3);
+        assert_eq!(summary.success, 1, "只有可解码图片写入 phash");
+        assert_eq!(summary.failed, 1, "坏图片解码失败");
+        assert_eq!(summary.skipped, 1, "视频跳过");
+        assert_eq!(summary.updated_ids, vec![img_id]);
+
+        let c = db.lock().unwrap();
+        let a = assets::get(&c, img_id).unwrap();
+        assert!(a.phash.is_some_and(|p| p > 0), "渐变图应有非 0 phash");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+
+
+/// W5d（§W5d）：感知哈希存量回填（骨架照抄 palette 回算：读行短锁、解码锁外、进度 + 取消）。
+/// 差异点（计划书明确要求）：写库走批量事务，**每 500 条提交一次** —— 解码在锁外，
+/// 只在批量落库瞬间短锁，绝不把解码时长压进 DB 锁。
+pub fn rescan_assets_phash(
+    db: &Arc<Mutex<Connection>>,
+    asset_ids: &[i64],
+    cancel: &AtomicBool,
+    mut on_progress: impl FnMut(&RefillProgress),
+) -> AppResult<RefillSummary> {
+    const BATCH: usize = 500;
+    let lock = || {
+        db.lock()
+            .map_err(|_| crate::error::AppError::msg("数据库锁中毒"))
+    };
+    let mut summary = RefillSummary {
+        total: asset_ids.len() as i64,
+        ..Default::default()
+    };
+    // 累积待写 (id, phash)，攒满 BATCH 一次性短锁落库（见 flush_phash_batch）
+    let mut pending: Vec<(i64, u64)> = Vec::new();
+
+    for (i, &id) in asset_ids.iter().enumerate() {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        let asset = {
+            let conn = lock()?;
+            assets::get(&conn, id).ok()
+        };
+        let Some(asset) = asset else {
+            summary.skipped += 1;
+            continue;
+        };
+        if !asset.mime_type.starts_with("image/") {
+            summary.skipped += 1;
+            continue;
+        }
+        // 取材：placeholder（入库即生成，已解码像素的最小载体）→ hd → 原图
+        let src = asset
+            .placeholder_path
+            .as_deref()
+            .map(std::path::PathBuf::from)
+            .or_else(|| asset.hd_thumbnail_path.as_deref().map(std::path::PathBuf::from))
+            .or_else(|| Some(std::path::PathBuf::from(&asset.file_path)));
+        let Some(src) = src.filter(|p| p.exists()) else {
+            summary.skipped += 1;
+            on_progress(&RefillProgress {
+                done: (i + 1) as i64,
+                total: summary.total,
+                success: summary.success,
+                failed: summary.failed,
+                skipped: summary.skipped,
+                current_id: id,
+            });
+            continue;
+        };
+        // 锁外解码（decode_thumb 内部已取全局并发闸，这里不再 acquire —— FX-08）
+        let decoded = crate::services::imaging::decode_thumb(&src, 128);
+        let Some(phash) = decoded.map(|img| crate::services::perceptual::dhash(&img)) else {
+            summary.failed += 1;
+            on_progress(&RefillProgress {
+                done: (i + 1) as i64,
+                total: summary.total,
+                success: summary.success,
+                failed: summary.failed,
+                skipped: summary.skipped,
+                current_id: id,
+            });
+            continue;
+        };
+        if phash == 0 {
+            // 全纯色/无差分图：0 是 set_phash 的哨兵，跳过（不是错误）
+            summary.skipped += 1;
+            continue;
+        }
+        summary.success += 1;
+        pending.push((id, phash));
+        if pending.len() >= BATCH {
+            flush_phash_batch(db, &mut summary, &mut pending)?;
+        }
+        on_progress(&RefillProgress {
+            done: (i + 1) as i64,
+            total: summary.total,
+            success: summary.success,
+            failed: summary.failed,
+            skipped: summary.skipped,
+            current_id: id,
+        });
+    }
+    flush_phash_batch(db, &mut summary, &mut pending)?;
+    Ok(summary)
+}
+
+/// 批量落库一批 phash：单事务写入 → commit（失败整体回滚）→ 计数归位。
+/// decode 阶段已把整批计进 success，这里把写库失败的条目扣回 success 转记 failed；
+/// updated_ids 只收真实写库成功的 id（与 palette 命令语义一致，绝不虚报）。
+fn flush_phash_batch(
+    db: &Arc<Mutex<Connection>>,
+    summary: &mut RefillSummary,
+    pending: &mut Vec<(i64, u64)>,
+) -> AppResult<()> {
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let conn = db.lock().map_err(|_| crate::error::AppError::msg("数据库锁中毒"))?;
+    let tx = conn.unchecked_transaction()?;
+    let mut ok_ids: Vec<i64> = Vec::new();
+    for &(id, phash) in pending.iter() {
+        if assets::set_phash(&tx, id, phash).is_ok() {
+            ok_ids.push(id);
+        }
+    }
+    tx.commit()?;
+    let n = pending.len();
+    let written = ok_ids.len();
+    summary.success -= (n - written) as i64;
+    summary.failed += (n - written) as i64;
+    summary.updated_ids.extend(ok_ids);
+    pending.clear();
+    Ok(())
 }

@@ -136,3 +136,13 @@ export function setFavorite(ids: number[], favorite: boolean): Promise<number> {
 export function setRating(ids: number[], rating: number): Promise<number> {
   return invoke<number>("set_rating", { ids, rating });
 }
+
+/** W5d：感知相似扫描（dHash 汉明 ≤ threshold；excludeKinship 排除同源 RAW+JPG） */
+export function scanDuplicatesSimilar(threshold: number, excludeKinship: boolean): Promise<DupGroup[]> {
+  return invoke<DupGroup[]>("dedup_scan_similar", { threshold, excludeKinship });
+}
+
+/** W5d：感知哈希存量回填（missing = 只补缺；all = 全部图片；ids = 指定 id） */
+export function rescanAssetPhash(ids: number[] | null, scope: "all" | "missing" | "ids"): Promise<{ total: number; success: number; failed: number; skipped: number }> {
+  return invoke("rescan_asset_phash", { ids, scope });
+}

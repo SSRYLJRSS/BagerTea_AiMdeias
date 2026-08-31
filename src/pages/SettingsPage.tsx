@@ -14,6 +14,7 @@ import { backupDb, clearThumbnailCache, getDataDir, openDataDir, openLogsDir, re
 import {
   rescanAssetMetadata,
   rescanAssetPalette,
+  rescanAssetPhash,
   cancelMediaRefill,
   getPaletteStatus,
   type RefillProgress,
@@ -138,7 +139,6 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
   const [paletteRunning, setPaletteRunning] = useState(false);
   const paletteUnsub = useRef<(() => void) | null>(null);
   useEffect(() => () => paletteUnsub.current?.(), []);
-
   const onRescanPalette = async (scope: "all" | "missing") => {
     setPaletteRunning(true);
     setPaletteResult(null);
@@ -159,6 +159,35 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
       paletteUnsub.current?.();
       paletteUnsub.current = null;
       setPaletteProgress(null);
+    }
+  };
+
+  // ── W5d（§W5d）：感知哈希存量回填（与色板回算互斥：同一 refill_running 闸）──
+  const [phashRunning, setPhashRunning] = useState(false);
+  const phashUnsub = useRef<(() => void) | null>(null);
+  const [phashProgress, setPhashProgress] = useState<RefillProgress | null>(null);
+  const [phashResult, setPhashResult] = useState<string | null>(null);
+  useEffect(() => () => phashUnsub.current?.(), []);
+
+  const onRescanPhash = async (scope: "all" | "missing") => {
+    setPhashRunning(true);
+    setPhashResult(null);
+    setPhashProgress(null);
+    on<RefillProgress>("media_refill://progress", (p) => setPhashProgress(p))
+      .then((unsub) => {
+        phashUnsub.current = unsub;
+      })
+      .catch(() => undefined);
+    try {
+      const r = await rescanAssetPhash([], scope);
+      setPhashResult(`感知哈希回填完成：总数 ${r.total}，成功 ${r.success}，跳过 ${r.skipped}，失败 ${r.failed}`);
+    } catch (e) {
+      setPhashResult(e instanceof Error ? e.message : String(e));
+    } finally {
+      setPhashRunning(false);
+      phashUnsub.current?.();
+      phashUnsub.current = null;
+      setPhashProgress(null);
     }
   };
 
@@ -856,6 +885,38 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
               )}
               {paletteResult && (
                 <p className="px-4 py-2 text-xs text-[var(--color-text-secondary)]">{paletteResult}</p>
+              )}
+              {/* W5d（§W5d）：感知哈希回填（相似图去重的前提；新导入的图片已自动计算，这里只补存量） */}
+              <Field
+                label="感知哈希回填"
+                hint="用本地算法给图片算感知哈希（dHash），供「查找重复素材 → 相似图」识别连拍/同画面。新导入的图片已自动计算；这里只处理升级前导入的存量。只补缺失＝只处理还没有哈希的图片（快）；全部重算＝覆盖已有哈希（适合算法升级后）。纯本地计算，不调 AI"
+              >
+                <div className="flex items-center gap-2">
+                  <Button disabled={phashRunning || paletteRunning || refilling} onClick={() => void onRescanPhash("missing")}>
+                    只补缺失哈希
+                  </Button>
+                  <Button disabled={phashRunning || paletteRunning || refilling} onClick={() => void onRescanPhash("all")}>
+                    全部重算
+                  </Button>
+                  {phashRunning ? (
+                    <Button
+                      onClick={() => {
+                        void cancelMediaRefill().catch(() => undefined);
+                        setPhashResult("正在取消…");
+                      }}
+                    >
+                      取消
+                    </Button>
+                  ) : null}
+                </div>
+              </Field>
+              {phashProgress && phashRunning && (
+                <p className="px-4 py-2 text-xs text-[var(--color-text-secondary)]">
+                  感知哈希回填中 {phashProgress.done}/{phashProgress.total}（成功 {phashProgress.success} · 跳过 {phashProgress.skipped} · 失败 {phashProgress.failed}）
+                </p>
+              )}
+              {phashResult && (
+                <p className="px-4 py-2 text-xs text-[var(--color-text-secondary)]">{phashResult}</p>
               )}
               <Field
                 label="视频代理缓存"

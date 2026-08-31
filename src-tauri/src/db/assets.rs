@@ -1291,6 +1291,18 @@ pub fn set_placeholder_path(conn: &Connection, id: i64, path: &str) -> AppResult
     Ok(())
 }
 
+/// W5d（§W5d）：写感知哈希（phash 列在 V19 追加；0 是无意义值，不入库）。
+pub fn set_phash(conn: &Connection, id: i64, phash: u64) -> AppResult<()> {
+    if phash == 0 {
+        return Ok(());
+    }
+    conn.execute(
+        "UPDATE assets SET phash = ?1 WHERE id = ?2",
+        rusqlite::params![phash as i64, id],
+    )?;
+    Ok(())
+}
+
 /// FB2-08：写算法色板 + 主导三维度索引列（「按颜色筛选」走这三列，palette_json 只用于渲染色条）。
 pub fn set_palette(
     conn: &Connection,
@@ -1368,6 +1380,38 @@ pub fn list_ids_needing_palette(conn: &Connection) -> AppResult<Vec<i64>> {
         }
     }
     Ok(ids)
+}
+
+/// W5d（§W5d）：列出缺少感知哈希的素材 id（phash 只对图片有意义；视频无 dHash）。
+/// 覆盖三个范围：missing（图片 + phash 为空）/ all（全部图片）/ ids（指定 id 中未删的图片）。
+pub fn list_ids_needing_phash(conn: &Connection, scope: &str, ids: &[i64]) -> AppResult<Vec<i64>> {
+    match scope {
+        "missing" => {
+            let mut stmt = conn.prepare(
+                "SELECT id FROM assets WHERE deleted_at IS NULL AND mime_type LIKE 'image/%' AND phash IS NULL",
+            )?;
+            let rows = stmt.query_map([], |r| r.get(0))?;
+            Ok(rows.filter_map(|r| r.ok()).collect())
+        }
+        "all" => {
+            let mut stmt = conn.prepare(
+                "SELECT id FROM assets WHERE deleted_at IS NULL AND mime_type LIKE 'image/%'",
+            )?;
+            let rows = stmt.query_map([], |r| r.get(0))?;
+            Ok(rows.filter_map(|r| r.ok()).collect())
+        }
+        _ => {
+            if ids.is_empty() {
+                return Ok(Vec::new());
+            }
+            let list = ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
+            let mut stmt = conn.prepare(&format!(
+                "SELECT id FROM assets WHERE id IN ({list}) AND mime_type LIKE 'image/%'"
+            ))?;
+            let rows = stmt.query_map([], |r| r.get(0))?;
+            Ok(rows.filter_map(|r| r.ok()).collect())
+        }
+    }
 }
 
 /// FB4-03（§5.5）：按 id 查询色板补丁（定向同步用，只返回色板相关字段）。

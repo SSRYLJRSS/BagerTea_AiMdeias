@@ -451,6 +451,27 @@ pub fn write_thumb(src: &Path, out: &Path, max_px: u32) -> bool {
     }
 }
 
+/// W5d（§W5d）：解码并写缩略图，顺带返回 dHash（入库搭车 —— decode_thumb 内部
+/// 必然产出已解码像素，从这里算 phash 是零额外解码；None = 未解码出图像/视频）。
+pub fn write_thumb_with_phash(src: &Path, out: &Path, max_px: u32) -> (bool, Option<u64>) {
+    match decode_thumb(src, max_px) {
+        Some(img) => {
+            let phash = super::perceptual::dhash(&img);
+            let ok = img.save_with_format(out, image::ImageFormat::WebP).is_ok();
+            (ok, Some(phash))
+        }
+        None => (false, None),
+    }
+}
+
+/// W5d（§W5d）：解码出已下采样图像 + dHash（回填命令用；只调一次 decode_thumb，
+/// 绝不额外解码原文件 —— decode_thumb 的返回就是已解码像素）。
+pub fn decode_thumb_phash(src: &Path, max_px: u32) -> Option<(image::DynamicImage, Option<u64>)> {
+    let img = decode_thumb(src, max_px)?;
+    let phash = super::perceptual::dhash(&img);
+    Some((img, Some(phash)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

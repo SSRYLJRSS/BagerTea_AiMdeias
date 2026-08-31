@@ -1,11 +1,13 @@
-/** 重复素材检测弹窗（M3-02 R-20）：hash 精确分组卡片，保留最早入库项高亮，
- *  其余可勾选批量处理；删除走现有双策略（借鉴 digiKam 去重向导「保留策略建议 + 逐组确认」形态）
+/** 重复素材检测弹窗（M3-02 R-20 + W5d）：hash 精确分组 / 感知相似分组两种模式。
+ *  精确组高亮最早入库项，其余可勾选批量处理；删除走现有双策略
+ *  （借鉴 digiKam 去重向导「保留策略建议 + 逐组确认」形态）。
+ *  W5d（§W5d）：相似图模式走 dedup_scan_similar（dHash 汉明 ≤ 8 + 可选排除同源 RAW+JPG）。
  */
 import { useEffect, useState } from "react";
 import Modal from "@/components/common/Modal";
 import Button from "@/components/common/Button";
 import Thumbnail from "@/components/library/Thumbnail";
-import { deleteAssets, scanDuplicates, type DeleteStrategy } from "@/api/assets";
+import { deleteAssets, scanDuplicates, scanDuplicatesSimilar, type DeleteStrategy } from "@/api/assets";
 import { useLibraryStore } from "@/stores/libraryStore";
 import type { DupGroup } from "@/types/asset";
 
@@ -14,8 +16,12 @@ interface DupDialogProps {
   onClose: () => void;
 }
 
+type ScanMode = "exact" | "similar";
+
 export default function DupDialog({ open, onClose }: DupDialogProps) {
   const removeLocal = useLibraryStore((s) => s.removeLocal);
+  const [mode, setMode] = useState<ScanMode>("exact");
+  const [excludeKinship, setExcludeKinship] = useState(true);
   const [groups, setGroups] = useState<DupGroup[]>([]);
   const [scanning, setScanning] = useState(false);
   /** 勾选待处理的素材 id（默认每组除最早项外全选） */
@@ -29,7 +35,10 @@ export default function DupDialog({ open, onClose }: DupDialogProps) {
     if (!open) return;
     setScanning(true);
     setError(null);
-    scanDuplicates()
+    const run = mode === "exact"
+      ? scanDuplicates()
+      : scanDuplicatesSimilar(8, excludeKinship);
+    run
       .then((gs) => {
         setGroups(gs);
         // 默认勾选每组非最早项（保留策略建议）
@@ -39,7 +48,7 @@ export default function DupDialog({ open, onClose }: DupDialogProps) {
       })
       .catch((e) => setError(e instanceof Error ? e.message : String(e)))
       .finally(() => setScanning(false));
-  }, [open]);
+  }, [open, mode, excludeKinship]);
 
   const close = () => {
     setStrategy("remove_from_library");
@@ -90,6 +99,8 @@ export default function DupDialog({ open, onClose }: DupDialogProps) {
     void run();
   };
 
+  const similar = mode === "similar";
+
   return (
     <Modal open={open} title="查找重复素材" onClose={close} wide
       footer={
@@ -102,16 +113,53 @@ export default function DupDialog({ open, onClose }: DupDialogProps) {
         </>
       }
     >
+      {/* W5d：精确重复 / 相似图 模式切换 */}
+      <div className="mb-3 flex items-center gap-2">
+        <div className="grid grid-cols-2 rounded-lg bg-[var(--color-surface)] p-0.5" aria-label="扫描模式">
+          <button
+            type="button"
+            onClick={() => setMode("exact")}
+            data-active={!similar}
+            className="rounded-md px-3 py-1.5 text-xs text-[var(--color-text-secondary)] transition-colors data-[active=true]:bg-[var(--color-surface-raised)] data-[active=true]:font-semibold data-[active=true]:text-[var(--color-text)] data-[active=true]:shadow-sm"
+          >
+            精确重复
+          </button>
+          <button
+            type="button"
+            onClick={() => setMode("similar")}
+            data-active={similar}
+            className="rounded-md px-3 py-1.5 text-xs text-[var(--color-text-secondary)] transition-colors data-[active=true]:bg-[var(--color-surface-raised)] data-[active=true]:font-semibold data-[active=true]:text-[var(--color-text)] data-[active=true]:shadow-sm"
+          >
+            相似图
+          </button>
+        </div>
+        {similar && (
+          <label className="flex cursor-pointer items-center gap-1.5 text-xs text-[var(--color-text-secondary)]">
+            <input
+              type="checkbox"
+              checked={excludeKinship}
+              onChange={(e) => setExcludeKinship(e.target.checked)}
+              className="accent-[var(--color-accent)]"
+            />
+            排除同源 RAW+JPG
+          </label>
+        )}
+      </div>
+
       {scanning && <p className="py-6 text-center text-sm text-[var(--color-text-secondary)]">扫描中…</p>}
 
       {!scanning && groups.length === 0 && (
-        <p className="py-6 text-center text-sm text-[var(--color-text-secondary)]">未发现重复素材</p>
+        <p className="py-6 text-center text-sm text-[var(--color-text-secondary)]">
+          {similar ? "未发现相似素材" : "未发现重复素材"}
+        </p>
       )}
 
       {!scanning && groups.length > 0 && (
         <div className="flex flex-col gap-4">
           <p className="text-xs text-[var(--color-text-secondary)]">
-            共 {groups.length} 组重复（按文件内容 hash 精确匹配）。每组高亮项为最早入库、建议保留，其余可勾选处理。
+            {similar
+              ? `共 ${groups.length} 组相似（按画面感知相似匹配）。每组高亮项为最早入库、建议保留，其余可勾选处理。`
+              : `共 ${groups.length} 组重复（按文件内容 hash 精确匹配）。每组高亮项为最早入库、建议保留，其余可勾选处理。`}
           </p>
 
           <div className="flex max-h-[46vh] flex-col gap-3 overflow-y-auto">

@@ -692,16 +692,17 @@ pub fn import_paths<F: Fn(ImportProgress) + Sync>(
     }
 
     // ③ 并行生成占位图（B14：par_iter 内检查 cancel；永不失败，失败落通用占位图）
+    // W5d：占位图是已解码像素的唯一搭车点，顺带收集 dHash 回写 assets.phash。
     let thumb_total = pending_thumbs.len() as i64;
     let thumb_done = AtomicI64::new(0);
-    let paths_out: Vec<(i64, PathBuf)> = pending_thumbs
+    let paths_out: Vec<(i64, PathBuf, Option<u64>)> = pending_thumbs
         .par_iter()
         .map(|(id, file, mime_type)| {
             // B14：取消后未开始的任务快速跳过（返回空路径，后续跳过回写）
             if cancel.load(Ordering::Relaxed) {
-                return (*id, PathBuf::new());
+                return (*id, PathBuf::new(), None);
             }
-            let p = thumbs.extract_placeholder(*id, file, mime_type);
+            let (p, phash) = thumbs.extract_placeholder(*id, file, mime_type);
             let n = thumb_done.fetch_add(1, Ordering::Relaxed) + 1;
             let mut pe = ImportProgress::new(&task_id, ImportPhase::Previewing);
             pe.phase_current = n;
@@ -714,7 +715,7 @@ pub fn import_paths<F: Fn(ImportProgress) + Sync>(
             pe.duplicates = result.duplicates;
             pe.failed = result.failed;
             progress(pe);
-            (*id, p)
+            (*id, p, phash)
         })
         .collect();
 
@@ -722,9 +723,12 @@ pub fn import_paths<F: Fn(ImportProgress) + Sync>(
     {
         let conn = db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
         let tx = conn.unchecked_transaction()?;
-        for (id, p) in &paths_out {
+        for (id, p, phash) in &paths_out {
             if !p.as_os_str().is_empty() {
                 assets::set_placeholder_path(&tx, *id, &p.to_string_lossy())?;
+                if let Some(ph) = phash {
+                    assets::set_phash(&tx, *id, *ph)?;
+                }
             }
         }
         tx.commit()?;
