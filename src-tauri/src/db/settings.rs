@@ -73,7 +73,9 @@ pub struct AiSettings {
     pub api_key: String,
     #[serde(default = "default_model", skip_serializing)]
     pub model: String,
-    #[serde(default)]
+    // W0-6：auto_tagging / local_model_tier 全库零消费点（老 JSON 反序列化兼容保留，
+    // 不再序列化；下个大版本再彻底移除）。替代品见 W5g「一键送打标」。
+    #[serde(default, skip_serializing)]
     pub auto_tagging: bool,
     #[serde(default)]
     pub video_tagging: bool,
@@ -83,7 +85,7 @@ pub struct AiSettings {
     /// FB2-07：frames 模式抽帧数（2~8），默认 3
     #[serde(default = "default_video_frame_count")]
     pub video_frame_count: i64,
-    #[serde(default = "default_tier")]
+    #[serde(default = "default_tier", skip_serializing)]
     pub local_model_tier: String,
     #[serde(default = "default_batch_limit")]
     pub batch_limit: i64,

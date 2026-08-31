@@ -106,11 +106,9 @@ function mkSettings(over: Partial<Settings> = {}): Settings {
     ai: {
       profiles: [{ id: "p1", name: "配置 1", apiMode: "openai", kind: "cloud", baseUrl: "", apiKey: "", model: "qwen-vl-plus" }],
       activeProfile: "p1",
-      autoTagging: false,
       videoTagging: false,
       videoTaggingMode: "cover",
       videoFrameCount: 3,
-      localModelTier: "light",
       batchLimit: 500,
       ollamaSourceId: "auto",
     },

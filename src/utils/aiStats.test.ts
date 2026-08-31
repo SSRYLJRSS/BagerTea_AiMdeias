@@ -55,3 +55,16 @@ describe("computeAiStats", () => {
     expect(estimateRequests(stats, "frames", 3)).toBe(7);
   });
 });
+
+describe("W0-4 modified 计入已确认", () => {
+  it("modified 状态计为已确认，不再从批次统计里消失", () => {
+    const stats = computeAiStats([
+      { status: "confirmed", suggestedTags: { scene: ["海边"] } },
+      { status: "modified", suggestedTags: { subject: ["人"] } },
+      { status: "rejected", suggestedTags: {} },
+    ]);
+    expect(stats.confirmed).toBe(2);
+    expect(stats.failed).toBe(1);
+    expect(stats.total).toBe(3);
+  });
+});

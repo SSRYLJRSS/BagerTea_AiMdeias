@@ -16,11 +16,9 @@ function mkSettings(): Settings {
     ai: {
       profiles: [],
       activeProfile: "",
-      autoTagging: false,
       videoTagging: false,
       videoTaggingMode: "cover",
       videoFrameCount: 3,
-      localModelTier: "light",
       batchLimit: 500,
       ollamaSourceId: "auto",
     },
@@ -65,7 +63,7 @@ vi.mock("@/api/thumbnail", () => ({
 }));
 vi.mock("@/api/settings", () => ({
   getSettings: vi.fn().mockResolvedValue({
-    ai: { profiles: [], activeProfile: "", autoTagging: false, videoTagging: false, localModelTier: "light", batchLimit: 500, ollamaSourceId: "auto" },
+    ai: { profiles: [], activeProfile: "", videoTagging: false, batchLimit: 500, ollamaSourceId: "auto" },
     theme: "system",
     thumbnailCacheMb: 2048,
     tagCategories: [],

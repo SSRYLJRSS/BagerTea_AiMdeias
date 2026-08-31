@@ -162,3 +162,21 @@ describe("normalizeSettings", () => {
     expect(s2.appearance.colorStrip.mode).toBe("ratio");
   });
 });
+
+describe("W0-6 死配置清理", () => {
+  it("老 JSON 含 autoTagging/localModelTier 时安全忽略，不再出现在产物中", () => {
+    const s = normalizeSettings({
+      ai: {
+        profiles: [],
+        activeProfile: "",
+        autoTagging: true,
+        localModelTier: "standard",
+        videoTagging: false,
+        batchLimit: 30,
+      },
+    });
+    expect("autoTagging" in s.ai).toBe(false);
+    expect("localModelTier" in s.ai).toBe(false);
+    expect(s.ai.batchLimit).toBe(30);
+  });
+});

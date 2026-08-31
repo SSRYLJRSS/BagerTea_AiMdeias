@@ -32,6 +32,16 @@ pub fn open_data_dir(app: tauri::AppHandle, state: State<AppState>) -> AppResult
         .map_err(|e| AppError::msg(format!("打开文件夹失败: {e}")))
 }
 
+/// W0-9：打开日志目录（data_dir/logs，tracing-appender 滚动文件所在处）
+#[tauri::command]
+pub fn open_logs_dir(app: tauri::AppHandle, state: State<AppState>) -> AppResult<()> {
+    use tauri_plugin_opener::OpenerExt;
+    let logs_dir = state.data_dir.join("logs");
+    app.opener()
+        .open_path(logs_dir.to_string_lossy().as_ref(), None::<&str>)
+        .map_err(|e| AppError::msg(format!("打开日志目录失败: {e}")))
+}
+
 /// 分类重置应用数据（设置页「数据与缓存 → 重置数据」勾选传入）
 /// 只清数据库记录与本软件派生缓存文件，不触碰素材原文件。
 #[tauri::command]

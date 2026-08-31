@@ -11,29 +11,26 @@ import type { MetadataFilter } from "@/types/asset";
  *  离散分面按 key 的 in/eq 值判断；范围分面按是否已存在等价条件判断。
  */
 function isValueActive(filters: MetadataFilter[], key: string, value: string): boolean {
-  // V18 色调分面：点选产出的是 dominant_hue / dominant_sat 条件（而非 hue key），
-  // 逆映射按与 bucketToFilter 输出等价判断高亮。
-  if (key === "hue") {
-    const bucket = bucketToFilter(key, value);
-    if (!bucket) return false;
-    return filters.some(
-      (f) =>
-        f.key === bucket.key &&
-        f.op === bucket.op &&
-        String(f.value ?? "") === String(bucket.value ?? "") &&
-        String(f.min ?? "") === String(bucket.min ?? "") &&
-        String(f.max ?? "") === String(bucket.max ?? ""),
+  // W0-2：统一走 bucketToFilter 的产物做等价比较。duration→duration_ms、
+  // taken_month→taken_at 这类 key 会被改写，按面板 key 反查会漏（点选后高亮丢失）。
+  const bucket = bucketToFilter(key, value);
+  if (!bucket) return false;
+  return filters.some((f) => {
+    if (f.key !== bucket.key) return false;
+    // 离散等值 bucket：面板会把多个选中合并成一条 in，值命中即生效
+    if (bucket.op === "eq") {
+      if (f.op === "eq") return String(f.value ?? "") === String(bucket.value ?? "");
+      if (f.op === "in") return (f.values ?? []).some((item) => String(item) === String(bucket.value ?? ""));
+      return false;
+    }
+    // 范围 bucket：key/op/value/min/max 全等价才视为该 bucket 生效（单 bucket 语义）
+    return (
+      f.op === bucket.op &&
+      String(f.value ?? "") === String(bucket.value ?? "") &&
+      String(f.min ?? "") === String(bucket.min ?? "") &&
+      String(f.max ?? "") === String(bucket.max ?? "")
     );
-  }
-  const relevant = filters.filter((f) => f.key === key);
-  const filter = bucketToFilter(key, value);
-  if (!filter) return false;
-  // 离散分面：in 命中 values 或 eq 命中 value
-  if (relevant.some((f) => f.op === "in" && (f.values ?? []).some((item) => String(item) === value))) return true;
-  if (relevant.some((f) => f.op === "eq" && String(f.value) === value)) return true;
-  // 范围分面：已有同 key 条件即视为该 bucket 生效（单 bucket 语义）
-  if (filter.op !== "eq") return relevant.length > 0;
-  return false;
+  });
 }
 
 /** 把某个分面当前选中的原始值集合转成 op 化 MetadataFilter 数组。
@@ -45,10 +42,15 @@ function selectedToFilters(selected: Map<string, string[]>): MetadataFilter[] {
     const first = bucketToFilter(key, values[0]);
     if (!first) continue;
     const isDiscreteEq = first.op === "eq";
-    // 数值型离散分面（iso/aperture/focal）：后端已支持 `in` 且接受数字字符串（P0-2），
-    // 把多个选中值合并为一条 `in`，值为数字，避免字符串传给数值编译器导致整次查询失败。
-    if (isDiscreteEq && ["iso", "aperture", "focal"].includes(first.key)) {
-      const nums = values.map((v) => Number(v)).filter((n) => Number.isFinite(n));
+    // 数值型离散分面（iso/aperture/focal/resolution）：后端已支持 `in` 且接受数字（P0-2），
+    // 把多个选中值合并为一条 `in`，值为数字。W0-1：resolution 的展示值是 "1920x1080"，
+    // 必须经 bucketToFilter 换算成像素乘积，直接 Number(label) 会得到 NaN → 整次查询被拒。
+    if (isDiscreteEq && ["iso", "aperture", "focal", "resolution"].includes(first.key)) {
+      const nums = values
+        .map((v) => bucketToFilter(key, v))
+        .filter((f): f is NonNullable<typeof f> => f !== null && f.op === "eq")
+        .map((f) => Number(f.value))
+        .filter((n) => Number.isFinite(n));
       if (nums.length > 0) out.push({ key: first.key, op: "in", values: nums });
     } else if (isDiscreteEq) {
       // 字符串离散分面：合并为一条 `in`（值保持字符串）。

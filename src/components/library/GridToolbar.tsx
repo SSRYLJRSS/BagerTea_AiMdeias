@@ -44,7 +44,7 @@ const SIZE_STEPS = [
   { step: 5, label: "大", Icon: Square, title: "格子大" },
 ];
 
-export default function GridToolbar({ onAiTag, onAssignTags, onExport, onMove, onDelete, onPurge }: GridToolbarProps) {
+export default function GridToolbar({ onAiTag, onAssignTags, onExport, onMove, onDelete, onDedup, onPurge }: GridToolbarProps) {
   const { setFilter, total, sortBy, sortDir, trashOnly, removeLocal } = useLibraryStore(
     useShallow((s) => ({
       setFilter: s.setFilter,
@@ -108,6 +108,17 @@ export default function GridToolbar({ onAiTag, onAssignTags, onExport, onMove, o
       ) : (
         <>
           <ContextActionBar onAiTag={onAiTag} onAssignTags={onAssignTags} onExport={onExport} onMove={onMove} onDelete={onDelete} />
+          {/* W0-7：恢复去重入口（dedup_scan + DupDialog 已交付但此前不可达）。hash 重复组为 0 时显示「没有重复」是正确结果 */}
+          {onDedup && (
+            <button
+              type="button"
+              onClick={onDedup}
+              className="shrink-0 rounded px-1.5 py-0.5 text-xs text-[var(--color-text-secondary)] transition-colors hover:bg-[var(--color-surface)] hover:text-[var(--color-text)]"
+              title="扫描内容完全相同的素材（精确 hash 去重）"
+            >
+              查找重复
+            </button>
+          )}
           {/* R-21 排序下拉 + 方向切换 */}
           <div className="flex shrink-0 items-center gap-0.5">
             <select

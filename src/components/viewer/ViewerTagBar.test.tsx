@@ -50,11 +50,9 @@ const mkSettings = (): Settings => ({
   ai: {
     profiles: [],
     activeProfile: "",
-    autoTagging: false,
     videoTagging: false,
     videoTaggingMode: "cover",
     videoFrameCount: 3,
-    localModelTier: "light",
     batchLimit: 500,
     ollamaSourceId: "auto",
   },

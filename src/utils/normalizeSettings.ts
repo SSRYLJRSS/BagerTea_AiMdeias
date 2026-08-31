@@ -66,13 +66,11 @@ function normalizeAi(raw: unknown): AiSettings {
   const profiles: ApiProfile[] = Array.isArray(r.profiles)
     ? r.profiles.map(normalizeProfile).filter((p) => p.id !== "")
     : [];
-  const tier = asStr(r.localModelTier, "light");
   return {
     profiles,
     activeProfile: asStr(r.activeProfile, ""),
-    autoTagging: asBool(r.autoTagging, false),
+    // W0-6：autoTagging/localModelTier 已删（后端零消费；老 JSON 里的值直接忽略）
     videoTagging: asBool(r.videoTagging, false),
-    localModelTier: tier === "standard" ? "standard" : "light",
     // FB3-07：批大小收敛到 [10,50]（云端执行层实际范围）；越界值（含历史 500/0）归一到默认 30，
     // 与 Rust 端 AiSettings::normalize 的行为一致（不做区间钳制——0 不应变成 10 这种「看似有效」的值）
     batchLimit: (() => {

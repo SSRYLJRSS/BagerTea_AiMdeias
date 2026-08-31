@@ -22,13 +22,12 @@ export interface AiSettings {
   profiles: ApiProfile[];
   /** 当前激活档案 id */
   activeProfile: string;
-  autoTagging: boolean;
+  /** W0-6：autoTagging/localModelTier 已删（后端零消费，skip_serializing 只读兼容） */
   videoTagging: boolean;
   /** FB2-07：视频打标模式（决策 5：默认首帧/封面） */
   videoTaggingMode: "cover" | "frames";
   /** FB2-07：frames 模式抽帧数（2~8） */
   videoFrameCount: number;
-  localModelTier: "light" | "standard";
   batchLimit: number;
   /** 一键安装的下载源偏好（"auto" = 测速选最快；旧数据缺省视为 auto） */
   ollamaSourceId: string;

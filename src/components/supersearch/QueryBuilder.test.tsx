@@ -226,3 +226,32 @@ describe("QueryBuilder", () => {
     expect(Array.from(select.options).some((o) => o.textContent?.startsWith("标签 #123"))).toBe(true);
   });
 });
+
+describe("W0-3 条件公式包含根级标签", () => {
+  it("queryBuilder_includes_root_tags：根级标签（parentId=null，find_or_create_canonical 的产物）出现在标签下拉中", () => {
+    const mkTag = (id: number, name: string, facetKey: string) => ({
+      id, name, canonicalName: name, normalizedName: name, facetKey,
+      parentId: null, status: "active" as const, isSystem: false, isPreset: false,
+      sortOrder: 0, assetCount: 0, totalCount: 0, aliases: [], path: name,
+    });
+    // 模拟真实库：19 个标签全部为根级（无父子层级）
+    useTagStore.setState({
+      tree: [
+        { tag: mkTag(1, "海边", "scene"), children: [] },
+        { tag: mkTag(2, "人像", "subject"), children: [] },
+        { tag: mkTag(3, "胶片", "style"), children: [] },
+      ],
+      loading: false, treesByFacet: {}, expanded: new Set(),
+    });
+    render(<QueryBuilder />);
+    fireEvent.click(screen.getByRole("button", { name: "+ 添加第一个条件" }));
+    const field = screen.getByLabelText("条件字段");
+    fireEvent.change(field, { target: { value: "tag" } });
+    // 标签选择框应包含全部三个根级标签（旧代码 walk(root.children) 会漏光）
+    const tagSelect = screen.getByLabelText("条件值") as HTMLSelectElement;
+    const optionTexts = Array.from(tagSelect.options).map((o) => o.textContent ?? "");
+    expect(optionTexts.some((t) => t.includes("海边"))).toBe(true);
+    expect(optionTexts.some((t) => t.includes("人像"))).toBe(true);
+    expect(optionTexts.some((t) => t.includes("胶片"))).toBe(true);
+  });
+});

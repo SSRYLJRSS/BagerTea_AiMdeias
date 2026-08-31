@@ -10,7 +10,7 @@ import { open as pickDir } from "@tauri-apps/plugin-dialog";
 import { on } from "@/api/client";
 import Button from "@/components/common/Button";
 import { ollamaInstallStatus, ollamaRemoveInstaller } from "@/api/ollama";
-import { clearThumbnailCache, getDataDir, openDataDir, resetAppData, type ResetDataSelection } from "@/api/settings";
+import { clearThumbnailCache, getDataDir, openDataDir, openLogsDir, resetAppData, type ResetDataSelection } from "@/api/settings";
 import {
   rescanAssetMetadata,
   rescanAssetPalette,
@@ -886,6 +886,9 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
                   <Button onClick={() => void openDataDir()}>打开文件夹</Button>
                 </div>
               </Field>
+              <Field label="日志目录" hint="运行日志（保留 7 天）；遇到问题时打包此目录发给支持">
+                <Button onClick={() => void openLogsDir()}>打开日志目录</Button>
+              </Field>
               <Field label="反馈" hint="功能建议或问题反馈">
                 <span className="text-xs text-[var(--color-text-secondary)]">可在素材库问题反馈入口提交</span>
               </Field>
@@ -957,16 +960,8 @@ function AiPurposePanel({
         </button>
       </div>
 
-      <Field label="打标时机" hint="自动：入库即打标；手动：AI 打标页发起（仅打标 AI 生效）">
-        <select
-          value={draft.ai.autoTagging ? "auto" : "manual"}
-          onChange={(e) => patchAi({ autoTagging: e.target.value === "auto" })}
-          className="ui-control rounded-md px-2 py-1.5 text-sm outline-none"
-        >
-          <option value="manual">手动（默认）</option>
-          <option value="auto">自动</option>
-        </select>
-      </Field>
+      {/* W0-6：删「打标时机」死配置（auto_tagging 后端零消费点，选「自动」无任何效果）。
+          替代品为 W5g「一键送打标」。 */}
       {!isSuperSearch && (
         <Field label="视频 AI 打标" hint="对视频抽帧后打标（耗时更长）">
           <span className="flex items-center gap-2">

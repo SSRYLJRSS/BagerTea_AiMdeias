@@ -313,11 +313,9 @@ describe("AssetGrid FB2-01 档位缩放（Alt/Ctrl+滚轮）", () => {
       ai: {
         profiles: [],
         activeProfile: "",
-        autoTagging: false,
         videoTagging: false,
         videoTaggingMode: "cover",
         videoFrameCount: 3,
-        localModelTier: "light",
         batchLimit: 500,
         ollamaSourceId: "auto",
       },

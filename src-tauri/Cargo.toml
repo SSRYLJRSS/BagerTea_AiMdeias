@@ -35,7 +35,12 @@ serde_json = "1"
 thiserror = "1"
 kamadak-exif = "0.5"
 tracing = "0.1"
-tracing-subscriber = "0.3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# W0-9：日志落文件（发布版 windows_subsystem="windows" 无控制台，stdout 日志不可见）
+tracing-appender = "0.2"
+# W0-10：迁移失败需在 tauri app 启动前弹原生 dialog（plugin dialog 需要 AppHandle；
+# 版本与 tauri-plugin-dialog 2.7 传递依赖一致，避免双份 rfd）
+rfd = "0.16"
 rayon = "1"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "tiff", "bmp", "tga"] }
 # T05a 云端 AI 打标：blocking 与现有同步 command 风格一致（避免跨 await 持 DB 锁）

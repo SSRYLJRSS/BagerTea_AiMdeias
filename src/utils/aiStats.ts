@@ -38,7 +38,8 @@ export function computeAiStats(suggestions: StatEntry[]): AiStats {
     if (s.status === "pending") {
       if (Object.keys(s.suggestedTags).length === 0) awaitingGeneration += 1;
       else awaitingConfirmation += 1;
-    } else if (s.status === "confirmed") {
+    } else if (s.status === "confirmed" || s.status === "modified") {
+      // W0-4（N4）：用户改后确认（modified）也算「已确认」，否则它从批次统计里凭空消失。
       confirmed += 1;
     } else if (s.status === "rejected") {
       failed += 1;

@@ -20,6 +20,11 @@ export function openDataDir(): Promise<void> {
   return invoke<void>("open_data_dir");
 }
 
+/** W0-9：打开日志目录（data_dir/logs，排障时打包发给支持） */
+export function openLogsDir(): Promise<void> {
+  return invoke<void>("open_logs_dir");
+}
+
 /** 手动清除缩略图缓存（R-33） */
 export { clearThumbnailCache } from "./thumbnail";
 

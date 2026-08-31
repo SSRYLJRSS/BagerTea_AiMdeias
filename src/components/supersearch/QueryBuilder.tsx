@@ -52,7 +52,9 @@ export default function QueryBuilder() {
   useEffect(() => { if (tagTree.length === 0 && !tagsLoading) void useTagStore.getState().refresh(); }, [tagTree.length, tagsLoading]);
   const flatTags = useMemo(() => {
     const out: FlatTag[] = []; const walk = (nodes: import("@/types/tag").TagNode[], facet: string) => { for (const node of nodes) { const nextFacet = node.tag.facetKey || facet; out.push({ id: node.tag.id, name: node.tag.name, facet: nextFacet }); walk(node.children, nextFacet); } };
-    for (const root of tagTree) walk(root.children, root.tag.facetKey); return out;
+    // W0-3：从根节点自身开始收集（find_or_create_canonical 建的是根级标签，
+    // 旧写法 walk(root.children) 会漏掉全部根级标签，导致下拉一个标签都选不到）
+    for (const root of tagTree) { const rootFacet = root.tag.facetKey; out.push({ id: root.tag.id, name: root.tag.name, facet: rootFacet }); walk(root.children, rootFacet); } return out;
   }, [tagTree]);
   // §9.8：resolvedTags 里 tagStore 找不到的 id → synthetic option（保留名称，绝不退回「选择标签」）
   const syntheticTags = useMemo(() => {

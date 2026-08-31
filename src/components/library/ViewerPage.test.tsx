@@ -124,7 +124,7 @@ describe("ViewerPage 查看器色条（FB3-10 §12.2）", () => {
     const { useSettingsStore: sstore, DEFAULT_APPEARANCE: DA } = await import("@/stores/settingsStore");
     sstore.setState({
       settings: {
-        ai: { profiles: [], activeProfile: "", autoTagging: false, videoTagging: false, videoTaggingMode: "cover", videoFrameCount: 3, localModelTier: "light", batchLimit: 30, ollamaSourceId: "auto" },
+        ai: { profiles: [], activeProfile: "", videoTagging: false, videoTaggingMode: "cover", videoFrameCount: 3, batchLimit: 30, ollamaSourceId: "auto" },
         theme: "system",
         thumbnailCacheMb: 2048,
         tagCategories: [],
