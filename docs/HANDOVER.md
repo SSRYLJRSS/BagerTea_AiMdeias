@@ -32,6 +32,8 @@ npm run typecheck && npm run build
 | SQLite 数据库 | `%APPDATA%\bagertea_ai_media_v2\library.db` |
 | 素材总库 | 设置页可配（入库文件实际存放地，分库=总库下新建文件夹） |
 | 缩略图缓存 | 设置页可查看/手动清除 |
+| 运行日志 | `%APPDATA%\bagertea_ai_media_v2\logs\app.log*`（tracing-appender 按天滚动，保留 7 天） |
+| 数据库备份 | 设置页「数据与缓存 → 数据库备份与恢复」（VACUUM INTO 单文件快照，建议存移动硬盘/网盘） |
 
 ## 三、目录导览
 
@@ -41,7 +43,7 @@ chabaosucai/
 ├── src/                     # 前端 React
 │   ├── pages/               #   4 个页面：入库/素材库/打标/设置
 │   ├── components/          #   common·layout·library·import·ai·dialogs
-│   ├── stores/              #   Zustand × 5
+│   ├── stores/              #   Zustand × 8
 │   ├── api/                 #   invoke 封装
 │   └── types/               #   与 Rust serde 对齐
 ├── src-tauri/
@@ -90,6 +92,7 @@ npm run tauri build    # 产出安装包（src-tauri/target/release/bundle/）
 | 打标全部失败 | 看 tracing 日志 warn；多半是模型不支持视觉或中转站截断——换 qwen-vl-max / gpt-4o 级模型实测 |
 | 缩略图全黑/加载不出 | 查 imaging 策略链日志；确认不是 DB 锁饿死（TROUBLESHOOTING #1） |
 | 配置错乱 | 删 `library.db` 里 `app_settings` 行可重置为默认（会丢 API Key，先备份） |
+| 数据误删/损坏 | 设置页「数据库备份与恢复 → 从备份恢复」：校验通过后现库改名 `library.db.old` 保底 → 覆盖 → 自动重启。恢复会拒绝运行中的入库/导出/打标任务；老版本备份恢复后自动走迁移升级 |
 | 需要清空测试数据 | 应用内删除功能；**不要**直接 SQL DELETE |
 
 ## 七、协作约定速记

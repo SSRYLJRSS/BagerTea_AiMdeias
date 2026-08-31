@@ -9,7 +9,7 @@
 
 ```
 ┌──────────────────────────── 前端（React 19 + Zustand + Tailwind v4）────────────────────────────┐
-│  pages（4 页） ──► stores（5 个） ──► api/（invoke 封装） ──► types（与 Rust serde 对齐）        │
+│  pages（5 页） ──► stores（8 个） ──► api/（invoke 封装） ──► types（与 Rust serde 对齐）        │
 │  components/（common · layout · library · import · ai · dialogs）                                │
 └──────────────────────────────────────┬─────────────────────────────────────────────────────────┘
                                        │ Tauri invoke / 事件（ai://progress 等）
@@ -70,7 +70,7 @@ ai_cmd / assets_cmd / import_cmd / thumbnail_cmd / tags_cmd / settings_cmd / exp
 | 层 | 内容 |
 |---|---|
 | `pages/` | ImportPage（编排层瘦身）/ LibraryPage / AiTaggingPage / SettingsPage / SuperSearchPage |
-| `stores/` | libraryStore / selectionStore / tagStore / aiStore / settingsStore / taskStore（全局任务条，M3-04）/ superSearchStore（独立 query，防污染普通素材库） |
+| `stores/` | 8 个：libraryStore / selectionStore / tagStore / aiStore / settingsStore / taskStore（全局任务条，M3-04）/ superSearchStore（独立 query，防污染普通素材库）/ metadataStore（文件属性分面） |
 | `api/` | invoke 封装 + 模块级缓存（preview.ts）；`client.ts` 统一错误；superSearch.ts 把 ResolvedSearchQuery 转 AssetFilter |
 | `types/` | 与 Rust 结构体 serde 对齐（改 Rust 字段必须同步改这里） |
 
@@ -115,7 +115,7 @@ decode_thumb(path, target_px)
 ### 4.3 标签体系
 
 - **EXIF 自身标签**：入库自动提取，只读展示，打标界面不显示、不参与 AI 打标
-- **AI 分类标签**：`CategorizedTags`（分类名→标签数组）；分类即父标签复用标签树（零新表）；`TagCategory.max` 写入提示词"可多选 1-N 个"；设置页可自定义分类与上限
+- **AI 分类标签**：`CategorizedTags`（分类名→标签数组）；分类即父标签复用标签树（零新表）；分面上限读 `tag_facets.max_items`（V20 合表后单一事实源，`TagCategory.max` 已随 JSON 侧废除）写入提示词"可多选 1-N 个"；设置页可自定义分类与上限
 
 ### 4.4 中文搜索与超级搜索
 
@@ -135,7 +135,7 @@ decode_thumb(path, target_px)
 |---|---|
 | 入库 | ImportPage（本地 state）→ import_cmd → importer（复制/改名/EXIF/占位图）→ assets 落库 |
 | 缩略图 | Thumbnail.tsx → thumbnail_cmd → thumbnail.rs → imaging.rs → 缓存目录 |
-| AI 打标 | LibraryPage 选图 → aiStore.createBatch → ai_cmd → ai.create_batch（pending 占位）→ AiTaggingPage → startBatch → run_cloud_batch（逐条 request_tags→set_suggestion_tags，失败置 rejected）→ emit 进度 → Workbench 确认 → ai_apply_tags 写标签树 |
+| AI 打标 | LibraryPage 选图 → aiStore.createBatch → ai_cmd → ai.create_batch（pending 占位）→ AiTaggingPage → startBatch → run_cloud_batch（逐条 request_tags→set_suggestion_tags，失败置 rejected）→ emit 进度 → Workbench 确认 → ai_confirm_suggestion（单条确认写标签；批量套用走 apply_tags） |
 | 本地模型 | LocalModelGroup → ollama_cmd → ollama_setup/ollama_installer（检测/推荐/拉取/一键安装） |
 | 搜索 | SearchInput（防抖）→ assets_cmd.list_assets → search.rs（FTS5 三策略） |
 | 超级搜索 | BottomBar 双击素材库 → SuperSearchPage → superSearchStore → assets.list（库内谓词） |

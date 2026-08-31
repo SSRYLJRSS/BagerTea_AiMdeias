@@ -8,10 +8,13 @@
 
 ## 一、当前焦点
 
-- **正在做**：用户反馈问题修复（2026-08-26 启动，见 [用户反馈问题开发指导书](review/用户反馈问题开发指导书-2026-08-26.md)）——A~F 已完成，G 收尾中
-- **已完成**：A 设置页白屏防护（Error Boundary + normalizeSettings + 异步模块降级）、B 批量确认与视频开关链路（统计语义修复 + confirm_all_pending 过滤空建议 + MIME 优先 isVideo + 视频批次前端提示）、C 稳定 facet key 与 color 存量迁移（工作台白名单 + visibleInWorkbench + V11 迁移 + 未知 key warning）、D 批次撤销数据安全（手工覆盖清 source_batch_id + undo 守卫 + undone 状态）、E 素材选择（普通点击切换 + Shift 范围切换 + 锚点更新）、F 视频悬浮预览（卡片内 overlay + 去 250ms 延迟 + 播放生命周期）
-- **下一步**：G 收尾——三关（typecheck/test:unit/build）与 cargo test 已全绿；文档已同步。**真机走查**（验收矩阵中 UI/播放/分面显示项）依赖 Tauri 运行环境，需在真机确认
-- **阻塞项**：真机走查依赖 Tauri GUI 运行环境（本开发环境无法启动应用逐项走查）；视频悬浮播放、颜色归类显示、工作台分面显隐等最终 UI 验收需真机走查
+- **正在做**：第二批 W5–W7 全部完成（功能层 + 搜索健壮化 + 测试文档），已打 `wp7-release` tag
+- **已完成（第二批）**：
+  - W5 功能层：体验断点六件套（f1 空库引导 / f2 导入失败明细 / f3 无配置跳转 / f4 右键外部打开 / f5 GPS 展示 / f6 搜索条件持久化）、同源文件组（W5h，三层边界：数据独立 / 打标同步 / 浏览默认独立）、提示词工程（W5a，a1–a12）、数据库备份恢复（W5c，VACUUM INTO + .old 保底 + 重启）、一键送打标（W5g）、收藏评级前端（W5b，星标/角标/右键/排序/快捷键 1-5/0/F）、感知去重（W5d，dHash 入库搭车 + 回填命令 + 相似图扫描）
+  - W6 搜索健壮化：facetHint enum 收窄 + 三层降级（永不红字，配置错误除外）+ 部分剔除规则 + 提示词补强 + 前端黄字三态
+  - W7：Rust 单测补齐（w7_facet_tests 8 项）、前端测试补齐（metadataStore / AiSearchBar / useOllama / ImportPage / LocalModelGroup）、性能探针（3 万行 phash 193ms、深翻页随深度 131→348ms）、文档同步（ARCHITECTURE / facet-contract-v2 / super-search-contract-v2 / PROGRESS / HANDOVER）
+- **下一步**：真机走查验收矩阵（GUI 环境依赖项：播放器/收藏评级交互/备份恢复弹窗/相似图去重），跑 `npm run tauri dev` 逐项过
+- **阻塞项**：真机走查依赖 Tauri GUI 运行环境（本开发环境无法启动应用逐项走查）
 
 ---
 

@@ -1007,7 +1007,7 @@ pub fn is_valid_sort_by(s: &str) -> bool {
 }
 
 /// §9.2 Prompt 硬规则（停用词由 SEARCH_CONCEPT_STOPWORDS 生成，与本地清洗同一集合）。
-fn build_system_prompt(facets: &[FacetPromptContext]) -> String {
+pub fn build_system_prompt(facets: &[FacetPromptContext]) -> String {
     let stop = SEARCH_CONCEPT_STOPWORDS.join("、");
     let mut p = String::new();
     p.push_str(
