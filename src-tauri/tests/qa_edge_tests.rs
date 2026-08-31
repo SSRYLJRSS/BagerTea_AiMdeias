@@ -1325,3 +1325,62 @@ fn b27_clear_all_thumbnail_paths_writes_null() -> AppResult<()> {
     );
     Ok(())
 }
+
+/// W1-4 真机验收：对真实库的 205 张 RW2 跑宽高回填（需真机样本；库为开发者本机库才跑）。
+/// 直接调 media_refill::rescan_assets_dimensions（与 rescan_image_dimensions 命令同一路径）。
+#[test]
+#[ignore = "真机验收：写真实库，仅手动跑（cargo test -- --ignored）"]
+fn w1_refill_real_library_rw2_dimensions() {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, Mutex};
+    let db_path = std::path::PathBuf::from(
+        std::env::var("APPDATA").unwrap().replace('\\', "/") + "/bagertea_ai_media_v2/library.db",
+    );
+    if !db_path.exists() {
+        eprintln!("跳过：真机库不存在");
+        return;
+    }
+    let conn = rusqlite::Connection::open(&db_path).expect("打开真机库");
+    let before: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM assets WHERE lower(file_ext)='rw2' AND width IS NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    println!("RW2 宽高缺失（回填前）: {before}");
+    drop(conn);
+
+    let db = Arc::new(Mutex::new(
+        rusqlite::Connection::open(&db_path).unwrap(),
+    ));
+    let cancel = AtomicBool::new(false);
+    let ids = {
+        let c = db.lock().unwrap();
+        bagertea_ai_media_v2_lib::db::assets::list_ids_needing_dimensions(&c).unwrap()
+    };
+    println!("候选 id 数: {}", ids.len());
+    let start = std::time::Instant::now();
+    let summary = bagertea_ai_media_v2_lib::services::media_refill::rescan_assets_dimensions(
+        &db, &ids, &cancel, |p| {
+            if p.done % 20 == 0 {
+                println!("进度 {}/{}", p.done, p.total);
+            }
+        },
+    )
+    .unwrap();
+    println!(
+        "回填完成：total={} success={} failed={} skipped={} 耗时 {:?}",
+        summary.total, summary.success, summary.failed, summary.skipped, start.elapsed()
+    );
+    let c = db.lock().unwrap();
+    let after: i64 = c
+        .query_row(
+            "SELECT COUNT(*) FROM assets WHERE lower(file_ext)='rw2' AND width IS NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    println!("RW2 宽高缺失（回填后）: {after}");
+    assert_eq!(after, 0, "回填后 RW2 宽高缺失应为 0");
+}
