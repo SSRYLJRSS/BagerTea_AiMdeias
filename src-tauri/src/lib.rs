@@ -254,6 +254,10 @@ pub fn run() {
             commands::get_asset,
             commands::delete_assets,
             commands::trash_restore,
+            // W2-8：收藏/评级/手动旋转（② T17）
+            commands::set_favorite,
+            commands::set_rating,
+            commands::set_user_rotation,
             commands::dedup_scan,
             commands::get_asset_urls,
             commands::reveal_in_folder,
@@ -290,6 +294,9 @@ pub fn run() {
             commands::list_all_tag_facets,
             commands::create_tag_facet,
             commands::update_tag_facet_display,
+            // W2-2/W2-3：合并编辑 + 级联删除（分面契约）
+            commands::update_tag_facet,
+            commands::delete_tag_facet,
             commands::update_tag_facet_rules,
             commands::reorder_tag_facets,
             commands::deactivate_tag_facet,

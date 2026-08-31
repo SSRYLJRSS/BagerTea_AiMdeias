@@ -51,7 +51,7 @@ pub async fn ai_parse_search_query(
                         tracing::warn!("超级搜索读取用途绑定失败，回退默认档案: {e}");
                         e
                     })?;
-            let facets = tag_facets::build_prompt_context(&conn, &s.ai_facet_configs)?;
+            let facets = tag_facets::build_prompt_context(&conn)?;
             let dict = super_search_ai::collect_tag_dictionary(&conn, &facets)?;
             (s.ai, facets, dict)
         };

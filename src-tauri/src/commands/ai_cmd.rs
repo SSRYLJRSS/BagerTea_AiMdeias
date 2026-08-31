@@ -153,10 +153,10 @@ pub async fn ai_start_batch(
             s
         };
         let cfg = all.ai;
-        // P1B：ai_facet_configs 合并库内 tag_facets 生成提示词上下文（短锁立即释放）
+        // W2-1：提示词上下文直接从 tag_facets 读（V20 合表后不再需要 configs 参数；短锁立即释放）
         let facets = {
             let conn = db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
-            crate::db::tag_facets::build_prompt_context(&conn, &all.ai_facet_configs)?
+            crate::db::tag_facets::build_prompt_context(&conn)?
         };
         registry
             .lock()

@@ -831,7 +831,7 @@ pub fn request_intent(
             f.key,
             f.selection_mode,
             f.max_items.unwrap_or(3),
-            f.hint
+            f.description // W2-1：hint 已并入 description（V20 合表）
         ));
     }
     user.push_str("\n用户查询：<query>");
@@ -1528,7 +1528,6 @@ mod tests {
             key: "people".into(),
             display_name: "人物".into(),
             description: String::new(),
-            hint: String::new(),
             selection_mode: "multi".into(),
             max_items: Some(5),
         }];

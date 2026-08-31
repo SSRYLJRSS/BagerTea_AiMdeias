@@ -172,6 +172,27 @@ pub fn trash_restore(state: State<AppState>, ids: Vec<i64>) -> AppResult<u64> {
     assets::restore(&conn, &ids)
 }
 
+/// W2-8（② T17）：批量收藏/取消收藏
+#[tauri::command]
+pub fn set_favorite(state: State<AppState>, ids: Vec<i64>, favorite: bool) -> AppResult<u64> {
+    let conn = lock_db(&state)?;
+    assets::set_favorite(&conn, &ids, favorite)
+}
+
+/// W2-8（② T17）：批量评级（0 = 清除）
+#[tauri::command]
+pub fn set_rating(state: State<AppState>, ids: Vec<i64>, rating: i64) -> AppResult<u64> {
+    let conn = lock_db(&state)?;
+    assets::set_rating(&conn, &ids, rating)
+}
+
+/// W2-8（② T17）：批量手动旋转（0/90/180/270，写 user_rotation）
+#[tauri::command]
+pub fn set_user_rotation(state: State<AppState>, ids: Vec<i64>, rotation: i64) -> AppResult<u64> {
+    let conn = lock_db(&state)?;
+    assets::set_user_rotation(&conn, &ids, rotation)
+}
+
 /// R-22 超期回收站自动清理（启动时调用，不常驻定时器）：
 /// 短锁取清单 → 锁外删文件（失败保留记录，沿用 B03 语义）→ 短锁硬删 DB + 清缩略图
 pub fn purge_expired_trash(

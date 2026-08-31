@@ -34,15 +34,17 @@ fn categorized_tag_ids(conn: &Connection, tags: &CategorizedTags) -> AppResult<V
         if category.is_empty() {
             continue;
         }
-        let facet_key = tag_facets::key_for_legacy_name(category);
+        // W2-10：分面 key 路由唯一入口 —— DB 有该 key（自建分面）原样用；
+        // 中文旧名命中映射；都不中落 custom。旧代码直接查映射表，自建分面永远落 custom。
+        let (facet_key, _resolved) = tag_facets::resolve_facet_key(conn, category)?;
         for name in names {
             let name = name.trim();
             if !name.is_empty() {
                 // 旧 AI 协议传中文分类名时保留根节点兼容；新协议传稳定 facet key 时直接创建规范标签。
-                if category == facet_key {
-                    ids.push(tags::find_or_create_canonical(conn, facet_key, name)?);
+                if category.trim() == facet_key {
+                    ids.push(tags::find_or_create_canonical(conn, &facet_key, name)?);
                 } else {
-                    let parent = tags::find_or_create_facet_root(conn, facet_key, category)?;
+                    let parent = tags::find_or_create_facet_root(conn, &facet_key, category)?;
                     ids.push(tags::find_or_create_child(conn, parent, name)?);
                 }
             }
@@ -191,7 +193,7 @@ pub fn set_suggestion_tags(conn: &Connection, id: i64, tags: &CategorizedTags) -
     )?;
     let now = chrono::Utc::now().timestamp_millis();
     for (category, names) in tags {
-        let facet_key = tag_facets::key_for_legacy_name(category);
+        let (facet_key, _resolved) = tag_facets::resolve_facet_key(conn, category)?;
         for name in names {
             let raw = name.trim();
             if raw.is_empty() {
@@ -399,7 +401,9 @@ fn confirm_suggestion_inner(
     let final_pairs: Vec<(String, String, i64)> = tags
         .iter()
         .flat_map(|(category, names)| {
-            let facet_key = tag_facets::key_for_legacy_name(category).to_string();
+            let facet_key = tag_facets::resolve_facet_key(conn, category)
+                .map(|(k, _)| k)
+                .unwrap_or_else(|_| "custom".to_string());
             names.iter().filter_map(move |name| {
                 let normalized = tags::normalize_name(name);
                 if normalized.is_empty() { return None; }

@@ -405,6 +405,45 @@ pub fn list_by_facet(conn: &Connection, facet_key: &str) -> AppResult<Vec<TagNod
     Ok(filter(tree, facet_key))
 }
 
+/// W2-9：按使用次数降序取 Top-N 标签（高频词优先 → 标签收敛更快）。
+/// 单条 GROUP BY 走 idx_asset_tags_tag；标签名 >12 字截断；总输出 1500 字符上限。
+/// 供 W5a 提示词拼入候选词（「含义相同就用已有的词」约束的事实基础）。
+pub fn top_tags_per_facet(conn: &Connection, n: usize) -> AppResult<Vec<(String, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT t.facet_key, t.name, COUNT(at.asset_id) AS uses
+           FROM tags t JOIN asset_tags at ON at.tag_id = t.id
+          WHERE t.status = 'active'
+          GROUP BY t.id
+          ORDER BY uses DESC, t.sort_order, t.id
+          LIMIT ?1",
+    )?;
+    let rows: Vec<(String, String)> = stmt
+        .query_map([n as i64], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    // 按分面分组聚合成 "facet_key: 词1/词2/..."，超 12 字的词截断，总量 1500 字符封顶
+    let mut by_facet: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+    for (facet, name) in rows {
+        let short: String = name.chars().take(12).collect();
+        by_facet.entry(facet).or_default().push(short);
+    }
+    const CAP: usize = 1500;
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut total: usize = 0;
+    for (facet, words) in by_facet {
+        let line = words.join("/");
+        total += line.chars().count() + facet.len() + 2;
+        if total > CAP {
+            break;
+        }
+        out.push((facet, line));
+    }
+    Ok(out)
+}
+
 pub fn search_candidates(
     conn: &Connection,
     facet_key: Option<&str>,
@@ -420,7 +459,10 @@ pub fn search_candidates(
            FROM tags t LEFT JOIN tag_aliases ta ON ta.tag_id=t.id
           WHERE COALESCE(t.status,'active')='active'
             AND (COALESCE(t.normalized_name,lower(trim(t.name))) LIKE ?1
-              OR ta.normalized_alias LIKE ?1)"
+              OR ta.normalized_alias LIKE ?1)
+            AND EXISTS (SELECT 1 FROM tag_facets f
+                         WHERE f.key = COALESCE(t.facet_key,'custom')
+                           AND f.status = 'active')"
             .to_string(),
     );
     if facet_key.is_some() {

@@ -520,6 +520,10 @@ fn order_by(filter: &AssetFilter) -> String {
             "CASE WHEN a.width IS NULL OR a.height IS NULL THEN 1 ELSE 0 END ASC, (a.width * a.height) {dir}"
         ),
         Some("name") => format!("a.file_name {dir}"),
+        // W2-8：未评级（rating=0）排最后，其余按评级排序
+        Some("rating") => format!(
+            "CASE WHEN a.rating = 0 THEN 1 ELSE 0 END ASC, a.rating {dir}"
+        ),
         Some("modified_at") => format!("a.modified_at {dir}"),
         _ => format!("a.created_at {dir}"),
     };
@@ -547,6 +551,8 @@ const VALID_SORT: &[&str] = &[
     "name",
     "size",
     "resolution",
+    // W2-8：按评级排序（选片核心动作：把 5 星排前面；未评级排最后）
+    "rating",
 ];
 
 impl AssetFilter {
@@ -777,6 +783,30 @@ pub fn list_metadata_facets(
                 "CASE WHEN a.duration_ms < 10000 THEN 'lt_10s' WHEN a.duration_ms < 60000 THEN '10_60s' WHEN a.duration_ms < 300000 THEN '1_5m' ELSE 'gte_5m' END",
                 "CASE WHEN a.duration_ms < 10000 THEN '小于 10 秒' WHEN a.duration_ms < 60000 THEN '10 秒–1 分钟' WHEN a.duration_ms < 300000 THEN '1–5 分钟' ELSE '大于等于 5 分钟' END",
                 "a.duration_ms IS NOT NULL",
+            )?,
+        },
+        // W2-8：评级分面（0 = 未评级不展示；点击走 rating eq/gte 数值管道）
+        MetadataFacet {
+            key: "rating".into(),
+            display_name: "评级".into(),
+            description: "你给素材打的星级".into(),
+            items: metadata_items(
+                conn,
+                "CAST(a.rating AS TEXT)",
+                "CASE a.rating WHEN 1 THEN '★' WHEN 2 THEN '★★' WHEN 3 THEN '★★★' WHEN 4 THEN '★★★★' ELSE '★★★★★' END",
+                "a.rating > 0",
+            )?,
+        },
+        // W2-8：收藏分面（favorite 仿 has_location 的 CASE 编译，值域 yes/no）
+        MetadataFacet {
+            key: "favorite".into(),
+            display_name: "收藏".into(),
+            description: "你收藏的素材".into(),
+            items: metadata_items(
+                conn,
+                "CASE WHEN a.favorite = 1 THEN 'yes' ELSE 'no' END",
+                "CASE WHEN a.favorite = 1 THEN '已收藏' ELSE '未收藏' END",
+                "a.favorite = 1",
             )?,
         },
         MetadataFacet {
@@ -1153,6 +1183,51 @@ pub fn list_geo_taken_all_ids(conn: &Connection) -> AppResult<Vec<i64>> {
 
 /// 回填 GPS 定位与拍摄时间（仅补空，不覆盖已有值；老素材无定位保持 NULL）。
 /// 注意 COALESCE 参数顺序：已有列值在前，新值在后 —— COALESCE(旧, 新) 才是「只补空」。
+/// W2-8：批量收藏/取消收藏（favorite 0/1）。返回受影响行数。
+pub fn set_favorite(conn: &Connection, ids: &[i64], favorite: bool) -> AppResult<u64> {
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    let list = ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
+    let n = conn.execute(
+        &format!("UPDATE assets SET favorite = ?1 WHERE id IN ({list})"),
+        rusqlite::params![if favorite { 1 } else { 0 }],
+    )?;
+    Ok(n as u64)
+}
+
+/// W2-8：批量评级（0–5；0 = 清除评级）。
+pub fn set_rating(conn: &Connection, ids: &[i64], rating: i64) -> AppResult<u64> {
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    if !(0..=5).contains(&rating) {
+        return Err(AppError::msg("评级只允许 0–5（0 = 清除）"));
+    }
+    let list = ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
+    let n = conn.execute(
+        &format!("UPDATE assets SET rating = ?1 WHERE id IN ({list})"),
+        rusqlite::params![rating],
+    )?;
+    Ok(n as u64)
+}
+
+/// W2-8：批量手动旋转（0/90/180/270；写入 user_rotation，严禁碰 ffprobe 的 rotation）。
+pub fn set_user_rotation(conn: &Connection, ids: &[i64], rotation: i64) -> AppResult<u64> {
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    if ![0, 90, 180, 270].contains(&rotation) {
+        return Err(AppError::msg("旋转角只允许 0/90/180/270"));
+    }
+    let list = ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
+    let n = conn.execute(
+        &format!("UPDATE assets SET user_rotation = ?1 WHERE id IN ({list})"),
+        rusqlite::params![rotation],
+    )?;
+    Ok(n as u64)
+}
+
 /// W1-4：图片宽高缺失候选（RAW 无法被 image_dimensions 解码的历史存量）。
 pub fn list_ids_needing_dimensions(conn: &Connection) -> AppResult<Vec<i64>> {
     let mut stmt = conn.prepare(

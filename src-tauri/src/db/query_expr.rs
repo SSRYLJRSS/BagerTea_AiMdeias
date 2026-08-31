@@ -73,6 +73,12 @@ pub enum LeafCond {
         #[serde(default)]
         scope: SearchScope,
     },
+    /// W2-7：分面有任意标签（「场景 有任意标签」—— 打标补漏核心场景）
+    #[serde(rename_all = "camelCase")]
+    FacetHasAny { facet_key: String },
+    /// W2-7：分面没有标签（「场景 没有标签」—— 精准补漏筛选）
+    #[serde(rename_all = "camelCase")]
+    FacetMissing { facet_key: String },
 }
 
 fn default_true() -> bool {
@@ -157,6 +163,12 @@ fn validate_leaf(cond: &LeafCond) -> AppResult<()> {
         LeafCond::Search { value, .. } => {
             if value.chars().count() > 200 {
                 return Err(AppError::msg("搜索关键词过长"));
+            }
+            Ok(())
+        }
+        LeafCond::FacetHasAny { facet_key } | LeafCond::FacetMissing { facet_key } => {
+            if facet_key.trim().is_empty() {
+                return Err(AppError::msg("分面 key 不能为空"));
             }
             Ok(())
         }
@@ -263,10 +275,31 @@ pub fn compile_leaf(conn: &Connection, cond: &LeafCond) -> AppResult<(String, Ve
             mode,
             include_descendants,
         } => {
-            // §12.5：Tag 叶子不能忽略 facet_key——校验未知分面不被静默折叠成 custom；
-            // 且已存在的标签若其分面与声明不符（跨分面串用），明确报错而非返回错误结果。
-            validate_tag_leaf_facet(conn, facet_key, tag_ids)?;
-            compile_tag_leaf(tag_ids, mode.as_deref(), *include_descendants)
+            // W2-6：facet 一致性校验改为「剔除 + warning，不报错整次查询」。
+            // 旧语义（一个标签跨分面就拒绝整次查询）在分面删除/重建后会卡死已保存的搜索。
+            let valid_ids = filter_tags_by_facet(conn, facet_key, tag_ids);
+            if valid_ids.is_empty() {
+                return Ok(("1=1".to_string(), Vec::new()));
+            }
+            compile_tag_leaf(&valid_ids, mode.as_deref(), *include_descendants)
+        }
+        LeafCond::FacetHasAny { facet_key } => {
+            validate_facet_exists(conn, facet_key)?;
+            Ok((
+                "EXISTS (SELECT 1 FROM asset_tags at2 JOIN tags t2 ON t2.id = at2.tag_id
+                  WHERE at2.asset_id = a.id AND t2.facet_key = ?1 AND t2.status = 'active')"
+                    .to_string(),
+                vec![Value::Text(facet_key.clone())],
+            ))
+        }
+        LeafCond::FacetMissing { facet_key } => {
+            validate_facet_exists(conn, facet_key)?;
+            Ok((
+                "NOT EXISTS (SELECT 1 FROM asset_tags at3 JOIN tags t3 ON t3.id = at3.tag_id
+                  WHERE at3.asset_id = a.id AND t3.facet_key = ?1 AND t3.status = 'active')"
+                    .to_string(),
+                vec![Value::Text(facet_key.clone())],
+            ))
         }
         LeafCond::ExcludeTag { tag_ids, .. } => {
             let mut sql = String::new();
@@ -291,14 +324,38 @@ pub fn compile_leaf(conn: &Connection, cond: &LeafCond) -> AppResult<(String, Ve
     }
 }
 
-/// §12.5：校验 Tag 叶子的 facet_key。
-///  - 未知 facet：返回明确错误（不静默折叠成 custom）；
-///  - 已存在标签但分面与声明不符（跨分面串用 tag_id）：返回明确错误；
-///  - facet_key 为空（排除标签/历史兼容）跳过校验；tag 不存在（宽容）不报错。
-fn validate_tag_leaf_facet(conn: &Connection, facet_key: &str, tag_ids: &[i64]) -> AppResult<()> {
+/// W2-6：Tag 叶子的 facet 一致性过滤 —— 不属于声明 facet_key 的 tag_id 直接剔除并 warning，
+/// 不再报错整次查询（分面删除/重建后，已保存的搜索不应被一个失效 tag_id 卡死）。
+/// 全部剔除时返回空 Vec，compile_leaf 侧折叠为 1=1（条件恒真，查询继续）。
+fn filter_tags_by_facet(conn: &Connection, facet_key: &str, tag_ids: &[i64]) -> Vec<i64> {
     if facet_key.is_empty() {
-        return Ok(());
+        return tag_ids.to_vec();
     }
+    let placeholders = tag_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    if placeholders.is_empty() {
+        return Vec::new();
+    }
+    let mut vals: Vec<Value> = vec![Value::Text(facet_key.to_string())];
+    for &t in tag_ids {
+        vals.push(Value::Integer(t));
+    }
+    let mut valid: Vec<i64> = Vec::new();
+    if let Ok(mut stmt) = conn.prepare(&format!(
+        "SELECT id FROM tags WHERE facet_key = ? AND id IN ({placeholders})"
+    )) {
+        if let Ok(rows) = stmt.query_map(params_from_iter(vals), |r| r.get::<_, i64>(0)) {
+            valid.extend(rows.filter_map(|r| r.ok()));
+        }
+    }
+    let dropped = tag_ids.len() - valid.len();
+    if dropped > 0 {
+        tracing::warn!("剔除 {dropped} 个不属于分面 {facet_key} 的标签（查询继续）");
+    }
+    valid
+}
+
+/// W2-7：FacetHasAny / FacetMissing 的分面存在性校验（编译期报错，区别于 Tag 的剔除策略）。
+fn validate_facet_exists(conn: &Connection, facet_key: &str) -> AppResult<()> {
     let exists: Option<i64> = conn
         .query_row(
             "SELECT 1 FROM tag_facets WHERE key = ?1",
@@ -308,22 +365,6 @@ fn validate_tag_leaf_facet(conn: &Connection, facet_key: &str, tag_ids: &[i64]) 
         .optional()?;
     if exists.is_none() {
         return Err(AppError::msg(format!("未知分面：{facet_key}")));
-    }
-    if tag_ids.is_empty() {
-        return Ok(());
-    }
-    let placeholders = tag_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-    let mut vals: Vec<Value> = vec![Value::Text(facet_key.to_string())];
-    for &t in tag_ids {
-        vals.push(Value::Integer(t));
-    }
-    let mismatched: i64 = conn.query_row(
-        &format!("SELECT COUNT(*) FROM tags WHERE facet_key <> ? AND id IN ({placeholders})"),
-        params_from_iter(vals),
-        |r| r.get(0),
-    )?;
-    if mismatched > 0 {
-        return Err(AppError::msg(format!("标签不属于分面 {facet_key}")));
     }
     Ok(())
 }
@@ -575,6 +616,19 @@ mod tests {
                 },
             ],
         };
+        // W2-6：tag_ids 需真实存在于声明分面（不存在会被剔除+折叠 1=1）——先造标签
+        conn.execute(
+            "INSERT INTO tags (name, normalized_name, canonical_name, facet_key, is_system, status, sort_order)
+             VALUES ('海边', '海边', '海边', 'scene', 0, 'active', 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tags (name, normalized_name, canonical_name, facet_key, is_system, status, sort_order)
+             VALUES ('日落', '日落', '日落', 'scene', 0, 'active', 1)",
+            [],
+        )
+        .unwrap();
         let (sql, params) = compile_expr(&conn, &expr).unwrap();
         assert!(sql.contains("EXISTS"));
         assert!(sql.contains(">="));
@@ -586,8 +640,9 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_facet_key_not_silent_custom() {
-        // §12.5：未知 facet 不静默折叠成 custom
+    fn unknown_facet_dropped_not_error_not_silent() {
+        // W2-6：未知 facet（或标签不属于声明分面）→ 剔除 + warning，查询继续（1=1），
+        // 不再报错整次查询（旧行为会卡死分面删除后已保存的搜索）
         let conn = init_memory().unwrap();
         let expr = QueryExpr::Leaf {
             cond: LeafCond::Tag {
@@ -597,12 +652,13 @@ mod tests {
                 include_descendants: true,
             },
         };
-        let err = compile_expr(&conn, &expr).unwrap_err();
-        assert!(err.to_string().contains("未知分面"));
+        let (sql, params) = compile_expr(&conn, &expr).unwrap();
+        assert_eq!(sql, "1=1", "剔除后折叠为恒真");
+        assert!(params.is_empty());
     }
 
     #[test]
-    fn rejects_tag_belonging_to_wrong_facet() {
+    fn tag_belonging_to_wrong_facet_is_dropped() {
         let conn = init_memory().unwrap();
         // 造一个在 scene 分面下的标签
         conn.execute(
@@ -611,7 +667,7 @@ mod tests {
             [],
         )
         .unwrap();
-        // 声明为 color 分面但 tag 属于 scene → 报错
+        // W2-6：声明为 color 分面但 tag 属于 scene → 剔除该 tag（warning），折叠 1=1
         let expr = QueryExpr::Leaf {
             cond: LeafCond::Tag {
                 facet_key: "color".into(),
@@ -620,8 +676,9 @@ mod tests {
                 include_descendants: false,
             },
         };
-        let err = compile_expr(&conn, &expr).unwrap_err();
-        assert!(err.to_string().contains("不属于分面"));
+        let (sql, params) = compile_expr(&conn, &expr).unwrap();
+        assert_eq!(sql, "1=1", "剔除后折叠为恒真");
+        assert!(params.is_empty());
     }
 
     #[test]

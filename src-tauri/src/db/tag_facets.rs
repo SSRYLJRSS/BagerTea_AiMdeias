@@ -13,8 +13,8 @@ use crate::error::{AppError, AppResult};
 pub struct FacetPromptContext {
     pub key: String,
     pub display_name: String,
+    /// V20 合表后：description 同时承载「给人的说明」与「给 AI 的 hint」（W2-1 删独立 hint）
     pub description: String,
-    pub hint: String,
     pub selection_mode: String,
     pub max_items: Option<i64>,
 }
@@ -41,7 +41,9 @@ pub struct TagFacet {
 pub struct FacetImpact {
     pub tag_count: i64,
     pub asset_count: i64,
-    pub ai_config_count: i64,
+    /// V20 合表后 aiFacetConfigs 恒为 0（W2-4：改报 suggestion items / tag_ops 计数）
+    pub ai_suggestion_item_count: i64,
+    pub tag_op_count: i64,
 }
 
 /// 校验稳定 key：小写 snake_case，2–64 字符，只允许字母/数字/下划线，不以数字开头（指导书 §12.3）。
@@ -309,6 +311,107 @@ pub fn reorder(conn: &Connection, ordered_keys: &[String]) -> AppResult<()> {
     Ok(())
 }
 
+/// W2-2：合并编辑命令 —— 6 字段一个事务（display_name/description/input_mode/
+/// selection_mode/max_items/applies_to）。替代 update_display + update_rules 两个
+/// 即时写命令（旧命令保留 deprecated 标记，W4 前端切换完再删）。
+/// 部分字段非法时全部不生效（单一保存通道语义）。
+pub fn update_facet(
+    conn: &Connection,
+    key: &str,
+    display_name: &str,
+    description: &str,
+    input_mode: &str,
+    selection_mode: &str,
+    max_items: Option<i64>,
+    applies_to: &str,
+) -> AppResult<()> {
+    let display_name = display_name.trim().to_string();
+    if display_name.is_empty() {
+        return Err(AppError::msg("显示名不能为空"));
+    }
+    if input_mode != "ai_and_manual" && input_mode != "manual_only" {
+        return Err(AppError::msg("input_mode 只允许 ai_and_manual | manual_only"));
+    }
+    if selection_mode != "single" && selection_mode != "multi" {
+        return Err(AppError::msg("selection_mode 只允许 single | multi"));
+    }
+    let max_items = match selection_mode {
+        "single" => Some(1),
+        _ => match max_items {
+            Some(n) if n >= 1 => Some(n),
+            Some(_) => return Err(AppError::msg("多选分面的 max_items 必须为正整数或为空")),
+            None => None,
+        },
+    };
+    if applies_to != "all" && applies_to != "image" && applies_to != "video" {
+        return Err(AppError::msg("applies_to 只允许 all | image | video"));
+    }
+    let now = chrono::Utc::now().timestamp_millis();
+    let tx = conn.unchecked_transaction()?;
+    let n = tx.execute(
+        "UPDATE tag_facets SET
+            display_name = ?2, description = ?3, input_mode = ?4,
+            selection_mode = ?5, max_items = ?6, applies_to = ?7, updated_at = ?8
+          WHERE key = ?1",
+        params![key, display_name, description.trim(), input_mode,
+                selection_mode, max_items, applies_to, now],
+    )?;
+    if n == 0 {
+        return Err(AppError::msg("分面不存在"));
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// W2-3：删除报告（数字与 W2-4 get_impact 一致，可互相印证）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FacetDeleteReport {
+    pub tags_deleted: i64,
+    pub unlinked: i64,
+    pub ops_deleted: i64,
+    pub items_deleted: i64,
+}
+
+/// W2-3：物理删除分面 + 全级联。删除顺序（不可调换）：
+/// ① asset_tags（让 trg_at_ad 跑，刷 FTS）
+/// ② tag_ops（防 undo_batch JOIN 到已删 tag）
+/// ③ ai_suggestion_items（facet_key 裸 TEXT 无外键）
+/// ④ tag_aliases → ⑤ tags → ⑥ tag_facets
+/// 系统分面拒绝（Q2：key 有大量代码/文档引用）。ai_suggestions.suggested_tags JSON 保留（AI 原始返回可追溯）。
+pub fn delete_facet(conn: &Connection, key: &str) -> AppResult<FacetDeleteReport> {
+    let f = get(conn, key)?;
+    if f.is_system {
+        return Err(AppError::msg("系统分面不能删除（只允许停用）"));
+    }
+    let tx = conn.unchecked_transaction()?;
+    let unlinked = tx.execute(
+        "DELETE FROM asset_tags WHERE tag_id IN (SELECT id FROM tags WHERE facet_key = ?1)",
+        [key],
+    )? as i64;
+    let ops_deleted = tx.execute(
+        "DELETE FROM tag_ops WHERE tag_id IN (SELECT id FROM tags WHERE facet_key = ?1)",
+        [key],
+    )? as i64;
+    let items_deleted = tx.execute(
+        "DELETE FROM ai_suggestion_items WHERE facet_key = ?1",
+        [key],
+    )? as i64;
+    tx.execute(
+        "DELETE FROM tag_aliases WHERE tag_id IN (SELECT id FROM tags WHERE facet_key = ?1)",
+        [key],
+    )?;
+    let tags_deleted = tx.execute("DELETE FROM tags WHERE facet_key = ?1", [key])? as i64;
+    tx.execute("DELETE FROM tag_facets WHERE key = ?1", [key])?;
+    tx.commit()?;
+    Ok(FacetDeleteReport {
+        tags_deleted,
+        unlinked,
+        ops_deleted,
+        items_deleted,
+    })
+}
+
 /// 停用（软停用，保留历史引用）。系统分面默认拒绝停用（可提供 force 以仅停止展示）。
 pub fn deactivate(conn: &Connection, key: &str) -> AppResult<()> {
     let f = get(conn, key)?;
@@ -352,15 +455,24 @@ pub fn get_impact(conn: &Connection, key: &str) -> AppResult<FacetImpact> {
         [key],
         |r| r.get(0),
     )?;
-    let ai_config_count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM settings WHERE key = 'ai_facet_configs' AND value LIKE ?1",
-        [format!("%{key}%")],
+    // W2-4：ai_suggestion_items.facet_key 是裸 TEXT 无外键，删除时必须清；
+    // tag_ops 同理（防 undo_batch JOIN 到已删 tag）。计数与 W2-3 实际删除量一致。
+    let ai_suggestion_item_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM ai_suggestion_items WHERE facet_key = ?1",
+        [key],
+        |r| r.get(0),
+    )?;
+    let tag_op_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM tag_ops o
+          JOIN tags t ON t.id = o.tag_id WHERE t.facet_key = ?1",
+        [key],
         |r| r.get(0),
     )?;
     Ok(FacetImpact {
         tag_count,
         asset_count,
-        ai_config_count,
+        ai_suggestion_item_count,
+        tag_op_count,
     })
 }
 
@@ -528,7 +640,41 @@ mod tests {
     }
 }
 
-/// 兼容旧 AI 分类显示名，所有新协议应直接使用稳定 key。
+/// W2-10：AI 返回分类 key 的唯一路由入口。三条分支：
+/// ① DB 里存在该 key → 原样返回（自建分面走这条）
+/// ② 中文旧名表命中且该 key 在 DB → 返回映射结果
+/// ③ 都不中 → custom + warning（绝不静默丢进 custom：必须留痕）
+///
+/// 返回 (facet_key, 旧名映射到的 key)。第二个返回值仅用于日志区分来源。
+pub fn resolve_facet_key(conn: &Connection, raw: &str) -> AppResult<(String, String)> {
+    let raw = raw.trim();
+    let exists = |key: &str| -> bool {
+        conn.query_row(
+            "SELECT 1 FROM tag_facets WHERE key = ?1",
+            [key],
+            |_| Ok(()),
+        )
+        .is_ok()
+    };
+    // ① DB 直存
+    if exists(raw) {
+        return Ok((raw.to_string(), raw.to_string()));
+    }
+    // ② 旧名表映射
+    let mapped = key_for_legacy_name(raw);
+    if mapped != raw && exists(mapped) {
+        return Ok((mapped.to_string(), mapped.to_string()));
+    }
+    // ③ 兜底 custom（含警告：manual_only/停用分面落这里说明 AI 输出了不参与 AI 的分类）
+    if mapped != raw || raw != "custom" {
+        tracing::warn!("AI 返回未知分面 key「{raw}」，路由到 custom（该分类不存在或不参与 AI 打标）");
+    }
+    Ok(("custom".to_string(), "custom".to_string()))
+}
+
+/// 兼容旧 AI 分类显示名（纯函数：只查中文旧名表，**不再作为路由入口**——
+/// W2-10 起分面 key 路由必须走 resolve_facet_key，它会查 DB 让自建分面生效）。
+/// 仅保留给：解析历史 CategorizedTags JSON 的中文 key（老数据确实存着中文分类名）。
 pub fn key_for_legacy_name(name: &str) -> &'static str {
     match name.trim() {
         "subject" => "subject",
@@ -569,39 +715,28 @@ pub fn display_name_for_key(key: &str) -> &'static str {
     }
 }
 
-/// 由设置中的 ai_facet_configs 与数据库 tag_facets 合并出 AI 提示词上下文。
-/// tag_facets 是唯一事实源：selection_mode / max_items / 描述 以数据库为准；
-/// hint / display_name（可选覆盖）来自设置；只保留 enabled_for_ai = true 的分面。
-pub fn build_prompt_context(
-    conn: &Connection,
-    configs: &[AiFacetConfig],
-) -> AppResult<Vec<FacetPromptContext>> {
-    let db_facets: std::collections::BTreeMap<String, TagFacet> = list(conn)?
-        .into_iter()
-        .map(|f| (f.key.clone(), f))
+/// W2-1：tag_facets 是唯一事实源 —— 直接从 DB 读，只取
+/// `input_mode = 'ai_and_manual'`（参与 AI）且 active 的分面。
+/// V20 合表后 settings.aiFacetConfigs 的语义已全部搬进 tag_facets，不再传参。
+/// 一次消灭③诊断的四类 bug：两个保存通道、两个显示名、孤儿条目、缺条目静默不参与 AI。
+pub fn build_prompt_context(conn: &Connection) -> AppResult<Vec<FacetPromptContext>> {
+    let mut stmt = conn.prepare(
+        "SELECT key, display_name, description, selection_mode, max_items
+           FROM tag_facets
+          WHERE status = 'active' AND input_mode = 'ai_and_manual'
+          ORDER BY sort_order",
+    )?;
+    let out = stmt
+        .query_map([], |r| {
+            Ok(FacetPromptContext {
+                key: r.get(0)?,
+                display_name: r.get(1)?,
+                description: r.get(2)?,
+                selection_mode: r.get(3)?,
+                max_items: r.get(4)?,
+            })
+        })?
+        .filter_map(|r| r.ok())
         .collect();
-    let mut out = Vec::new();
-    for cfg in configs {
-        if !cfg.enabled_for_ai {
-            continue;
-        }
-        let Some(dbf) = db_facets.get(&cfg.facet_key) else {
-            // 设置在数据库无此分面：跳过（防陈旧配置）
-            continue;
-        };
-        let display_name = cfg
-            .display_name
-            .clone()
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| dbf.display_name.clone());
-        out.push(FacetPromptContext {
-            key: cfg.facet_key.clone(),
-            display_name,
-            description: dbf.description.clone(),
-            hint: cfg.hint.clone(),
-            selection_mode: dbf.selection_mode.clone(),
-            max_items: dbf.max_items,
-        });
-    }
     Ok(out)
 }

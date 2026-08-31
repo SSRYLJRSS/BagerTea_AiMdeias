@@ -82,6 +82,16 @@ fn key_spec(key: &str) -> Option<KeySpec> {
             kind: ValueKind::String,
             null_guard: None,
         },
+        // W2-8：评级（0–5；0 = 未评级）。INTEGER 列自带 0 默认值，非 NULL 语义。
+        "rating" => KeySpec {
+            kind: ValueKind::Number,
+            null_guard: None,
+        },
+        // W2-8：收藏有无（分面用）：仿 has_location 编译为 CASE 表达式，值域 yes/no
+        "favorite" => KeySpec {
+            kind: ValueKind::String,
+            null_guard: None,
+        },
         "taken_at" | "created_at" | "modified_at" => KeySpec {
             kind: ValueKind::Date,
             null_guard: Some("IS NOT NULL"),
@@ -107,6 +117,9 @@ fn allowed_ops(key: &str) -> &'static [&'static str] {
             &["eq", "in", "gt", "gte", "lt", "lte", "between"]
         }
         "has_location" => &["eq", "in"],
+        // W2-8：评级数值比较 + 收藏有无
+        "rating" => &["eq", "in", "gt", "gte", "lt", "lte", "between"],
+        "favorite" => &["eq", "in"],
         "taken_at" | "created_at" | "modified_at" => &["gte", "lte", "between"],
         "folder" => &["eq", "in"],
         _ => &[],
@@ -141,6 +154,9 @@ fn value_expr(key: &str) -> String {
             "(CASE WHEN a.latitude IS NOT NULL AND a.longitude IS NOT NULL THEN 'yes' ELSE 'no' END)"
                 .into()
         }
+        // W2-8：收藏有无（favorite 列 0/1，分面侧呈现 yes/no）
+        "favorite" => "(CASE WHEN a.favorite = 1 THEN 'yes' ELSE 'no' END)".into(),
+        "rating" => "a.rating".into(),
         "taken_at" => "a.taken_at".into(),
         "created_at" => "a.created_at".into(),
         "modified_at" => "a.modified_at".into(),

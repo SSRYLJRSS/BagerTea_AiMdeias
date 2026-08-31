@@ -168,7 +168,6 @@ fn categories() -> Vec<FacetPromptContext> {
         key: "scene".into(),
         display_name: "场景".into(),
         description: "场景".into(),
-        hint: String::new(),
         selection_mode: "single".into(),
         max_items: Some(3),
     }]

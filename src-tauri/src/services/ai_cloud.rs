@@ -66,10 +66,10 @@ fn build_prompt(facets: &[FacetPromptContext]) -> String {
             c.display_name,
             c.key,
             rule,
-            if c.hint.is_empty() {
+            if c.description.trim().is_empty() {
                 String::new()
             } else {
-                format!("：{}", c.hint)
+                format!("：{}", c.description) // W2-1：hint 已并入 description（V20 合表）
             }
         ));
     }

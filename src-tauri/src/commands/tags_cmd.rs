@@ -54,7 +54,37 @@ pub fn create_tag_facet(
     )
 }
 
-/// 修改显示属性（显示名/描述；key 不可改）。
+/// W2-2：合并编辑命令（6 字段一个事务）。旧 update_tag_facet_display /
+/// update_tag_facet_rules 保留 deprecated 标记，W4 前端切换完再删。
+#[tauri::command]
+pub fn update_tag_facet(
+    state: State<AppState>,
+    key: String,
+    display_name: String,
+    description: String,
+    input_mode: String,
+    selection_mode: String,
+    max_items: Option<i64>,
+    applies_to: String,
+) -> AppResult<()> {
+    let conn = lock_db(&state)?;
+    crate::db::tag_facets::update_facet(
+        &conn, &key, &display_name, &description, &input_mode,
+        &selection_mode, max_items, &applies_to,
+    )
+}
+
+/// W2-3：物理删除分面 + 全级联（系统分面拒绝）。返回删除报告供确认弹窗对账。
+#[tauri::command]
+pub fn delete_tag_facet(
+    state: State<AppState>,
+    key: String,
+) -> AppResult<crate::db::tag_facets::FacetDeleteReport> {
+    let conn = lock_db(&state)?;
+    crate::db::tag_facets::delete_facet(&conn, &key)
+}
+
+/// 修改显示属性（显示名/描述；key 不可改）。【deprecated：W2-2 起 W4 前端改走 update_tag_facet】
 #[tauri::command]
 pub fn update_tag_facet_display(
     state: State<AppState>,
