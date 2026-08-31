@@ -3,6 +3,7 @@
  *  error（数据查询）与 aiError（AI 解析）分离：AI 解析失败保留当前 query/expr/items，不触发 refresh。
  *  请求代际防旧响应覆盖新查询。 */
 import { create } from "zustand";
+import { persist } from "zustand/middleware";
 import { listSuperAssets, listSuperAssetIds, aiParseSearchQuery } from "@/api/superSearch";
 import { useSelectionStore } from "@/stores/selectionStore";
 import type { Asset, ResolvedSearchQuery, MetadataFilter } from "@/types/asset";
@@ -127,7 +128,11 @@ export interface SuperSearchState {
   clearQuery: () => void;
 }
 
-export const useSuperSearchStore = create<SuperSearchState>((set, get) => ({
+// W5f-f6：搜索条件持久化（localStorage）—— 只存 expr + query（带版本号），
+// hydrate 不触发请求；进页走既有代际机制单次查询（partialize 排除 items/loading 等瞬态）。
+export const useSuperSearchStore = create<SuperSearchState>()(
+  persist(
+    (set, get) => ({
   query: defaultQuery(),
   expr: undefined,
   items: [],
@@ -293,6 +298,16 @@ export const useSuperSearchStore = create<SuperSearchState>((set, get) => ({
     const def = defaultQuery();
     void get().replaceQuery(def, undefined);
   },
-}));
+}),
+{
+  name: "super-search-conditions",
+  version: 1,
+  partialize: (state) => ({
+    expr: state.expr,
+    query: state.query,
+  }),
+},
+  ),
+);
 
 export type { MetadataFilter };

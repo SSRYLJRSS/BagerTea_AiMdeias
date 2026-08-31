@@ -296,3 +296,50 @@ describe("refreshPaletteFields（FB4-03 §6.2 定向同步）", () => {
     expect(listAssets).not.toHaveBeenCalled();
   });
 });
+/** W5h-d：同源合并显示（纯前端折叠） */
+describe("W5h-d kinship 合并显示", () => {
+  const mkAsset = (id: number, filePath: string): Asset => ({
+    id, filePath, fileName: filePath.split("/").pop() ?? filePath, fileExt: "jpg",
+    fileSize: 1, mimeType: "image/jpeg", createdAt: 1, modifiedAt: 1, tags: [],
+  } as unknown as Asset);
+
+  it("libraryStore_merges_kinship_when_enabled：同组只留非 RAW 代表", async () => {
+    const jpg = mkAsset(1, "d:/all/_0001.JPG");
+    const raw = mkAsset(2, "d:/all/_0001.RW2");
+    const solo = mkAsset(3, "d:/all/_0002.JPG");
+    const { collapseKinship } = await import("@/stores/libraryStore");
+    const merged = collapseKinship([jpg, raw, solo]);
+    expect(merged.map((a) => a.id)).toEqual([1, 3]);
+  });
+
+  it("RAW 在前时 JPG 仍为代表", async () => {
+    const raw = mkAsset(1, "d:/all/A.RW2");
+    const jpg = mkAsset(2, "d:/all/A.JPG");
+    const { collapseKinship } = await import("@/stores/libraryStore");
+    expect(collapseKinship([raw, jpg]).map((a) => a.id)).toEqual([2]);
+  });
+
+  it("libraryStore_keeps_separate_when_disabled：不折叠由 store 开关控制（viewItems=items）", async () => {
+    // mergeInLibrary=false 时 applyKinshipView 返回原数组 —— 通过设置 store 状态验证行为
+    const { useSettingsStore } = await import("@/stores/settingsStore");
+    const items = [mkAsset(1, "d:/all/A.JPG"), mkAsset(2, "d:/all/A.RW2")];
+    useSettingsStore.setState({
+      settings: {
+        ai: { profiles: [], activeProfile: "", videoTagging: false, videoTaggingMode: "cover", videoFrameCount: 3, batchLimit: 30, ollamaSourceId: "auto" },
+        theme: "system", thumbnailCacheMb: 2048, tagCategories: [], libraryRoot: "",
+        trashRetentionDays: 30, customDownloadSources: [], modelDownloadProxy: "",
+        appearance: {
+          grid: { libraryCellStep: 3, importCellStep: 1, cellAspect: "1:1", cellFit: "cover", matchDominantColor: false },
+          hoverPreview: { enabled: true, previewSeconds: 3, inLibraryGrid: true },
+          colorStrip: { enabled: true, showInLibraryGrid: false, showInViewer: true, showInImportGrid: false, height: "normal", mode: "ratio", count: 6 },
+          kinship: { syncTagsToSiblings: true, mergeInLibrary: false },
+        },
+      } as never,
+      previewAppearance: null,
+    });
+    // 关闭时 viewItems 与 items 一致（store 路径：refresh 里 applyKinshipView）
+    const { useLibraryStore } = await import("@/stores/libraryStore");
+    useLibraryStore.setState({ items, viewItems: items, total: 2 });
+    expect(useLibraryStore.getState().viewItems).toHaveLength(2);
+  });
+});

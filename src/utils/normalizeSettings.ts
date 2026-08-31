@@ -153,10 +153,16 @@ function normalizeColorStrip(raw: unknown): ColorStripAppearance {
 
 function normalizeAppearance(raw: unknown): Appearance {
   const r = isRecord(raw) ? raw : {};
+  const k = isRecord(r.kinship) ? r.kinship : {};
   return {
     grid: normalizeGrid(r.grid),
     hoverPreview: normalizeHoverPreview(r.hoverPreview),
     colorStrip: normalizeColorStrip(r.colorStrip),
+    // W5h：同源文件组（缺省 = 后端默认：同步开、合并显示关）
+    kinship: {
+      syncTagsToSiblings: asBool(k.syncTagsToSiblings, true),
+      mergeInLibrary: asBool(k.mergeInLibrary, false),
+    },
   };
 }
 

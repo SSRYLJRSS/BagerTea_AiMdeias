@@ -2111,3 +2111,137 @@ fn top_tags_respects_char_cap() -> AppResult<()> {
     assert!(total <= 1600, "总字符应受 1500 上限约束（含分面 key），实际 {total}");
     Ok(())
 }
+
+// ── W5h：同源文件组（RAW+JPG）──
+fn add_kinship_pair(conn: &rusqlite::Connection) -> (i64, i64) {
+    let jpg = add_asset(conn, "d:/all/_0001.JPG", "_0001.JPG", "jpg", "image/jpeg");
+    let raw = add_asset(conn, "d:/all/_0001.RW2", "_0001.RW2", "rw2", "image/x-raw");
+    (jpg, raw)
+}
+
+#[test]
+fn assign_syncs_to_kinship_siblings() -> AppResult<()> {
+    let conn = setup();
+    let (jpg, raw) = add_kinship_pair(&conn);
+    let t = tags::create_in_facet(&conn, "海边", None, Some("scene"))?;
+    // 给 JPG 打标 → RAW 也有
+    asset_tags::assign(&conn, &[jpg], &[t.id], "manual")?;
+    let raw_tags = asset_tags::get_asset_tags(&conn, raw)?;
+    assert!(raw_tags.iter().any(|x| x.id == t.id), "给 JPG 打标应同步到同源 RAW");
+    Ok(())
+}
+
+#[test]
+fn assign_records_ops_for_both() -> AppResult<()> {
+    let conn = setup();
+    let (jpg, raw) = add_kinship_pair(&conn);
+    let t = tags::create_in_facet(&conn, "海边", None, Some("scene"))?;
+    asset_tags::assign(&conn, &[jpg], &[t.id], "manual")?;
+    // tag_ops 两行（每条真实写入各一行 → undo_batch 可对称回滚）
+    let ops: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM tag_ops WHERE tag_id = ?1",
+        [t.id],
+        |r| r.get(0),
+    )?;
+    assert_eq!(ops, 2, "同源写入必须各记一行流水（jpg + raw）");
+    void_op(&raw);
+    Ok(())
+}
+
+fn void_op(_raw: &i64) {}
+
+#[test]
+fn undo_reverts_both() -> AppResult<()> {
+    let conn = setup();
+    let (jpg, raw) = add_kinship_pair(&conn);
+    let t = tags::create_in_facet(&conn, "海边", None, Some("scene"))?;
+    // 用 AI 批次路径：assign with batch → undo_batch
+    let batch = ai::create_batch(&conn, &[jpg], "cloud")?;
+    // 直接模拟确认写入（走 assign_inner 带 batch_id）
+    conn.execute(
+        "INSERT INTO asset_tags (asset_id, tag_id, source, created_at, confirmation, confirmed_at, confirmed_by, source_batch_id)
+         VALUES (?1, ?2, 'ai_cloud', 1, 'confirmed', 1, 'ai_cloud', ?3)",
+        rusqlite::params![jpg, t.id, batch.id],
+    )?;
+    conn.execute(
+        "INSERT INTO tag_ops (asset_id, tag_id, op, actor, batch_id, created_at)
+         VALUES (?1, ?2, 'add', 'ai_cloud', ?3, 1)",
+        rusqlite::params![jpg, t.id, batch.id],
+    )?;
+    // 手动给 raw 也补上同批次流水（模拟 assign_inner 的同源展开）
+    conn.execute(
+        "INSERT INTO asset_tags (asset_id, tag_id, source, created_at, confirmation, confirmed_at, confirmed_by, source_batch_id)
+         VALUES (?1, ?2, 'ai_cloud', 1, 'confirmed', 1, 'ai_cloud', ?3)",
+        rusqlite::params![raw, t.id, batch.id],
+    )?;
+    conn.execute(
+        "INSERT INTO tag_ops (asset_id, tag_id, op, actor, batch_id, created_at)
+         VALUES (?1, ?2, 'add', 'ai_cloud', ?3, 1)",
+        rusqlite::params![raw, t.id, batch.id],
+    )?;
+    let undone = tag_ops::undo_batch(&conn, batch.id)?;
+    assert!(undone > 0);
+    let jpg_tags = asset_tags::get_asset_tags(&conn, jpg)?;
+    let raw_tags = asset_tags::get_asset_tags(&conn, raw)?;
+    assert!(jpg_tags.is_empty(), "撤销应回滚 JPG 的标签");
+    assert!(raw_tags.is_empty(), "撤销应回滚同源 RAW 的标签");
+    Ok(())
+}
+
+#[test]
+fn sync_off_does_not_touch_sibling() -> AppResult<()> {
+    let conn = setup();
+    let (jpg, raw) = add_kinship_pair(&conn);
+    // 关闭同源同步
+    conn.execute(
+        "UPDATE settings SET value = json_set(value, '$.appearance.kinship.syncTagsToSiblings', json('false'))
+          WHERE key = 'app_settings'",
+        [],
+    )
+    .or_else(|_| {
+        // settings 行可能不存在（内存库未写过）：写一份最小 JSON
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES ('app_settings', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [r#"{"appearance":{"kinship":{"syncTagsToSiblings":false}}}"#],
+        )
+    })?;
+    let t = tags::create_in_facet(&conn, "海边", None, Some("scene"))?;
+    asset_tags::assign(&conn, &[jpg], &[t.id], "manual")?;
+    let raw_tags = asset_tags::get_asset_tags(&conn, raw)?;
+    assert!(raw_tags.is_empty(), "关闭同步后不得动同源文件");
+    Ok(())
+}
+
+#[test]
+fn create_batch_dedups_kinship() -> AppResult<()> {
+    let conn = setup();
+    let (jpg, raw) = add_kinship_pair(&conn);
+    let batch = ai::create_batch(&conn, &[jpg, raw], "cloud")?;
+    // 同源组只保留一个代表 → total = 1
+    assert_eq!(batch.total, 1, "同源组应去重（2 张 → 1 次请求）");
+    // 代表是 JPG（非 RAW 优先）
+    let rep: i64 = conn.query_row(
+        "SELECT asset_id FROM ai_suggestions WHERE batch_id = ?1",
+        [batch.id],
+        |r| r.get(0),
+    )?;
+    assert_eq!(rep, jpg, "代表应为非 RAW（JPG 解码快有内嵌预览）");
+    Ok(())
+}
+
+#[test]
+fn batch_total_reflects_dedup() -> AppResult<()> {
+    let conn = setup();
+    // 两组同源 + 一张独立 = 5 张 → 3 次请求
+    let (j1, r1) = (add_asset(&conn, "d:/a/A.JPG", "A.JPG", "jpg", "image/jpeg"),
+                    add_asset(&conn, "d:/a/A.RW2", "A.RW2", "rw2", "image/x-raw"));
+    void_op(&r1);
+    let (j2, r2) = (add_asset(&conn, "d:/a/B.JPG", "B.JPG", "jpg", "image/jpeg"),
+                    add_asset(&conn, "d:/a/B.RW2", "B.RW2", "rw2", "image/x-raw"));
+    void_op(&r2);
+    let solo = add_asset(&conn, "d:/a/C.JPG", "C.JPG", "jpg", "image/jpeg");
+    let batch = ai::create_batch(&conn, &[j1, r1, j2, r2, solo], "cloud")?;
+    assert_eq!(batch.total, 3, "5 张（两组同源 + 1 独立）应去重为 3 次请求");
+    Ok(())
+}

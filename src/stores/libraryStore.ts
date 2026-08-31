@@ -1,11 +1,60 @@
 /** 素材库数据与筛选状态（虚拟网格数据源） */
 import { create } from "zustand";
 import { listAssets, listAssetIds, getAssetPalettePatches, type AssetPalettePatch } from "@/api/assets";
+import { useSettingsStore } from "@/stores/settingsStore";
 import { useSelectionStore } from "@/stores/selectionStore";
 import { markStartup } from "@/utils/startupMarks";
 import type { Asset, AssetFilter, AssetType, FacetTagFilter, MetadataFilter } from "@/types/asset";
 
 const PAGE_SIZE = 200;
+
+/** W5h-d：同源合并显示的纯前端折叠 —— 每组（同目录同主干名 + 一 RAW 一非 RAW）只留代表（非 RAW 优先）。
+ *  不动后端查询：total/分页/分面计数语义全部保持（计划书 §W5h-d 关键取舍）。
+ *  is_raw 判定用扩展名白名单（与后端 utils::mime::is_raw_ext 同源）。 */
+const RAW_EXTS = new Set(["raw", "cr2", "cr3", "crw", "nef", "nrw", "arw", "srf", "sr2", "dng", "raf", "orf", "rw2", "pef", "iiq", "3fr", "erf", "srw", "kdc", "dcr", "mos", "mef", "x3f", "rwl"]);
+
+function kinshipKeyOf(a: Asset): { key: string; isRaw: boolean } {
+  const p = (a.filePath ?? "").split("\\").join("/").toLowerCase();
+  const slash = p.lastIndexOf("/");
+  const dir = slash >= 0 ? p.slice(0, slash) : "";
+  const name = slash >= 0 ? p.slice(slash + 1) : p;
+  const dot = name.lastIndexOf(".");
+  const stem = dot >= 0 ? name.slice(0, dot) : name;
+  const ext = dot >= 0 ? name.slice(dot + 1) : "";
+  return { key: `${dir}/${stem}`, isRaw: RAW_EXTS.has(ext) };
+}
+
+export function collapseKinship(items: Asset[]): Asset[] {
+  const best = new Map<string, Asset>();
+  for (const a of items) {
+    const { key, isRaw } = kinshipKeyOf(a);
+    const cur = best.get(key);
+    if (!cur) {
+      best.set(key, a);
+      continue;
+    }
+    // 非 RAW 优先做代表（JPG 解码快、有内嵌预览）
+    const curRaw = kinshipKeyOf(cur).isRaw;
+    if (curRaw && !isRaw) best.set(key, a);
+  }
+  // 保持原顺序
+  const visible = new Set(best.values());
+  return items.filter((a) => visible.has(a));
+}
+
+/** 当前是否开启合并显示（读 settingsStore；默认关） */
+function kinshipMergeEnabled(): boolean {
+  try {
+    return useSettingsStore.getState().settings?.appearance.kinship.mergeInLibrary ?? false;
+  } catch {
+    return false;
+  }
+}
+
+/** 应用（或不应用）合并显示，产出 viewItems */
+function applyKinshipView(items: Asset[]): Asset[] {
+  return kinshipMergeEnabled() ? collapseKinship(items) : items;
+}
 
 /** 请求代际计数（模块级，跨 set 调用共享）：refresh/loadMore 响应回写前校验，
  *  过期请求（筛选已变更/已有新请求发出）直接丢弃，防异步响应覆盖竞态（P1-01） */
@@ -60,6 +109,8 @@ function toApiFilter(f: LibraryFilter, offset: number, limit?: number): AssetFil
 
 interface LibraryState {
   items: Asset[];
+  /** W5h-d：合并显示开启时的「可见列表」（每组只留代表）；关闭时与 items 相同 */
+  viewItems: Asset[];
   total: number;
   loading: boolean;
   error: string | null;
@@ -92,6 +143,7 @@ interface LibraryState {
 
 export const useLibraryStore = create<LibraryState>((set, get) => ({
   items: [],
+  viewItems: [],
   total: 0,
   loading: false,
   error: null,
@@ -143,7 +195,8 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
       // P1-01：响应返回时筛选可能已变更/更新请求已发出——过期响应直接丢弃，
       // 不写 items/total、不碰 loading（loading 归最新请求管）
       if (seq !== requestSeq) return;
-      set({ items: dedupItems(page.items), total: page.total, loading: false });
+      const items = dedupItems(page.items);
+      set({ items, viewItems: applyKinshipView(items), total: page.total, loading: false });
       markStartup("library_ready"); // §4.1：素材列表 ready 打点（首次成功刷新即首屏 ready）
     } catch (e) {
       if (seq !== requestSeq) return;
@@ -162,8 +215,10 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
       const page = await listAssets(toApiFilter(filter, items.length, PAGE_SIZE));
       if (seq !== requestSeq) return;
       const known = new Set(items.map((a) => a.id));
+      const next = [...items, ...page.items.filter((a) => !known.has(a.id))];
       set({
-        items: [...items, ...page.items.filter((a) => !known.has(a.id))],
+        items: next,
+        viewItems: applyKinshipView(next),
         total: page.total,
         loading: false,
       });
@@ -184,8 +239,10 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
     set((s) => {
       // B09：只减当前视图内实际移除的数量，避免选中含跨筛选 id 时 total 多减
       const removedInView = s.items.filter((a) => gone.has(a.id)).length;
+      const items = s.items.filter((a) => !gone.has(a.id));
       return {
-        items: s.items.filter((a) => !gone.has(a.id)),
+        items,
+        viewItems: applyKinshipView(items),
         total: Math.max(0, s.total - removedInView),
       };
     });

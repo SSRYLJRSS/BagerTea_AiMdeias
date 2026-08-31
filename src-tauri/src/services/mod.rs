@@ -6,6 +6,7 @@ pub mod export_local;
 pub mod heic_decode;
 pub mod imaging;
 pub mod importer;
+pub mod kinship;
 pub mod media_refill;
 pub mod ollama_installer;
 pub mod ollama_runtime;

@@ -5,8 +5,54 @@ use rusqlite::Connection;
 use super::{tag_ops, tags::Tag};
 use crate::error::AppResult;
 
+/// W5h-b：查出 asset 的同源 asset_id（同目录同主干名 + 一个 RAW 一个非 RAW）。
+/// 返回调用方给的 id 本身除外。数据层两条记录独立，这里只在打标层展开。
+fn kinship_sibling_ids(conn: &Connection, asset_id: i64) -> Vec<i64> {
+    let path: Option<String> = conn
+        .query_row(
+            "SELECT file_path FROM assets WHERE id = ?1",
+            [asset_id],
+            |r| r.get(0),
+        )
+        .ok();
+    let Some(path) = path else { return Vec::new() };
+    let (key, is_raw) = crate::services::kinship::kinship_key(&path);
+    // 同 key 的所有素材里，取 is_raw 相反的那些（一个 RAW 一个非 RAW）
+    let mut stmt = match conn.prepare("SELECT id, file_path FROM assets WHERE deleted_at IS NULL") {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    let rows = match stmt.query_map([], |r| {
+        Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+    }) {
+        Ok(rows) => rows,
+        Err(_) => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    for row in rows.flatten() {
+        if row.0 == asset_id {
+            continue;
+        }
+        let (k, raw) = crate::services::kinship::kinship_key(&row.1);
+        if k == key && raw != is_raw {
+            out.push(row.0);
+        }
+    }
+    out
+}
+
+/// W5h-b：设置开关是否开启同源同步（读设置失败时按默认开启处理——设置损坏不应静默关闭功能）
+fn kinship_sync_enabled(conn: &Connection) -> bool {
+    super::settings::get_settings(conn)
+        .map(|s| s.appearance.kinship.sync_tags_to_siblings)
+        .unwrap_or(true)
+}
+
 /// 不带事务的内部版：供外层已开事务的调用方使用（如 ai::confirm_suggestion）
 /// R-25：真实新增的关联写 add 流水（batch_id 由 AI 确认流传入，手工为 None）
+/// W5h-b：assign_inner 是关联写入的唯一收口（ai::confirm/apply/tags_cmd::assign 全走它）——
+/// 同源同步在这里做（五个调用点分别处理必然漏一个）。同源写入各有独立流水行，
+/// undo_batch 倒序回滚自动覆盖两条，无需特殊处理。
 pub(crate) fn assign_inner(
     conn: &Connection,
     asset_ids: &[i64],
@@ -14,8 +60,26 @@ pub(crate) fn assign_inner(
     source: &str,
     batch_id: Option<i64>,
 ) -> AppResult<()> {
+    // W5h-b：开启同源同步时展开 asset_ids（每个素材追加其同源 id；去重防止重复写入）
+    let effective_ids: Vec<i64> = if kinship_sync_enabled(conn) {
+        let mut seen = std::collections::HashSet::new();
+        let mut ids = Vec::new();
+        for &aid in asset_ids {
+            if seen.insert(aid) {
+                ids.push(aid);
+            }
+            for sib in kinship_sibling_ids(conn, aid) {
+                if seen.insert(sib) {
+                    ids.push(sib);
+                }
+            }
+        }
+        ids
+    } else {
+        asset_ids.to_vec()
+    };
     let now = chrono::Utc::now().timestamp_millis();
-    for &aid in asset_ids {
+    for &aid in &effective_ids {
         for &tid in tag_ids {
             let n = conn.execute(
                 "INSERT OR IGNORE INTO asset_tags
@@ -56,7 +120,25 @@ pub fn assign(
 /// R-25：真实移除的关联写 remove 流水（actor 读原关联 source，保证 AI 标签可溯源）
 pub fn remove(conn: &Connection, asset_ids: &[i64], tag_ids: &[i64]) -> AppResult<()> {
     let tx = conn.unchecked_transaction()?;
-    for &aid in asset_ids {
+    // W5h-b：摘标签同步到同源文件（与 assign_inner 对称；关闭开关则回到独立行为）
+    let effective_ids: Vec<i64> = if kinship_sync_enabled(&tx) {
+        let mut seen = std::collections::HashSet::new();
+        let mut ids = Vec::new();
+        for &aid in asset_ids {
+            if seen.insert(aid) {
+                ids.push(aid);
+            }
+            for sib in kinship_sibling_ids(&tx, aid) {
+                if seen.insert(sib) {
+                    ids.push(sib);
+                }
+            }
+        }
+        ids
+    } else {
+        asset_ids.to_vec()
+    };
+    for &aid in &effective_ids {
         for &tid in tag_ids {
             let src: Option<String> = tx
                 .query_row(

@@ -100,6 +100,14 @@ export function buildCommonFields(a: Asset): MetaField[] {
     field("入库时间", a.createdAt ? formatDate(a.createdAt) : "未提供"),
     field("修改时间", a.modifiedAt ? formatDate(a.modifiedAt) : "未提供"),
     field("元数据状态", failed ? "读取失败" : a.metadataScannedAt ? "已读取" : "未读取"),
+    // W5f-f5（Q4 保留）：GPS 定位展示（地图砍了，展示留着；经纬度 6 位小数可复制）
+    field(
+      "定位",
+      a.latitude != null && a.longitude != null
+        ? `${a.latitude.toFixed(6)}, ${a.longitude.toFixed(6)}`
+        : "无定位",
+      a.latitude != null && a.longitude != null,
+    ),
   ];
 }
 

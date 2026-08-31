@@ -52,6 +52,9 @@ export interface Asset {
   dominantLum?: number | null;
   // FB5-05（§7.3）：一句话描述（最多 20 字符，素材字段，不进标签树/统计）
   contentDescription?: string;
+  // V18：GPS 定位（有符号十进制度，北纬东经为正；无定位为 null）
+  latitude?: number | null;
+  longitude?: number | null;
   // V19（W3-1）：收藏/评级/手动旋转/phash（可选 + 默认值兼容旧响应）
   /** 收藏标记（0/1；后端 NOT NULL DEFAULT 0） */
   favorite?: number;

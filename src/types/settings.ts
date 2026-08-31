@@ -124,8 +124,16 @@ export interface ColorStripAppearance {
   count: 4 | 6 | 8; // 默认 6
 }
 
+/** W5h：同源文件组（RAW+JPG）设置。syncTagsToSiblings 默认开（打标算同一张照片）；
+ *  mergeInLibrary 默认关（素材库独立显示，用户定案 2026-08-31）。 */
+export interface KinshipAppearance {
+  syncTagsToSiblings: boolean;
+  mergeInLibrary: boolean;
+}
+
 export interface Appearance {
   grid: GridAppearance;
   hoverPreview: HoverPreviewAppearance;
   colorStrip: ColorStripAppearance;
+  kinship: KinshipAppearance;
 }

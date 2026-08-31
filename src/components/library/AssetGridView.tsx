@@ -8,6 +8,7 @@ import { useShallow } from "zustand/react/shallow";
 import AssetCard from "./AssetCard";
 import ContextMenu, { type MenuEntry } from "@/components/common/ContextMenu";
 import { getAssetUrls, revealInFolder } from "@/api/assets";
+import { openFileExternal } from "@/api/import";
 import { useElementSize, useEscape } from "@/hooks/hooks";
 import { useLibraryStore } from "@/stores/libraryStore";
 import { useSelectionStore } from "@/stores/selectionStore";
@@ -282,6 +283,28 @@ export default function AssetGridView({
     if (paths[0]) await revealInFolder(paths[0]);
   }, [selected]);
 
+  // W5f-f4：用系统默认程序打开（openFileExternal 在 api/import.ts，入库页同款）
+  const openFirstExternal = useCallback(async () => {
+    const first = Array.from(selected)[0];
+    if (first == null) return;
+    const paths = await getAssetUrls([first]);
+    if (paths[0]) await openFileExternal(paths[0]);
+  }, [selected]);
+
+  // W5f-f1：当前是否带任何筛选/搜索条件（区分「库为空」与「筛选无结果」）
+  const hasActiveFilter = useLibraryStore((st) => {
+    const f = st.filter;
+    return (
+      f.assetType !== "all" ||
+      f.untaggedOnly ||
+      f.tagId != null ||
+      (f.facetFilters ?? []).length > 0 ||
+      (f.excludeTagIds ?? []).length > 0 ||
+      (f.metadataFilters ?? []).length > 0 ||
+      f.search.trim() !== ""
+    );
+  });
+
   const menuEntries = useMemo((): MenuEntry[] => {
     const common: MenuEntry[] = [
       { label: "全选", onClick: () => void fetchAllIds().then(setAll) },
@@ -301,12 +324,18 @@ export default function AssetGridView({
       { label: "删除", onClick: onDelete },
       { divider: true },
       { label: "复制路径", onClick: () => void copyPaths() },
+      // W5f-f4：用默认程序打开（单选；Lightroom/Capture One 打开 RAW 是高频动作）
+      {
+        label: "用默认程序打开",
+        disabled: selected.size !== 1,
+        onClick: () => void openFirstExternal(),
+      },
       { label: "打开所在文件夹", disabled: selected.size !== 1, onClick: () => void revealFirst() },
       { divider: true },
       ...common,
       { label: "取消选择", onClick: clear },
     ];
-  }, [selected.size, fetchAllIds, setAll, invert, onAiTag, onAssignTags, onExport, onMove, onDelete, copyPaths, revealFirst, clear]);
+  }, [selected.size, fetchAllIds, setAll, invert, onAiTag, onAssignTags, onExport, onMove, onDelete, copyPaths, revealFirst, openFirstExternal, clear]);
 
   if (items.length === 0) {
     return (
@@ -318,7 +347,37 @@ export default function AssetGridView({
             : "flex h-full flex-1 items-center justify-center text-sm text-[var(--color-text-secondary)]"
         }
       >
-        {loading ? "加载中…" : total === 0 ? "没有符合条件的素材" : "没有匹配的素材"}
+        {loading ? (
+          "加载中…"
+        ) : total === 0 ? (
+          // W5f-f1：区分「库为空」（引导导入）与「筛选无结果」（清除筛选）
+          hasActiveFilter ? (
+            <div className="flex flex-col items-center gap-2">
+              <span>没有符合条件的素材</span>
+              <button
+                type="button"
+                onClick={() => useLibraryStore.getState().setFilter({ assetType: "all", untaggedOnly: false, tagId: null, facetFilters: [], excludeTagIds: [], metadataFilters: [], search: "" })}
+                className="rounded-md border border-[var(--color-border)] px-3 py-1.5 text-xs text-[var(--color-text-secondary)] hover:bg-[var(--color-surface)] hover:text-[var(--color-text)]"
+              >
+                清除筛选条件
+              </button>
+            </div>
+          ) : (
+            <div className="flex flex-col items-center gap-2">
+              <span>素材库还是空的</span>
+              <span className="text-xs text-[var(--color-text-tertiary)]">先导入一些图片或视频，再配置 AI 打标</span>
+              <button
+                type="button"
+                onClick={() => window.dispatchEvent(new CustomEvent("app:navigate", { detail: "import" }))}
+                className="rounded-md bg-[var(--color-accent)] px-3 py-1.5 text-xs font-medium text-[var(--color-accent-text)]"
+              >
+                去导入素材
+              </button>
+            </div>
+          )
+        ) : (
+          "没有匹配的素材"
+        )}
       </div>
     );
   }

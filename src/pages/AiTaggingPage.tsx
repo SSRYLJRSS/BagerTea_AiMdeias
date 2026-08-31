@@ -474,9 +474,19 @@ export default function AiTaggingPage() {
               当前模型
             </h3>
             {settings.ai.profiles.length === 0 ? (
-              <p className="text-xs leading-5 text-[var(--color-text-secondary)]">
-                还没有 API 配置，去「设置 → AI 打标」添加中转站或本地服务
-              </p>
+              <div className="flex items-center gap-2">
+                <p className="text-xs leading-5 text-[var(--color-text-secondary)]">
+                  还没有 API 配置，去「设置 → AI 打标」添加中转站或本地服务
+                </p>
+                {/* W5f-f3：纯文字改跳转按钮 */}
+                <button
+                  type="button"
+                  onClick={() => window.dispatchEvent(new CustomEvent("app:navigate", { detail: "settings" }))}
+                  className="rounded-md bg-[var(--color-accent)] px-2.5 py-1 text-xs font-medium text-[var(--color-accent-text)]"
+                >
+                  去设置添加
+                </button>
+              </div>
             ) : (
               <div className="flex flex-col gap-2">
                 <select

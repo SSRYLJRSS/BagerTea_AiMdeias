@@ -482,6 +482,39 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
           {route === "general" && (
             <>
               <Group title="通用外观">
+              {/* W5h：同源文件组（RAW+JPG）两个开关 —— 打标层默认开、浏览层默认关（用户定案） */}
+              <Field
+                label="同源文件打标同步"
+                hint="同一张照片的 RAW+JPG 只打一次标：AI 批次自动去重（请求减半），确认后标签自动同步到另一份"
+              >
+                <Toggle
+                  checked={draftAppearance.kinship?.syncTagsToSiblings ?? true}
+                  onChange={(v) => {
+                    const next: Settings = {
+                      ...draft,
+                      appearance: { ...draftAppearance, kinship: { ...draftAppearance.kinship, syncTagsToSiblings: v } },
+                    };
+                    dirty(next);
+                    pushPreview(next.appearance);
+                  }}
+                />
+              </Field>
+              <Field
+                label="素材库合并显示同源文件"
+                hint="开启后每组 RAW+JPG 只显示一个（非 RAW 优先）；关闭则两份都显示。注意：合并显示下顶栏计数仍为后端总数"
+              >
+                <Toggle
+                  checked={draftAppearance.kinship?.mergeInLibrary ?? false}
+                  onChange={(v) => {
+                    const next: Settings = {
+                      ...draft,
+                      appearance: { ...draftAppearance, kinship: { ...draftAppearance.kinship, mergeInLibrary: v } },
+                    };
+                    dirty(next);
+                    pushPreview(next.appearance);
+                  }}
+                />
+              </Field>
               <Field label="主题" hint="跟随系统 / 浅色 / 深色；切换即时预览，保存后记住">
                 <select
                   value={draft.theme}

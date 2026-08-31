@@ -336,6 +336,31 @@ pub struct Appearance {
     pub hover_preview: HoverPreviewAppearance,
     #[serde(default)]
     pub color_strip: ColorStripAppearance,
+    /// W5h：同源文件组（RAW+JPG）。sync_tags_to_siblings 默认开（打标层算同一张照片，
+    /// 请求量 410→205）；merge_in_library 默认关（素材库独立显示，用户定案）。
+    #[serde(default)]
+    pub kinship: KinshipAppearance,
+}
+
+/// W5h：同源文件组设置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KinshipAppearance {
+    /// 打标层：给一张打标自动同步到同源文件；建批时同源去重（默认 true）
+    #[serde(default = "default_true")]
+    pub sync_tags_to_siblings: bool,
+    /// 浏览层：素材库合并显示（每组的代表 + 「+RAW」角标；默认 false 独立显示）
+    #[serde(default)]
+    pub merge_in_library: bool,
+}
+
+impl Default for KinshipAppearance {
+    fn default() -> Self {
+        Self {
+            sync_tags_to_siblings: true,
+            merge_in_library: false,
+        }
+    }
 }
 
 impl Default for GridAppearance {
@@ -377,6 +402,7 @@ impl Default for Appearance {
             grid: GridAppearance::default(),
             hover_preview: HoverPreviewAppearance::default(),
             color_strip: ColorStripAppearance::default(),
+            kinship: KinshipAppearance::default(),
         }
     }
 }

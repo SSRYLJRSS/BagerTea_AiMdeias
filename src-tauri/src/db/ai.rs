@@ -105,12 +105,65 @@ const BATCH_COLS: &str = "id, status, mode, total, processed, confirmed, created
 pub fn create_batch(conn: &Connection, asset_ids: &[i64], mode: &str) -> AppResult<AiBatch> {
     let now = chrono::Utc::now().timestamp_millis();
     let tx = conn.unchecked_transaction()?;
+    // W5h-c：同源组内只保留一个代表（非 RAW 优先——JPG 有内嵌预览、解码快）。
+    // 代表确认后标签经 assign_inner 自动同步给 RAW → 最终两条都有标签。
+    // 批次 total 记去重后数量（与 ai_suggestions 行数一致）。
+    // 复用 sync_tags_to_siblings 同一开关：关掉则不去重不同步（回到独立行为）。
+    let effective_ids: Vec<i64> = {
+        let sync = super::settings::get_settings(&tx)
+            .map(|s| s.appearance.kinship.sync_tags_to_siblings)
+            .unwrap_or(true);
+        if !sync {
+            asset_ids.to_vec()
+        } else {
+            // 读全部 (id, file_path)，按 kinship_key 分组，每组保留非 RAW（若无非 RAW 保留第一个）
+            let mut stmt = tx.prepare(
+                "SELECT id, file_path FROM assets WHERE deleted_at IS NULL",
+            )?;
+            let rows: Vec<(i64, String)> = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .filter_map(|r| r.ok())
+                .collect();
+            drop(stmt);
+            let path_by_id: std::collections::HashMap<i64, &str> =
+                rows.iter().map(|(id, p)| (*id, p.as_str())).collect();
+            let mut group_best: std::collections::HashMap<String, i64> = Default::default();
+            for (id, path) in &rows {
+                let (key, is_raw) = crate::services::kinship::kinship_key(path);
+                let selected = asset_ids.contains(id);
+                if !selected {
+                    continue;
+                }
+                match group_best.get(&key) {
+                    Some(&cur) => {
+                        // 已有代表：非 RAW 优先替换
+                        let cur_raw = path_by_id
+                            .get(&cur)
+                            .map(|p| crate::services::kinship::kinship_key(p).1)
+                            .unwrap_or(false);
+                        if cur_raw && !is_raw {
+                            group_best.insert(key, *id);
+                        }
+                    }
+                    None => {
+                        group_best.insert(key, *id);
+                    }
+                }
+            }
+            // 保持用户传入顺序（去重不重排）
+            asset_ids
+                .iter()
+                .copied()
+                .filter(|id| group_best.values().any(|v| v == id))
+                .collect()
+        }
+    };
     tx.execute(
         "INSERT INTO ai_batches (status, mode, total, created_at) VALUES ('pending', ?1, ?2, ?3)",
-        rusqlite::params![mode, asset_ids.len() as i64, now],
+        rusqlite::params![mode, effective_ids.len() as i64, now],
     )?;
     let batch_id = tx.last_insert_rowid();
-    for &aid in asset_ids {
+    for &aid in &effective_ids {
         tx.execute(
             "INSERT INTO ai_suggestions (batch_id, asset_id, suggested_tags, created_at)
              VALUES (?1, ?2, '[]', ?3)",

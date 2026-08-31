@@ -44,6 +44,8 @@ export default function ImportPage() {
   const loadSettings = useSettingsStore((s) => s.load);
 
   const [plan, setPlan] = useState<ImportPlan | null>(null);
+  // W5f-f2：导入失败明细展开状态
+  const [showImportErrors, setShowImportErrors] = useState(false);
   const [collection, setCollection] = useState("");
   const [renamePattern, setRenamePattern] = useState("");
   const [dragOver, setDragOver] = useState(false);
@@ -269,8 +271,24 @@ export default function ImportPage() {
             {progress && progress.message && <span>阶段：{progress.message}</span>}
           </div>
         )}
+        {/* W5f-f2：导入失败明细 —— 首行摘要 + 可展开全量清单 */}
         {result && result.errors.length > 0 && (
-          <p className="mb-3 max-w-lg truncate text-xs text-[var(--color-danger)]">{result.errors[0]}</p>
+          <div className="mb-3 max-w-lg text-xs text-[var(--color-danger)]">
+            <button
+              type="button"
+              onClick={() => setShowImportErrors((v) => !v)}
+              className="text-left"
+            >
+              失败 {result.errors.length} 个{showImportErrors ? "（收起明细）" : "（展开明细）"}
+            </button>
+            {showImportErrors && (
+              <ul className="mt-1 max-h-40 space-y-0.5 overflow-y-auto rounded-md bg-[var(--color-surface)] p-2">
+                {result.errors.map((e, i) => (
+                  <li key={i} className="break-all">{e}</li>
+                ))}
+              </ul>
+            )}
+          </div>
         )}
         {error && !running && <p className="mb-3 text-xs text-[var(--color-danger)]">{error}</p>}
 

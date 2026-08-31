@@ -30,6 +30,7 @@ function mkSettings(): Settings {
       grid: { libraryCellStep: 3, importCellStep: 1, cellAspect: "1:1", cellFit: "cover", matchDominantColor: false },
       hoverPreview: { enabled: true, previewSeconds: 3, inLibraryGrid: true },
       colorStrip: { enabled: true, showInLibraryGrid: false, showInViewer: true, showInImportGrid: false, height: "normal", mode: "ratio", count: 6 },
+      kinship: { syncTagsToSiblings: true, mergeInLibrary: false },
     },
   };
 }

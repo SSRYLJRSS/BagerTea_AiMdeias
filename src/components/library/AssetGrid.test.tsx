@@ -143,6 +143,7 @@ beforeEach(() => {
   vi.mocked(listAssetIds).mockResolvedValue([1, 2]);
   useLibraryStore.setState({
     items: [],
+    viewItems: [],
     total: 0,
     loading: false,
     error: null,
@@ -157,13 +158,14 @@ beforeEach(() => {
     },
   });
   useSelectionStore.setState({ selected: new Set(), anchorIndex: null });
-  (useLibraryStore.getState() as unknown as { items: Asset[]; total: number }).items = [];
+  (useLibraryStore.getState() as unknown as { items: Asset[]; viewItems: Asset[]; total: number }).items = [];
+  (useLibraryStore.getState() as unknown as { viewItems: Asset[] }).viewItems = [];
 });
 
 describe("AssetGrid 单击选择语义", () => {
   it("单击未选中卡片 → 选中它；再击已选中卡片 → 取消（E-1 切换语义）", async () => {
     const assets = [mkAsset(1), mkAsset(2)];
-    useLibraryStore.setState({ items: assets, total: 2 });
+    useLibraryStore.setState({ items: assets, viewItems: assets, total: 2 });
     renderGrid();
     const card1 = cardByName("a1.jpg");
     expect(card1).toBeTruthy();
@@ -185,7 +187,7 @@ describe("AssetGrid 单击选择语义", () => {
 
   it("选中集有跨筛选残留时单击追加：不误清已有选中", async () => {
     const assets = [mkAsset(1), mkAsset(2)];
-    useLibraryStore.setState({ items: assets, total: 2 });
+    useLibraryStore.setState({ items: assets, viewItems: assets, total: 2 });
     // 预置「选中了视图外的 id 9」的跨筛选残留（B09 场景）
     useSelectionStore.setState({ selected: new Set([9]), anchorIndex: null });
     renderGrid();
@@ -197,7 +199,7 @@ describe("AssetGrid 单击选择语义", () => {
 
   it("Ctrl+单击加选/再击减选切换", async () => {
     const assets = [mkAsset(1), mkAsset(2), mkAsset(3)];
-    useLibraryStore.setState({ items: assets, total: 3 });
+    useLibraryStore.setState({ items: assets, viewItems: assets, total: 3 });
     renderGrid();
     fireEvent.click(cardByName("a1.jpg"));
     fireEvent.click(cardByName("a2.jpg"), { ctrlKey: true });
@@ -211,7 +213,7 @@ describe("AssetGrid 单击选择语义", () => {
 
   it("右键未选中卡片 → 加入选中并开菜单（不影响已有选中）", async () => {
     const assets = [mkAsset(1), mkAsset(2)];
-    useLibraryStore.setState({ items: assets, total: 2 });
+    useLibraryStore.setState({ items: assets, viewItems: assets, total: 2 });
     renderGrid();
     fireEvent.click(cardByName("a1.jpg")); // 先选中 a1
 
@@ -224,7 +226,7 @@ describe("AssetGrid 单击选择语义", () => {
 
   it("右键已选中卡片 → 选中集不变（允许多选右键操作）", async () => {
     const assets = [mkAsset(1), mkAsset(2), mkAsset(3)];
-    useLibraryStore.setState({ items: assets, total: 3 });
+    useLibraryStore.setState({ items: assets, viewItems: assets, total: 3 });
     useSelectionStore.setState({ selected: new Set([1, 2]), anchorIndex: null });
     renderGrid();
 
@@ -235,7 +237,7 @@ describe("AssetGrid 单击选择语义", () => {
 
   it("右键菜单打开期间 Ctrl+A/Ctrl+I 不生效（防误触反选全选）", async () => {
     const assets = [mkAsset(1), mkAsset(2)];
-    useLibraryStore.setState({ items: assets, total: 2 });
+    useLibraryStore.setState({ items: assets, viewItems: assets, total: 2 });
     renderGrid();
     fireEvent.click(cardByName("a1.jpg"));
     fireEvent.contextMenu(cardByName("a2.jpg")); // 打开菜单（a2 追加进选中）
@@ -258,7 +260,7 @@ describe("AssetGrid 单击选择语义", () => {
 describe("AssetGrid 双击预览（F19 语义）", () => {
   it("双击预览：第二次点击按 E-1 切换（取消选中），但仍打开预览", () => {
     const assets = [mkAsset(1), mkAsset(2)];
-    useLibraryStore.setState({ items: assets, total: 2 });
+    useLibraryStore.setState({ items: assets, viewItems: assets, total: 2 });
     const preview = vi.fn();
     renderGrid(preview);
     const card = cardByName("a1.jpg");
@@ -272,7 +274,7 @@ describe("AssetGrid 双击预览（F19 语义）", () => {
 
   it("单击已选中的卡片再击 → 取消（E-1 不再「保持不变」）", () => {
     const assets = [mkAsset(1), mkAsset(2)];
-    useLibraryStore.setState({ items: assets, total: 2 });
+    useLibraryStore.setState({ items: assets, viewItems: assets, total: 2 });
     renderGrid();
     const card = cardByName("a1.jpg");
 
@@ -286,7 +288,7 @@ describe("AssetGrid §13.1 列数变化稳定性", () => {
   it("窗口宽度改变（列数变化）后 asset id 与文件名仍对应（不整行 remount 毁状态）", async () => {
     // 造 6 个素材：宽屏 4 列 → 两行，窄屏 2 列 → 三行
     const assets = Array.from({ length: 6 }, (_, i) => mkAsset(i + 1));
-    useLibraryStore.setState({ items: assets, total: 6 });
+    useLibraryStore.setState({ items: assets, viewItems: assets, total: 6 });
     renderGrid();
 
     // 宽屏（800 → 4 列）：a1..a4 可见
@@ -334,7 +336,7 @@ describe("AssetGrid FB2-01 档位缩放（Alt/Ctrl+滚轮）", () => {
   it("Alt+滚轮上滚 → 档位 +1 且不越界；即时写入 previewAppearance", () => {
     vi.useFakeTimers();
     useSettingsStore.setState({ settings: mkSettingsAppearance(), previewAppearance: null });
-    useLibraryStore.setState({ items: [mkAsset(1), mkAsset(2)], total: 2 });
+    useLibraryStore.setState({ items: [mkAsset(1), mkAsset(2)], viewItems: [mkAsset(1), mkAsset(2)], total: 2 });
     const { container } = renderGrid();
     const scrollEl = container.querySelector(".overflow-y-auto") as HTMLElement;
     expect(scrollEl).not.toBeNull();
@@ -350,7 +352,7 @@ describe("AssetGrid FB2-01 档位缩放（Alt/Ctrl+滚轮）", () => {
 
   it("不按修饰键的滚轮不触发档位变化（无回归）", () => {
     useSettingsStore.setState({ settings: mkSettingsAppearance(), previewAppearance: null });
-    useLibraryStore.setState({ items: [mkAsset(1)], total: 1 });
+    useLibraryStore.setState({ items: [mkAsset(1)], viewItems: [mkAsset(1)], total: 1 });
     const { container } = renderGrid();
     const scrollEl = container.querySelector(".overflow-y-auto") as HTMLElement;
     fireEvent.wheel(scrollEl, { deltaY: -100 }); // 无 Alt/Ctrl
