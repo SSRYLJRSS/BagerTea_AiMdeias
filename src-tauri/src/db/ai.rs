@@ -248,11 +248,19 @@ pub fn set_suggestion_tags(conn: &Connection, id: i64, tags: &CategorizedTags) -
     for (category, names) in tags {
         let (facet_key, _resolved) = tag_facets::resolve_facet_key(conn, category)?;
         for name in names {
-            let raw = name.trim();
+            // W5a（a9）：支持置信度内联格式 {"t":"标签","c":0.9}（纯字符串回退，提示词两种都允许）
+            let (raw, confidence): (String, Option<f64>) =
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(name.trim()) {
+                    let t = v.get("t").and_then(|t| t.as_str()).unwrap_or("").trim().to_string();
+                    let c = v.get("c").and_then(|c| c.as_f64());
+                    (t, c)
+                } else {
+                    (name.trim().to_string(), None)
+                };
             if raw.is_empty() {
                 continue;
             }
-            let normalized = tags::normalize_name(raw);
+            let normalized = tags::normalize_name(&raw);
             let tag_id: Option<i64> = conn
                 .query_row(
                     "SELECT t.id FROM tags t
@@ -266,9 +274,9 @@ pub fn set_suggestion_tags(conn: &Connection, id: i64, tags: &CategorizedTags) -
                 .ok();
             conn.execute(
                 "INSERT INTO ai_suggestion_items
-                 (suggestion_id, facet_key, raw_name, normalized_name, tag_id, decision, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6)",
-                rusqlite::params![id, facet_key, raw, normalized, tag_id, now],
+                 (suggestion_id, facet_key, raw_name, normalized_name, tag_id, confidence, decision, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7)",
+                rusqlite::params![id, facet_key, raw, normalized, tag_id, confidence, now],
             )?;
         }
     }

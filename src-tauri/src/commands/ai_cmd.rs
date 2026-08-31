@@ -137,15 +137,16 @@ pub async fn ai_start_batch(
                             "本批次包含视频，但未检测到 ffmpeg：无法抽帧打标。请安装 ffmpeg 并加入 PATH，或在设置中关闭「视频 AI 打标」后重试。",
                         ));
                     }
-                    // 本地模型视觉能力启发式检查（仅本地档案；云端默认支持，不做此检）
-                    if profile_is_local {
-                        if let Some(active) = s.ai.active() {
-                            if !crate::services::ai_cloud::model_supports_vision(&active.model) {
-                                return Err(AppError::msg(format!(
-                                    "本批次包含视频，但当前本地模型「{}」不支持视觉（图片/视频抽帧）输入。请更换支持图片输入的视觉模型（如 qwen2.5vl、llava、moondream），保存后重新开始批次。",
-                                    active.model
-                                )));
-                            }
+                }
+                // W5a（a11）：本地模型视觉能力检查对图片批次也生效（此前只在 has_video 块内——
+                // 图片库（如本库 0 视频）该检查从未运行过，纯图片批次会带着纯文本模型起跑后逐条失败）
+                if profile_is_local {
+                    if let Some(active) = s.ai.active() {
+                        if !crate::services::ai_cloud::model_supports_vision(&active.model) {
+                            return Err(AppError::msg(format!(
+                                "当前本地模型「{}」不支持视觉（图片/视频）输入，无法打标。请更换支持图片输入的视觉模型（如 qwen2.5vl、llava、moondream），保存后重新开始批次。",
+                                active.model
+                            )));
                         }
                     }
                 }

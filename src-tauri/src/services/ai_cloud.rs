@@ -41,56 +41,86 @@ pub struct MediaAnalysis {
 /// 按分面组装提示词（P1B + C-3）：使用稳定英文 facetKey 作为 JSON 键，中文显示名仅作说明；
 /// 避免模型返回中文分类名导致归类不稳定，也确保 color 独立于 style。
 /// FB5-05（§7.4）：同时要求输出 description（一句话描述，最多 20 字，规则见下）。
-fn build_prompt(facets: &[FacetPromptContext]) -> String {
-    let mut lines = String::from(
-        "请为这张图片生成画面内容的一句话中文描述与分面标签。只返回一个 JSON 对象，不要其他内容。\n",
+fn build_system_prompt() -> String {
+    let mut sys = String::from(
+        "你是图片素材打标助手。分析用户提供的图片，返回一句话描述与分面标签。\n",
     );
-    lines.push_str(
-        "JSON 结构：{\"description\": \"一句话描述\", \"tags\": {\"分面key\": [\"标签\"]}}。\n",
-    );
-    lines.push_str("description 规则：\n");
-    lines.push_str("- 用一句话中文描述画面内容（如「夜晚树下多人合影」），最多 20 个字符；\n");
-    lines.push_str("- 不写文件质量、摄影建议，不以「这是一张」「这张图片展示」开头；\n");
-    lines.push_str("- 不堆砌逗号标签；description 不得复制进任何 tags 数组。\n");
-    lines.push_str(
-        "tags 规则（键必须为英文分面 key，值为标签字符串数组，无合适标签的分面给空数组）：\n",
-    );
+    sys.push_str("输出格式（严格遵守）：\n");
+    sys.push_str("- 只返回一个 JSON 对象，不要任何其他文字、解释或代码围栏；\n");
+    sys.push_str("- 结构：{\"description\": \"一句话描述\", \"tags\": {\"分面key\": [\"标签\"]}}。\n");
+    sys.push_str("description 规则：\n");
+    sys.push_str("- 一句话中文描述画面内容（如「夜晚树下多人合影」），最多 20 个字符；\n");
+    sys.push_str("- 不写文件质量、摄影建议，不以「这是一张」「这张图片展示」开头；\n");
+    sys.push_str("- 不堆砌逗号标签；description 不得复制进任何 tags 数组。\n");
+    sys.push_str("标签规则：\n");
+    sys.push_str("- 每个标签为中文 2–6 字（如「海边」「人像」「逆光」）；\n");
+    sys.push_str("- 标签必须描述画面中可观察到的内容，不确定的分面给空数组，不要猜；\n");
+    sys.push_str("- 一个标签只归入一个分面；\n");
+    sys.push_str("- 多值如实输出：一张图既是「海边」又是「日落」时，scene 里两个都写，不要只挑一个；\n");
+    sys.push_str("- 用户给出候选词时，含义相同必须用已有词，不要造近义词（已有「海边」就不要写「海滨」）。\n");
+    // W5a（a9）：置信度内联（审核界面 <0.5 标红；纯字符串仍是合法回退）
+    sys.push_str("- 标签可带置信度：写成 {\"t\":\"标签\",\"c\":0.9}（c 为 0 到 1 的数字；纯字符串也接受）。
+");
+    sys
+}
+
+/// W5a（a2/a3/a5）：user 段 —— 每分面拼 description + 规则 + Top-N 候选词 + 真实 few-shot。
+/// top_tags 来自 W2-9 top_tags_per_facet（按使用次数降序，高频词优先 → 标签收敛）。
+pub fn build_user_prompt(facets: &[FacetPromptContext], top_tags: &[(String, String)]) -> String {
+    let mut user = String::from("请为这张图片打标。可用的分类（key 为英文标识）：\n");
     for c in facets {
         let rule = if c.selection_mode == "single" {
-            "（单选，最多 1 个）".to_string()
+            "单选，最多 1 个".to_string()
         } else {
-            format!("（可多选，1-{} 个）", c.max_items.unwrap_or(3).max(1))
+            match c.max_items {
+                Some(n) => format!("可多选，最多 {n} 个"),
+                None => "可多选，数量不限".to_string(),
+            }
         };
-        lines.push_str(&format!(
-            "- {}(key: {}){}{}\n",
+        user.push_str(&format!(
+            "- {}（key: {}，{rule}）{}\n",
             c.display_name,
             c.key,
-            rule,
             if c.description.trim().is_empty() {
                 String::new()
             } else {
-                format!("：{}", c.description) // W2-1：hint 已并入 description（V20 合表）
-            }
+                format!("：{}", c.description)
+            },
         ));
     }
-    // FB2-08（§14.3①）：示例 JSON 与规则句由 facets 参数实际内容生成，不再硬编码任何 key。
-    let example: String = {
-        let pairs: Vec<String> = facets
-            .iter()
-            .take(3)
-            .map(|c| format!("\"{}\":[\"…\"]", c.key))
-            .collect();
-        if pairs.is_empty() {
-            "{}".to_string()
-        } else {
-            format!("{{{}}}", pairs.join(","))
+    if !top_tags.is_empty() {
+        user.push_str("\n已有标签候选词（含义相同就用已有的词，不要造近义词）：\n");
+        for (facet, words) in top_tags {
+            user.push_str(&format!("- {facet}: {words}\n"));
         }
+    }
+    let ex_keys: Vec<&str> = facets.iter().take(2).map(|c| c.key.as_str()).collect();
+    let example = if ex_keys.is_empty() {
+        "{}".to_string()
+    } else {
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(k) = ex_keys.first() {
+            parts.push(format!("\"{k}\": [\"示例词\"]"));
+        }
+        if ex_keys.len() > 1 {
+            parts.push(format!("\"{}\": []", ex_keys[1]));
+        }
+        format!("{{{}}}", parts.join(", "))
     };
-    lines.push_str(&format!(
-        "示例：{{\"description\":\"…\",\"tags\":{example}}}。\n"
+    user.push_str(&format!(
+        "\n输出示例（结构参考；tags 只含该图真实可观察到的分类）：\n{{\"description\": \"黄昏海边有人散步\", \"tags\": {example}}}\n"
     ));
-    lines.push_str("每个标签只能归入一个分面；不确定归属时留空，不要猜。");
-    lines
+    user
+}
+
+/// 兼容旧调用（单段 = system + user）
+fn build_prompt(facets: &[FacetPromptContext]) -> String {
+    format!("{}\n{}", build_system_prompt(), build_user_prompt(facets, &[]))
+}
+
+/// W5a（a7）：动态 max_tokens —— 固定 500 在分面多时会把 JSON 截断 → 解析失败 → 整条 rejected。
+fn dynamic_max_tokens(facet_count: usize) -> i64 {
+    (300 + 120 * facet_count as i64).clamp(500, 1600)
 }
 
 /// 从模型回复中提取分类标签对象（宽容：先整串 JSON，再退化找 {...} 片段；旧扁平数组收进「未分类」）
@@ -143,6 +173,16 @@ pub fn parse_categorized_checked(
     content: &str,
     valid_keys: &[&str],
 ) -> (CategorizedTags, Vec<String>) {
+    parse_categorized_checked_ex(content, valid_keys, &[])
+}
+
+/// W5a（a10）：manual_only_keys 区分「分面已停用」与「该分类不参与 AI 打标」——
+/// 旧文案对 manual_only 分面也说「已停用」，语义不准（用户会以为要去恢复它）。
+pub fn parse_categorized_checked_ex(
+    content: &str,
+    valid_keys: &[&str],
+    manual_only_keys: &[String],
+) -> (CategorizedTags, Vec<String>) {
     let raw = parse_categorized(content);
     let mut warnings = Vec::new();
     let mut out = CategorizedTags::new();
@@ -160,6 +200,11 @@ pub fn parse_categorized_checked(
                 "未知分面 key「{trimmed}」已归入自定义，建议改用稳定 facetKey"
             ));
             "custom".to_string()
+        } else if manual_only_keys.iter().any(|m| m == trimmed) || manual_only_keys.iter().any(|m| m == mapped) {
+            warnings.push(format!(
+                "分类「{trimmed}」不参与 AI 自动打标（只手工填写），本次返回的标签已丢弃"
+            ));
+            continue;
         } else {
             warnings.push(format!("分面「{trimmed}」已停用，本次返回的标签已丢弃"));
             continue;
@@ -293,7 +338,12 @@ pub fn model_supports_vision(model: &str) -> bool {
 /// description 经 normalize_content_description（最多 20 字）；
 /// tags 经 parse_categorized_checked（未知 key → custom + warning，绝不静默丢）。
 /// 「标签为空但描述非空」= 有效分析（旧 parse_tags_strict 会直接拒绝，FB5-05 放宽）。
-pub fn parse_media_analysis(content: &str, valid_keys: &[&str]) -> AppResult<MediaAnalysis> {
+pub fn parse_media_analysis(
+    content: &str,
+    valid_keys: &[&str],
+    facets: &[FacetPromptContext],
+    manual_keys: &[String],
+) -> AppResult<MediaAnalysis> {
     let trimmed = content.trim();
     // FX-02：本地模型（gemma3 等）常把 JSON 包在 ```json … ``` 代码围栏里。
     // 整串解析失败时先剥围栏（取首个 { 到末个 }），否则顶层键 "description"/"tags"
@@ -326,7 +376,29 @@ pub fn parse_media_analysis(content: &str, valid_keys: &[&str]) -> AppResult<Med
             (String::new(), trimmed.to_string())
         };
     let description = normalize_content_description(&raw_desc);
-    let (tags, warnings) = parse_categorized_checked(&tags_content, valid_keys);
+    let (mut tags, warnings) = parse_categorized_checked_ex(&tags_content, valid_keys, manual_keys);
+    // W5a（a8）：按 selection_mode / max_items 强制裁剪（替换无差别 take(5)）。
+    // single 恒 1 个；multi 裁到 max_items（None = 不限）；超量记 warning。
+    {
+        let rule_for = |key: &str| -> (bool, Option<usize>) {
+            facets
+                .iter()
+                .find(|f| f.key == key)
+                .map(|f| (f.selection_mode == "single", f.max_items.map(|n| n as usize)))
+                .unwrap_or((false, Some(5)))
+        };
+        for (key, list) in tags.iter_mut() {
+            let (single, max) = rule_for(key);
+            let cap = if single { Some(1) } else { max };
+            if let Some(cap) = cap {
+                if list.len() > cap {
+                    tracing::warn!("分面 {key} 标签超量（{} 个 > 上限 {cap}），已裁剪", list.len());
+                    list.truncate(cap);
+                }
+            }
+        }
+        tags.retain(|_, v| !v.is_empty());
+    }
     for w in &warnings {
         tracing::warn!("AI 打标未知分面 key：{w}");
     }
@@ -348,6 +420,8 @@ fn request_analysis(
     client: &reqwest::blocking::Client,
     cfg: &ApiProfile,
     facets: &[FacetPromptContext],
+    top_tags: &[(String, String)],
+    manual_keys: &[String],
     image_path: &std::path::Path,
 ) -> AppResult<MediaAnalysis> {
     // 连接失败引导（P3-01a）：本地档案连不上时明示安装/启动本地服务
@@ -376,7 +450,10 @@ fn request_analysis(
         _ => "image/jpeg",
     };
 
-    let prompt = build_prompt(facets);
+    // W5a：system + user 双段（Anthropic 分支用顶层 system 参数；OpenAI 兼容走 messages[0]）
+    let system = build_system_prompt();
+    let user = build_user_prompt(facets, top_tags);
+    let max_tokens = dynamic_max_tokens(facets.len()); // a7：动态上限防 JSON 截断
     let base = cfg.base_url.trim_end_matches('/');
 
     // 发起一次请求并取回模型文本回复（不同协议分支各自组包）
@@ -385,11 +462,12 @@ fn request_analysis(
         Box::new(move || {
             let body = serde_json::json!({
                 "model": cfg.model,
-                "max_tokens": 500,
+                "max_tokens": max_tokens,
+                "system": system, // W5a-a1：Anthropic 顶层 system 参数
                 "messages": [{
                     "role": "user",
                     "content": [
-                        { "type": "text", "text": prompt },
+                        { "type": "text", "text": user },
                         { "type": "image", "source": { "type": "base64", "media_type": mime, "data": b64 } }
                     ]
                 }]
@@ -412,14 +490,22 @@ fn request_analysis(
             let mut body = serde_json::json!({
                 "model": cfg.model,
                 "messages": [{
+                    "role": "system",
+                    "content": system,
+                }, {
                     "role": "user",
                     "content": [
-                        { "type": "text", "text": prompt },
+                        { "type": "text", "text": user },
                         { "type": "image_url", "image_url": { "url": format!("data:{mime};base64,{b64}") } }
                     ]
                 }],
-                "max_tokens": 500
+                "max_tokens": max_tokens
             });
+            // W5a-a6：本地档案加 response_format json_object（仿 request_text_raw:670）。
+            // 云端不加（部分中转站对视觉请求的 response_format 支持不稳）；剥围栏容错链保留作降级。
+            if cfg.is_local() {
+                body["response_format"] = serde_json::json!({ "type": "json_object" });
+            }
             // §8.4：本地请求显式传 keep_alive（不依赖默认值）
             apply_keep_alive(&mut body, cfg.is_local());
 
@@ -449,7 +535,7 @@ fn request_analysis(
     let mut content = fetch()?;
     // C-4：有效分面 key 集合（稳定 facetKey），用于校验未知 key 并记录 warning
     let valid_keys: Vec<&str> = facets.iter().map(|f| f.key.as_str()).collect();
-    if let Ok(a) = parse_media_analysis(&content, &valid_keys) {
+    if let Ok(a) = parse_media_analysis(&content, &valid_keys, facets, manual_keys) {
         return Ok(a);
     }
     // 本地档案失败自愈：任何解析失败（@@@@ 退化 / 乱码 / 答非所问）都先卸载重载一次再重试。
@@ -457,7 +543,7 @@ fn request_analysis(
     if cfg.is_local() {
         unload_ollama_model(cfg);
         if let Ok(c) = fetch() {
-            if let Ok(a) = parse_media_analysis(&c, &valid_keys) {
+            if let Ok(a) = parse_media_analysis(&c, &valid_keys, facets, manual_keys) {
                 return Ok(a);
             }
             content = c;
@@ -471,7 +557,7 @@ fn request_analysis(
         }
     }
     // 非退化（模型正常回复但没按提示词输出 JSON）：保留原始错误信息便于定位
-    parse_media_analysis(&content, &valid_keys)
+    parse_media_analysis(&content, &valid_keys, facets, manual_keys)
 }
 
 /// 从 Anthropic Messages 响应中取第一个 text 内容块
@@ -1104,6 +1190,8 @@ fn analyze_video_frames(
     client: &reqwest::blocking::Client,
     cfg: &ApiProfile,
     facets: &[FacetPromptContext],
+    top_tags: &[(String, String)],
+    manual_keys: &[String],
     asset: &assets::Asset,
     frame_count: usize,
 ) -> AppResult<MediaAnalysis> {
@@ -1127,7 +1215,7 @@ fn analyze_video_frames(
     }
     let mut results: Vec<MediaAnalysis> = Vec::new();
     for f in &frames {
-        if let Ok(a) = request_analysis(client, cfg, facets, f) {
+        if let Ok(a) = request_analysis(client, cfg, facets, &[], &[], f) {
             results.push(a);
         }
     }
@@ -1201,6 +1289,23 @@ pub fn run_cloud_batch<F: Fn(AiProgress)>(
         let conn = lock()?;
         ai::list_suggestions(&conn, batch_id)?
     };
+    // W5a（a2/a5）：Top-20 候选词（按使用次数降序 → 标签收敛）进 user 段提示词
+    let top_tags: Vec<(String, String)> = {
+        let conn = lock()?;
+        crate::db::tags::top_tags_per_facet(&conn, 20).unwrap_or_default()
+    };
+    // W5a（a10）：manual_only 分面清单（warning 文案区分「不参与 AI」与「已停用」）
+    let manual_keys: Vec<String> = {
+        let conn = lock()?;
+        conn.prepare(
+            "SELECT key FROM tag_facets WHERE status = 'active' AND input_mode = 'manual_only'",
+        )
+        .and_then(|mut stmt| {
+            stmt.query_map([], |r| r.get::<_, String>(0))
+                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        })
+        .unwrap_or_default()
+    };
     // v2.11：可选只处理前 N 张（其余保持 pending，可再次启动）
     // F15a（2026-08-22）：筛选仅看 status=="pending" 会把「已生成候选但未确认」的条目重复送 AI
     // （set_suggestion_tags 不改 status）→ 续跑重复请求 + processed 虚增。修复：待处理 = pending 且尚无候选。
@@ -1247,19 +1352,23 @@ pub fn run_cloud_batch<F: Fn(AiProgress)>(
                     &client,
                     profile,
                     facets,
+                    &top_tags,
+                    &manual_keys,
                     asset,
                     (cfg.video_frame_count as usize).clamp(2, 8),
                 ),
                 // cover（默认）：复用入库时生成的视频封面，needs 高清图优先
-                _ => request_analysis(&client, profile, facets, &pick_image(asset)),
+                _ => request_analysis(&client, profile, facets, &top_tags, &manual_keys, &pick_image(asset)),
             }
         } else {
             // 网络请求（可能耗时数十秒）：不持 DB 锁
-            request_analysis(&client, profile, facets, &pick_image(asset))
+            request_analysis(&client, profile, facets, &top_tags, &manual_keys, &pick_image(asset))
         }
     };
 
     let mut processed = 0i64;
+    // W5a（a12）：连续失败计数（成功清零；≥3 熔断）
+    let mut consecutive_failures = 0u32;
     for chunk in todo.chunks(chunk_size) {
         for s in chunk {
             if cancel.load(Ordering::Relaxed) {
@@ -1280,13 +1389,26 @@ pub fn run_cloud_batch<F: Fn(AiProgress)>(
             {
                 let conn = lock()?;
                 match tags {
-                    Ok(a) => ai::set_suggestion_result(&conn, s.id, &a.tags, &a.description)?,
+                    Ok(a) => {
+                        // W5a（a12）：成功清零连续失败计数（单条内的退避重试不计入熔断）
+                        consecutive_failures = 0;
+                        ai::set_suggestion_result(&conn, s.id, &a.tags, &a.description)?
+                    }
                     Err(e) => {
                         // 单条失败不阻塞批次：建议置 rejected 并记录空标签与失败原因（v6 详情落库）
                         let err = e.to_string();
                         tracing::warn!("asset {} 打标失败: {err}", s.asset_id);
                         let _ = ai::set_suggestion_error(&conn, s.id, &err);
                         ai::reject_suggestion(&conn, s.id)?;
+                        // W5a（a12）：熔断 —— 连续失败 ≥3 说明是配置/网络级问题
+                        //（key 无效/额度耗尽/断网），继续跑只会浪费请求与时间。
+                        consecutive_failures += 1;
+                        if consecutive_failures >= 3 {
+                            ai::set_batch_status(&conn, batch_id, "interrupted")?;
+                            return Err(AppError::msg(format!(
+                                "连续 {consecutive_failures} 条打标失败，已中断批次（大概率是配置或网络问题，最近错误：{err}）。修复后可在打标页继续未完成的条目。"
+                            )));
+                        }
                     }
                 }
                 ai::inc_batch_processed(&conn, batch_id)?;
@@ -1349,13 +1471,13 @@ mod tests {
     #[test]
     fn strict_garbage_is_err() {
         // FB5-05：parse_media_analysis 取代 parse_tags_strict；垃圾输入仍判失败
-        assert!(super::parse_media_analysis("我无法查看这张图片", &[]).is_err());
+        assert!(super::parse_media_analysis("我无法查看这张图片", &[], &[], &[]).is_err());
     }
 
     #[test]
     fn strict_valid_object_ok() {
         let valid = ["scene", "style"];
-        let r = super::parse_media_analysis("{\"场景\": [\"公园\"]}", &valid).unwrap();
+        let r = super::parse_media_analysis("{\"场景\": [\"公园\"]}", &valid, &[], &[]).unwrap();
         assert_eq!(r.tags.get("scene").unwrap(), &vec!["公园".to_string()]);
     }
 
@@ -1639,6 +1761,8 @@ mod tests {
         let a = super::parse_media_analysis(
             r#"{"description":"这是一张夜晚树下多人合影。","tags":{"subject":["树"],"lighting":["夜间"],"people":["多人"]}}"#,
             &valid,
+            &[],
+            &[],
         )
         .unwrap();
         assert_eq!(a.description, "夜晚树下多人合影");
@@ -1648,7 +1772,7 @@ mod tests {
     #[test]
     fn parse_media_analysis_old_protocol_no_description() {
         let valid = ["subject"];
-        let a = super::parse_media_analysis(r#"{"subject":["树"]}"#, &valid).unwrap();
+        let a = super::parse_media_analysis(r#"{"subject":["树"]}"#, &valid, &[], &[]).unwrap();
         assert_eq!(a.description, "");
         assert_eq!(a.tags.get("subject").unwrap(), &vec!["树".to_string()]);
     }
@@ -1658,11 +1782,11 @@ mod tests {
         // 标签为空但描述非空 = 有效分析（§7.5 放宽）
         let valid = ["subject"];
         let a =
-            super::parse_media_analysis(r#"{"description":"纯红底色","tags":{}}"#, &valid).unwrap();
+            super::parse_media_analysis(r#"{"description":"纯红底色","tags":{}}"#, &valid, &[], &[]).unwrap();
         assert_eq!(a.description, "纯红底色");
         assert!(a.tags.is_empty());
         // 扁平旧数组也兼容（无描述；未知 key 归 custom）
-        let a2 = super::parse_media_analysis(r#"["人像"]"#, &valid).unwrap();
+        let a2 = super::parse_media_analysis(r#"["人像"]"#, &valid, &[], &[]).unwrap();
         assert_eq!(a2.description, "");
         assert!(
             a2.tags.values().flatten().any(|t| t == "人像"),
@@ -1674,9 +1798,9 @@ mod tests {
     fn parse_media_analysis_both_empty_fails() {
         let valid = ["subject"];
         let err =
-            super::parse_media_analysis(r#"{"description":"","tags":{}}"#, &valid).unwrap_err();
+            super::parse_media_analysis(r#"{"description":"","tags":{}}"#, &valid, &[], &[]).unwrap_err();
         assert!(err.to_string().contains("模型未返回"));
-        let err2 = super::parse_media_analysis("not json", &valid).unwrap_err();
+        let err2 = super::parse_media_analysis("not json", &valid, &[], &[]).unwrap_err();
         assert!(err2.to_string().contains("模型未返回"));
     }
 
@@ -1687,7 +1811,7 @@ mod tests {
     fn parse_media_analysis_fenced_json_new_protocol() {
         let valid = ["subject", "scene", "style", "people", "composition", "lighting"];
         let raw = "```json\n{\n  \"description\": \"女孩斜站街旁\",\n  \"tags\": {\n    \"scene\": [\"街道\"],\n    \"style\": [\"清新\"],\n    \"people\": [\"女\", \"青少年\"],\n    \"subject\": [\"女孩\"],\n    \"composition\": [\"特写\"],\n    \"lighting\": [\"柔光\"]\n  }\n}\n```";
-        let a = super::parse_media_analysis(raw, &valid).unwrap();
+        let a = super::parse_media_analysis(raw, &valid, &[], &[]).unwrap();
         assert_eq!(a.description, "女孩斜站街旁");
         assert_eq!(a.tags.get("scene").unwrap(), &vec!["街道".to_string()]);
         assert_eq!(a.tags.get("people").unwrap(), &vec!["女".to_string(), "青少年".to_string()]);
@@ -1699,7 +1823,7 @@ mod tests {
         // 围栏 + 前后闲话（宽容截取首个 { 到末个 }）
         let valid = ["subject"];
         let raw = "好的，以下是整理好的并符合规格的JSON格式：\n```json\n{\"description\":\"夜晚树下自拍\",\"tags\":{\"subject\":[\"树\"]}}\n```";
-        let a = super::parse_media_analysis(raw, &valid).unwrap();
+        let a = super::parse_media_analysis(raw, &valid, &[], &[]).unwrap();
         assert_eq!(a.description, "夜晚树下自拍");
         assert_eq!(a.tags.get("subject").unwrap(), &vec!["树".to_string()]);
     }
@@ -1709,7 +1833,7 @@ mod tests {
         // 围栏包裹的旧协议（无 description 字段）：标签按分面归位，描述为空
         let valid = ["scene"];
         let raw = "```json\n{\"场景\": [\"公园\"]}\n```";
-        let a = super::parse_media_analysis(raw, &valid).unwrap();
+        let a = super::parse_media_analysis(raw, &valid, &[], &[]).unwrap();
         assert_eq!(a.description, "");
         assert_eq!(a.tags.get("scene").unwrap(), &vec!["公园".to_string()]);
     }
