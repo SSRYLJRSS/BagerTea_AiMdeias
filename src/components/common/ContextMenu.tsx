@@ -6,7 +6,7 @@ import clsx from "clsx";
 
 export type MenuEntry =
   | { label: string; disabled?: boolean; onClick: () => void }
-  | { label: string; children: { label: string; onClick: () => void }[] }
+  | { label: string; children: ({ label: string; onClick: () => void } | { divider: true })[] }
   | { divider: true };
 
 interface ContextMenuProps {
@@ -62,18 +62,22 @@ export default function ContextMenu({ x, y, entries, onClose }: ContextMenuProps
               </div>
               {openSub === i && (
                 <div className="absolute top-0 left-full z-50 ml-0.5 min-w-[96px] rounded-lg border border-[var(--color-border)] bg-[var(--color-bg)] py-1 shadow-lg">
-                  {entry.children.map((c, j) => (
-                    <button
-                      key={j}
-                      onClick={() => {
-                        onClose();
-                        c.onClick();
-                      }}
-                      className="flex w-full items-center px-3 py-1.5 text-left text-sm text-[var(--color-text)] transition-colors hover:bg-[var(--color-surface)]"
-                    >
-                      {c.label}
-                    </button>
-                  ))}
+                  {entry.children.map((c, j) =>
+                    "divider" in c ? (
+                      <div key={j} className="mx-2 my-1 border-t border-[var(--color-border)]" />
+                    ) : (
+                      <button
+                        key={j}
+                        onClick={() => {
+                          onClose();
+                          c.onClick();
+                        }}
+                        className="flex w-full items-center px-3 py-1.5 text-left text-sm text-[var(--color-text)] transition-colors hover:bg-[var(--color-surface)]"
+                      >
+                        {c.label}
+                      </button>
+                    ),
+                  )}
                 </div>
               )}
             </div>

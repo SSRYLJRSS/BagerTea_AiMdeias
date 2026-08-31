@@ -7,7 +7,7 @@ import { useVirtualizer } from "@tanstack/react-virtual";
 import { useShallow } from "zustand/react/shallow";
 import AssetCard from "./AssetCard";
 import ContextMenu, { type MenuEntry } from "@/components/common/ContextMenu";
-import { getAssetUrls, revealInFolder } from "@/api/assets";
+import { getAssetUrls, revealInFolder, setFavorite, setRating } from "@/api/assets";
 import { openFileExternal } from "@/api/import";
 import { useElementSize, useEscape } from "@/hooks/hooks";
 import { useLibraryStore } from "@/stores/libraryStore";
@@ -231,11 +231,75 @@ export default function AssetGridView({
     };
   }, [stepCell, scrollElementRef, ref]);
 
+  // W5b（§W5b）：收藏/评级 = 乐观更新 + 失败回滚（patchLocal 走刷新代际，不整页重载）。
+  const patchLocal = useCallback(
+    (ids: number[], patch: Partial<Asset>) => useLibraryStore.getState().patchLocal(ids, patch),
+    [],
+  );
+
+  const toggleFavorite = useCallback(
+    (ids: number[]) => {
+      if (ids.length === 0) return;
+      // 以当前第一张为准取反（批量操作：全部设成「收藏」或「取消收藏」）
+      const first = useLibraryStore.getState().items.find((a) => a.id === ids[0]);
+      const target = first?.favorite !== 1;
+      const prev = new Map(
+        ids.map((id) => [
+          id,
+          useLibraryStore.getState().items.find((a) => a.id === id)?.favorite,
+        ]),
+      );
+      patchLocal(ids, { favorite: target ? 1 : 0 });
+      void setFavorite(ids, target).catch((e) => {
+        ids.forEach((id) => patchLocal([id], { favorite: prev.get(id) }));
+        console.warn("收藏更新失败，已回滚：", e);
+      });
+    },
+    [patchLocal],
+  );
+
+  const applyRating = useCallback(
+    (rating: number) => {
+      const ids = Array.from(selected);
+      if (ids.length === 0) return;
+      const prev = new Map(
+        ids.map((id) => [
+          id,
+          useLibraryStore.getState().items.find((a) => a.id === id)?.rating,
+        ]),
+      );
+      patchLocal(ids, { rating });
+      void setRating(ids, rating).catch((e) => {
+        ids.forEach((id) => patchLocal([id], { rating: prev.get(id) }));
+        console.warn("评级更新失败，已回滚：", e);
+      });
+    },
+    [selected, patchLocal],
+  );
+
   // FB2-01：Ctrl/Cmd + = / - 增减一档（复用既有 keydown 效果，避开 INPUT 与菜单打开态）
+  // W5b（§W5b）：选片手不离键盘 —— 1–5 设评级、0 清除、F 切收藏（无修饰键，选中的素材生效）
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (menu) return;
       if ((e.target as HTMLElement)?.tagName === "INPUT") return;
+      if (!e.ctrlKey && !e.metaKey && !e.altKey) {
+        if (e.key >= "1" && e.key <= "5") {
+          e.preventDefault();
+          applyRating(Number(e.key));
+          return;
+        }
+        if (e.key === "0") {
+          e.preventDefault();
+          applyRating(0);
+          return;
+        }
+        if (e.key === "f" || e.key === "F") {
+          e.preventDefault();
+          toggleFavorite(Array.from(selected));
+          return;
+        }
+      }
       if (!(e.ctrlKey || e.metaKey)) return;
       if (e.key === "a" || e.key === "A") {
         e.preventDefault();
@@ -253,7 +317,7 @@ export default function AssetGridView({
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [fetchAllIds, setAll, invert, menu, stepCell]);
+  }, [fetchAllIds, setAll, invert, menu, stepCell, applyRating, toggleFavorite, selected]);
 
   const handleContextMenu = useCallback(
     (asset: Asset, _index: number, e: React.MouseEvent) => {
@@ -323,6 +387,21 @@ export default function AssetGridView({
       { label: "移动到…", onClick: onMove },
       { label: "删除", onClick: onDelete },
       { divider: true },
+      // W5b（§W5b）：右键收藏 + 评级子菜单（对选中集批量生效）
+      { label: "收藏", onClick: () => toggleFavorite(Array.from(selected)) },
+      {
+        label: "评级",
+        children: [
+          { label: "★★★★★", onClick: () => applyRating(5) },
+          { label: "★★★★", onClick: () => applyRating(4) },
+          { label: "★★★", onClick: () => applyRating(3) },
+          { label: "★★", onClick: () => applyRating(2) },
+          { label: "★", onClick: () => applyRating(1) },
+          { divider: true },
+          { label: "清除评级", onClick: () => applyRating(0) },
+        ],
+      },
+      { divider: true },
       { label: "复制路径", onClick: () => void copyPaths() },
       // W5f-f4：用默认程序打开（单选；Lightroom/Capture One 打开 RAW 是高频动作）
       {
@@ -335,7 +414,7 @@ export default function AssetGridView({
       ...common,
       { label: "取消选择", onClick: clear },
     ];
-  }, [selected.size, fetchAllIds, setAll, invert, onAiTag, onAssignTags, onExport, onMove, onDelete, copyPaths, revealFirst, openFirstExternal, clear]);
+  }, [selected.size, fetchAllIds, setAll, invert, onAiTag, onAssignTags, onExport, onMove, onDelete, copyPaths, revealFirst, openFirstExternal, clear, toggleFavorite, applyRating]);
 
   if (items.length === 0) {
     return (
@@ -427,6 +506,7 @@ export default function AssetGridView({
                     onPreview={handlePreview}
                     onContextMenu={handleContextMenu}
                     onSearchDominant={onSearchDominant}
+                    onToggleFavorite={(a) => toggleFavorite([a.id])}
                   />
                 );
               })}

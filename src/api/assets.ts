@@ -126,3 +126,13 @@ export function getPaletteStatus(): Promise<PaletteStatus> {
 export function getAssetPalettePatches(ids: number[]): Promise<AssetPalettePatch[]> {
   return invoke<AssetPalettePatch[]>("get_asset_palette_patches", { ids });
 }
+
+/** W2-8：收藏/取消收藏（批量；返回受影响行数） */
+export function setFavorite(ids: number[], favorite: boolean): Promise<number> {
+  return invoke<number>("set_favorite", { ids, favorite });
+}
+
+/** W2-8：批量设评级（rating 0 = 清除；返回受影响行数） */
+export function setRating(ids: number[], rating: number): Promise<number> {
+  return invoke<number>("set_rating", { ids, rating });
+}

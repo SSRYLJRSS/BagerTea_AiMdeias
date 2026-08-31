@@ -27,14 +27,15 @@ interface GridToolbarProps {
   onPurge: () => void;
 }
 
-/** R-21 排序选项（与后端 AssetFilter.sortBy 对齐） */
-const SORT_OPTIONS: { value: "created_at" | "taken_at" | "size" | "resolution" | "name" | "modified_at"; label: string }[] = [
+/** R-21 排序选项（与后端 AssetFilter.sortBy 对齐）；W2-8 补「评级」 */
+const SORT_OPTIONS: { value: "created_at" | "taken_at" | "size" | "resolution" | "name" | "modified_at" | "rating"; label: string }[] = [
   { value: "created_at", label: "入库时间" },
   { value: "taken_at", label: "拍摄时间" },
   { value: "modified_at", label: "修改时间" },
   { value: "name", label: "文件名" },
   { value: "size", label: "文件大小" },
   { value: "resolution", label: "分辨率" },
+  { value: "rating", label: "评级" },
 ];
 
 /** FB2-01 三态大小入口：小/中/大 → 档位 1 / 3 / 5（与滚轮、Ctrl+± 状态同步） */
