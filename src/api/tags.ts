@@ -161,3 +161,14 @@ export function recentTagOps(limit = 100): Promise<import("@/types/asset").TagOp
 export function undoTagBatch(batchId: number): Promise<number> {
   return invoke<number>("tag_undo_batch", { batchId });
 }
+
+/** 一句话描述列表（标签与分类设置页展示；描述走 FTS 模糊搜索） */
+export interface ContentDescription {
+  assetId: number;
+  fileName: string;
+  description: string;
+}
+
+export function listContentDescriptions(limit?: number): Promise<ContentDescription[]> {
+  return invoke<ContentDescription[]>("list_content_descriptions", { limit });
+}

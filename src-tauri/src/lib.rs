@@ -250,6 +250,8 @@ pub fn run() {
             // 素材
             commands::list_assets,
             commands::list_asset_ids,
+            // 一句话描述列表（标签设置页展示）
+            commands::list_content_descriptions,
             commands::list_metadata_facets,
             commands::get_asset,
             commands::delete_assets,

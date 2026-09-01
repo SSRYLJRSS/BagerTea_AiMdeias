@@ -320,6 +320,8 @@ describe("AssetGrid FB2-01 档位缩放（Alt/Ctrl+滚轮）", () => {
         videoFrameCount: 3,
         batchLimit: 500,
         ollamaSourceId: "auto",
+        systemPromptTagging: "",
+        systemPromptSearch: "",
       },
       theme: "system",
       thumbnailCacheMb: 2048,

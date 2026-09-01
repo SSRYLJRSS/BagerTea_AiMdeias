@@ -503,7 +503,7 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
               {/* §9.2/§9.5：分面结构 + AI 行为 + 分类词条在同一个分面详情内完成；
                    不再并列「AI 行为配置」独立列表与「分类词条」顶层卡片（§9.3） */}
               <div className="p-2">
-                <FacetManagePanel />
+                <FacetManagePanel draft={draft} onPatchAi={patchAi} />
               </div>
             </Group>
           )}

@@ -1811,3 +1811,16 @@ mod tests {
         assert_eq!(b.phash, None);
     }
 }
+
+/// 列出非空的一句话描述（标签与分类设置页展示用；描述走 FTS 模糊搜索，不参与分面精确筛选）。
+pub fn list_content_descriptions(conn: &Connection, limit: i64) -> AppResult<Vec<(i64, String, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, file_name, content_description FROM assets
+          WHERE deleted_at IS NULL AND content_description IS NOT NULL AND content_description != ''
+          ORDER BY id LIMIT ?1",
+    )?;
+    let rows = stmt.query_map([limit], |r| {
+        Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+    })?;
+    Ok(rows.filter_map(|r| r.ok()).collect())
+}

@@ -5,6 +5,8 @@
  *  - 编辑弹窗 6 字段一个保存通道（update_tag_facet 单事务；替代旧的「基本规则即时写 + AI 行为进草稿」双通道）
  *  - 新建弹窗 2 个必填（名称 + 这类标签是什么）；key 自动 slugify，CJK 生成空串时明确提示
  *  - 删除确认弹窗：精确影响数字 + 输入分类名确认 + 三按钮（取消 / 停用替代 / 确认删除）
+ *  - 「一句话描述（AI 生成）」：与分面条目同形态的可点开条目——点开看已有描述，
+ *    里面提供打标/搜索提示词编辑（draft 草稿，页面「保存设置」统一落库；空 = 用内置默认）
  */
 import { useCallback, useEffect, useMemo, useState } from "react";
 import clsx from "clsx";
@@ -17,12 +19,15 @@ import {
   deleteTagFacet,
   getTagFacetImpact,
   listAllTagFacets,
+  listContentDescriptions,
   reorderTagFacets,
   restoreTagFacet,
   updateTagFacet,
   type FacetDeleteReport,
+  type ContentDescription,
 } from "@/api/tags";
 import type { TagFacet, TagFacetImpact } from "@/types/tag";
+import type { Settings } from "@/types/settings";
 
 const APP_TO_OPTIONS: { value: "all" | "image" | "video"; label: string }[] = [
   { value: "all", label: "全部素材" },
@@ -46,7 +51,10 @@ function ruleSummary(f: TagFacet): string {
   return f.appliesTo === "all" ? mode : `${mode} · ${applies}`;
 }
 
-export default function FacetManagePanel() {
+export default function FacetManagePanel({ draft, onPatchAi }: {
+  draft: Settings;
+  onPatchAi: (patch: Partial<Settings["ai"]>) => void;
+}) {
   const [facets, setFacets] = useState<TagFacet[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -62,6 +70,10 @@ export default function FacetManagePanel() {
   const [termsFacet, setTermsFacet] = useState<TagFacet | null>(null);
   /** 拖拽中：跨组 = 改 input_mode；组内 = reorder */
   const [dragKey, setDragKey] = useState<string | null>(null);
+  /** 一句话描述：可点开条目（像分面条目一样点开看内容），展开态 */
+  const [descOpen, setDescOpen] = useState(false);
+  /** 提示词编辑区是否已展开（与描述列表同在一个展开条目内） */
+  const [promptOpen, setPromptOpen] = useState(false);
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -73,6 +85,24 @@ export default function FacetManagePanel() {
     } finally {
       setLoading(false);
     }
+  }, []);
+
+  /** 一句话描述展示（AI 生成，走 FTS 模糊搜索；失败静默降级不阻塞面板） */
+  const [descriptions, setDescriptions] = useState<ContentDescription[]>([]);
+  const [descLoading, setDescLoading] = useState(true);
+  useEffect(() => {
+    let cancelled = false;
+    listContentDescriptions(200)
+      .then((d) => {
+        if (!cancelled) setDescriptions(d);
+      })
+      .catch(() => undefined)
+      .finally(() => {
+        if (!cancelled) setDescLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   useEffect(() => {
@@ -91,10 +121,14 @@ export default function FacetManagePanel() {
     }
   };
 
-  const active = useMemo(() => facets.filter((f) => f.status === "active"), [facets]);
+  // custom（AI 未知分类的兜底桶，resolve_facet_key 分支③）与 color（V16 起由算法主色
+  // 替代，属机器可读属性，色条 + 文件属性面板承担展示）不在分面管理 UI 展示——界面干净，
+  // 后端兜底链路不受影响（隐藏 ≠ 删除）。
+  const visibleFacets = useMemo(() => facets.filter((f) => f.key !== "custom" && f.key !== "color"), [facets]);
+  const active = useMemo(() => visibleFacets.filter((f) => f.status === "active"), [visibleFacets]);
   const aiGroup = useMemo(() => active.filter((f) => f.inputMode === "ai_and_manual"), [active]);
   const manualGroup = useMemo(() => active.filter((f) => f.inputMode === "manual_only"), [active]);
-  const inactive = useMemo(() => facets.filter((f) => f.status !== "active"), [facets]);
+  const inactive = useMemo(() => visibleFacets.filter((f) => f.status !== "active"), [visibleFacets]);
 
   /** 跨组拖动 = 改 input_mode（走 update_tag_facet 单事务） */
   const moveToGroup = (facet: TagFacet, group: "ai" | "manual") => {
@@ -271,6 +305,84 @@ export default function FacetManagePanel() {
               )}
             </section>
           )}
+
+          {/* 一句话描述（AI 生成）：与分面同形态的可点开条目——点开看具体描述，
+              里面提供打标/搜索提示词编辑（进 draft，「保存设置」统一落库；空 = 内置默认） */}
+          <section className="mt-1">
+            <button
+              type="button"
+              onClick={() => setDescOpen((v) => !v)}
+              className="flex w-full items-center gap-2 rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] px-2 py-1.5 text-left"
+            >
+              <span className="text-[var(--color-text-tertiary)]">{descOpen ? "▾" : "▸"}</span>
+              <span className="min-w-0 flex-1 truncate text-xs font-medium text-[var(--color-text)]">一句话描述（AI 生成）</span>
+              {!descLoading && <span className="shrink-0 rounded bg-[var(--color-surface-hover)] px-1 text-[10px] text-[var(--color-text-secondary)]">{descriptions.length} 条</span>}
+              {draft.ai.systemPromptTagging.trim() && <span className="shrink-0 rounded bg-[var(--color-surface-hover)] px-1 text-[10px] text-[var(--color-text-secondary)]">已改提示词</span>}
+            </button>
+            {descOpen && (
+              <div className="mt-1.5 flex flex-col gap-2 rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] p-2">
+                <p className="text-[11px] leading-4 text-[var(--color-text-secondary)]">
+                  打标时 AI 顺带生成的整句描述，属于自由文本不进分面（分面=精确筛选）；已加入全文索引，超级搜索可直接模糊搜到（如「夜晚树下多人」）。
+                </p>
+                {descLoading ? (
+                  <p className="text-[11px] text-[var(--color-text-tertiary)]">加载描述…</p>
+                ) : descriptions.length === 0 ? (
+                  <p className="text-[11px] text-[var(--color-text-tertiary)]">
+                    还没有一句话描述。AI 打标确认时会自动生成；生成后这里可查看、超级搜索可搜到。
+                  </p>
+                ) : (
+                  <ul className="flex max-h-40 flex-col gap-1 overflow-y-auto">
+                    {descriptions.map((d) => (
+                      <li key={d.assetId} className="flex items-baseline gap-2 rounded bg-[var(--color-surface)] px-2 py-1">
+                        <span className="max-w-28 shrink-0 truncate text-[10px] text-[var(--color-text-tertiary)]" title={d.fileName}>
+                          {d.fileName}
+                        </span>
+                        <span className="min-w-0 flex-1 text-[11px] leading-4 text-[var(--color-text-secondary)]" title={d.description}>
+                          {d.description}
+                        </span>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+
+                {/* 提示词编辑：点开条目内部；空 = 用内置默认提示词 */}
+                <div className="border-t border-[var(--color-border)] pt-2">
+                  <button
+                    type="button"
+                    onClick={() => setPromptOpen((v) => !v)}
+                    className="flex items-center gap-1 text-[11px] text-[var(--color-text-secondary)] hover:text-[var(--color-text)]"
+                  >
+                    {promptOpen ? "▾" : "▸"} 提示词（可选，自行修改）
+                  </button>
+                  {promptOpen && (
+                    <div className="mt-1.5 flex flex-col gap-2">
+                      <label className="flex flex-col gap-1 text-[11px]">
+                        <span className="text-[var(--color-text-secondary)]">AI 打标提示词（控制标签与一句话描述的生成）</span>
+                        <textarea
+                          className="ui-control min-h-28 w-full px-2 py-1.5 text-xs"
+                          value={draft.ai.systemPromptTagging}
+                          onChange={(e) => onPatchAi({ systemPromptTagging: e.target.value })}
+                          placeholder="留空 = 使用内置默认提示词"
+                        />
+                      </label>
+                      <label className="flex flex-col gap-1 text-[11px]">
+                        <span className="text-[var(--color-text-secondary)]">超级搜索提示词（控制 AI 识别搜索意图）</span>
+                        <textarea
+                          className="ui-control min-h-28 w-full px-2 py-1.5 text-xs"
+                          value={draft.ai.systemPromptSearch}
+                          onChange={(e) => onPatchAi({ systemPromptSearch: e.target.value })}
+                          placeholder="留空 = 使用内置默认提示词"
+                        />
+                      </label>
+                      <p className="text-[10px] leading-3 text-[var(--color-text-tertiary)]">
+                        改动先进入草稿，点右上角「保存设置」才生效；清空恢复内置默认。
+                      </p>
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+          </section>
         </>
       )}
 

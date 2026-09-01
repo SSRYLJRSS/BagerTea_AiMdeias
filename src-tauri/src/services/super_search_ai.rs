@@ -825,7 +825,12 @@ pub fn request_intent(
     }
 
     let schema = intent_schema(facets);
-    let system = build_system_prompt(facets);
+    // 用户可在设置页覆盖搜索 system prompt（非空优先；空 = 内置默认）
+    let system = if cfg.system_prompt_search.trim().is_empty() {
+        build_system_prompt(facets)
+    } else {
+        cfg.system_prompt_search.clone()
+    };
     let mut user = String::from("标签词典（规范名 | aliases: 可搜索别名）\n");
     for t in dict {
         user.push_str(&format!("- {t}\n"));

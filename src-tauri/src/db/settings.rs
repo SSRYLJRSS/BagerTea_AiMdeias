@@ -92,6 +92,12 @@ pub struct AiSettings {
     /// 一键安装的下载源偏好（"auto" = 测速选最快；旧数据缺省视为 auto）
     #[serde(default = "default_ollama_source_id")]
     pub ollama_source_id: String,
+    /// AI 打标提示词覆盖（用户可自行修改；空 = 用内置默认）
+    #[serde(default)]
+    pub system_prompt_tagging: String,
+    /// 超级搜索提示词覆盖（用户可自行修改；空 = 用内置默认）
+    #[serde(default)]
+    pub system_prompt_search: String,
 }
 
 impl AiSettings {
@@ -227,6 +233,8 @@ impl Default for AiSettings {
             local_model_tier: default_tier(),
             batch_limit: default_batch_limit(),
             ollama_source_id: default_ollama_source_id(),
+            system_prompt_tagging: String::new(),
+            system_prompt_search: String::new(),
         }
     }
 }

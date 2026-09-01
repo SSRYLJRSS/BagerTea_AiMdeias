@@ -418,6 +418,7 @@ fn request_analysis(
     top_tags: &[(String, String)],
     manual_keys: &[String],
     image_path: &std::path::Path,
+    system_override: &str,
 ) -> AppResult<MediaAnalysis> {
     // 连接失败引导（P3-01a）：本地档案连不上时明示安装/启动本地服务
     let conn_err = |e: reqwest::Error| {
@@ -446,7 +447,12 @@ fn request_analysis(
     };
 
     // W5a：system + user 双段（Anthropic 分支用顶层 system 参数；OpenAI 兼容走 messages[0]）
-    let system = build_system_prompt();
+    // 用户可在设置页覆盖 system prompt（非空优先；空 = 内置默认）
+    let system = if system_override.trim().is_empty() {
+        build_system_prompt()
+    } else {
+        system_override.to_string()
+    };
     let user = build_user_prompt(facets, top_tags);
     let max_tokens = dynamic_max_tokens(facets.len()); // a7：动态上限防 JSON 截断
     let base = cfg.base_url.trim_end_matches('/');
@@ -1189,6 +1195,7 @@ fn analyze_video_frames(
     manual_keys: &[String],
     asset: &assets::Asset,
     frame_count: usize,
+    system_override: &str,
 ) -> AppResult<MediaAnalysis> {
     let dir = std::env::temp_dir().join(format!(
         "bagertea_kframes_{}_{}",
@@ -1210,7 +1217,7 @@ fn analyze_video_frames(
     }
     let mut results: Vec<MediaAnalysis> = Vec::new();
     for f in &frames {
-        if let Ok(a) = request_analysis(client, cfg, facets, top_tags, manual_keys, f) {
+        if let Ok(a) = request_analysis(client, cfg, facets, top_tags, manual_keys, f, system_override) {
             results.push(a);
         }
     }
@@ -1351,13 +1358,14 @@ pub fn run_cloud_batch<F: Fn(AiProgress)>(
                     &manual_keys,
                     asset,
                     (cfg.video_frame_count as usize).clamp(2, 8),
+                    &cfg.system_prompt_tagging,
                 ),
                 // cover（默认）：复用入库时生成的视频封面，needs 高清图优先
-                _ => request_analysis(&client, profile, facets, &top_tags, &manual_keys, &pick_image(asset)),
+                _ => request_analysis(&client, profile, facets, &top_tags, &manual_keys, &pick_image(asset), &cfg.system_prompt_tagging),
             }
         } else {
             // 网络请求（可能耗时数十秒）：不持 DB 锁
-            request_analysis(&client, profile, facets, &top_tags, &manual_keys, &pick_image(asset))
+            request_analysis(&client, profile, facets, &top_tags, &manual_keys, &pick_image(asset), &cfg.system_prompt_tagging)
         }
     };
 

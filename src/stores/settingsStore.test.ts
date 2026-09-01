@@ -24,6 +24,8 @@ function mkSettings(): Settings {
       videoFrameCount: 3,
       batchLimit: 500,
       ollamaSourceId: "auto",
+      systemPromptTagging: "",
+      systemPromptSearch: "",
     },
     theme: "light",
     thumbnailCacheMb: 2048,

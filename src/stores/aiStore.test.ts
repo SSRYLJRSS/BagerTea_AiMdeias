@@ -69,6 +69,8 @@ const mkSettings = (over: Partial<Settings["ai"]> = {}): Settings => ({
     videoFrameCount: 3,
     batchLimit: 500,
     ollamaSourceId: "auto",
+    systemPromptTagging: "",
+    systemPromptSearch: "",
     ...over,
   },
   theme: "system",

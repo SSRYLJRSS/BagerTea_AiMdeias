@@ -80,6 +80,8 @@ function normalizeAi(raw: unknown): AiSettings {
     ollamaSourceId: asStr(r.ollamaSourceId, "auto"),
     videoTaggingMode: asEnum(r.videoTaggingMode, ["cover", "frames"] as const, "cover"),
     videoFrameCount: clampInt(r.videoFrameCount, 2, 8, 3),
+    systemPromptTagging: asStr(r.systemPromptTagging, ""),
+    systemPromptSearch: asStr(r.systemPromptSearch, ""),
   };
 }
 

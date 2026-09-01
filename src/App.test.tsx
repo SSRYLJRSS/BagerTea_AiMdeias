@@ -21,6 +21,8 @@ function mkSettings(): Settings {
       videoFrameCount: 3,
       batchLimit: 500,
       ollamaSourceId: "auto",
+      systemPromptTagging: "",
+      systemPromptSearch: "",
     },
     theme: "system",
     thumbnailCacheMb: 2048,
@@ -64,7 +66,7 @@ vi.mock("@/api/thumbnail", () => ({
 }));
 vi.mock("@/api/settings", () => ({
   getSettings: vi.fn().mockResolvedValue({
-    ai: { profiles: [], activeProfile: "", videoTagging: false, batchLimit: 500, ollamaSourceId: "auto" },
+    ai: { profiles: [], activeProfile: "", videoTagging: false, batchLimit: 500, systemPromptTagging: "", systemPromptSearch: "", ollamaSourceId: "auto" },
     theme: "system",
     thumbnailCacheMb: 2048,
     tagCategories: [],

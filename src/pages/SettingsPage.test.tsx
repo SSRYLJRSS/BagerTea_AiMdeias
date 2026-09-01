@@ -74,6 +74,7 @@ vi.mock("@/api/thumbnail", () => ({
 vi.mock("@/api/tags", async (importOriginal) => ({
   ...(await importOriginal<Record<string, unknown>>()),
   listAllTagFacets: vi.fn().mockResolvedValue([]),
+  listContentDescriptions: vi.fn().mockResolvedValue([]),
 }));
 vi.mock("@/api/assets", () => ({
   rescanAssetMetadata: assetMocks.rescanAssetMetadata,
@@ -113,6 +114,8 @@ function mkSettings(over: Partial<Settings> = {}): Settings {
       videoFrameCount: 3,
       batchLimit: 500,
       ollamaSourceId: "auto",
+      systemPromptTagging: "",
+      systemPromptSearch: "",
     },
     theme: "system",
     thumbnailCacheMb: 2048,

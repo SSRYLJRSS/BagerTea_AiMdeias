@@ -293,3 +293,26 @@ pub fn reveal_in_folder(
         .reveal_item_in_dir(&path)
         .map_err(|e| AppError::msg(format!("打开所在文件夹失败: {e}")))
 }
+
+/// 一句话描述列表（标签与分类设置页展示；描述走 FTS 模糊搜索，不参与分面精确筛选）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContentDescription {
+    pub asset_id: i64,
+    pub file_name: String,
+    pub description: String,
+}
+
+#[tauri::command]
+pub fn list_content_descriptions(state: State<AppState>, limit: Option<i64>) -> AppResult<Vec<ContentDescription>> {
+    let conn = lock_db(&state)?;
+    let rows = assets::list_content_descriptions(&conn, limit.unwrap_or(200).clamp(1, 500))?;
+    Ok(rows
+        .into_iter()
+        .map(|(asset_id, file_name, description)| ContentDescription {
+            asset_id,
+            file_name,
+            description,
+        })
+        .collect())
+}

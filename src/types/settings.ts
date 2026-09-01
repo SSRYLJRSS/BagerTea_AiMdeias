@@ -29,6 +29,10 @@ export interface AiSettings {
   /** FB2-07：frames 模式抽帧数（2~8） */
   videoFrameCount: number;
   batchLimit: number;
+  /** AI 打标提示词覆盖（空 = 用内置默认） */
+  systemPromptTagging: string;
+  /** 超级搜索提示词覆盖（空 = 用内置默认） */
+  systemPromptSearch: string;
   /** 一键安装的下载源偏好（"auto" = 测速选最快；旧数据缺省视为 auto） */
   ollamaSourceId: string;
 }

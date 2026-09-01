@@ -6,6 +6,7 @@ import { render, screen, waitFor, fireEvent } from "@testing-library/react";
 import FacetManagePanel from "@/components/settings/FacetManagePanel";
 import { listAllTagFacets, createTagFacet, updateTagFacet, deleteTagFacet, getTagFacetImpact, restoreTagFacet } from "@/api/tags";
 import type { TagFacet } from "@/types/tag";
+import type { Settings } from "@/types/settings";
 
 vi.mock("@/api/tags", () => ({
   listAllTagFacets: vi.fn(),
@@ -18,7 +19,44 @@ vi.mock("@/api/tags", () => ({
   deactivateTagFacet: vi.fn().mockResolvedValue(undefined),
   restoreTagFacet: vi.fn().mockResolvedValue(undefined),
   getTagFacetImpact: vi.fn().mockResolvedValue({ tagCount: 2, assetCount: 3, aiSuggestionItemCount: 0, tagOpCount: 0 }),
+  listContentDescriptions: vi.fn().mockResolvedValue([]),
 }));
+
+/** 页面草稿（提示词编辑进 draft，由「保存设置」统一落库） */
+const mkDraft = (over: Partial<Settings["ai"]> = {}): Settings => ({
+  ai: {
+    profiles: [],
+    activeProfile: "",
+    videoTagging: false,
+    videoTaggingMode: "cover",
+    videoFrameCount: 3,
+    batchLimit: 500,
+    systemPromptTagging: "",
+    systemPromptSearch: "",
+    ollamaSourceId: "auto",
+    ...over,
+  },
+  theme: "system",
+  thumbnailCacheMb: 2048,
+  tagCategories: [],
+  libraryRoot: "",
+  trashRetentionDays: 30,
+  customDownloadSources: [],
+  modelDownloadProxy: "",
+  appearance: {
+    grid: { libraryCellStep: 3, importCellStep: 1, cellAspect: "1:1", cellFit: "cover", matchDominantColor: false },
+    hoverPreview: { enabled: true, previewSeconds: 3, inLibraryGrid: true },
+    colorStrip: { enabled: true, showInLibraryGrid: false, showInViewer: true, showInImportGrid: false, height: "normal", mode: "ratio", count: 6 },
+    kinship: { syncTagsToSiblings: true, mergeInLibrary: false },
+  },
+});
+
+const renderPanel = (over: Partial<Settings["ai"]> = {}) => {
+  const draft = mkDraft(over);
+  const onPatchAi = vi.fn((patch: Partial<Settings["ai"]>) => patch);
+  const utils = render(<FacetManagePanel draft={draft} onPatchAi={onPatchAi} />);
+  return { ...utils, draft, onPatchAi };
+};
 
 const facet = (over: Partial<TagFacet> = {}): TagFacet => ({
   key: "clothing_color",
@@ -45,25 +83,25 @@ describe("W4 facetManagePanel_two_groups", () => {
     vi.mocked(listAllTagFacets).mockResolvedValue([
       facet(),
       facet({ key: "auth_state", displayName: "授权状态", inputMode: "manual_only" }),
-      facet({ key: "color", displayName: "色彩", status: "inactive", isSystem: true }),
+      facet({ key: "vintage", displayName: "旧货", status: "inactive", isSystem: true }),
     ]);
-    render(<FacetManagePanel />);
+    renderPanel();
     await waitFor(() => expect(screen.getByText("衣服颜色")).toBeInTheDocument());
     // 两个组标题都在
     expect(screen.getByText("AI 自动打标的分类")).toBeInTheDocument();
     expect(screen.getByText("只手工填写的分类")).toBeInTheDocument();
     // 停用的折叠（默认收起，只显示计数）
     expect(screen.getByText(/已停用的分类（1）/)).toBeInTheDocument();
-    expect(screen.queryByText("色彩")).not.toBeInTheDocument();
+    expect(screen.queryByText("旧货")).not.toBeInTheDocument();
     // 展开停用区后出现 + 有恢复按钮
     fireEvent.click(screen.getByText(/已停用的分类/));
-    expect(screen.getByText("色彩")).toBeInTheDocument();
+    expect(screen.getByText("旧货")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "恢复" })).toBeInTheDocument();
   });
 
   it("编辑弹窗：6 字段一个保存按钮（update_tag_facet 单事务）", async () => {
     vi.mocked(listAllTagFacets).mockResolvedValue([facet()]);
-    render(<FacetManagePanel />);
+    renderPanel();
     await waitFor(() => expect(screen.getByText("衣服颜色")).toBeInTheDocument());
     fireEvent.click(screen.getByRole("button", { name: "编辑" }));
     // 弹窗字段
@@ -85,7 +123,7 @@ describe("W4 facetManagePanel_two_groups", () => {
   it("新建弹窗：2 个必填；CJK 名称自动 key 为空时提示输入英文标识", async () => {
     vi.mocked(listAllTagFacets).mockResolvedValue([facet()]);
     vi.mocked(createTagFacet).mockResolvedValue(facet());
-    render(<FacetManagePanel />);
+    renderPanel();
     await waitFor(() => expect(screen.getByText("衣服颜色")).toBeInTheDocument());
     fireEvent.click(screen.getAllByRole("button", { name: "+ 新增分类" })[0]);
     // 中文名（slugify 产出空）+ 描述都填 → 报错要求英文标识
@@ -103,7 +141,7 @@ describe("W4 facetManagePanel_two_groups", () => {
 
   it("删除确认：显示精确影响数字；输入分类名后才能确认删除", async () => {
     vi.mocked(listAllTagFacets).mockResolvedValue([facet()]);
-    render(<FacetManagePanel />);
+    renderPanel();
     await waitFor(() => expect(screen.getByText("衣服颜色")).toBeInTheDocument());
     fireEvent.click(screen.getByRole("button", { name: "删除" }));
     // 影响数字（getTagFacetImpact 返回 tagCount=2 assetCount=3）
@@ -120,22 +158,44 @@ describe("W4 facetManagePanel_two_groups", () => {
 
   it("停用区恢复按钮调用 restoreTagFacet", async () => {
     vi.mocked(listAllTagFacets).mockResolvedValue([
-      facet({ key: "color", displayName: "色彩", status: "inactive", isSystem: true }),
+      facet({ key: "vintage", displayName: "旧货", status: "inactive", isSystem: true }),
     ]);
-    render(<FacetManagePanel />);
+    renderPanel();
     await waitFor(() => expect(screen.getByText(/已停用的分类（1）/)).toBeInTheDocument());
     fireEvent.click(screen.getByText(/已停用的分类/));
     fireEvent.click(screen.getByRole("button", { name: "恢复" }));
-    await waitFor(() => expect(restoreTagFacet).toHaveBeenCalledWith("color"));
+    await waitFor(() => expect(restoreTagFacet).toHaveBeenCalledWith("vintage"));
   });
 
   it("系统分面不显示删除按钮（Q2：只允许停用）", async () => {
     vi.mocked(listAllTagFacets).mockResolvedValue([
       facet({ key: "scene", displayName: "场景", isSystem: true }),
     ]);
-    render(<FacetManagePanel />);
+    renderPanel();
     await waitFor(() => expect(screen.getByText("场景")).toBeInTheDocument());
     expect(screen.queryByRole("button", { name: "删除" })).not.toBeInTheDocument();
     expect(getTagFacetImpact).not.toHaveBeenCalled();
+  });
+
+  it("一句话描述：可点开条目，展开看内容；提示词编辑进 draft（onPatchAi）", async () => {
+    vi.mocked(listAllTagFacets).mockResolvedValue([facet()]);
+    const { onPatchAi, draft } = renderPanel();
+    await waitFor(() => expect(screen.getByText("衣服颜色")).toBeInTheDocument());
+    // 折叠条目可见（含 0 条计数），默认收起
+    const toggle = screen.getByRole("button", { name: /一句话描述（AI 生成）/ });
+    expect(screen.getByText("0 条")).toBeInTheDocument();
+    // 点开 → 展开空态说明
+    fireEvent.click(toggle);
+    expect(await screen.findByText(/还没有一句话描述/)).toBeInTheDocument();
+    // 展开提示词编辑区
+    fireEvent.click(screen.getByRole("button", { name: /提示词/ }));
+    const tagging = screen.getByLabelText(/AI 打标提示词/);
+    const search = screen.getByLabelText(/超级搜索提示词/);
+    expect(tagging).toHaveValue(draft.ai.systemPromptTagging);
+    // 输入 → onPatchAi 收到对应 patch
+    fireEvent.change(tagging, { target: { value: "你是素材打标助手" } });
+    expect(onPatchAi).toHaveBeenCalledWith({ systemPromptTagging: "你是素材打标助手" });
+    fireEvent.change(search, { target: { value: "你是搜索助手" } });
+    expect(onPatchAi).toHaveBeenCalledWith({ systemPromptSearch: "你是搜索助手" });
   });
 });

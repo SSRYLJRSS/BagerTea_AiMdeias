@@ -160,6 +160,8 @@ fn settings_with(profile: ApiProfile) -> AiSettings {
         local_model_tier: "light".into(),
         batch_limit: 500,
         ollama_source_id: "auto".into(),
+        system_prompt_tagging: String::new(),
+        system_prompt_search: String::new(),
     }
 }
 
