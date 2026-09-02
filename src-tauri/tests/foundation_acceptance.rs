@@ -5,7 +5,9 @@
 //!   F 波次 → 组 1/2/3/5/10/12；A 波次 → 组 4/5；S 波次 → 组 6/9/11；
 //!   C 波次 → 组 7；全部绿 + 四关全绿 → foundation-verified。
 
-use bagertea_ai_media_v2_lib::db::{init_memory, migrations, schema_features, tag_facets, tags};
+use bagertea_ai_media_v2_lib::db::{
+    init_memory, asset_tags, assets, migrations, query_expr, schema_features, tag_facets, tags,
+};
 use bagertea_ai_media_v2_lib::error::AppResult;
 
 fn mem() -> rusqlite::Connection {
@@ -565,4 +567,195 @@ fn find_by_term_is_deterministic() {
     // Exact 模式对「林子」无 canonical 命中
     let miss = tags::find_by_term(&c, "scene", "林子", tags::TermMatch::Exact).unwrap();
     assert!(miss.hits.is_empty(), "Exact 只匹配 canonical");
+}
+
+// ═══════════════ 组 1（F4）：可见性三常量 —— 消费点一致性矩阵 ═══════════════
+
+/// F4 辅助：插入一张图片素材，返回 id。
+fn f4_insert_asset(conn: &rusqlite::Connection, path: &str) -> i64 {
+    assets::insert(conn, path, path.rsplit('/').next().unwrap_or("a.jpg"), "jpg", 1024, "image/jpeg", 1700000000000)
+        .expect("插入素材失败")
+}
+
+/// F4：status × cfg_* 组合下，数据层消费点（侧栏树 list_tree / 提示词 build_prompt_context /
+/// AI 候选词 top_tags_per_facet / 候选搜索 search_candidates / 详情 get_asset_tags+角标 /
+/// 条件叶子 FacetHasAny）可见性一致。
+/// 价值：不是「验证现在对」，而是下次有人加第八个消费点时会失败（指南 §F4）。
+#[test]
+fn facet_capability_matrix() {
+    struct Row {
+        name: &'static str,
+        status: &'static str,
+        visible: bool,
+        ai: bool,
+        searchable: bool,
+        nav: bool,
+        prompt: bool,
+        top: bool,
+        search: bool,
+        detail_effective: bool,
+    }
+    let rows = [
+        Row { name: "active+全cfg=1", status: "active", visible: true, ai: true, searchable: true, nav: true, prompt: true, top: true, search: true, detail_effective: true },
+        Row { name: "active+cfg_ai=0", status: "active", visible: true, ai: false, searchable: true, nav: true, prompt: false, top: false, search: true, detail_effective: true },
+        Row { name: "active+cfg_visible=0", status: "active", visible: false, ai: true, searchable: true, nav: false, prompt: true, top: true, search: true, detail_effective: true },
+        Row { name: "active+cfg_searchable=0", status: "active", visible: true, ai: true, searchable: false, nav: true, prompt: true, top: true, search: false, detail_effective: true },
+        Row { name: "inactive（cfg保持）", status: "inactive", visible: true, ai: true, searchable: true, nav: false, prompt: false, top: false, search: true, detail_effective: false },
+    ];
+    for r in &rows {
+        let c = mem();
+        tag_facets::create(&c, "cap", "能力分面", "", "multi", None, "all").unwrap();
+        let t = tags::create_in_facet(&c, "能力词", None, Some("cap")).unwrap();
+        let aid = f4_insert_asset(&c, "d:/cap.jpg");
+        asset_tags::assign(&c, &[aid], &[t.id], "manual").unwrap();
+        c.execute(
+            "UPDATE tag_facets SET status=?1, cfg_visible_in_navigation=?2,
+                    cfg_ai_assignable=?3, cfg_searchable=?4 WHERE key='cap'",
+            rusqlite::params![r.status, r.visible as i64, r.ai as i64, r.searchable as i64],
+        )
+        .unwrap();
+
+        let in_nav = tags::list_tree(&c).unwrap().iter().any(|n| n.tag.facet_key == "cap");
+        assert_eq!(in_nav, r.nav, "[{}] 侧栏可见性不符", r.name);
+
+        let in_prompt = tag_facets::build_prompt_context(&c, "image")
+            .unwrap()
+            .iter()
+            .any(|f| f.key == "cap");
+        assert_eq!(in_prompt, r.prompt, "[{}] 提示词参与不符", r.name);
+
+        let in_top = tags::top_tags_per_facet(&c, 200)
+            .unwrap()
+            .iter()
+            .any(|(f, _)| f == "cap");
+        assert_eq!(in_top, r.top, "[{}] AI 候选词不符", r.name);
+
+        let cands = tags::search_candidates(&c, None, "能力词").unwrap();
+        assert_eq!(cands.len() > 0, r.search, "[{}] 候选搜索不符", r.name);
+
+        let detail = asset_tags::get_asset_tags(&c, aid).unwrap();
+        let dtag = detail.iter().find(|x| x.id == t.id).expect("详情恒显示（不过滤）");
+        assert_eq!(
+            dtag.facet_effective, r.detail_effective,
+            "[{}] 详情「已停用」角标不符",
+            r.name
+        );
+
+        let (frag, _) = query_expr::compile_leaf(&c, &query_expr::LeafCond::FacetHasAny { facet_key: "cap".into() })
+            .unwrap();
+        let dropped = frag.trim() == "1=1";
+        assert_eq!(dropped, !r.searchable, "[{}] 条件叶子剔除策略不符", r.name);
+    }
+
+    // 停用 → 恢复：回原配置（矩阵第 6 行）——生命周期状态永不覆盖 cfg_*
+    let c = mem();
+    tag_facets::create(&c, "cap2", "能力分面2", "", "multi", None, "all").unwrap();
+    let t2 = tags::create_in_facet(&c, "能力词2", None, Some("cap2")).unwrap();
+    let aid2 = f4_insert_asset(&c, "d:/cap2.jpg");
+    asset_tags::assign(&c, &[aid2], &[t2.id], "manual").unwrap();
+    tag_facets::deactivate(&c, "cap2").unwrap();
+    // inactive：侧栏/提示词/AI候选停；详情仍显示 + 角标；可搜保持
+    assert!(!tags::list_tree(&c).unwrap().iter().any(|n| n.tag.facet_key == "cap2"));
+    assert!(!tag_facets::build_prompt_context(&c, "image").unwrap().iter().any(|f| f.key == "cap2"));
+    assert!(!tags::top_tags_per_facet(&c, 200).unwrap().iter().any(|(f, _)| f == "cap2"));
+    assert!(!tags::search_candidates(&c, None, "能力词2").unwrap().is_empty(), "停用分面标签仍可搜");
+    let detail2 = asset_tags::get_asset_tags(&c, aid2).unwrap();
+    assert!(!detail2.iter().find(|x| x.id == t2.id).unwrap().facet_effective, "停用分面详情打角标");
+    // restore：回原配置
+    tag_facets::restore(&c, "cap2").unwrap();
+    assert!(tags::list_tree(&c).unwrap().iter().any(|n| n.tag.facet_key == "cap2"));
+    assert!(tag_facets::build_prompt_context(&c, "image").unwrap().iter().any(|f| f.key == "cap2"));
+    assert!(tags::top_tags_per_facet(&c, 200).unwrap().iter().any(|(f, _)| f == "cap2"));
+    let detail3 = asset_tags::get_asset_tags(&c, aid2).unwrap();
+    assert!(detail3.iter().find(|x| x.id == t2.id).unwrap().facet_effective, "恢复后角标消失");
+}
+
+/// F4：停用分面的标签仍可搜 —— FTS 全文搜索 + 候选搜索都保持命中
+/// （SEARCHABLE_TAG / FTS 触发器只读 cfg_searchable，不看 f.status）。
+#[test]
+fn deactivated_facet_tags_still_searchable() {
+    use bagertea_ai_media_v2_lib::db::search;
+    let c = mem();
+    tag_facets::create(&c, "mood_x", "情绪", "", "multi", None, "all").unwrap();
+    let t = tags::create_in_facet(&c, "松弛感", None, Some("mood_x")).unwrap();
+    let aid = f4_insert_asset(&c, "d:/mood.jpg");
+    asset_tags::assign(&c, &[aid], &[t.id], "manual").unwrap();
+    assert_eq!(
+        search::search_asset_ids_all(&c, "松弛感").unwrap(),
+        vec![aid],
+        "停用前 FTS 应命中"
+    );
+    tag_facets::deactivate(&c, "mood_x").unwrap();
+    assert_eq!(
+        search::search_asset_ids_all(&c, "松弛感").unwrap(),
+        vec![aid],
+        "停用分面的标签仍可搜（FTS 只看 cfg_searchable）"
+    );
+    assert_eq!(
+        tags::search_candidates(&c, None, "松弛").unwrap().len(),
+        1,
+        "停用分面的标签仍进候选"
+    );
+    // 对照：cfg_searchable=0 后候选搜索实时剔除（live 读）
+    c.execute("UPDATE tag_facets SET cfg_searchable = 0 WHERE key = 'mood_x'", [])
+        .unwrap();
+    assert!(tags::search_candidates(&c, None, "松弛").unwrap().is_empty());
+}
+
+/// F4：停用分面的标签不得作为「已有候选词」喂给 AI（top_tags_per_facet 收口 AI_ASSIGNABLE_TAG）。
+#[test]
+fn top_tags_excludes_inactive_facet() {
+    let c = mem();
+    let key = "cap_top";
+    tag_facets::create(&c, key, "候选分面", "", "multi", None, "all").unwrap();
+    let t = tags::create_in_facet(&c, "高频词", None, Some(key)).unwrap();
+    let aid = f4_insert_asset(&c, "d:/top.jpg");
+    asset_tags::assign(&c, &[aid], &[t.id], "manual").unwrap();
+    assert!(
+        tags::top_tags_per_facet(&c, 200).unwrap().iter().any(|(f, _)| f == key),
+        "active 分面应进 AI 候选"
+    );
+    tag_facets::deactivate(&c, key).unwrap();
+    assert!(
+        !tags::top_tags_per_facet(&c, 200).unwrap().iter().any(|(f, _)| f == key),
+        "停用分面不得进 AI 候选（避免 AI 照产出后又被解析层丢弃的自相矛盾）"
+    );
+}
+
+/// F4：build_prompt_context(media_kind) 按 applies_to 过滤 ——
+/// 视频专属分面不污染图片批次提示词；'all' 用于超级搜索词典全量。
+#[test]
+fn prompt_context_respects_applies_to() {
+    let c = mem();
+    tag_facets::create(&c, "f_all", "通用", "", "multi", None, "all").unwrap();
+    tag_facets::create(&c, "f_img", "画面", "", "multi", None, "image").unwrap();
+    tag_facets::create(&c, "f_vid", "运镜", "", "multi", None, "video").unwrap();
+    let img_keys: Vec<String> = tag_facets::build_prompt_context(&c, "image")
+        .unwrap()
+        .iter()
+        .map(|f| f.key.clone())
+        .collect();
+    assert!(img_keys.contains(&"f_all".into()) && img_keys.contains(&"f_img".into()), "图片上下文应含 all+image: {img_keys:?}");
+    assert!(!img_keys.contains(&"f_vid".into()), "视频专属分面不得进图片上下文: {img_keys:?}");
+    let vid_keys: Vec<String> = tag_facets::build_prompt_context(&c, "video")
+        .unwrap()
+        .iter()
+        .map(|f| f.key.clone())
+        .collect();
+    assert!(vid_keys.contains(&"f_all".into()) && vid_keys.contains(&"f_vid".into()), "视频上下文应含 all+video: {vid_keys:?}");
+    assert!(!vid_keys.contains(&"f_img".into()), "图片专属分面不得进视频上下文: {vid_keys:?}");
+    // 'all'：全量（超级搜索词典需要跨类型）——含系统分面 + 自定义三档
+    let all_keys: Vec<String> = tag_facets::build_prompt_context(&c, "all")
+        .unwrap()
+        .iter()
+        .map(|f| f.key.clone())
+        .collect();
+    assert!(
+        all_keys.contains(&"f_all".into())
+            && all_keys.contains(&"f_img".into())
+            && all_keys.contains(&"f_vid".into()),
+        "'all' 应含全部三档: {all_keys:?}"
+    );
+    // 非法 media_kind 报错
+    assert!(tag_facets::build_prompt_context(&c, "audio").is_err());
 }

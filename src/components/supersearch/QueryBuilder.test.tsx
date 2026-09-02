@@ -234,7 +234,7 @@ describe("W0-3 条件公式包含根级标签", () => {
     const mkTag = (id: number, name: string, facetKey: string) => ({
       id, name, canonicalName: name, normalizedName: name, facetKey,
       parentId: null, status: "active" as const, isSystem: false, isPreset: false,
-      sortOrder: 0, assetCount: 0, totalCount: 0, aliases: [], path: name,
+      sortOrder: 0, assetCount: 0, totalCount: 0, aliases: [], path: name, facetEffective: true,
     });
     // 模拟真实库：19 个标签全部为根级（无父子层级）
     useTagStore.setState({
@@ -263,7 +263,7 @@ describe("W3-3 QueryBuilder 三合一", () => {
   const mkTag = (id: number, name: string, facetKey: string) => ({
     id, name, canonicalName: name, normalizedName: name, facetKey,
     parentId: null, status: "active" as const, isSystem: false, isPreset: false,
-    sortOrder: 0, assetCount: 0, totalCount: 0, aliases: [], path: name,
+    sortOrder: 0, assetCount: 0, totalCount: 0, aliases: [], path: name, facetEffective: true,
   });
 
   it("_includes_root_tags：根级标签出现在下拉（W0-3 回归守护）", () => {

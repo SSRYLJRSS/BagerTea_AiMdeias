@@ -17,6 +17,7 @@ use rusqlite::types::Value;
 use rusqlite::{params_from_iter, Connection, OptionalExtension};
 
 use super::sql_utils::offset_placeholders;
+use super::tag_facets::EFF_SEARCH;
 use crate::error::{AppError, AppResult};
 
 /// FB5-05（§8.2/§8.3）：搜索范围。列名只能由本枚举映射，绝不能来自模型或用户字符串。
@@ -284,7 +285,10 @@ pub fn compile_leaf(conn: &Connection, cond: &LeafCond) -> AppResult<(String, Ve
             compile_tag_leaf(&valid_ids, mode.as_deref(), *include_descendants)
         }
         LeafCond::FacetHasAny { facet_key } => {
-            validate_facet_exists(conn, facet_key)?;
+            if !facet_searchable(conn, facet_key) {
+                tracing::warn!("分面 {facet_key} 不存在或 cfg_searchable=0，剔除该条件（查询继续）");
+                return Ok(("1=1".to_string(), Vec::new()));
+            }
             Ok((
                 "EXISTS (SELECT 1 FROM asset_tags at2 JOIN tags t2 ON t2.id = at2.tag_id
                   WHERE at2.asset_id = a.id AND t2.facet_key = ?1 AND t2.status = 'active')"
@@ -293,7 +297,10 @@ pub fn compile_leaf(conn: &Connection, cond: &LeafCond) -> AppResult<(String, Ve
             ))
         }
         LeafCond::FacetMissing { facet_key } => {
-            validate_facet_exists(conn, facet_key)?;
+            if !facet_searchable(conn, facet_key) {
+                tracing::warn!("分面 {facet_key} 不存在或 cfg_searchable=0，剔除该条件（查询继续）");
+                return Ok(("1=1".to_string(), Vec::new()));
+            }
             Ok((
                 "NOT EXISTS (SELECT 1 FROM asset_tags at3 JOIN tags t3 ON t3.id = at3.tag_id
                   WHERE at3.asset_id = a.id AND t3.facet_key = ?1 AND t3.status = 'active')"
@@ -355,19 +362,21 @@ fn filter_tags_by_facet(conn: &Connection, facet_key: &str, tag_ids: &[i64]) -> 
     valid
 }
 
-/// W2-7：FacetHasAny / FacetMissing 的分面存在性校验（编译期报错，区别于 Tag 的剔除策略）。
-fn validate_facet_exists(conn: &Connection, facet_key: &str) -> AppResult<()> {
-    let exists: Option<i64> = conn
+/// W2-7 + F4：FacetHasAny / FacetMissing 的分面可搜性校验（编译期剔除，区别于 Tag 的剔除策略）。
+/// 分面不存在或 cfg_searchable=0 时 warning + 整叶剔除（1=1），不再报错整次查询
+/// （与 W2-6 一致：分面删除/重建后已保存的搜索不应被卡死）。
+fn facet_searchable(conn: &Connection, facet_key: &str) -> bool {
+    let searchable: Option<i64> = conn
         .query_row(
-            "SELECT 1 FROM tag_facets WHERE key = ?1",
+            &format!(
+                "SELECT 1 FROM tag_facets f WHERE f.key = ?1 AND {EFF_SEARCH}"
+            ),
             [facet_key],
             |r| r.get(0),
         )
-        .optional()?;
-    if exists.is_none() {
-        return Err(AppError::msg(format!("未知分面：{facet_key}")));
-    }
-    Ok(())
+        .optional()
+        .unwrap_or(None);
+    searchable.is_some()
 }
 
 /// 标签叶子（含后代/any-all），复用 build_where 的 EXISTS 形态。

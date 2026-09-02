@@ -803,19 +803,30 @@ pub fn display_name_for_key(key: &str) -> &'static str {
     }
 }
 
-/// W2-1：tag_facets 是唯一事实源 —— 直接从 DB 读，只取
-/// `input_mode = 'ai_and_manual'`（参与 AI）且 active 的分面。
+/// W2-1：tag_facets 是唯一事实源 —— 直接从 DB 读，只取参与 AI 的分面。
 /// V20 合表后 settings.aiFacetConfigs 的语义已全部搬进 tag_facets，不再传参。
 /// 一次消灭③诊断的四类 bug：两个保存通道、两个显示名、孤儿条目、缺条目静默不参与 AI。
-pub fn build_prompt_context(conn: &Connection) -> AppResult<Vec<FacetPromptContext>> {
-    let mut stmt = conn.prepare(
+///
+/// F4：筛选条件改用 EFF_AI（cfg_ai_assignable 事实源，取代旧 input_mode 列判断），
+/// 并按 `applies_to` 消费 media_kind —— 视频专属分面不再污染图片批次提示词：
+/// - `media_kind = "all"`：返回全部参与 AI 的分面（超级搜索词典需要跨类型全量）；
+/// - `media_kind = "image" | "video"`：只取 `applies_to IN ('all', media_kind)`。
+pub fn build_prompt_context(
+    conn: &Connection,
+    media_kind: &str,
+) -> AppResult<Vec<FacetPromptContext>> {
+    if !matches!(media_kind, "all" | "image" | "video") {
+        return Err(AppError::msg("media_kind 只允许 all | image | video"));
+    }
+    let mut stmt = conn.prepare(&format!(
         "SELECT key, display_name, description, selection_mode, max_items
-           FROM tag_facets
-          WHERE status = 'active' AND input_mode = 'ai_and_manual'
-          ORDER BY sort_order",
-    )?;
+           FROM tag_facets f
+          WHERE {EFF_AI}
+            AND (?1 = 'all' OR f.applies_to = 'all' OR f.applies_to = ?1)
+          ORDER BY f.sort_order"
+    ))?;
     let out = stmt
-        .query_map([], |r| {
+        .query_map(params![media_kind], |r| {
             Ok(FacetPromptContext {
                 key: r.get(0)?,
                 display_name: r.get(1)?,

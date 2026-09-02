@@ -17,6 +17,8 @@ export interface Tag {
   totalCount: number;
   aliases: string[];
   path: string;
+  /** F4：所在分面生命周期是否有效（存在且 active）。UI 打「已停用」角标 */
+  facetEffective: boolean;
 }
 
 export interface TagFacet {

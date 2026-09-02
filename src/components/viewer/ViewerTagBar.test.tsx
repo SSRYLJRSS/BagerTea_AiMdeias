@@ -30,6 +30,7 @@ const mkTag = (id: number, name: string, facetKey: string): Tag => ({
   totalCount: 0,
   aliases: [],
   path: "",
+  facetEffective: true,
 });
 
 const mkFacet = (key: string, displayName: string): TagFacet => ({

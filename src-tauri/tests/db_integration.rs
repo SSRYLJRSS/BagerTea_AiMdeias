@@ -1428,7 +1428,7 @@ fn prompt_context_reflects_facet_config_overrides() -> AppResult<()> {
         "UPDATE tag_facets SET description = '识别拍摄场景', display_name = '场景' WHERE key = 'scene'",
         [],
     )?;
-    let ctx = db::tag_facets::build_prompt_context(&conn)?;
+    let ctx = db::tag_facets::build_prompt_context(&conn, "all")?;
     let scene = ctx
         .iter()
         .find(|c| c.key == "scene")
@@ -1444,20 +1444,21 @@ fn prompt_context_reflects_facet_config_overrides() -> AppResult<()> {
 fn prompt_context_excludes_manual_only_and_includes_description() -> AppResult<()> {
     let conn = setup();
     tag_facets::create(&conn, "manual_field", "手工字段", "只手工填写", "multi", None, "all")?;
+    // F4：参与 AI 的事实源是 cfg_ai_assignable（input_mode 已降级为派生列），置 0 = 不进提示词
     conn.execute(
-        "UPDATE tag_facets SET input_mode = 'manual_only' WHERE key = 'manual_field'",
+        "UPDATE tag_facets SET cfg_ai_assignable = 0 WHERE key = 'manual_field'",
         [],
     )?;
     tag_facets::create(&conn, "ai_field", "AI字段", "这段描述会原样给 AI 看", "multi", None, "all")?;
-    let ctx = db::tag_facets::build_prompt_context(&conn)?;
+    let ctx = db::tag_facets::build_prompt_context(&conn, "all")?;
     assert!(
         !ctx.iter().any(|c| c.key == "manual_field"),
-        "manual_only 分面不得进 AI 提示词"
+        "cfg_ai_assignable=0 分面不得进 AI 提示词"
     );
     let ai = ctx
         .iter()
         .find(|c| c.key == "ai_field")
-        .expect("ai_and_manual 分面应进提示词");
+        .expect("参与 AI 的分面应进提示词");
     assert_eq!(ai.description, "这段描述会原样给 AI 看");
     Ok(())
 }
@@ -1752,7 +1753,7 @@ fn user_created_facet_full_pipeline() -> AppResult<()> {
     tag_facets::create(&conn, "clothing_color", "人物服装颜色", "人物服装的主色", "multi", None, "all")?;
 
     // ② build_prompt_context 含它（V20 后 input_mode=ai_and_manual 默认参与 AI）
-    let ctx = bagertea_ai_media_v2_lib::db::tag_facets::build_prompt_context(&conn)?;
+    let ctx = bagertea_ai_media_v2_lib::db::tag_facets::build_prompt_context(&conn, "all")?;
     assert!(
         ctx.iter().any(|f| f.key == "clothing_color"),
         "自建分面必须进 AI 提示词上下文，实际: {:?}",
@@ -1914,15 +1915,20 @@ fn delete_facet_rejects_system() -> AppResult<()> {
 
 // W2-5：候选搜索排除已停用分面下的标签
 #[test]
-fn candidates_exclude_inactive_facet() -> AppResult<()> {
+fn candidates_include_inactive_facet_but_exclude_searchable_off() -> AppResult<()> {
     let conn = setup();
     tag_facets::create(&conn, "mood2", "氛围", "", "multi", None, "all")?;
     let _t = tags::create_in_facet(&conn, "宁静感", None, Some("mood2"))?;
     let hits = tags::search_candidates(&conn, None, "宁静")?;
     assert_eq!(hits.len(), 1, "停用前应能搜到");
     tag_facets::deactivate(&conn, "mood2")?;
+    // F4 语义变更：停用分面（cfg 保持）的标签仍可搜 —— SEARCHABLE_TAG 不看 f.status
     let hits2 = tags::search_candidates(&conn, None, "宁静")?;
-    assert!(hits2.is_empty(), "停用分面下的标签不得出现在候选");
+    assert_eq!(hits2.len(), 1, "停用分面标签仍可搜（cfg_searchable 保持 1）");
+    // 真正退出候选的是 cfg_searchable = 0
+    conn.execute("UPDATE tag_facets SET cfg_searchable = 0 WHERE key = 'mood2'", [])?;
+    let hits3 = tags::search_candidates(&conn, None, "宁静")?;
+    assert!(hits3.is_empty(), "cfg_searchable=0 分面的标签不得出现在候选");
     Ok(())
 }
 
@@ -1995,12 +2001,11 @@ fn facet_has_any_and_missing_compile() -> AppResult<()> {
     })?;
     assert_eq!(missing.total, 1);
 
-    // 未知分面编译报错
-    assert!(
-        bagertea_ai_media_v2_lib::db::query_expr::compile_leaf(
-            &conn, &LeafCond::FacetHasAny { facet_key: "nope".into() }
-        ).is_err()
-    );
+    // F4：未知/不可搜分面 → warning + 整叶剔除（1=1），不再报错整次查询
+    let (frag, _params) = bagertea_ai_media_v2_lib::db::query_expr::compile_leaf(
+        &conn, &LeafCond::FacetHasAny { facet_key: "nope".into() },
+    )?;
+    assert_eq!(frag, "1=1", "未知分面剔除为恒真条件，查询继续");
     // validate_expr 覆盖新变体：空 key 报错
     assert!(
         bagertea_ai_media_v2_lib::db::query_expr::validate_expr(&QueryExpr::Leaf {

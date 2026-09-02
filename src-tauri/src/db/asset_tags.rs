@@ -2,7 +2,7 @@
 
 use rusqlite::Connection;
 
-use super::{tag_ops, tags::Tag};
+use super::{tag_ops, tags::Tag, tags::FACET_EFFECTIVE};
 use crate::error::AppResult;
 
 /// W5h-b：查出 asset 的同源 asset_id（同目录同主干名 + 一个 RAW 一个非 RAW）。
@@ -173,15 +173,16 @@ pub fn remove(conn: &Connection, asset_ids: &[i64], tag_ids: &[i64]) -> AppResul
 }
 
 pub fn get_asset_tags(conn: &Connection, asset_id: i64) -> AppResult<Vec<Tag>> {
-    let mut stmt = conn.prepare(
+    // F4：详情恒显示（不过滤停用分面/标签），facet_effective 供 UI 打「已停用」角标
+    let mut stmt = conn.prepare(&format!(
         "SELECT t.id, t.name, COALESCE(t.canonical_name,t.name),
                 COALESCE(t.normalized_name,lower(trim(t.name))), COALESCE(t.facet_key,'custom'),
                 t.parent_id, COALESCE(t.status,'active'), COALESCE(t.is_system,0),
-                t.is_preset, t.sort_order
+                t.is_preset, t.sort_order, {FACET_EFFECTIVE} AS facet_effective
            FROM asset_tags at JOIN tags t ON t.id = at.tag_id
           WHERE at.asset_id = ?1 AND COALESCE(t.status,'active') != 'blocked'
           ORDER BY t.sort_order, t.id",
-    )?;
+    ))?;
     let mut tags = stmt
         .query_map([asset_id], |r| {
             Ok(Tag {
@@ -195,6 +196,7 @@ pub fn get_asset_tags(conn: &Connection, asset_id: i64) -> AppResult<Vec<Tag>> {
                 is_system: r.get::<_, i64>(7)? != 0,
                 is_preset: r.get::<_, i64>(8)? != 0,
                 sort_order: r.get(9)?,
+                facet_effective: r.get::<_, i64>(10)? != 0,
                 asset_count: 0,
                 total_count: 0,
                 aliases: Vec::new(),

@@ -5,6 +5,33 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::AppResult;
 
+// ═══════════════ F4：可见性三常量（各一个声明处，消费点全部引用） ═══════════════
+// ⚠ COALESCE(t.status,'active') 兼容历史 NULL status；EXISTS 分面子查询判有效值。
+
+/// 导航可见（侧栏、标签树、TagAssignDialog）：分面 active 且 cfg_visible_in_navigation=1
+pub(crate) const NAV_VISIBLE_TAG: &str =
+    "COALESCE(t.status,'active') = 'active' AND EXISTS (SELECT 1 FROM tag_facets f \
+      WHERE f.key = COALESCE(t.facet_key,'custom') \
+        AND f.status = 'active' AND f.cfg_visible_in_navigation = 1)";
+
+/// 可搜索。⚠ 不看 f.status —— 停用分面的标签仍可搜（F4 语义变更）
+pub(crate) const SEARCHABLE_TAG: &str =
+    "COALESCE(t.status,'active') = 'active' AND EXISTS (SELECT 1 FROM tag_facets f \
+      WHERE f.key = COALESCE(t.facet_key,'custom') AND f.cfg_searchable = 1)";
+
+/// 可进 AI 提示词：分面 active 且 cfg_ai_assignable=1
+pub(crate) const AI_ASSIGNABLE_TAG: &str =
+    "COALESCE(t.status,'active') = 'active' AND EXISTS (SELECT 1 FROM tag_facets f \
+      WHERE f.key = COALESCE(t.facet_key,'custom') \
+        AND f.status = 'active' AND f.cfg_ai_assignable = 1)";
+
+/// F4：分面生命周期是否有效（存在且 active，不看 cfg_*）。详情页据此对
+/// 「分面已停用/已删除」的标签打「已停用/孤儿」角标（get_asset_tags 不过滤恒显示）。
+pub(crate) const FACET_EFFECTIVE: &str =
+    "EXISTS (SELECT 1 FROM tag_facets f \
+      WHERE f.key = COALESCE(t.facet_key,'custom') AND f.status = 'active')";
+
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Tag {
@@ -26,6 +53,9 @@ pub struct Tag {
     pub aliases: Vec<String>,
     #[serde(default)]
     pub path: String,
+    /// F4：所在分面生命周期是否有效（存在且 active）。UI 打「已停用」角标用。
+    #[serde(default)]
+    pub facet_effective: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -84,17 +114,19 @@ pub fn total_count(conn: &Connection, id: i64) -> AppResult<i64> {
 }
 
 /// 全量标签树（百级标签规模，逐标签 CTE 计数毫秒级，架构 §1.4 已论证）
+/// F4：可见性收口 NAV_VISIBLE_TAG —— 分面 active + cfg_visible_in_navigation=1 才显示
 pub fn list_tree(conn: &Connection) -> AppResult<Vec<TagNode>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare(&format!(
         "SELECT t.id, t.name, COALESCE(t.canonical_name, t.name),
                 COALESCE(t.normalized_name, lower(trim(t.name))),
                 COALESCE(t.facet_key, 'custom'), t.parent_id,
                 COALESCE(t.status, 'active'), COALESCE(t.is_system, 0),
                 t.is_preset, t.sort_order,
-                (SELECT COUNT(*) FROM asset_tags at WHERE at.tag_id = t.id) AS asset_count
-           FROM tags t WHERE COALESCE(t.status, 'active') = 'active'
+                (SELECT COUNT(*) FROM asset_tags at WHERE at.tag_id = t.id) AS asset_count,
+                {FACET_EFFECTIVE} AS facet_effective
+           FROM tags t WHERE {NAV_VISIBLE_TAG}
           ORDER BY t.sort_order, t.id",
-    )?;
+    ))?;
     let mut tags: Vec<Tag> = stmt
         .query_map([], |r| {
             Ok(Tag {
@@ -112,6 +144,7 @@ pub fn list_tree(conn: &Connection) -> AppResult<Vec<TagNode>> {
                 total_count: 0,
                 aliases: Vec::new(),
                 path: String::new(),
+                facet_effective: r.get::<_, i64>(11)? != 0,
             })
         })?
         .collect::<Result<_, _>>()?;
@@ -175,6 +208,13 @@ pub fn create_in_facet(
         rusqlite::params![name, parent_id, normalized, facet],
     )?;
     let id = conn.last_insert_rowid();
+    let facet_effective = conn
+        .query_row(
+            "SELECT status = 'active' FROM tag_facets WHERE key = ?1",
+            [&facet],
+            |r| r.get::<_, bool>(0),
+        )
+        .unwrap_or(false);
     Ok(Tag {
         id,
         name: name.to_string(),
@@ -190,6 +230,7 @@ pub fn create_in_facet(
         total_count: 0,
         aliases: Vec::new(),
         path: String::new(),
+        facet_effective,
     })
 }
 
@@ -409,14 +450,15 @@ pub fn list_by_facet(conn: &Connection, facet_key: &str) -> AppResult<Vec<TagNod
 /// 单条 GROUP BY 走 idx_asset_tags_tag；标签名 >12 字截断；总输出 1500 字符上限。
 /// 供 W5a 提示词拼入候选词（「含义相同就用已有的词」约束的事实基础）。
 pub fn top_tags_per_facet(conn: &Connection, n: usize) -> AppResult<Vec<(String, String)>> {
-    let mut stmt = conn.prepare(
+    // F4：AI_ASSIGNABLE_TAG —— 停用分面的标签不得作为「已有候选词」喂给 AI
+    let mut stmt = conn.prepare(&format!(
         "SELECT t.facet_key, t.name, COUNT(at.asset_id) AS uses
            FROM tags t JOIN asset_tags at ON at.tag_id = t.id
-          WHERE t.status = 'active'
+          WHERE {AI_ASSIGNABLE_TAG}
           GROUP BY t.id
           ORDER BY uses DESC, t.sort_order, t.id
           LIMIT ?1",
-    )?;
+    ))?;
     let rows: Vec<(String, String)> = stmt
         .query_map([n as i64], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
@@ -450,20 +492,18 @@ pub fn search_candidates(
     query: &str,
 ) -> AppResult<Vec<Tag>> {
     let normalized = normalize_name(query);
-    let mut sql = String::from(
+    // F4：可搜性收口 SEARCHABLE_TAG（不再内联判 f.status='active'）
+    let mut sql = format!(
         "SELECT DISTINCT t.id, t.name, COALESCE(t.canonical_name,t.name),
                 COALESCE(t.normalized_name,lower(trim(t.name))), COALESCE(t.facet_key,'custom'),
                 t.parent_id, COALESCE(t.status,'active'), COALESCE(t.is_system,0),
                 t.is_preset, t.sort_order,
-                (SELECT COUNT(*) FROM asset_tags at WHERE at.tag_id=t.id)
+                (SELECT COUNT(*) FROM asset_tags at WHERE at.tag_id=t.id),
+                {FACET_EFFECTIVE}
            FROM tags t LEFT JOIN tag_aliases ta ON ta.tag_id=t.id
-          WHERE COALESCE(t.status,'active')='active'
+          WHERE {SEARCHABLE_TAG}
             AND (COALESCE(t.normalized_name,lower(trim(t.name))) LIKE ?1
-              OR ta.normalized_alias LIKE ?1)
-            AND EXISTS (SELECT 1 FROM tag_facets f
-                         WHERE f.key = COALESCE(t.facet_key,'custom')
-                           AND f.status = 'active')"
-            .to_string(),
+              OR ta.normalized_alias LIKE ?1)"
     );
     if facet_key.is_some() {
         sql.push_str(" AND COALESCE(t.facet_key,'custom') = ?2");
@@ -501,6 +541,7 @@ fn tag_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Tag> {
         total_count: 0,
         aliases: Vec::new(),
         path: String::new(),
+        facet_effective: r.get::<_, i64>(11)? != 0,
     })
 }
 

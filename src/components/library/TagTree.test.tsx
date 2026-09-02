@@ -33,6 +33,7 @@ const mkTag = (id: number, name: string, facetKey = "subject", parentId: number 
   totalCount: 1,
   aliases: [],
   path: name,
+  facetEffective: true,
 });
 
 /** 两级树：1(人像) → 2(特写)；3(风景) → 4(海岸)；默认只展开 1（部分展开态） */

@@ -229,6 +229,7 @@ conn_retry_test!(openai_success_writes_suggestions_and_progress, {
         batch.id,
         &settings_with(profile(&srv.url(), "openai", "cloud")),
         &categories(),
+        &categories(),
         None,
         &cancel,
         progress,
@@ -294,6 +295,7 @@ conn_retry_test!(anthropic_mode_sends_messages_and_key_header, {
         batch.id,
         &settings_with(profile(&srv.url(), "anthropic", "cloud")),
         &categories(),
+        &categories(),
         None,
         &Arc::new(AtomicBool::new(false)),
         progress,
@@ -344,6 +346,7 @@ conn_retry_test!(empty_tags_marks_rejected_and_batch_continues, {
         &dbm,
         batch.id,
         &settings_with(profile(&srv.url(), "openai", "cloud")),
+        &categories(),
         &categories(),
         None,
         &Arc::new(AtomicBool::new(false)),
@@ -400,6 +403,7 @@ conn_retry_test!(http_500_marks_rejected_and_batch_done, {
         batch.id,
         &settings_with(profile(&srv.url(), "openai", "cloud")),
         &categories(),
+        &categories(),
         None,
         &Arc::new(AtomicBool::new(false)),
         progress,
@@ -448,6 +452,7 @@ conn_retry_test!(cancel_mid_batch_keeps_remaining_pending, {
         &dbm,
         batch.id,
         &settings_with(profile(&srv.url(), "openai", "cloud")),
+        &categories(),
         &categories(),
         None,
         &cancel,
@@ -499,6 +504,7 @@ conn_retry_test!(limit_two_then_resume_rest, {
         batch.id,
         &cfg,
         &categories(),
+        &categories(),
         Some(2),
         &Arc::new(AtomicBool::new(false)),
         progress,
@@ -534,6 +540,7 @@ conn_retry_test!(limit_two_then_resume_rest, {
         &dbm,
         batch.id,
         &cfg,
+        &categories(),
         &categories(),
         None,
         &Arc::new(AtomicBool::new(false)),
@@ -597,6 +604,7 @@ conn_retry_test!(no_pending_run_errors_with_clear_message, {
         batch.id,
         &cfg,
         &categories(),
+        &categories(),
         None,
         &Arc::new(AtomicBool::new(false)),
         progress,
@@ -623,6 +631,7 @@ conn_retry_test!(no_pending_run_errors_with_clear_message, {
         &dbm,
         batch.id,
         &cfg,
+        &categories(),
         &categories(),
         None,
         &Arc::new(AtomicBool::new(false)),
@@ -663,7 +672,7 @@ conn_retry_test!(resume_after_cancel_skips_generated, {
     let cancel = Arc::new(AtomicBool::new(false));
     let cancel_ref = Arc::clone(&cancel);
     let progress = move |_p: ai_cloud::AiProgress| cancel_ref.store(true, Ordering::Relaxed);
-    ai_cloud::run_cloud_batch(&dbm, batch.id, &cfg, &categories(), None, &cancel, progress)?;
+    ai_cloud::run_cloud_batch(&dbm, batch.id, &cfg, &categories(), &categories(), None, &cancel, progress)?;
     {
         let conn = dbm.lock().unwrap();
         let b = ai::get_batch(&conn, batch.id)?;
@@ -685,6 +694,7 @@ conn_retry_test!(resume_after_cancel_skips_generated, {
         &dbm,
         batch.id,
         &cfg,
+        &categories(),
         &categories(),
         None,
         &Arc::new(AtomicBool::new(false)),
@@ -759,6 +769,7 @@ conn_retry_test!(connection_refused_local_profile_hint, {
         &dbm,
         batch.id,
         &settings_with(profile("http://127.0.0.1:1", "openai", "local")),
+        &categories(),
         &categories(),
         None,
         &Arc::new(AtomicBool::new(false)),

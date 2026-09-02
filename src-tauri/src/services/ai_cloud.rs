@@ -1259,6 +1259,7 @@ pub fn run_cloud_batch<F: Fn(AiProgress)>(
     batch_id: i64,
     cfg: &AiSettings,
     facets: &[FacetPromptContext],
+    facets_video: &[FacetPromptContext],
     limit: Option<i64>,
     cancel: &Arc<AtomicBool>,
     progress: F,
@@ -1343,8 +1344,10 @@ pub fn run_cloud_batch<F: Fn(AiProgress)>(
     }
 
     // 单条打标计算（网络请求不持 DB 锁）；失败由调用方决定重试/降级
+    // F4：图片条目用 facets（all+image），视频条目用 facets_video（all+video）
     let compute = |asset: &crate::db::assets::Asset| -> AppResult<MediaAnalysis> {
         let is_video = asset.mime_type.starts_with("video/");
+        let kind_facets: &[FacetPromptContext] = if is_video { facets_video } else { facets };
         if is_video && !cfg.video_tagging {
             return Err(AppError::msg(
                 "视频 AI 打标未开启。请打开\"设置 → AI 设置 → 自动打标 → 视频 AI 打标\"，保存后重新开始批次。",
@@ -1357,7 +1360,7 @@ pub fn run_cloud_batch<F: Fn(AiProgress)>(
                 "frames" => analyze_video_frames(
                     &client,
                     profile,
-                    facets,
+                    kind_facets,
                     &top_tags,
                     &manual_keys,
                     asset,
@@ -1365,11 +1368,11 @@ pub fn run_cloud_batch<F: Fn(AiProgress)>(
                     &cfg.system_prompt_tagging,
                 ),
                 // cover（默认）：复用入库时生成的视频封面，needs 高清图优先
-                _ => request_analysis(&client, profile, facets, &top_tags, &manual_keys, &pick_image(asset), &cfg.system_prompt_tagging),
+                _ => request_analysis(&client, profile, kind_facets, &top_tags, &manual_keys, &pick_image(asset), &cfg.system_prompt_tagging),
             }
         } else {
             // 网络请求（可能耗时数十秒）：不持 DB 锁
-            request_analysis(&client, profile, facets, &top_tags, &manual_keys, &pick_image(asset), &cfg.system_prompt_tagging)
+            request_analysis(&client, profile, kind_facets, &top_tags, &manual_keys, &pick_image(asset), &cfg.system_prompt_tagging)
         }
     };
 

@@ -155,16 +155,20 @@ pub async fn ai_start_batch(
         };
         let cfg = all.ai;
         // W2-1：提示词上下文直接从 tag_facets 读（V20 合表后不再需要 configs 参数；短锁立即释放）
-        let facets = {
+        // F4：按媒体类型各取一份 —— 图片批次只带 all+image 分面，视频批次 only all+video，
+        //     「只适用于视频」的分面不再污染图片提示词（mixed 批次两条都传给执行层按条目取）。
+        let (facets, facets_video) = {
             let conn = db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
-            crate::db::tag_facets::build_prompt_context(&conn)?
+            let facets = crate::db::tag_facets::build_prompt_context(&conn, "image")?;
+            let facets_video = crate::db::tag_facets::build_prompt_context(&conn, "video")?;
+            (facets, facets_video)
         };
         registry
             .lock()
             .map_err(|_| AppError::msg("锁中毒"))?
             .insert(batch_id, Arc::clone(&cancel));
 
-        let r = ai_cloud::run_cloud_batch(&db, batch_id, &cfg, &facets, limit, &cancel, |p: AiProgress| {
+        let r = ai_cloud::run_cloud_batch(&db, batch_id, &cfg, &facets, &facets_video, limit, &cancel, |p: AiProgress| {
             let _ = app.emit("ai://progress", p);
         });
         // B12：收尾清理 flag——锁中毒不再静默吞

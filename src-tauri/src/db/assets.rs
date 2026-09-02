@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 pub use super::search_query::MetadataFilter;
 use super::search_query::{self};
 use super::sql_utils::offset_placeholders;
-use super::{search, tags::Tag};
+use super::{search, tags::FACET_EFFECTIVE, tags::Tag};
 use crate::error::{AppError, AppResult};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -934,7 +934,7 @@ fn fill_tags(conn: &Connection, items: &mut [Asset]) -> AppResult<()> {
         "SELECT at.asset_id, t.id, t.name, COALESCE(t.canonical_name,t.name),
                 COALESCE(t.normalized_name,lower(trim(t.name))), COALESCE(t.facet_key,'custom'),
                 t.parent_id, COALESCE(t.status,'active'), COALESCE(t.is_system,0),
-                t.is_preset, t.sort_order
+                t.is_preset, t.sort_order, {FACET_EFFECTIVE} AS facet_effective
            FROM asset_tags at JOIN tags t ON t.id = at.tag_id
           WHERE at.asset_id IN ({ids}) AND COALESCE(t.status,'active') != 'blocked'
           ORDER BY t.sort_order, t.id"
@@ -953,6 +953,7 @@ fn fill_tags(conn: &Connection, items: &mut [Asset]) -> AppResult<()> {
                 is_system: r.get::<_, i64>(8)? != 0,
                 is_preset: r.get::<_, i64>(9)? != 0,
                 sort_order: r.get(10)?,
+                facet_effective: r.get::<_, i64>(11)? != 0,
                 asset_count: 0,
                 total_count: 0,
                 aliases: Vec::new(),

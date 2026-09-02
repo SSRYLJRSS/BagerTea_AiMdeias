@@ -349,13 +349,13 @@ fn probe_raw_dimension_walk() {
 fn probe_prompt_size() {
     use bagertea_ai_media_v2_lib::db::{self, tag_facets};
     let conn = db::init_memory().unwrap();
-    let facets = tag_facets::build_prompt_context(&conn).unwrap();
+    let facets = tag_facets::build_prompt_context(&conn, "all").unwrap();
     // 用中等分面数模拟真实场景（含用户自建分面时）
     let facets = if facets.len() >= 8 { facets } else {
         for i in 0..(8 - facets.len()) {
             tag_facets::create(&conn, &format!("user_facet_{i}"), &format!("用户分面{i}"), "测试描述", "multi", Some(5), "all").unwrap();
         }
-        tag_facets::build_prompt_context(&conn).unwrap()
+        tag_facets::build_prompt_context(&conn, "all").unwrap()
     };
     let system = bagertea_ai_media_v2_lib::services::super_search_ai::build_system_prompt(&facets);
     // user 段在 request_intent 内联拼接，这里复刻（含分面说明段；词典与查询句按真实量级估算）
