@@ -482,6 +482,205 @@ pub fn run_retriever(conn: &Connection, r: &Retriever) -> AppResult<Vec<i64>> {
     }
 }
 
+// ═══════════════ C-2：AST 感知命中诊断（2N+1 次 COUNT） ═══════════════
+
+/// 单个叶子条件的诊断。path = 从根到该叶子的子节点索引路径（OR/AND children 下标）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LeafDiagnostic {
+    pub path: Vec<usize>,
+    pub label: String,
+    /// ① 该条件单独执行的命中数
+    pub self_count: i64,
+    /// ② 完整表达式的命中数（所有叶子共享同一个值）
+    pub result_count: i64,
+    /// ③ 把该叶子从 AST 中移除后的命中数
+    pub count_without_leaf: i64,
+    /// ④ delta = count_without_leaf - result_count
+    ///    AND 下为正（砍掉多少）；OR 下为负（贡献多少）；NOT 下反转 —— 唯一三态都有意义的量
+    pub delta: i64,
+}
+
+/// should（加分项）诊断：不淘汰结果，只显示「命中该加分项的素材数 / 结果总数」。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShouldDiagnostic {
+    pub label: String,
+    pub hit_count: i64,
+    pub total_count: i64,
+}
+
+/// 对 SearchPlanV3 做 AST 命中诊断（N 叶子 = 2N+1 次 COUNT；毫秒级）。
+/// filter/must_not 叶子进 LeafDiagnostic；should 单独进 ShouldDiagnostic（hits/total）。
+pub fn diagnose_search_plan(
+    conn: &Connection,
+    plan: &SearchPlanV3,
+) -> AppResult<(Vec<LeafDiagnostic>, Vec<ShouldDiagnostic>)> {
+    let result_count = count_plan(conn, plan)?;
+    let mut leaves: Vec<LeafDiagnostic> = Vec::new();
+    // filter 树叶子
+    if let Some(f) = &plan.filter {
+        collect_leaves(conn, plan, f, &[], true, result_count, &mut leaves)?;
+    }
+    // must_not 树叶子（NOT 语境）
+    if let Some(m) = &plan.must_not {
+        collect_leaves(conn, plan, m, &[], false, result_count, &mut leaves)?;
+    }
+    // should 命中/总数
+    let mut should_diag = Vec::new();
+    for sc in &plan.should {
+        let mut solo = SearchPlanV3::default();
+        solo.filter = Some(QueryExpr::Leaf { cond: sc.cond.clone() });
+        solo.minimum_should_match = 0;
+        let hit = count_plan(conn, &solo)?;
+        should_diag.push(ShouldDiagnostic {
+            label: if sc.label.is_empty() {
+                format!("加分项")
+            } else {
+                sc.label.clone()
+            },
+            hit_count: hit,
+            total_count: result_count,
+        });
+    }
+    Ok((leaves, should_diag))
+}
+
+fn count_plan(conn: &Connection, plan: &SearchPlanV3) -> AppResult<i64> {
+    let compiled = compile_search_plan(conn, plan)?;
+    let sql = format!("SELECT COUNT(*) FROM (\n{}\n) _diag", compiled.sql);
+    let n: i64 = conn.query_row(
+        &sql,
+        rusqlite::params_from_iter(compiled.params.iter()),
+        |r| r.get(0),
+    )?;
+    Ok(n)
+}
+
+/// 递归收集叶子。pos = 相对当前树根的路径；ctx_and=true 时叶子在正向 filter（AND/OR 语境），
+/// ctx_and=false 表示 must_not（NOT 语境，self_count = 叶子单独命中数，语义与指南表一致）。
+fn collect_leaves(
+    conn: &Connection,
+    plan: &SearchPlanV3,
+    node: &QueryExpr,
+    prefix: &[usize],
+    positive: bool,
+    result_count: i64,
+    out: &mut Vec<LeafDiagnostic>,
+) -> AppResult<()> {
+    match node {
+        QueryExpr::Leaf { cond } => {
+            // self_count：叶子单独执行（在 NOT 语境下也是「该条件本身」的命中数）
+            let mut solo = SearchPlanV3::default();
+            solo.filter = Some(QueryExpr::Leaf { cond: cond.clone() });
+            solo.minimum_should_match = 0;
+            let self_count = count_plan(conn, &solo)?;
+            // without：从原树移除该叶子（按 prefix 定位）后重算
+            let mut variant = plan.clone();
+            if positive {
+                variant.filter = remove_leaf(variant.filter.as_ref(), prefix);
+            } else {
+                variant.must_not = remove_leaf(variant.must_not.as_ref(), prefix);
+            }
+            let without = count_plan(conn, &variant)?;
+            let label = cond_label(cond);
+            out.push(LeafDiagnostic {
+                path: prefix.to_vec(),
+                label,
+                self_count,
+                result_count,
+                count_without_leaf: without,
+                delta: without - result_count,
+            });
+            Ok(())
+        }
+        QueryExpr::And { children } | QueryExpr::Or { children } => {
+            for (i, c) in children.iter().enumerate() {
+                let mut p = prefix.to_vec();
+                p.push(i);
+                collect_leaves(conn, plan, c, &p, positive, result_count, out)?;
+            }
+            Ok(())
+        }
+        QueryExpr::Not { child } => {
+            // NOT 子树：进入即翻转语境（指南 NOT B：self = B 单独命中）
+            let mut p = prefix.to_vec();
+            p.push(0);
+            collect_leaves(conn, plan, child, &p, !positive, result_count, out)
+        }
+    }
+}
+
+/// 从 expr 移除 path 指定的叶子；返回 None 表示整棵被移除（子树空）。
+fn remove_leaf(expr: Option<&QueryExpr>, path: &[usize]) -> Option<QueryExpr> {
+    let e = expr?;
+    if path.is_empty() {
+        return None; // 移除根
+    }
+    match e {
+        QueryExpr::Leaf { .. } => None, // 路径不匹配（叶子上还有下标）→ 不变
+        QueryExpr::And { children } | QueryExpr::Or { children } => {
+            let i = path[0];
+            if i >= children.len() {
+                return Some(e.clone());
+            }
+            let mut kids = children.clone();
+            if path.len() == 1 {
+                kids.remove(i);
+            } else {
+                let sub = remove_leaf(Some(&kids[i]), &path[1..]);
+                match sub {
+                    Some(n) => kids[i] = n,
+                    None => {
+                        kids.remove(i);
+                    }
+                }
+            }
+            match kids.len() {
+                0 => None,
+                1 => Some(kids.into_iter().next().unwrap()),
+                _ => Some(match e {
+                    QueryExpr::And { .. } => QueryExpr::And { children: kids },
+                    _ => QueryExpr::Or { children: kids },
+                }),
+            }
+        }
+        QueryExpr::Not { child } => {
+            if path.len() == 1 {
+                return Some(e.clone()); // 不会从 Not 上取叶子
+            }
+            let sub = remove_leaf(Some(child), &path[1..]);
+            match sub {
+                Some(n) => Some(QueryExpr::Not {
+                    child: Box::new(n),
+                }),
+                None => None,
+            }
+        }
+    }
+}
+
+fn cond_label(cond: &LeafCond) -> String {
+    match cond {
+        LeafCond::Tag { facet_key, tag_ids, term_query, .. } => {
+            if let Some(tq) = term_query.as_deref().filter(|s| !s.is_empty()) {
+                format!("{facet_key}: {tq}")
+            } else {
+                format!("{facet_key}: 标签×{}", tag_ids.len())
+            }
+        }
+        LeafCond::ExcludeTag { facet_key, tag_ids } => {
+            format!("排除 {facet_key}×{}", tag_ids.len())
+        }
+        LeafCond::AssetType { value } => format!("类型: {value}"),
+        LeafCond::Untagged => "未打标".into(),
+        LeafCond::Metadata { filter } => format!("{} {} {:?}", filter.key, filter.op, filter.value),
+        LeafCond::Search { value, .. } => format!("关键词: {value}"),
+        LeafCond::FacetHasAny { facet_key } => format!("{facet_key} 有任意标签"),
+        LeafCond::FacetMissing { facet_key } => format!("{facet_key} 没有标签"),
+    }
+}
+
 /// S6：schema 版本迁移（plan_schema_version 3 → 4 时在此加 migrate_plan_v3_to_v4；
 /// 现在结构未变，直接原样返回）。读到旧版本先迁移再执行。
 pub fn migrate_plan(plan: &mut SearchPlanV3) {
@@ -773,5 +972,163 @@ mod tests {
         assert!(!ids.is_empty(), "Fts 检索应命中含词素材");
         assert_eq!(ids[0], hit, "精确命中素材应排最前：{ids:?}");
         assert!(!ids.contains(&miss), "无关素材不得出现在 bm25 排序结果里");
+    }
+
+
+    // ═══════════════ C-2：AST 命中诊断 ═══════════════
+    fn d_tag(facet: &str, id: i64) -> QueryExpr {
+        QueryExpr::Leaf {
+            cond: LeafCond::Tag {
+                facet_key: facet.into(),
+                tag_ids: vec![id],
+                mode: Some("any".into()),
+                include_descendants: true,
+                term_query: None,
+                term_match: crate::db::tags::TermMatch::Alias,
+            },
+        }
+    }
+    fn diag_leaves(conn: &Connection, plan: &SearchPlanV3) -> Vec<LeafDiagnostic> {
+        diagnose_search_plan(conn, plan).unwrap().0
+    }
+
+    /// C-2：AND 中把结果砍到 0 的叶子 —— delta>0 且 result_count==0（罪魁祸首标红依据）。
+    #[test]
+    fn diagnostic_delta_identifies_zeroing_leaf() {
+        let c = init_memory().unwrap();
+        let a = tag(&c, "scene", "标签甲");
+        let b = tag(&c, "scene", "标签乙");
+        let a1 = insert_asset(&c, "d:/d1.jpg");
+        let a2 = insert_asset(&c, "d:/d2.jpg");
+        let _b1 = insert_asset(&c, "d:/d3.jpg");
+        asset_tags::assign(&c, &[a1], &[a], "manual").unwrap();
+        asset_tags::assign(&c, &[a2], &[a], "manual").unwrap();
+        asset_tags::assign(&c, &[_b1], &[b], "manual").unwrap();
+        let plan = SearchPlanV3 {
+            filter: Some(QueryExpr::And {
+                children: vec![d_tag("scene", a), d_tag("scene", b)],
+            }),
+            should: Vec::new(),
+            ranking: Ranking::Relevance { retrievers: RetrieverPlan::default() },
+            ..Default::default()
+        };
+        let leaves = diag_leaves(&c, &plan);
+        assert_eq!(leaves.len(), 2);
+        // children 顺序 = [标签甲, 标签乙]
+        let al = &leaves[0];
+        let bl = &leaves[1];
+        assert_eq!(bl.result_count, 0);
+        assert!(bl.delta > 0, "乙把结果砍到 0 → delta 为正：{bl:?}");
+        assert_eq!(al.self_count, 2);
+        assert_eq!(bl.self_count, 1);
+    }
+
+    /// C-2：self_count==0 单独标注（区分「条件本身无效」与「与其他条件冲突」）。
+    #[test]
+    fn diagnostic_self_count_zero_is_distinguished() {
+        let c = init_memory().unwrap();
+        let a = tag(&c, "scene", "标签甲");
+        let z = tag(&c, "scene", "无人标签");
+        let a1 = insert_asset(&c, "d:/e1.jpg");
+        asset_tags::assign(&c, &[a1], &[a], "manual").unwrap();
+        let plan = SearchPlanV3 {
+            filter: Some(QueryExpr::And {
+                children: vec![d_tag("scene", a), d_tag("scene", z)],
+            }),
+            ranking: Ranking::Relevance { retrievers: RetrieverPlan::default() },
+            ..Default::default()
+        };
+        let leaves = diag_leaves(&c, &plan);
+        let al = &leaves[0];
+        let zl = &leaves[1];
+        assert_eq!(zl.self_count, 0, "无人标签自身 0 命中");
+        assert_eq!(zl.result_count, 0);
+        assert!(zl.delta > 0, "移除无人标签后有结果");
+        assert!(al.self_count > 0);
+    }
+
+    /// C-2：OR / NOT 下 delta 语义 —— OR 叶子 delta<0（贡献），NOT 叶子 delta>0。
+    #[test]
+    fn diagnostic_works_under_or_and_not() {
+        let c = init_memory().unwrap();
+        let a = tag(&c, "scene", "标签甲");
+        let b = tag(&c, "scene", "标签乙");
+        let mut a_ids = Vec::new();
+        for i in 0..3 {
+            let id = insert_asset(&c, &format!("d:/or_a{i}.jpg"));
+            asset_tags::assign(&c, &[id], &[a], "manual").unwrap();
+            a_ids.push(id);
+        }
+        let mut b_ids = Vec::new();
+        for i in 0..2 {
+            let id = insert_asset(&c, &format!("d:/or_b{i}.jpg"));
+            asset_tags::assign(&c, &[id], &[b], "manual").unwrap();
+            b_ids.push(id);
+        }
+        // OR：结果 5；乙贡献 → delta = without(甲 3) - result(5) = -2
+        let or_plan = SearchPlanV3 {
+            filter: Some(QueryExpr::Or {
+                children: vec![d_tag("scene", a), d_tag("scene", b)],
+            }),
+            ranking: Ranking::Relevance { retrievers: RetrieverPlan::default() },
+            ..Default::default()
+        };
+        let leaves = diag_leaves(&c, &or_plan);
+        let bl = &leaves[1]; // [甲, 乙]
+        assert_eq!(bl.self_count, 2);
+        assert_eq!(bl.result_count, 5);
+        assert!(bl.delta < 0, "OR 下乙贡献 → delta 为负：{bl:?}");
+        // NOT（must_not 单叶子 B，需与甲有交集才能体现排除量）：新库单独构造
+        let c2 = init_memory().unwrap();
+        let a2 = tag(&c2, "scene", "标签甲");
+        let b2 = tag(&c2, "scene", "标签乙");
+        let _p1 = insert_asset(&c2, "d:/n1.jpg");
+        let _p2 = insert_asset(&c2, "d:/n2.jpg");
+        let p3 = insert_asset(&c2, "d:/n3.jpg");
+        asset_tags::assign(&c2, &[_p1, _p2, p3], &[a2], "manual").unwrap();
+        asset_tags::assign(&c2, &[p3], &[b2], "manual").unwrap(); // 甲 3 张，其中 1 张含乙
+        let not_plan = SearchPlanV3 {
+            filter: Some(d_tag("scene", a2)),
+            must_not: Some(d_tag("scene", b2)),
+            ranking: Ranking::Relevance { retrievers: RetrieverPlan::default() },
+            ..Default::default()
+        };
+        let nl = diag_leaves(&c2, &not_plan);
+        let bl2 = &nl[1]; // [filter甲, must_not乙]
+        assert_eq!(bl2.self_count, 1, "乙单独命中 1：{bl2:?}");
+        assert_eq!(bl2.delta, 1, "NOT 下乙排除了 1：{bl2:?}");
+    }
+
+    /// C-2：should 显示「命中该加分项的素材数 / 结果总数」。
+    #[test]
+    fn diagnostic_should_shows_hit_ratio() {
+        let c = init_memory().unwrap();
+        let a = tag(&c, "scene", "标签甲");
+        let s = tag(&c, "scene", "加分乙");
+        let a1 = insert_asset(&c, "d:/f1.jpg");
+        let a2 = insert_asset(&c, "d:/f2.jpg");
+        asset_tags::assign(&c, &[a1, a2], &[a], "manual").unwrap();
+        asset_tags::assign(&c, &[a1], &[s], "manual").unwrap();
+        let plan = SearchPlanV3 {
+            filter: Some(d_tag("scene", a)),
+            should: vec![ShouldClause {
+                cond: LeafCond::Tag {
+                    facet_key: "scene".into(),
+                    tag_ids: vec![s],
+                    mode: Some("any".into()),
+                    include_descendants: true,
+                    term_query: None,
+                    term_match: crate::db::tags::TermMatch::Alias,
+                },
+                weight: 1.0,
+                label: "加分乙（蓝天）".into(),
+            }],
+            ranking: Ranking::Relevance { retrievers: RetrieverPlan::default() },
+            ..Default::default()
+        };
+        let (_, should_diag) = diagnose_search_plan(&c, &plan).unwrap();
+        assert_eq!(should_diag.len(), 1);
+        assert_eq!(should_diag[0].hit_count, 1);
+        assert_eq!(should_diag[0].total_count, 2);
     }
 }
