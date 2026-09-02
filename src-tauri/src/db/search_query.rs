@@ -38,6 +38,64 @@ pub struct CompiledMetadata {
     pub params: Vec<Value>,
 }
 
+/// S0：可搜元数据 key 的**单一事实源**（= key_spec 全部分支）。
+/// `key_spec` 入口先按本常量放行，任何不在全集里的 key 一律 None ——
+/// 「加 spec 忘了 key」不可能发生（分支不达）；「加 key 忘了 spec」由
+/// 验收测试 `whitelist_single_source` 抓住。其余白名单（AI 提示词、
+/// schema enum、排序校验）全部引用本常量，不再各自维护一份。
+pub const ALL_METADATA_KEYS: &[&str] = &[
+    "file_ext",
+    "mime_type",
+    "video_codec",
+    "audio_codec",
+    "camera",
+    "lens",
+    "shutter",
+    "iso",
+    "aperture",
+    "focal",
+    "width",
+    "height",
+    "resolution",
+    "aspect_ratio",
+    "file_size",
+    "duration_ms",
+    "dominant_hue",
+    "dominant_sat",
+    "dominant_lum",
+    "latitude",
+    "longitude",
+    "has_location",
+    "rating",
+    "favorite",
+    "taken_at",
+    "created_at",
+    "modified_at",
+    "folder",
+];
+
+/// S0：排序字段白名单**单一事实源**。assets.rs `VALID_SORT` / AI 侧
+/// `is_valid_sort_by` / `validate_intent` 三份都改为引用本常量。
+pub const ALL_SORT_KEYS: &[&str] = &[
+    "created_at",
+    "taken_at",
+    "modified_at",
+    "name",
+    "size",
+    "resolution",
+    "rating",
+];
+
+/// S0：key 是否在白名单（AI schema / 提示词生成用）。
+pub fn is_metadata_key(key: &str) -> bool {
+    ALL_METADATA_KEYS.contains(&key)
+}
+
+/// S0：key 是否可编译（白名单 + 有完整 spec 分支）。验收测试正向断言用。
+pub fn is_supported_metadata_key(key: &str) -> bool {
+    key_spec(key).is_some()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum ValueKind {
     String,
@@ -54,6 +112,11 @@ struct KeySpec {
 }
 
 fn key_spec(key: &str) -> Option<KeySpec> {
+    // S0：key 集合以 ALL_METADATA_KEYS 为唯一事实源 —— 不在全集里的一律 None。
+    // 反方向（spec 认识的都在全集里）由此结构性保证：分支先过白名单才可达。
+    if !ALL_METADATA_KEYS.contains(&key) {
+        return None;
+    }
     Some(match key {
         "file_ext" | "mime_type" | "video_codec" | "audio_codec" => KeySpec {
             kind: ValueKind::String,

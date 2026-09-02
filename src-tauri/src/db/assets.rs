@@ -550,16 +550,8 @@ fn build_search_predicate(
     }
 }
 
-const VALID_SORT: &[&str] = &[
-    "created_at",
-    "taken_at",
-    "modified_at",
-    "name",
-    "size",
-    "resolution",
-    // W2-8：按评级排序（选片核心动作：把 5 星排前面；未评级排最后）
-    "rating",
-];
+// S0：排序白名单单一事实源（db/search_query.rs ALL_SORT_KEYS）——不再本地维护一份
+const VALID_SORT: &[&str] = super::search_query::ALL_SORT_KEYS;
 
 impl AssetFilter {
     /// 参数校验：非法 key/op/值/数量/排序/分页一律返回 AppError，不静默忽略。

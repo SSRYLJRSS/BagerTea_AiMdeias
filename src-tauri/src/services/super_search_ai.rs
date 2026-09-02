@@ -43,37 +43,9 @@ const OR_WORDS: &[&str] = &["或者", "或", "任一", "二选一"];
 const IMAGE_WORDS: &[&str] = &["图片", "照片", "相片", "图像"];
 const VIDEO_WORDS: &[&str] = &["视频", "录像", "片段", "短片"];
 
-/// §9.2.2：元数据 key 契约集（与 db/search_query.rs 白名单同步，禁止漂移）。
-/// 提示词教学段与 schema enum 均由本常量生成——单一事实源。
-/// latitude/longitude 为并行数据契约（REAL，有符号十进制度，支持 eq/gt/gte/lt/lte/between），
-/// 白名单补齐前本服务会按「丢弃 + warning」降级，不会整体报错。
-pub const METADATA_KEYS: &[&str] = &[
-    "file_ext",
-    "mime_type",
-    "video_codec",
-    "audio_codec",
-    "camera",
-    "lens",
-    "shutter",
-    "iso",
-    "aperture",
-    "focal",
-    "width",
-    "height",
-    "resolution",
-    "aspect_ratio",
-    "file_size",
-    "duration_ms",
-    "dominant_hue",
-    "dominant_sat",
-    "dominant_lum",
-    "taken_at",
-    "created_at",
-    "modified_at",
-    "folder",
-    "latitude",
-    "longitude",
-];
+/// §9.2.2：元数据 key 契约集 —— **单一事实源 = db/search_query.rs ALL_METADATA_KEYS**
+/// （S0：提示词教学段与 schema enum 均引用它，禁止漂移；禁止本文件再维护一份列表）。
+pub const METADATA_KEYS: &[&str] = crate::db::search_query::ALL_METADATA_KEYS;
 
 /// 元数据操作符全集（= search_query.rs 各 key allowed_ops 的并集）
 pub const METADATA_OPS: &[&str] = &["eq", "in", "gt", "gte", "lt", "lte", "between", "contains"];
@@ -207,12 +179,10 @@ pub struct AiSearchParseResult {
 /// 本函数收到的 metadata 均视为合法（编译期兜底见 query_expr::validate_expr）。
 pub fn validate_intent(intent: &SearchIntentV2, facets: &[FacetPromptContext]) -> AppResult<()> {
     if let Some(sb) = &intent.sort_by {
-        // R0-4：三份排序白名单之一（assets.rs VALID_SORT / is_valid_sort_by 均含 rating），
-        // validate_intent 必须一致，否则 rating 排序被整单降级为关键词搜索。
-        if !matches!(
-            sb.as_str(),
-            "created_at" | "taken_at" | "modified_at" | "name" | "size" | "resolution" | "rating"
-        ) {
+        // R0-4/S0：排序白名单单一事实源（search_query::ALL_SORT_KEYS）——
+        // validate_intent / is_valid_sort_by / assets VALID_SORT 三方必须一致，
+        // 否则 rating 排序被整单降级为关键词搜索。
+        if !crate::db::search_query::ALL_SORT_KEYS.contains(&sb.as_str()) {
             return Err(AppError::msg(format!("非法排序字段：{sb}")));
         }
     }
@@ -1005,12 +975,9 @@ pub fn sanitize_all(intent: &mut SearchIntentV2, facets: &[FacetPromptContext]) 
     warnings
 }
 
-/// 排序字段白名单（与 db/assets.rs VALID_SORT 对齐，单点声明）
+/// 排序字段白名单（S0：单一事实源 = db/search_query.rs ALL_SORT_KEYS，与 assets VALID_SORT 一致）
 pub fn is_valid_sort_by(s: &str) -> bool {
-    matches!(
-        s,
-        "created_at" | "taken_at" | "modified_at" | "name" | "size" | "resolution" | "rating"
-    )
+    crate::db::search_query::ALL_SORT_KEYS.contains(&s)
 }
 
 /// §9.2 Prompt 硬规则（停用词由 SEARCH_CONCEPT_STOPWORDS 生成，与本地清洗同一集合）。
@@ -1795,39 +1762,20 @@ mod tests {
             .collect();
         assert_eq!(keys, METADATA_KEYS, "enum 必须直接取自契约常量");
         assert_eq!(ops, METADATA_OPS, "enum 必须直接取自契约常量");
-        // 契约集 = search_query.rs 白名单全集 + 并行契约 latitude/longitude。
-        // 白名单清单镜像自 db/search_query.rs 的 key_spec（两边漂移时此测试提醒同步）。
-        let whitelist = [
-            "file_ext",
-            "mime_type",
-            "video_codec",
-            "audio_codec",
-            "camera",
-            "lens",
-            "shutter",
-            "iso",
-            "aperture",
-            "focal",
-            "width",
-            "height",
-            "resolution",
-            "aspect_ratio",
-            "file_size",
-            "duration_ms",
-            "dominant_hue",
-            "dominant_sat",
-            "dominant_lum",
-            "taken_at",
-            "created_at",
-            "modified_at",
-            "folder",
-        ];
-        for k in whitelist {
-            assert!(keys.contains(&k), "enum 缺少白名单 key：{k}");
+        // S0：单一事实源 —— METADATA_KEYS（= schema enum）= db/search_query.rs
+        // ALL_METADATA_KEYS（= key_spec 全部分支，含 rating/favorite/has_location）。
+        assert_eq!(
+            METADATA_KEYS,
+            crate::db::search_query::ALL_METADATA_KEYS,
+            "本文件不得再维护一份会漂移的 key 列表"
+        );
+        // 白名单 key 必须个个能编译（加了 key 忘了 spec 由 whitelist_single_source 抓）
+        for k in keys {
+            assert!(
+                crate::db::search_query::is_supported_metadata_key(k),
+                "schema 枚举了无法编译的 key：{k}"
+            );
         }
-        assert!(keys.contains(&"latitude"), "契约新增 latitude 必须在 enum");
-        assert!(keys.contains(&"longitude"), "契约新增 longitude 必须在 enum");
-        assert_eq!(keys.len(), whitelist.len() + 2, "enum 不得多出白名单之外的 key");
         // op 全集与白名单各 key allowed_ops 并集一致
         assert_eq!(
             ops,

@@ -1791,3 +1791,46 @@ fn auto_adopt_off_by_default() {
     assert!(s.auto_accept_exact_terms);
     assert!((s.confidence_min_suggest - 0.30).abs() < 1e-9);
 }
+
+// ═══════════════ S0：白名单单一事实源（搜索契约） ═══════════════
+
+/// S0：ALL_METADATA_KEYS 每个 key 都能编译（加了 key 忘了 spec 会失败）；
+/// ALL_SORT_KEYS 与 AI 侧 is_valid_sort_by / validate_intent 三处一致（rating 全合法）。
+#[test]
+fn whitelist_single_source() {
+    use bagertea_ai_media_v2_lib::db::search_query::{
+        is_metadata_key, is_supported_metadata_key, ALL_METADATA_KEYS, ALL_SORT_KEYS,
+    };
+    use bagertea_ai_media_v2_lib::services::super_search_ai::{
+        validate_intent, SearchIntentV2,
+    };
+    // 正向：全集每个 key 都必须有 key_spec（加 key 忘 spec → 编译期断言失败）
+    for k in ALL_METADATA_KEYS {
+        assert!(is_metadata_key(k), "白名单常量自身应认识 {k}");
+        assert!(
+            is_supported_metadata_key(k),
+            "ALL_METADATA_KEYS 里的 {k} 缺 key_spec 分支"
+        );
+    }
+    // 反方向（spec 认识的都在全集里）：key_spec 入口先按 ALL 白名单放行 —— 结构性保证，
+    // 分支不在全集里永远不达。
+    // 排序白名单三处一致：AI 侧 is_valid_sort_by / validate_intent / assets VALID_SORT（引用同常量）
+    for k in ALL_SORT_KEYS {
+        assert!(
+            bagertea_ai_media_v2_lib::services::super_search_ai::is_valid_sort_by(k),
+            "ALL_SORT_KEYS 里的 {k} 必须被 is_valid_sort_by 接受"
+        );
+    }
+    assert!(ALL_SORT_KEYS.contains(&"rating"), "rating 必须在排序白名单（R0-4 回归）");
+    assert!(
+        !bagertea_ai_media_v2_lib::services::super_search_ai::is_valid_sort_by("magic"),
+        "白名单之外必须拒绝"
+    );
+    // validate_intent 走同一常量：rating 合法、magic 拒绝
+    let mut i = SearchIntentV2::default();
+    i.sort_by = Some("rating".into());
+    assert!(validate_intent(&i, &[]).is_ok(), "rating 排序不得被降级");
+    let mut i2 = SearchIntentV2::default();
+    i2.sort_by = Some("magic".into());
+    assert!(validate_intent(&i2, &[]).is_err());
+}
