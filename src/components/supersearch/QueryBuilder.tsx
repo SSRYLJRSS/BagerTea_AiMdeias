@@ -11,6 +11,12 @@ import { useSuperSearchStore } from "@/stores/superSearchStore";
 import type { AssetType, MetadataFilter, MetadataFilterKey, MetadataOp } from "@/types/asset";
 import type { LeafCond, QueryExpr } from "@/types/queryExpr";
 import { mergeQueryExpr, normalizeExpr, serializeExpr } from "@/utils/queryExprUtils";
+import {
+  DATE_SHORTCUT_OPTIONS,
+  shortcutEndMs,
+  shortcutStartMs,
+  type DateShortcutKind,
+} from "@/utils/dateShortcuts";
 
 type FieldKey = "search" | "tag" | "excludeTag" | "assetType" | "untagged" | "facetHasAny" | "facetMissing" | MetadataFilterKey;
 type GroupMode = "and" | "or";
@@ -184,8 +190,60 @@ function ConditionValue({ cond, allTagOptions, onChange }: { cond: LeafCond; all
   }
   return <MetadataValue filter={cond.filter} onChange={(filter) => onChange({ ...cond, filter })} />;
 }
-function MetadataValue({ filter, onChange }: { filter: MetadataFilter; onChange: (filter: MetadataFilter) => void }) { const kind = FIELD_OPTIONS.find((item) => item.key === filter.key)?.kind ?? "number"; if (filter.op === "between") return <div className="grid grid-cols-[minmax(0,1fr)_16px_minmax(0,1fr)] items-center gap-1"><ValueInput kind={kind} value={filter.min} onChange={(min) => onChange({ ...filter, min })} /><span className="text-center text-[11px] text-[var(--color-text-tertiary)]">至</span><ValueInput kind={kind} value={filter.max} onChange={(max) => onChange({ ...filter, max })} /></div>; if (filter.op === "in") return <DraftInput ariaLabel="条件值" placeholder="多个值用逗号分隔" displayValue={(filter.values ?? []).join(", ")} onCommit={(raw) => onChange({ ...filter, values: raw.split(/[,，]/).map((x) => x.trim()).filter(Boolean) })} className={`${controlClass} w-full`} />; return <ValueInput kind={kind} value={filter.value} onChange={(value) => onChange({ ...filter, value })} />; }
-function ValueInput({ kind, value, onChange }: { kind: NonNullable<FieldOption["kind"]>; value: string | number | undefined; onChange: (value: string | number | undefined) => void }) { if (kind === "date") return <input aria-label="条件值" type="date" value={epochToDate(value)} onChange={(e) => onChange(dateToEpoch(e.target.value))} className={`${controlClass} w-full`} />; if (kind === "text") return <DraftInput ariaLabel="条件值" placeholder="输入值" displayValue={String(value ?? "")} onCommit={(raw) => onChange(raw)} className={`${controlClass} w-full`} />; const factor = kind === "size" ? 1024 * 1024 : kind === "duration" ? 1000 : kind === "resolution" ? 1_000_000 : 1; const suffix = kind === "size" ? "MB" : kind === "duration" ? "秒" : kind === "resolution" ? "MP" : ""; return <DraftInput ariaLabel="条件值" type="number" step={kind === "number" ? "any" : "0.1"} placeholder="输入数值" suffix={suffix} displayValue={typeof value === "number" ? String(value / factor) : ""} onCommit={(raw) => { if (raw.trim() === "") { onChange(undefined); return; } const n = Number(raw); onChange(Number.isNaN(n) ? undefined : n * factor); }} className={`${controlClass} w-full ${suffix ? "pr-9" : ""}`} />; }
+function MetadataValue({ filter, onChange }: { filter: MetadataFilter; onChange: (filter: MetadataFilter) => void }) {
+  const kind = FIELD_OPTIONS.find((item) => item.key === filter.key)?.kind ?? "number";
+  if (filter.op === "between")
+    return (
+      <div className="grid grid-cols-[minmax(0,1fr)_16px_minmax(0,1fr)] items-center gap-1">
+        <ValueInput kind={kind} value={filter.min} dateSide="start" onChange={(min) => onChange({ ...filter, min })} />
+        <span className="text-center text-[11px] text-[var(--color-text-tertiary)]">至</span>
+        <ValueInput kind={kind} value={filter.max} dateSide="end" onChange={(max) => onChange({ ...filter, max })} />
+      </div>
+    );
+  if (filter.op === "in") return <DraftInput ariaLabel="条件值" placeholder="多个值用逗号分隔" displayValue={(filter.values ?? []).join(", ")} onCommit={(raw) => onChange({ ...filter, values: raw.split(/[,，]/).map((x) => x.trim()).filter(Boolean) })} className={`${controlClass} w-full`} />;
+  // U-7 ②：日期快捷的语义与 op 绑定 —— gte/min 侧写期初，lte/max 侧写期末
+  return <ValueInput kind={kind} value={filter.value} dateSide={filter.op === "lte" ? "end" : "start"} onChange={(value) => onChange({ ...filter, value })} />;
+}
+function ValueInput({ kind, value, onChange, dateSide }: { kind: NonNullable<FieldOption["kind"]>; value: string | number | undefined; dateSide?: "start" | "end"; onChange: (value: string | number | undefined) => void }) {
+  if (kind === "date") return <DateValue value={value} side={dateSide ?? "start"} onChange={onChange} />;
+  if (kind === "text") return <DraftInput ariaLabel="条件值" placeholder="输入值" displayValue={String(value ?? "")} onCommit={(raw) => onChange(raw)} className={`${controlClass} w-full`} />;
+  if (kind === "size") return <SizeValue value={value} onChange={onChange} />;
+  const factor = kind === "duration" ? 1000 : kind === "resolution" ? 1_000_000 : 1;
+  const suffix = kind === "duration" ? "秒" : kind === "resolution" ? "MP" : "";
+  return <DraftInput ariaLabel="条件值" type="number" step={kind === "number" ? "any" : "0.1"} placeholder="输入数值" suffix={suffix} displayValue={typeof value === "number" ? String(value / factor) : ""} onCommit={(raw) => { if (raw.trim() === "") { onChange(undefined); return; } const n = Number(raw); onChange(Number.isNaN(n) ? undefined : n * factor); }} className={`${controlClass} w-full ${suffix ? "pr-9" : ""}`} />;
+}
+type SizeUnit = "KB" | "MB" | "GB";
+const SIZE_FACTORS: Record<SizeUnit, number> = { KB: 1024, MB: 1024 * 1024, GB: 1024 * 1024 * 1024 };
+const DEFAULT_SIZE_UNIT: SizeUnit = "MB";
+/** U-7 ①：size 字段（file_size）单位下拉 KB/MB/GB —— 显示按所选单位换算，提交始终是字节（后端不碰单位）。
+ *  独立子组件承载 useState（ValueInput 本身分支多，不能在其中条件性调用 hooks）。 */
+function SizeValue({ value, onChange }: { value: string | number | undefined; onChange: (v: string | number | undefined) => void }) {
+  const [unit, setUnit] = useState<SizeUnit>(DEFAULT_SIZE_UNIT);
+  const factor = SIZE_FACTORS[unit];
+  const display = typeof value === "number" && Number.isFinite(value) ? String(Math.round((value / factor) * 1000) / 1000) : "";
+  return (
+    <div className="flex min-w-0 items-stretch gap-1">
+      <DraftInput ariaLabel="条件值" type="number" step="0.1" placeholder="输入数值" displayValue={display} onCommit={(raw) => { if (raw.trim() === "") { onChange(undefined); return; } const n = Number(raw); onChange(Number.isNaN(n) ? undefined : Math.round(n * factor)); }} className={`${controlClass} w-full`} />
+      <select aria-label="数值单位" value={unit} onChange={(e) => setUnit(e.target.value as SizeUnit)} className={`${controlClass} w-16 shrink-0 text-[var(--color-text-secondary)]`}>
+        <option value="KB">KB</option><option value="MB">MB</option><option value="GB">GB</option>
+      </select>
+    </div>
+  );
+}
+/** U-7 ②：date 快捷（今天/本周/本月/今年）—— start 侧（gte/区间下限）写期初，end 侧（lte/区间上限）写期末；
+ *  选完立即落值并回到「自定义」，之后仍可手工改日期。 */
+function DateValue({ value, side, onChange }: { value: string | number | undefined; side: "start" | "end"; onChange: (v: string | number | undefined) => void }) {
+  const [pick, setPick] = useState("");
+  return (
+    <div className="flex min-w-0 items-stretch gap-1">
+      <input aria-label="条件值" type="date" value={epochToDate(value)} onChange={(e) => onChange(dateToEpoch(e.target.value))} className={`${controlClass} w-full`} />
+      <select aria-label="日期快捷" value={pick} onChange={(e) => { const kind = e.target.value as DateShortcutKind | ""; if (!kind) return; const now = new Date(); onChange(side === "end" ? shortcutEndMs(kind, now) : shortcutStartMs(kind, now)); setPick(""); }} className={`${controlClass} w-[72px] shrink-0 text-[var(--color-text-secondary)]`}>
+        <option value="">自定义</option>
+        {DATE_SHORTCUT_OPTIONS.map((o) => <option key={o.kind} value={o.kind}>{o.label}</option>)}
+      </select>
+    </div>
+  );
+}
 /** 文本/数值输入的本地 draft：输入时不提交到 store（不触发后端查询），失焦或 Enter 才提交。
  *  P0-1：解决「每输入一个字符 → commit → 行重建 → 失焦」问题。 */
 function DraftInput({ ariaLabel = "条件值", displayValue, onCommit, className, placeholder, type = "text", step, suffix }: { ariaLabel?: string; displayValue: string; onCommit: (display: string) => void; className?: string; placeholder?: string; type?: string; step?: string; suffix?: string }) {

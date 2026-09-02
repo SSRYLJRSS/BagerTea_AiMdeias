@@ -5,6 +5,7 @@ import { useSuperSearchStore } from "@/stores/superSearchStore";
 import { useTagStore } from "@/stores/tagStore";
 import { listSuperAssets } from "@/api/superSearch";
 import type { QueryExpr } from "@/types/queryExpr";
+import { shortcutEndMs, shortcutStartMs } from "@/utils/dateShortcuts";
 
 vi.mock("@/api/assets", () => ({
   listAssets: vi.fn().mockResolvedValue({ items: [], total: 0, hasMore: false }),
@@ -331,5 +332,96 @@ describe("W3-3 QueryBuilder 三合一", () => {
     expect(texts).toContain("有无定位");
     const groups = Array.from(field.querySelectorAll("optgroup")).map((g) => g.getAttribute("label"));
     expect(groups).toContain("定位");
+  });
+});
+
+/** U-7 ①：文件大小单位下拉 —— 显示按 KB/MB/GB 换算，提交始终是字节。 */
+describe("U-7 数值单位下拉", () => {
+  const openSizeRow = () => {
+    render(<QueryBuilder />);
+    fireEvent.click(screen.getByRole("button", { name: "+ 添加第一个条件" }));
+    fireEvent.change(screen.getByLabelText("条件字段"), { target: { value: "file_size" } });
+  };
+
+  it("queryBuilder_unit_dropdown_converts_to_bytes：选 KB 后输入 5 → 5120 字节", () => {
+    openSizeRow();
+    const unit = screen.getByLabelText("数值单位") as HTMLSelectElement;
+    expect(unit.value).toBe("MB"); // 默认 MB（旧行为）
+    fireEvent.change(unit, { target: { value: "KB" } });
+    const input = screen.getByRole("spinbutton", { name: "条件值" });
+    fireEvent.change(input, { target: { value: "5" } });
+    fireEvent.blur(input);
+    const expr = useSuperSearchStore.getState().expr;
+    expect(expr).toEqual({ op: "leaf", cond: { type: "metadata", filter: { key: "file_size", op: "eq", value: 5120 } } });
+  });
+
+  it("默认 MB：输入 5 → 5242880 字节", () => {
+    openSizeRow();
+    const input = screen.getByRole("spinbutton", { name: "条件值" });
+    fireEvent.change(input, { target: { value: "5" } });
+    fireEvent.blur(input);
+    const expr = useSuperSearchStore.getState().expr;
+    expect(expr).toEqual({ op: "leaf", cond: { type: "metadata", filter: { key: "file_size", op: "eq", value: 5242880 } } });
+  });
+
+  it("选 GB 后输入 1 → 1073741824 字节", () => {
+    openSizeRow();
+    fireEvent.change(screen.getByLabelText("数值单位"), { target: { value: "GB" } });
+    const input = screen.getByRole("spinbutton", { name: "条件值" });
+    fireEvent.change(input, { target: { value: "1" } });
+    fireEvent.blur(input);
+    const expr = useSuperSearchStore.getState().expr;
+    expect(expr).toEqual({ op: "leaf", cond: { type: "metadata", filter: { key: "file_size", op: "eq", value: 1073741824 } } });
+  });
+
+  it("unit 切换重算已有值（字节不变，显示按新单位换算）", () => {
+    useSuperSearchStore.setState({
+      expr: { op: "leaf", cond: { type: "metadata", filter: { key: "file_size", op: "eq", value: 5 * 1024 * 1024 } } },
+    });
+    render(<QueryBuilder />);
+    const unit = screen.getByLabelText("数值单位") as HTMLSelectElement;
+    expect(unit.value).toBe("MB");
+    expect((screen.getByRole("spinbutton", { name: "条件值" }) as HTMLInputElement).value).toBe("5");
+    fireEvent.change(unit, { target: { value: "KB" } });
+    expect((screen.getByRole("spinbutton", { name: "条件值" }) as HTMLInputElement).value).toBe("5120");
+    expect(useSuperSearchStore.getState().expr).toEqual({ op: "leaf", cond: { type: "metadata", filter: { key: "file_size", op: "eq", value: 5242880 } } });
+  });
+});
+
+/** U-7 ②：date 快捷（今天/本周/本月/今年）—— gte/下限写期初，lte/上限写期末，epoch ms 与 dateToEpoch 一致。 */
+describe("U-7 日期快捷", () => {
+  it("gte + 今天 → 本地零点", () => {
+    const now = new Date();
+    render(<QueryBuilder />);
+    fireEvent.click(screen.getByRole("button", { name: "+ 添加第一个条件" }));
+    fireEvent.change(screen.getByLabelText("条件字段"), { target: { value: "taken_at" } });
+    fireEvent.change(screen.getByLabelText("日期快捷"), { target: { value: "today" } });
+    const expr = useSuperSearchStore.getState().expr;
+    expect(expr).toEqual({ op: "leaf", cond: { type: "metadata", filter: { key: "taken_at", op: "gte", value: shortcutStartMs("today", now) } } });
+  });
+
+  it("lte + 本周 → 周日 23:59:59.999", () => {
+    const now = new Date();
+    render(<QueryBuilder />);
+    fireEvent.click(screen.getByRole("button", { name: "+ 添加第一个条件" }));
+    fireEvent.change(screen.getByLabelText("条件字段"), { target: { value: "created_at" } });
+    fireEvent.change(screen.getByLabelText("条件操作符"), { target: { value: "lte" } });
+    fireEvent.change(screen.getByLabelText("日期快捷"), { target: { value: "thisWeek" } });
+    const expr = useSuperSearchStore.getState().expr;
+    expect(expr).toEqual({ op: "leaf", cond: { type: "metadata", filter: { key: "created_at", op: "lte", value: shortcutEndMs("thisWeek", now) } } });
+  });
+
+  it("选中后快捷下拉回到自定义，可继续手工改日期", () => {
+    render(<QueryBuilder />);
+    fireEvent.click(screen.getByRole("button", { name: "+ 添加第一个条件" }));
+    fireEvent.change(screen.getByLabelText("条件字段"), { target: { value: "taken_at" } });
+    const quick = screen.getByLabelText("日期快捷") as HTMLSelectElement;
+    fireEvent.change(quick, { target: { value: "thisMonth" } });
+    expect((quick as HTMLSelectElement).value).toBe("");
+    const date = screen.getByLabelText("条件值") as HTMLInputElement;
+    expect(date.type).toBe("date");
+    // 手工改日期会覆盖快捷值
+    fireEvent.change(date, { target: { value: "2025-01-01" } });
+    expect(useSuperSearchStore.getState().expr).toEqual({ op: "leaf", cond: { type: "metadata", filter: { key: "taken_at", op: "gte", value: new Date("2025-01-01T00:00:00").getTime() } } });
   });
 });
