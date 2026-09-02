@@ -389,6 +389,165 @@ pub fn set_suggestion_result_typed(
     Ok(())
 }
 
+/// A4：AI 结果写入的自动化边界（「按词是否已在词表」而非 confidence 高低）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConfidencePolicy {
+    /// confidence < 此值不入库（连 pending 都不进）；默认 0.30
+    pub min_suggest: f64,
+    /// 精确命中词表 canonical/synonym → 自动接收（写 asset_tags，review_state='ai_unreviewed'）
+    pub auto_accept_exact_terms: bool,
+    /// AI 直接向词表建新词（显式开关，默认关 —— 新词一律 pending/「新词待确认」）
+    pub auto_adopt_new_terms: bool,
+}
+
+impl Default for ConfidencePolicy {
+    fn default() -> Self {
+        Self {
+            min_suggest: 0.30,
+            auto_accept_exact_terms: true,
+            auto_adopt_new_terms: false,
+        }
+    }
+}
+
+/// A4：带策略的结果写入（runner 用，取代无策略的 set_suggestion_result_typed）。
+///  - confidence < min_suggest → 不入库（连 pending 都不进，suggested_tags 同步剔除）
+///  - 精确命中 canonical/synonym：auto_accept_exact_terms → decision='accepted'
+///     并写 asset_tags（review_state='ai_unreviewed'，A3 状态机兜底）；否则 pending
+///  - 近似命中 → pending + decision_reason（F6-b 只提示，绝不自动改写）
+///  - 完全新词 → pending；auto_adopt_new_terms 开启才 find_or_create + accepted + 写 asset_tags
+/// 永不因 confidence 高就自动建词（LLM 自报置信度不具校准意义）。
+pub fn set_suggestion_result_policy(
+    conn: &Connection,
+    id: i64,
+    tags: &CategorizedTags,
+    proposals: &[TagProposal],
+    description: &str,
+    policy: &ConfidencePolicy,
+) -> AppResult<()> {
+    // 建议 → asset + 批次 mode（source 随批次：cloud → ai_cloud，local → ai_local）
+    let (asset_id, batch_id, mode): (i64, i64, String) = conn.query_row(
+        "SELECT s.asset_id, s.batch_id, b.mode FROM ai_suggestions s
+         JOIN ai_batches b ON b.id = s.batch_id WHERE s.id = ?1",
+        [id],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )?;
+    let source = match mode.as_str() {
+        "manual" => "manual",
+        "cloud" => "ai_cloud",
+        _ => "ai_local",
+    };
+
+    // 先按阈值裁剪：低置信词既不入库也不留在 suggested_tags（确认全部不会复活它）
+    let filtered_tags: CategorizedTags = {
+        let mut out: CategorizedTags = CategorizedTags::new();
+        for (category, names) in tags {
+            let mut kept = Vec::new();
+            'names: for n in names {
+                for p in proposals {
+                    let below = p.confidence.map(|c| (c as f64) < policy.min_suggest).unwrap_or(false);
+                    if below && p.raw_name.trim() == n.trim() {
+                        continue 'names;
+                    }
+                }
+                kept.push(n.clone());
+            }
+            if !kept.is_empty() {
+                out.insert(category.clone(), kept);
+            }
+        }
+        out
+    };
+    conn.execute(
+        "UPDATE ai_suggestions SET suggested_tags = ?1 WHERE id = ?2",
+        rusqlite::params![serde_json::to_string(&filtered_tags)?, id],
+    )?;
+    conn.execute(
+        "DELETE FROM ai_suggestion_items WHERE suggestion_id = ?1",
+        [id],
+    )?;
+    conn.execute(
+        "UPDATE ai_suggestions SET suggested_description = ?1 WHERE id = ?2",
+        rusqlite::params![description, id],
+    )?;
+
+    let now = chrono::Utc::now().timestamp_millis();
+    // 自动接收（accepted）的词统一收口写 asset_tags（ai_unreviewed）；去重
+    let mut auto_apply: Vec<(String, String, i64)> = Vec::new(); // (facet, name, tag_id)
+    for p in proposals {
+        let raw = p.raw_name.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        let normalized = tags::normalize_name(raw);
+        let low_conf = p.confidence.map(|c| (c as f64) < policy.min_suggest).unwrap_or(false);
+        if low_conf {
+            continue; // 低置信：不入库（连 pending 都不进）
+        }
+        let mut decision_reason: Option<String> = None;
+        // F3-a：精确反查（canonical/synonym 命中 → tag_id Some）
+        let mut tag_id: Option<i64> = tags::find_by_term(conn, &p.facet_key, &normalized, tags::TermMatch::Alias)
+            .ok()
+            .and_then(|l| l.hits.into_iter().next())
+            .map(|h| h.tag_id);
+        // 近似命中：只提示不自动改写（F6-b）
+        if tag_id.is_none() {
+            if let Some((_, owner, reason)) = tags::find_similar_tag(conn, &p.facet_key, &normalized)? {
+                decision_reason = Some(match reason {
+                    tags::SimilarReason::Substring => format!("疑似与「{owner}」重复"),
+                    tags::SimilarReason::Spell => format!("拼写相近：「{owner}」"),
+                });
+            }
+        }
+        let confidence = p.confidence.map(|c| c as f64);
+        // 决策：精确命中 → 自动接收开关；完全新词 → auto_adopt_new_terms 才真建词
+        let (decision, accepted): (String, bool) = match (tag_id, decision_reason.as_ref()) {
+            (Some(_), _) => {
+                if policy.auto_accept_exact_terms {
+                    ("accepted".to_string(), true)
+                } else {
+                    ("pending".to_string(), false)
+                }
+            }
+            // 近似命中（有 reason 无 tag_id）→ pending
+            (None, Some(_)) => ("pending".to_string(), false),
+            // 完全新词
+            (None, None) => {
+                if policy.auto_adopt_new_terms {
+                    tag_id = Some(tags::find_or_create_canonical(conn, &p.facet_key, raw)?);
+                    ("accepted".to_string(), true)
+                } else {
+                    ("pending".to_string(), false)
+                }
+            }
+        };
+        if accepted {
+            if let Some(tid) = tag_id {
+                auto_apply.push((p.facet_key.clone(), raw.to_string(), tid));
+            }
+        }
+        conn.execute(
+            "INSERT INTO ai_suggestion_items
+             (suggestion_id, facet_key, raw_name, normalized_name, tag_id, confidence, decision, decision_reason, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params![
+                id, p.facet_key, raw, normalized, tag_id, confidence, decision, decision_reason, now
+            ],
+        )?;
+    }
+    // 自动接收 → asset_tags（ai_unreviewed；INSERT OR IGNORE + 不覆盖 manual，A3 语义兜底）
+    if !auto_apply.is_empty() {
+        let mut tag_ids: Vec<i64> = Vec::new();
+        for (_, _, tid) in &auto_apply {
+            if !tag_ids.contains(tid) {
+                tag_ids.push(*tid);
+            }
+        }
+        asset_tags::assign_inner(conn, &[asset_id], &tag_ids, source, Some(batch_id))?;
+    }
+    Ok(())
+}
+
 /// A2：逐字写模型原始返回 + AnalysisResult 序列化（溯源；analysis_schema_version 恒 1，
 /// 旧行/旧版本默认 1，schema_version_allows_old_data 守护兼容）。
 pub fn set_suggestion_provenance(

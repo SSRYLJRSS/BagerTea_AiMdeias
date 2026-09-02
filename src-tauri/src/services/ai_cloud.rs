@@ -1605,6 +1605,12 @@ pub fn run_cloud_batch<F: Fn(AiProgress)>(
     let mut consecutive_failures = 0u32;
     // A2：批次级请求溯源只写一次（取本批首个成功请求的配置；视频帧合并不携带配置，等待后续成功项）
     let mut batch_config_written = false;
+    // A4：置信度策略（读设置；默认 = 指导书：min 0.30 / 精确命中自动接收 / 绝不自动建词）
+    let policy = ai::ConfidencePolicy {
+        min_suggest: cfg.confidence_min_suggest,
+        auto_accept_exact_terms: cfg.auto_accept_exact_terms,
+        auto_adopt_new_terms: cfg.auto_adopt_new_terms,
+    };
     for chunk in todo.chunks(chunk_size) {
         for s in chunk {
             if cancel.load(Ordering::Relaxed) {
@@ -1628,8 +1634,16 @@ pub fn run_cloud_batch<F: Fn(AiProgress)>(
                     Ok(a) => {
                         // W5a（a12）：成功清零连续失败计数（单条内的退避重试不计入熔断）
                         consecutive_failures = 0;
-                        // A1：typed 写建议（confidence 经 proposals 落库）
-                        ai::set_suggestion_result_typed(&conn, s.id, &a.tags, &a.proposals, &a.description)?;
+                        // A1/A4：typed 写建议（confidence 经 proposals 落库；精确命中按策略
+                        // 自动接收写 asset_tags(ai_unreviewed)，新词/近似词走 pending）
+                        ai::set_suggestion_result_policy(
+                            &conn,
+                            s.id,
+                            &a.tags,
+                            &a.proposals,
+                            &a.description,
+                            &policy,
+                        )?;
                         // A2：逐字存模型原始返回 + AnalysisResult 序列化（analysis_schema_version 恒 1）
                         ai::set_suggestion_provenance(
                             &conn,

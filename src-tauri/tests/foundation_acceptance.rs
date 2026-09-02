@@ -1664,3 +1664,130 @@ fn undo_batch_respects_review_state() {
     // D-4：重复撤销幂等返回 0
     assert_eq!(tag_ops::undo_batch(&c, sug.batch_id).unwrap(), 0);
 }
+
+// ═══════════════ A4：置信度策略（按词表而非 confidence 高低决定自动化程度） ═══════════════
+
+/// A4：精确命中词表 canonical → auto_accept_exact_terms（默认开）自动接收：
+/// item decision='accepted' + 写 asset_tags（review_state='ai_unreviewed'，A3 状态机兜底）。
+#[test]
+fn exact_term_auto_accepted() {
+    use bagertea_ai_media_v2_lib::db::ai::ConfidencePolicy;
+    let c = mem();
+    enable_terms(&c);
+    // feature 开时 create_in_facet 会把 canonical 词写进 tag_terms → 精确命中成立
+    let tag = tags::create_in_facet(&c, "海边", None, Some("scene")).unwrap();
+    let sug = f6_one_suggestion(&c);
+    let tags_map = ai::CategorizedTags::from([("scene".to_string(), vec!["海边".to_string()])]);
+    let proposals = vec![ai::TagProposal {
+        facet_key: "scene".into(),
+        raw_name: "海边".into(),
+        confidence: Some(0.9),
+    }];
+    ai::set_suggestion_result_policy(&c, sug.id, &tags_map, &proposals, "", &ConfidencePolicy::default())
+        .unwrap();
+    let items = ai::list_suggestion_items(&c, sug.id).unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].decision, "accepted", "精确命中应自动接收");
+    assert_eq!(items[0].tag_id, Some(tag.id));
+    // 自动接收 → asset_tags ai_unreviewed（source = ai_cloud + 批次溯源）
+    let (rs, src, sb): (String, String, Option<i64>) = c
+        .query_row(
+            "SELECT review_state, source, source_batch_id FROM asset_tags WHERE asset_id=?1 AND tag_id=?2",
+            rusqlite::params![sug.asset_id, tag.id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(rs, "ai_unreviewed", "自动接收的行保持未审核态，等用户确认升级");
+    assert_eq!(src, "ai_cloud");
+    assert_eq!(sb, Some(sug.batch_id));
+}
+
+/// A4：完全新词 → 只进 pending（不进 tags、不建词、不写 asset_tags）；自动建词默认关。
+#[test]
+fn new_term_goes_to_pending() {
+    use bagertea_ai_media_v2_lib::db::ai::ConfidencePolicy;
+    let c = mem();
+    let sug = f6_one_suggestion(&c);
+    let tags_map = ai::CategorizedTags::from([("scene".to_string(), vec!["太空漫步".to_string()])]);
+    let proposals = vec![ai::TagProposal {
+        facet_key: "scene".into(),
+        raw_name: "太空漫步".into(),
+        confidence: Some(0.8),
+    }];
+    ai::set_suggestion_result_policy(&c, sug.id, &tags_map, &proposals, "", &ConfidencePolicy::default())
+        .unwrap();
+    let items = ai::list_suggestion_items(&c, sug.id).unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].decision, "pending", "新词绝不自动建词");
+    assert!(items[0].tag_id.is_none(), "未采纳前 tag_id 保持 NULL");
+    let n: i64 = c
+        .query_row(
+            "SELECT COUNT(*) FROM tags WHERE name='太空漫步'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(n, 0, "新词不得被自动写进 tags");
+    let at: i64 = c
+        .query_row(
+            "SELECT COUNT(*) FROM asset_tags WHERE asset_id=?1",
+            [sug.asset_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(at, 0, "pending 词不得写 asset_tags");
+}
+
+/// A4：confidence < min_suggest（0.30）→ 不入库（连 pending 都不进），
+/// suggested_tags 同步剔除（「确认全部」不会复活低置信词）。
+#[test]
+fn low_confidence_dropped_entirely() {
+    use bagertea_ai_media_v2_lib::db::ai::ConfidencePolicy;
+    let c = mem();
+    let sug = f6_one_suggestion(&c);
+    let tags_map = ai::CategorizedTags::from([("scene".to_string(), vec!["低可信词".to_string()])]);
+    let proposals = vec![ai::TagProposal {
+        facet_key: "scene".into(),
+        raw_name: "低可信词".into(),
+        confidence: Some(0.1),
+    }];
+    ai::set_suggestion_result_policy(&c, sug.id, &tags_map, &proposals, "", &ConfidencePolicy::default())
+        .unwrap();
+    assert_eq!(
+        ai::list_suggestion_items(&c, sug.id).unwrap().len(),
+        0,
+        "低置信词连 pending 都不进"
+    );
+    let raw: String = c
+        .query_row(
+            "SELECT suggested_tags FROM ai_suggestions WHERE id=?1",
+            [sug.id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(!raw.contains("低可信词"), "suggested_tags 应剔除低置信词: {raw}");
+    let at: i64 = c
+        .query_row(
+            "SELECT COUNT(*) FROM asset_tags WHERE asset_id=?1",
+            [sug.asset_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(at, 0);
+}
+
+/// A4：显式开关 auto_adopt_new_terms 默认关（策略对象与设置对象同构缺省）。
+#[test]
+fn auto_adopt_off_by_default() {
+    use bagertea_ai_media_v2_lib::db::ai::ConfidencePolicy;
+    use bagertea_ai_media_v2_lib::db::settings::AiSettings;
+    let p = ConfidencePolicy::default();
+    assert!(!p.auto_adopt_new_terms, "AI 自动向词表建新词必须默认关");
+    assert!(p.auto_accept_exact_terms, "精确命中自动接收默认开");
+    assert!((p.min_suggest - 0.30).abs() < 1e-9, "min_suggest 默认 0.30");
+    // 设置对象缺省与默认策略一致（settings JSON 缺字段 → 同上默认）
+    let s = AiSettings::default();
+    assert!(!s.auto_adopt_new_terms);
+    assert!(s.auto_accept_exact_terms);
+    assert!((s.confidence_min_suggest - 0.30).abs() < 1e-9);
+}

@@ -162,6 +162,9 @@ fn settings_with(profile: ApiProfile) -> AiSettings {
         ollama_source_id: "auto".into(),
         system_prompt_tagging: String::new(),
         system_prompt_search: String::new(),
+        auto_accept_exact_terms: true,
+        auto_adopt_new_terms: false,
+        confidence_min_suggest: 0.30,
     }
 }
 

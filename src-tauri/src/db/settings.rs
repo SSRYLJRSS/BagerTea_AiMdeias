@@ -98,6 +98,16 @@ pub struct AiSettings {
     /// 超级搜索提示词覆盖（用户可自行修改；空 = 用内置默认）
     #[serde(default)]
     pub system_prompt_search: String,
+    // ── A4 置信度策略（默认与指导书一致；U 波次补设置页 UI 与风险措辞）──
+    /// 精确命中词表 canonical/synonym → 自动接收（写 asset_tags，review_state='ai_unreviewed'）
+    #[serde(default = "default_true")]
+    pub auto_accept_exact_terms: bool,
+    /// AI 直接向词表添加新标签（显式开关，默认关 —— 新词走「新词待确认」逐个采纳）
+    #[serde(default)]
+    pub auto_adopt_new_terms: bool,
+    /// AI 建议最低置信度阈值：confidence < 此值不入库（连 pending 都不进）；默认 0.30
+    #[serde(default = "default_conf_min_suggest")]
+    pub confidence_min_suggest: f64,
 }
 
 impl AiSettings {
@@ -152,6 +162,9 @@ impl AiSettings {
 
 fn default_api_mode() -> String {
     "openai".into()
+}
+fn default_conf_min_suggest() -> f64 {
+    0.30
 }
 fn default_ollama_source_id() -> String {
     "auto".into()
@@ -235,6 +248,9 @@ impl Default for AiSettings {
             ollama_source_id: default_ollama_source_id(),
             system_prompt_tagging: String::new(),
             system_prompt_search: String::new(),
+            auto_accept_exact_terms: true,
+            auto_adopt_new_terms: false,
+            confidence_min_suggest: 0.30,
         }
     }
 }
