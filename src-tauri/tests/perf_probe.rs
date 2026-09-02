@@ -6,15 +6,23 @@ use std::time::Instant;
 
 use bagertea_ai_media_v2_lib::services::imaging;
 
+/// R2-5：真实样本目录不再硬编码机器路径 —— 一律经环境变量注入；
+/// 未设置时落到临时目录（不存在 → 各探针自检后优雅跳过）。
+fn sample_dir() -> std::path::PathBuf {
+    std::env::var_os("IMG_SAMPLE_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("chabaosucai_samples"))
+}
+
 #[test]
 #[ignore = "手动性能探针"]
 fn probe_real_files() {
     let cases = [
-        (r"F:\pictures\20260726\_1091370.JPG", "相机 JPG"),
-        (r"F:\pictures\20260726\_1091370.RW2", "松下 RW2"),
+        (sample_dir().join("_1091370.JPG"), "相机 JPG"),
+        (sample_dir().join("_1091370.RW2"), "松下 RW2"),
     ];
     for (path, label) in cases {
-        let p = Path::new(path);
+        let p = path.as_path();
         if !p.exists() {
             println!("{label}: 文件不存在，跳过");
             continue;
@@ -59,7 +67,7 @@ fn probe_real_files() {
 #[test]
 #[ignore = "手动诊断"]
 fn probe_exif_error() {
-    let p = r"F:\pictures\20260726\_1091370.JPG";
+    let p = sample_dir().join("_1091370.JPG");
     let f = std::fs::File::open(p).unwrap();
     match exif::Reader::new().read_from_container(&mut std::io::BufReader::new(f)) {
         Ok(ex) => {
@@ -90,7 +98,8 @@ fn probe_exif_error() {
 #[ignore = "手动性能探针（需真实 RAW 样本目录）"]
 fn probe_raw_benchmark() {
     let dir = std::path::PathBuf::from(
-        std::env::var("RAW_SAMPLES_DIR").unwrap_or_else(|_| r"F:\raw_samples".into()),
+        // R2-5：样本目录经 RAW_SAMPLES_DIR 注入；未设置 → 空目录自检跳过
+        std::env::var("RAW_SAMPLES_DIR").unwrap_or_default(),
     );
     if !dir.exists() {
         println!("RAW_BENCH 样本目录不存在: {dir:?}（设 RAW_SAMPLES_DIR 指向真实 RAW 目录后再跑）");
@@ -209,7 +218,7 @@ fn probe_mixed_decode_throughput() {
 #[test]
 #[ignore = "手动性能探针（需真实样本）"]
 fn probe_raw_library_walk() {
-    let dir = Path::new(r"F:\pictures\20260726");
+    let dir = sample_dir();
     if !dir.exists() {
         println!("样本目录不存在: {dir:?}，请老板提供 RW2/CR3/NEF/ARW/HEIC 后再跑");
         return;
@@ -252,7 +261,6 @@ fn probe_raw_library_walk() {
 
 /// 深分页：3 万素材 + 复杂布尔表达式的深翻页耗时（① S6：COUNT + LIMIT/OFFSET 成本随页深增长）
 #[test]
-#[ignore = "手动性能探针"]
 fn probe_deep_pagination() {
     use bagertea_ai_media_v2_lib::db::{self, assets};
     let conn = db::init_memory().unwrap();
@@ -286,7 +294,6 @@ fn probe_deep_pagination() {
 
 /// phash 相似扫描：3 万行分桶 + 汉明比较耗时（验证「毫秒级」断言）
 #[test]
-#[ignore = "手动性能探针"]
 fn probe_phash_scan_30k() {
     use bagertea_ai_media_v2_lib::db::{self, assets, dedup};
     let conn = db::init_memory().unwrap();
@@ -315,7 +322,7 @@ fn probe_phash_scan_30k() {
 #[test]
 #[ignore = "手动性能探针"]
 fn probe_raw_dimension_walk() {
-    let dir = Path::new(r"F:\pictures\20260726");
+    let dir = sample_dir();
     if !dir.is_dir() {
         println!("RAW 目录不存在，跳过");
         return;
@@ -345,7 +352,6 @@ fn probe_raw_dimension_walk() {
 
 /// 提示词 token 量级：W5a 后 system + user 实际字符数（近似 token ≈ 字符数，中文 1 字 ≈ 1 token）
 #[test]
-#[ignore = "手动性能探针"]
 fn probe_prompt_size() {
     use bagertea_ai_media_v2_lib::db::{self, tag_facets};
     let conn = db::init_memory().unwrap();
