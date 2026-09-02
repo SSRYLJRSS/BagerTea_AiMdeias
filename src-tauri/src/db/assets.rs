@@ -131,6 +131,41 @@ pub struct PaletteStatus {
     pub unavailable: i64,
 }
 
+/// C-1：从 palette_json 全量重建 asset_palette_colors（回填命令的数据层）。
+/// 单事务：清空 → 遍历非空 palette（rank = 数组下标）→ rgb→桶插行。
+/// 幂等可重复执行；返回写入行数。
+pub fn rescan_palette_colors(conn: &Connection) -> AppResult<i64> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute("DELETE FROM asset_palette_colors", [])?;
+    let rows: Vec<(i64, Option<String>)> = {
+        let mut stmt = tx.prepare(
+            "SELECT id, palette_json FROM assets WHERE deleted_at IS NULL",
+        )?;
+        let r = stmt
+            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?)))?
+            .filter_map(|r| r.ok())
+            .collect();
+        r
+    };
+    let mut written: i64 = 0;
+    let mut stmt = tx.prepare(
+        "INSERT INTO asset_palette_colors (asset_id, rank, color_bucket, ratio)
+         VALUES (?1, ?2, ?3, ?4)",
+    )?;
+    for (id, raw) in rows {
+        let Some(segments) = parse_palette_json(raw) else { continue };
+        for (rank, seg) in segments.into_iter().enumerate() {
+            let (bucket, _name) =
+                crate::db::palette_bucket::bucket_of_rgb(seg.r, seg.g, seg.b);
+            stmt.execute(rusqlite::params![id, rank as i64, bucket, seg.ratio as f64])?;
+            written += 1;
+        }
+    }
+    drop(stmt);
+    tx.commit()?;
+    Ok(written)
+}
+
 /// FB4-03（§5.5）：轻量色板补丁 —— 只同步色板相关字段，不返回文件路径/标签/缩略图等无关字段。
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]

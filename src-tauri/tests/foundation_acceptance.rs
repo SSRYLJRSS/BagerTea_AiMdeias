@@ -2148,3 +2148,116 @@ fn create_batch_reports_merged_groups() {
     let b2 = ai::create_batch(&c, &[solo], "cloud").unwrap();
     assert_eq!(b2.merged_groups, 0);
 }
+
+// ═══════════════ C-1：色板关系表（V23 asset_palette_colors） ═══════════════
+
+fn c1_palette_json(segs: &[(u8, u8, u8, f32)]) -> String {
+    let arr: Vec<serde_json::Value> = segs
+        .iter()
+        .map(|(r, g, b, ratio)| {
+            serde_json::json!({"hex":"#000000","r":r,"g":g,"b":b,"ratio":ratio})
+        })
+        .collect();
+    serde_json::to_string(&arr).unwrap()
+}
+
+fn c1_set_palette(c: &rusqlite::Connection, id: i64, json: &str) {
+    c.execute(
+        "UPDATE assets SET palette_json = ?1 WHERE id = ?2",
+        rusqlite::params![json, id],
+    )
+    .unwrap();
+}
+
+/// C-1：ratio 阈值表达力（字符串列方案做不到）—— rank0 红占比 >0.2 命中。
+#[test]
+fn palette_ratio_threshold_works() {
+    let c = mem();
+    let a = f4_insert_asset(&c, "d:/c1_red.jpg");
+    c1_set_palette(&c, a, &c1_palette_json(&[(224, 32, 32, 0.6), (32, 32, 224, 0.3)]));
+    let n = assets::rescan_palette_colors(&c).unwrap();
+    assert!(n >= 2, "应写入主色+次色行：{n}");
+    let hits: i64 = c
+        .query_row(
+            "SELECT COUNT(*) FROM asset_palette_colors WHERE asset_id=?1 AND color_bucket=0 AND rank=0 AND ratio>0.2",
+            [a],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(hits, 1, "主色红占比 0.6 → ratio>0.2 命中");
+}
+
+/// C-1：前三色查询走覆盖索引 ix_apc_bucket（SEARCH，不是 SCAN）。
+#[test]
+fn palette_top3_query_uses_index() {
+    let c = mem();
+    let a = f4_insert_asset(&c, "d:/c1_idx.jpg");
+    c1_set_palette(&c, a, &c1_palette_json(&[(224, 32, 32, 0.6)]));
+    assets::rescan_palette_colors(&c).unwrap();
+    let plan: String = c
+        .query_row(
+            "EXPLAIN QUERY PLAN SELECT asset_id FROM asset_palette_colors
+              WHERE color_bucket = 0 AND rank < 3",
+            [],
+            |r| r.get(3),
+        )
+        .unwrap();
+    assert!(plan.contains("SEARCH"), "前三色查询必须走索引：{plan}");
+    assert!(!plan.contains("SCAN"), "不得全表扫：{plan}");
+}
+
+/// C-1：同时含红和蓝（前三色）→ INTERSECT 表达；metadata key palette_top3 in [红,蓝] 编译一致。
+#[test]
+fn palette_intersect_two_colors() {
+    use bagertea_ai_media_v2_lib::db::search_query::{compile_metadata, MetadataFilter};
+    let c = mem();
+    let a = f4_insert_asset(&c, "d:/c1_ab.jpg");
+    let b = f4_insert_asset(&c, "d:/c1_b.jpg");
+    // A 前三色含红+蓝；B 只含红
+    c1_set_palette(&c, a, &c1_palette_json(&[(224, 32, 32, 0.5), (100, 20, 255, 0.4)]));
+    c1_set_palette(&c, b, &c1_palette_json(&[(224, 32, 32, 0.8)]));
+    assets::rescan_palette_colors(&c).unwrap();
+    let both: Vec<i64> = c
+        .prepare(
+            "SELECT asset_id FROM asset_palette_colors WHERE color_bucket=0 AND rank<3
+             INTERSECT
+             SELECT asset_id FROM asset_palette_colors WHERE color_bucket=8 AND rank<3",
+        )
+        .unwrap()
+        .query_map([], |r| r.get::<_, i64>(0))
+        .unwrap()
+        .filter_map(|r| r.ok())
+        .collect();
+    assert!(both.contains(&a) && !both.contains(&b), "交集应只有 A：{both:?}");
+    // 编译层：palette_top3 in [红,蓝] → EXISTS(IN(0,8) AND rank<3)，经 list 端到端命中 A
+    let f_red = MetadataFilter {
+        key: "palette_top3".into(),
+        op: "eq".into(),
+        value: Some(serde_json::json!("红")),
+        values: None,
+        min: None,
+        max: None,
+    };
+    let f_blue = MetadataFilter {
+        key: "palette_top3".into(),
+        op: "eq".into(),
+        value: Some(serde_json::json!("蓝")),
+        values: None,
+        min: None,
+        max: None,
+    };
+    let compiled = compile_metadata(&f_red).unwrap().expect("palette_top3 可编译");
+    assert!(
+        compiled.sql.contains("rank < 3") && compiled.sql.contains("color_bucket IN (?1)"),
+        "{}",
+        compiled.sql
+    );
+    // 红 AND 蓝（两个 EXISTS 条件）→ 只有 A（与 INTERSECT 语义一致）
+    let filter = assets::AssetFilter {
+        metadata_filters: vec![f_red, f_blue],
+        ..Default::default()
+    };
+    let page = assets::list(&c, &filter).unwrap();
+    let ids: Vec<i64> = page.items.iter().map(|x| x.id).collect();
+    assert_eq!(ids, vec![a], "红∩蓝（前三色）应只有 A：{ids:?}");
+}

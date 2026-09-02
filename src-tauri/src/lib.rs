@@ -275,6 +275,7 @@ pub fn run() {
             commands::cancel_media_refill,
             // FB2-08：算法色板回算（独立的 rescan_*）
             commands::rescan_asset_palette,
+            commands::rescan_palette_colors,
             // V18：GPS 定位 + 视频拍摄时间存量回填（独立的 rescan_*）
             commands::rescan_asset_geo_taken,
             // W1-4：图片宽高存量回填（RAW 分辨率修复）

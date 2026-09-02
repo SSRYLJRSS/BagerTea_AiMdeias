@@ -72,6 +72,10 @@ pub const ALL_METADATA_KEYS: &[&str] = &[
     "created_at",
     "modified_at",
     "folder",
+    // C-1：色板关系表三个 rank 范围 key（值 = 折叠色名，eq/in）
+    "palette_dominant",
+    "palette_top3",
+    "palette_any",
 ];
 
 /// S0：排序字段白名单**单一事实源**。assets.rs `VALID_SORT` / AI 侧
@@ -145,6 +149,11 @@ fn key_spec(key: &str) -> Option<KeySpec> {
             kind: ValueKind::String,
             null_guard: None,
         },
+        // C-1：色板桶（EXISTS 子查询编译，值 = 折叠色名；此处仅 String kind 声明）
+        "palette_dominant" | "palette_top3" | "palette_any" => KeySpec {
+            kind: ValueKind::String,
+            null_guard: None,
+        },
         // W2-8：评级（0–5；0 = 未评级）。INTEGER 列自带 0 默认值，非 NULL 语义。
         "rating" => KeySpec {
             kind: ValueKind::Number,
@@ -180,6 +189,7 @@ fn allowed_ops(key: &str) -> &'static [&'static str] {
             &["eq", "in", "gt", "gte", "lt", "lte", "between"]
         }
         "has_location" => &["eq", "in"],
+        "palette_dominant" | "palette_top3" | "palette_any" => &["eq", "in"],
         // W2-8：评级数值比较 + 收藏有无
         "rating" => &["eq", "in", "gt", "gte", "lt", "lte", "between"],
         "favorite" => &["eq", "in"],
@@ -277,6 +287,76 @@ fn next_day_ms(s: &str) -> AppResult<i64> {
 /// 校验并编译单个元数据条件。校验失败返回 AppError。
 /// R2-2：量纲可疑区间的人话提示（不报错 —— 手填 100 字节是合法的，但值得点一句）。
 /// 把「静默 0 结果」变成「0 结果 + 一句人话」。只对数值型键的单值/min/max 生效。
+/// C-1：palette_* 编译为对 asset_palette_colors 的 EXISTS（值 = 折叠色名 → 桶 id）。
+/// - palette_dominant → rank=0；palette_top3 → rank<3；palette_any → 不限 rank。
+/// 实测关系表覆盖索引（ix_apc_bucket）；like/字符串列是 SCAN，故不用。
+fn compile_palette_meta(f: &MetadataFilter) -> AppResult<Option<CompiledMetadata>> {
+    let rank_sql = match f.key.as_str() {
+        "palette_dominant" => Some(" AND apc.rank = 0"),
+        "palette_top3" => Some(" AND apc.rank < 3"),
+        "palette_any" => None,
+        _ => return Ok(None),
+    };
+    let rank_sql = match rank_sql {
+        Some(x) => x,
+        None => return Ok(None), // 非 palette key
+    };
+    let names: Vec<String> = match f.op.as_str() {
+        "eq" => {
+            let Some(v) = f.value.as_ref() else {
+                return Err(AppError::msg("palette 等值条件缺少 value"));
+            };
+            match v {
+                serde_json::Value::String(s) => vec![s.clone()],
+                serde_json::Value::Array(a) => a
+                    .iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect(),
+                _ => return Err(AppError::msg("palette 等值条件值必须是色名")),
+            }
+        }
+        "in" => {
+            let mut out = Vec::new();
+            if let Some(v) = f.value.as_ref() {
+                if let Some(x) = v.as_str() {
+                    out.push(x.to_string());
+                }
+            }
+            if let Some(arr) = f.values.as_ref() {
+                for x in arr {
+                    if let Some(x) = x.as_str() {
+                        out.push(x.to_string());
+                    }
+                }
+            }
+            if out.is_empty() {
+                return Err(AppError::msg("palette in 条件缺少 values"));
+            }
+            out
+        }
+        _ => return Err(AppError::msg(format!("色板 key 不支持操作符：{}", f.op))),
+    };
+    let mut ids: Vec<rusqlite::types::Value> = Vec::new();
+    for name in names {
+        let id = crate::db::palette_bucket::bucket_id_of_name(&name).ok_or_else(|| {
+            AppError::msg(format!("未知色名：{name}（可用：红/橙/黄/黄绿/绿/青绿/青/天蓝/蓝/紫/品红/玫红/黑/灰/白）"))
+        })?;
+        ids.push(id.into());
+    }
+    let ph = ids
+        .iter()
+        .enumerate()
+        .map(|(i, _)| format!("?{}", i + 1))
+        .collect::<Vec<_>>()
+        .join(",");
+    Ok(Some(CompiledMetadata {
+        sql: format!(
+            "EXISTS (SELECT 1 FROM asset_palette_colors apc WHERE apc.asset_id = a.id AND apc.color_bucket IN ({ph}){rank_sql})"
+        ),
+        params: ids,
+    }))
+}
+
 pub fn dimension_warnings(f: &MetadataFilter) -> Vec<String> {
     let mut out = Vec::new();
     let num = |v: &serde_json::Value| -> Option<f64> {
@@ -327,6 +407,10 @@ pub fn compile_metadata(f: &MetadataFilter) -> AppResult<Option<CompiledMetadata
         )));
     }
 
+    // C-1：色板 key 走专用 EXISTS 编译（非列比较）
+    if let Some(c) = compile_palette_meta(f)? {
+        return Ok(Some(c));
+    }
     // 值校验按 kind 分支
     match spec.kind {
         ValueKind::String => compile_string(f, &spec, ops),

@@ -145,6 +145,24 @@ pub async fn rescan_asset_palette(
     .map_err(|e| AppError::msg(format!("色板回算线程异常: {e}")))?
 }
 
+/// C-1：从 palette_json 全量重建 asset_palette_colors（不解码图片，毫秒级；幂等）。
+/// 照抄 rescan_asset_palette 的具名后台线程骨架（本命令轻量，无进度事件仍走 spawn_blocking）。
+#[tauri::command]
+pub async fn rescan_palette_colors(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> AppResult<i64> {
+    let db = Arc::clone(&state.db);
+    tauri::async_runtime::spawn_blocking(move || -> AppResult<i64> {
+        let conn = db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
+        let n = assets::rescan_palette_colors(&conn)?;
+        let _ = app.emit("palette_colors://done", n);
+        Ok(n)
+    })
+    .await
+    .map_err(|e| AppError::msg(format!("色板关系表重建线程异常: {e}")))?
+}
+
 /// V18：GPS 定位 + 视频拍摄时间存量回填（scope = all | missing | ids）。
 /// 独立命令：语义与媒体元数据回填/色板回算都不同，且视频优先解析已存 ffprobe JSON，
 /// 大部分情况免拉子进程，单独跑成本低。只补空（COALESCE），不覆盖已有值。

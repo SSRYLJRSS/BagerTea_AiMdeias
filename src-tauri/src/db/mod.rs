@@ -8,6 +8,7 @@ pub mod backup;
 pub mod dedup;
 pub mod export;
 pub mod migrations;
+pub mod palette_bucket;
 pub mod query_expr;
 pub mod reset;
 pub mod schema_features;

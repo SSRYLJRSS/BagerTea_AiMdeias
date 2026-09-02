@@ -57,3 +57,42 @@ describe("colorNameZh", () => {
     }
   });
 });
+// ── C-1：与 db/palette_bucket.rs 锁同一张 fixture 表（同一 (h,s,l) 两侧同断言）──
+// 折叠规则与 Rust 一致：剥离 深/浅 前缀；深灰/浅灰 → 灰（色板桶只有 12 色块 + 黑/灰/白）。
+function collapseZh(name: string): string {
+  const base = name.startsWith("深") || name.startsWith("浅") ? name.slice(1) : name;
+  if (base === "深灰" || base === "浅灰") return "灰";
+  return base;
+}
+
+describe("palette_bucket_matches_colorname_ts (C-1 交叉锁)", () => {
+  // (hue, sat, lum, 折叠后桶名) —— Rust 侧 palette_bucket.rs 同表断言
+  const cases: Array<[number, number, number, string]> = [
+    [7, 80, 50, "红"],
+    [30, 80, 50, "橙"],
+    [55, 80, 50, "黄"],
+    [80, 80, 50, "黄绿"],
+    [120, 80, 50, "绿"],
+    [170, 80, 50, "青绿"],
+    [210, 80, 50, "青"],
+    [240, 80, 50, "天蓝"],
+    [285, 80, 50, "蓝"],
+    [305, 80, 50, "紫"],
+    [335, 80, 50, "品红"],
+    [350, 80, 50, "玫红"],
+    [200, 0, 10, "黑"],
+    [200, 3, 50, "灰"],
+    [200, 5, 95, "白"],
+  ];
+  it("15 桶与 Rust 侧一致", () => {
+    for (const [h, s, l, want] of cases) {
+      expect(collapseZh(colorNameZh(h, s, l))).toBe(want);
+    }
+  });
+  it("深/浅前缀折叠回基色；深灰/浅灰归灰", () => {
+    expect(collapseZh(colorNameZh(270, 80, 10))).toBe("蓝"); // 深蓝 → 蓝
+    expect(collapseZh(colorNameZh(7, 80, 90))).toBe("红"); // 浅红 → 红
+    expect(collapseZh(colorNameZh(200, 2, 30))).toBe("灰"); // 深灰 → 灰
+    expect(collapseZh(colorNameZh(200, 2, 70))).toBe("灰"); // 浅灰 → 灰
+  });
+});

@@ -1714,6 +1714,27 @@ pub fn migrate(conn: &Connection) -> AppResult<()> {
         migrate_v22a(conn)?;
         conn.pragma_update(None, "user_version", 22)?;
     }
+    // V23（C-1）：色板关系表 —— 无条件幂等段（CREATE IF NOT EXISTS），
+    // 不推进 user_version（既有版本号不可改；存量库每次启动自愈补齐）。
+    migrate_v23(conn)?;
+    Ok(())
+}
+
+/// V23（C-1）：色板关系表 —— 色名分桶查询（rank/ratio 是字符串方案表达不了的维度）。
+/// 幂等：CREATE TABLE IF NOT EXISTS。回填由 rescan_palette_colors 命令走 palette_json。
+fn migrate_v23(conn: &Connection) -> AppResult<()> {
+    conn.execute_batch(
+        r#"
+CREATE TABLE IF NOT EXISTS asset_palette_colors (
+  asset_id     INTEGER NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+  rank         INTEGER NOT NULL,        -- 0 = 主色，按 ratio 降序
+  color_bucket INTEGER NOT NULL,        -- 色名分桶，与 colorName.ts 分段一一对应（见 db/palette_bucket.rs）
+  ratio        REAL    NOT NULL,        -- 该色占比 0..1
+  PRIMARY KEY (asset_id, rank)
+);
+CREATE INDEX IF NOT EXISTS ix_apc_bucket ON asset_palette_colors(color_bucket, rank, asset_id);
+"#,
+    )?;
     Ok(())
 }
 
