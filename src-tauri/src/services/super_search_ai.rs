@@ -120,6 +120,154 @@ fn default_text_scope() -> String {
     "all".into()
 }
 
+// ═══════════════ S3：SearchIntentV3 —— preferred 加分项 + evidence 一致性守卫 ═══════════════
+
+/// 概念必要性（V3）。Required = V2 concept 语义（全部进 filter，默认，兼容 V2）；
+/// Preferred = 加分项（最好有/优先…，不进 filter，只影响相关度排序）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Necessity {
+    #[default]
+    Required,
+    Preferred,
+}
+
+/// V3 概念：V2 字段 + necessity/weight/evidence/term_match。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchConceptV3 {
+    pub text: String,
+    #[serde(default)]
+    pub role: String,
+    #[serde(default)]
+    pub facet_hint: Option<String>,
+    #[serde(default)]
+    pub confidence: Option<f32>,
+    /// Required（默认，兼容 V2）| Preferred
+    #[serde(default)]
+    pub necessity: Necessity,
+    /// 只给三档 0.5 / 1.0 / 2.0
+    #[serde(default)]
+    pub weight: Option<f32>,
+    /// 模型对「为什么判为加分」的**原文依据**。守卫用它做一致性校验。
+    #[serde(default)]
+    pub evidence: Option<String>,
+    /// 【S5】词匹配方式（默认 Alias；Prefix/Contains/Fuzzy 只在零结果兜底用）
+    #[serde(default)]
+    pub term_match: crate::db::tags::TermMatch,
+}
+
+/// V3 组：V2 字段语义不变（全部进 filter），新增 `preferred`（加分项 → should）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchGroupV3 {
+    #[serde(default = "default_asset_type")]
+    pub asset_type: String,
+    #[serde(default)]
+    pub concepts: Vec<SearchConceptV3>,
+    #[serde(default)]
+    pub text_terms: Vec<IntentTextTerm>,
+    #[serde(default)]
+    pub metadata: Vec<MetadataFilter>,
+    /// V3 新增：最好有 / 优先 / 尽量 / 更好 … → should（加分，不淘汰）
+    #[serde(default)]
+    pub preferred: Vec<SearchConceptV3>,
+}
+
+/// ③ 兜底用的「强偏好信号词」：只提示不降级。
+/// 注意故意**不含**「可有可无」——那是弱表达，原句只含它时记 info（见指南真值表）。
+pub const CORE_PREF_HINTS: &[&str] = &[
+    "最好", "优先", "尽量", "更好", "倾向", "接近", "偏",
+];
+
+/// S3：preferred 的 evidence 一致性守卫（纯函数；只降级，绝不反向升级）。
+/// ① evidence 必须是原句的**真子串**（trim + 全角/半角 + 大小写归一后比较）——
+///    模型编造依据 → 降级 required + warning（这条最强：要求依据落回原文）。
+/// ② evidence 必须覆盖该 concept 的 text 或其邻域（±8 字窗口，字节安全）——
+///    防止摘一段无关的话当依据。
+/// ③ 兜底信号（只提示不降级）：原句含任一强偏好词则静默；不含 → info warning
+///    「原文未见明显的偏好表述，已按加分项处理（可在下方改为必须）」。
+/// 降级：把条目从 preferred 移到 concepts 且 necessity=Required（依据保留可诊断）。
+pub fn guard_preferred(input: &str, group: &mut SearchGroupV3) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let norm = |s: &str| crate::db::tags::normalize_name(s);
+    let input_n = norm(input);
+    if input_n.is_empty() {
+        return warnings;
+    }
+    let core_hint = CORE_PREF_HINTS.iter().any(|h| input_n.contains(h));
+    // 需要降级回 concepts 的 preferred 下标（倒序移回保序）
+    let mut demote: Vec<usize> = Vec::new();
+    for (i, c) in group.preferred.iter().enumerate() {
+        let text_n = norm(&c.text);
+        if text_n.is_empty() {
+            demote.push(i);
+            continue;
+        }
+        let Some(ev) = c.evidence.as_deref() else {
+            warnings.push(format!(
+                "「{}」被标为加分项但没给出依据，已按必须处理（加分项必须说明依据）。",
+                c.text
+            ));
+            demote.push(i);
+            continue;
+        };
+        let ev_n = norm(ev);
+        // ① 依据必须是原句真子串
+        if ev_n.is_empty() || !input_n.contains(&ev_n) {
+            warnings.push(format!(
+                "「{}」的加分依据未落在原句（不可编造），已按必须处理。",
+                c.text
+            ));
+            demote.push(i);
+            continue;
+        }
+        // ② 依据覆盖 concept 或其 ±8 字邻域
+        let ev_start = input_n.find(&ev_n).unwrap_or(0);
+        let ev_end = ev_start + ev_n.len();
+        let covered = input_n
+            .find(&text_n)
+            .map(|p| {
+                let win_start = p.saturating_sub(24); // ±8 字（中文 3B ≈ 24B）
+                let win_end = (p + text_n.len() + 24).min(input_n.len());
+                ev_start < win_end && ev_end > win_start
+            })
+            .unwrap_or(false);
+        if !covered {
+            warnings.push(format!(
+                "「{}」的加分依据与概念本身无关（应摘原文里围绕该词的片段），已按必须处理。",
+                c.text
+            ));
+            demote.push(i);
+            continue;
+        }
+        // ③ 原句没有强偏好词 → info（保留 preferred）
+        if !core_hint {
+            warnings.push(format!(
+                "原文未见明显的偏好表述，已按加分项处理（可在下方改为必须）。"
+            ));
+        }
+    }
+    // 倒序移回 concepts（保序）
+    let mut moved: Vec<SearchConceptV3> = Vec::new();
+    for &i in demote.iter().rev() {
+        if let Some(c) = group.preferred.get(i) {
+            let mut c = c.clone();
+            c.necessity = Necessity::Required;
+            moved.push(c);
+        }
+    }
+    group.preferred = group
+        .preferred
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !demote.contains(i))
+        .map(|(_, c)| c.clone())
+        .collect();
+    group.concepts.extend(moved);
+    warnings
+}
+
 /// 已解析标签（前端展示）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -2022,5 +2170,123 @@ mod tests {
             &facets,
         );
         assert!(is_keyword_fallback(&i, "海边日落"));
+    }
+
+    // ═══════════════ S3：preferred evidence 守卫（纯函数真值表） ═══════════════
+
+    fn v3_group(input: &str, pref_text: &str, evidence: &str) -> (SearchGroupV3, Vec<String>) {
+        let mut g = SearchGroupV3 {
+            asset_type: "all".into(),
+            preferred: vec![SearchConceptV3 {
+                text: pref_text.into(),
+                role: "scene".into(),
+                facet_hint: Some("scene".into()),
+                confidence: Some(0.8),
+                necessity: Necessity::Preferred,
+                weight: Some(1.0),
+                evidence: Some(evidence.into()),
+                term_match: crate::db::tags::TermMatch::Alias,
+            }],
+            ..Default::default()
+        };
+        let warns = guard_preferred(input, &mut g);
+        (g, warns)
+    }
+
+    /// S3 真值表六行（指南表）：四行合法加分保留、两行编造/无关依据正确降级。
+    #[test]
+    fn guard_preferred_accepts_six_chinese_expressions() {
+        // ① ② 都过 + 强偏好词命中 → 静默（保留 preferred）
+        for (input, pref, ev) in [
+            ("最好有蓝天", "蓝天", "最好有蓝天"),
+            ("有蓝天更好", "蓝天", "有蓝天更好"),
+            ("尽量有蓝天", "蓝天", "尽量有蓝天"),
+        ] {
+            let (g, warns) = v3_group(input, pref, ev);
+            assert!(
+                g.preferred.iter().any(|c| c.text == pref && c.necessity == Necessity::Preferred),
+                "{input} 应保留为加分项（preferred={:?} concepts={:?}）",
+                g.preferred.iter().map(|c| &c.text).collect::<Vec<_>>(),
+                g.concepts.iter().map(|c| &c.text).collect::<Vec<_>>()
+            );
+            assert!(!warns.iter().any(|w| w.contains("已按必须")), "{input} warns={warns:?}");
+        }
+        // 「蓝天可有可无」：①② 过，原句无强偏好词（可有可无不在 CORE）→ info 但不降级
+        let (g2, w2) = v3_group("蓝天可有可无", "蓝天", "蓝天可有可无");
+        assert!(g2.preferred.iter().any(|c| c.text == "蓝天"), "可有可无不得降级");
+        assert!(
+            w2.iter().any(|w| w.contains("未见明显的偏好表述")),
+            "应记 info：{w2:?}"
+        );
+    }
+
+    /// S3：evidence 编造（不是原句子串）→ 降级 required。
+    #[test]
+    fn guard_rejects_fabricated_evidence() {
+        // 原句「必须有蓝天」没有「最好」；模型编造 evidence「最好有蓝天」→ ① 降级
+        let (g, warns) = v3_group("必须有蓝天", "蓝天", "最好有蓝天");
+        assert!(g.preferred.is_empty(), "编造依据必须降级：{warns:?}");
+        assert!(g.concepts.iter().any(|c| c.text == "蓝天" && c.necessity == Necessity::Required));
+        assert!(warns.iter().any(|w| w.contains("已按必须")), "{warns:?}");
+    }
+
+    /// S3：evidence 是原句子串但与 concept 无关（窗口外）→ 降级 required。
+    #[test]
+    fn guard_rejects_unrelated_evidence() {
+        // 原句「横图，最好清新」；concept=蓝天 evidence=最好清新（在原文，但离蓝天很远）
+        let input = "横图，最好清新";
+        let mut g = SearchGroupV3 {
+            asset_type: "all".into(),
+            preferred: vec![SearchConceptV3 {
+                text: "蓝天".into(),
+                role: "scene".into(),
+                facet_hint: None,
+                confidence: None,
+                necessity: Necessity::Preferred,
+                weight: None,
+                evidence: Some("最好清新".into()),
+                term_match: crate::db::tags::TermMatch::Alias,
+            }],
+            ..Default::default()
+        };
+        let warns = guard_preferred(input, &mut g);
+        assert!(g.preferred.is_empty(), "无关依据必须降级：{warns:?}");
+        assert!(g.concepts.iter().any(|c| c.text == "蓝天"));
+        assert!(warns.iter().any(|w| w.contains("已按必须")), "{warns:?}");
+    }
+
+    /// S3：只做 preferred → required 降级；required 概念绝不反向升级为 preferred。
+    #[test]
+    fn preferred_never_upgraded_to_required() {
+        let mut g = SearchGroupV3 {
+            asset_type: "all".into(),
+            concepts: vec![SearchConceptV3 {
+                text: "夜景".into(),
+                role: "scene".into(),
+                facet_hint: None,
+                confidence: Some(0.9),
+                necessity: Necessity::Required,
+                weight: None,
+                evidence: Some("排除夜景".into()), // 即便给了 evidence，也必须保持 required
+                term_match: crate::db::tags::TermMatch::Alias,
+            }],
+            preferred: vec![SearchConceptV3 {
+                text: "蓝天".into(),
+                role: "scene".into(),
+                facet_hint: None,
+                confidence: Some(0.8),
+                necessity: Necessity::Preferred,
+                weight: Some(1.0),
+                evidence: Some("最好有蓝天".into()),
+                term_match: crate::db::tags::TermMatch::Alias,
+            }],
+            ..Default::default()
+        };
+        let _warns = guard_preferred("不要夜景，最好有蓝天", &mut g);
+        // 夜景（required）仍在 concepts 且 necessity=Required
+        assert!(g.concepts.iter().any(|c| c.text == "夜景" && c.necessity == Necessity::Required));
+        assert!(!g.preferred.iter().any(|c| c.text == "夜景"), "required 不得升级为 preferred");
+        // 蓝天（证据合法）保留加分
+        assert!(g.preferred.iter().any(|c| c.text == "蓝天"));
     }
 }
