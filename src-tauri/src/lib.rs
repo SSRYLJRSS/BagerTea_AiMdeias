@@ -329,6 +329,11 @@ pub fn run() {
             commands::get_asset_tags,
             commands::tag_recent_ops,
             commands::tag_undo_batch,
+            // F2-e：数据完整性（冲突预检 + 约束能力状态 + apply + facet 一致性）
+            commands::detect_tag_constraints_conflicts,
+            commands::list_tag_constraint_features,
+            commands::apply_tag_constraints,
+            commands::check_terms_facet_consistency,
             // 缩略图
             commands::get_thumbnail,
             commands::clear_thumbnail_cache,

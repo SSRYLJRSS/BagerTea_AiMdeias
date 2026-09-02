@@ -650,6 +650,299 @@ pub fn seed_presets(conn: &Connection) -> AppResult<()> {
     Ok(())
 }
 
+// ═══════════════ F2-a：V22b 冲突预检（六类，只读） ═══════════════
+
+/// 分面内 term 冲突组（规范名↔规范名 / 规范名↔别名 / 别名↔别名 归一后去重）。
+/// 用于设置页展示「「海边」有 2 个条目（关联 12/3 张素材），合并到哪个？」
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TermConflictGroup {
+    pub facet_key: String,
+    pub term: String,
+    pub entries: Vec<TermConflictEntry>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TermConflictEntry {
+    /// 标签 id（tag_aliases 的归属标签）
+    pub tag_id: i64,
+    pub name: String,
+    /// canonical | alias
+    pub kind: String,
+    pub linked_assets: i64,
+}
+
+/// 孤儿标签（facet_key 指向不存在分面）—— 建议迁到 custom，需用户确认。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrphanTag {
+    pub id: i64,
+    pub name: String,
+    pub facet_key: String,
+}
+
+/// 跨分面挂父的标签（子标签 facet 与父 facet 不一致）—— 自动断开层级。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CrossFacetChild {
+    pub id: i64,
+    pub name: String,
+    pub parent_id: i64,
+    pub own_facet: String,
+    pub parent_facet: String,
+}
+
+/// 环边（断开最后一条边即可修复）。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CycleEdge {
+    pub id: i64,
+    pub name: String,
+    pub parent_id: Option<i64>,
+}
+
+/// tag_terms.facet_key 与 tags.facet_key 不一致（V22b 首次迁移时为空；后续 apply 时查）。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FacetMismatch {
+    pub tag_id: i64,
+    pub tag_name: String,
+    pub terms_facet: String,
+    pub tag_facet: String,
+}
+
+/// V22b 预检结果汇总。conflicts.is_empty() 才允许启用 tag_unique_terms 等约束。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TagConflictReport {
+    pub term_conflicts: Vec<TermConflictGroup>,
+    pub orphans: Vec<OrphanTag>,
+    pub cross_facet_children: Vec<CrossFacetChild>,
+    pub cycle_edges: Vec<CycleEdge>,
+    pub over_deep_subtrees: Vec<i64>,
+    pub facet_mismatches: Vec<FacetMismatch>,
+}
+
+impl TagConflictReport {
+    /// 是否零冲突（干净库 = 没有需要人工处理的 term 冲突；自动可修项也并入判断：
+    /// V22b 只在「无任何冲突」时直接启用 —— 有自动可修项也应让用户先知情）。
+    pub fn is_clean(&self) -> bool {
+        self.term_conflicts.is_empty()
+            && self.orphans.is_empty()
+            && self.cross_facet_children.is_empty()
+            && self.cycle_edges.is_empty()
+            && self.over_deep_subtrees.is_empty()
+            && self.facet_mismatches.is_empty()
+    }
+
+    pub fn total(&self) -> usize {
+        self.term_conflicts.len()
+            + self.orphans.len()
+            + self.cross_facet_children.len()
+            + self.cycle_edges.len()
+            + self.over_deep_subtrees.len()
+            + self.facet_mismatches.len()
+    }
+}
+
+/// F2-a：V22b 前置预检 —— 只读，不修改任何数据。
+/// 六类：
+///  ① 分面内 term 冲突（规范名↔规范名 / 规范名↔别名 / 别名↔别名，三类都查）
+///  ② facet_key 指向不存在分面的孤儿标签
+///  ③ 跨分面挂父的标签
+///  ④ 环（带深度上限的递归 CTE 探测）
+///  ⑤ 超过 8 层的子树
+///  ⑥ tag_terms.facet_key 与 tags.facet_key 不一致（首次迁移时为空，后续 apply 时查）
+pub fn detect_tag_conflicts(conn: &Connection) -> AppResult<TagConflictReport> {
+    // ── ① 分面内 term 冲突：canonical 与可搜别名归一到同一集合，(facet_key, term)
+    //    出现 ≥2 个不同标签即冲突（ux_terms 唯一索引的前置检查）──
+    let term_conflicts: Vec<TermConflictGroup> = {
+        // 冲突组：(facet_key, term) 至少命中 2 个不同标签
+        let mut group_stmt = conn.prepare(
+            "SELECT facet_key, term FROM (
+               SELECT t.facet_key, COALESCE(t.normalized_name, lower(trim(t.name))) AS term, t.id
+                 FROM tags t WHERE t.status = 'active'
+               UNION ALL
+               SELECT t.facet_key, ta.normalized_alias, t.id
+                 FROM tag_aliases ta JOIN tags t ON t.id = ta.tag_id
+                WHERE t.status = 'active' AND ta.is_searchable = 1
+             ) GROUP BY facet_key, term
+             HAVING COUNT(DISTINCT id) > 1
+             ORDER BY facet_key, term",
+        )?;
+        let groups: Vec<(String, String)> = group_stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .filter_map(|r| r.ok())
+            .collect();
+        let mut out = Vec::new();
+        for (facet, term) in groups {
+            let mut members: Vec<TermConflictEntry> = Vec::new();
+            // canonical 来源
+            let mut canonical = conn.prepare(
+                "SELECT t.id, t.name,
+                        (SELECT COUNT(*) FROM asset_tags at2 WHERE at2.tag_id = t.id)
+                   FROM tags t WHERE t.status='active' AND t.facet_key=?1
+                     AND COALESCE(t.normalized_name, lower(trim(t.name))) = ?2
+                   ORDER BY t.id",
+            )?;
+            let mut rows = canonical.query(rusqlite::params![facet, term])?;
+            while let Some(r) = rows.next()? {
+                members.push(TermConflictEntry {
+                    tag_id: r.get(0)?,
+                    name: r.get(1)?,
+                    kind: "canonical".into(),
+                    linked_assets: r.get(2)?,
+                });
+            }
+            // alias 来源（同一标签若已以 canonical 计入则不重复）
+            let mut alias = conn.prepare(
+                "SELECT t.id, t.name,
+                        (SELECT COUNT(*) FROM asset_tags at2 WHERE at2.tag_id = t.id)
+                   FROM tag_aliases ta JOIN tags t ON t.id = ta.tag_id
+                  WHERE t.status='active' AND t.facet_key=?1 AND ta.is_searchable=1
+                    AND ta.normalized_alias = ?2
+                    AND NOT EXISTS (
+                      SELECT 1 FROM tags tc WHERE tc.id = t.id AND tc.status='active'
+                        AND COALESCE(tc.normalized_name, lower(trim(tc.name))) = ?2)
+                   ORDER BY t.id",
+            )?;
+            let mut rows = alias.query(rusqlite::params![facet, term])?;
+            while let Some(r) = rows.next()? {
+                members.push(TermConflictEntry {
+                    tag_id: r.get(0)?,
+                    name: r.get(1)?,
+                    kind: "alias".into(),
+                    linked_assets: r.get(2)?,
+                });
+            }
+            if members.len() > 1 {
+                out.push(TermConflictGroup { facet_key: facet, term, entries: members });
+            }
+        }
+        out
+    };
+
+    // ── ② 孤儿标签：facet_key 指向不存在的分面 ──
+    let orphans: Vec<OrphanTag> = {
+        let mut stmt = conn.prepare(
+            "SELECT t.id, t.name, t.facet_key FROM tags t
+              WHERE t.status = 'active'
+                AND NOT EXISTS (SELECT 1 FROM tag_facets f WHERE f.key = t.facet_key)
+              ORDER BY t.facet_key, t.name",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(OrphanTag { id: r.get(0)?, name: r.get(1)?, facet_key: r.get(2)? })
+        })?;
+        rows.filter_map(|r| r.ok()).collect()
+    };
+
+    // ── ③ 跨分面挂父 ──
+    let cross_facet_children: Vec<CrossFacetChild> = {
+        let mut stmt = conn.prepare(
+            "SELECT t.id, t.name, t.parent_id, t.facet_key, p.facet_key
+               FROM tags t JOIN tags p ON p.id = t.parent_id
+              WHERE t.status='active' AND t.facet_key != p.facet_key
+              ORDER BY t.id",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(CrossFacetChild {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                parent_id: r.get(2)?,
+                own_facet: r.get(3)?,
+                parent_facet: r.get(4)?,
+            })
+        })?;
+        rows.filter_map(|r| r.ok()).collect()
+    };
+
+    // ── ④ 环（深度上限探测）：沿父链 12 步内回到自身即环成员 ──
+    let cycle_edges: Vec<CycleEdge> = {
+        let mut all = conn.prepare(
+            "SELECT id, name, parent_id FROM tags
+              WHERE parent_id IS NOT NULL AND status='active'",
+        )?;
+        let nodes: Vec<(i64, String, Option<i64>)> = all
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .filter_map(|r| r.ok())
+            .collect();
+        let mut out = Vec::new();
+        for (id, name, pid) in nodes {
+            let mut cur = id;
+            let mut is_cycle = false;
+            for _ in 0..12 {
+                let parent: Option<Option<i64>> = conn
+                    .query_row("SELECT parent_id FROM tags WHERE id=?1", [cur], |r| r.get(0))
+                    .ok();
+                match parent {
+                    Some(Some(p)) if p == id => { is_cycle = true; break; }
+                    Some(Some(p)) => cur = p,
+                    _ => break,
+                }
+            }
+            if is_cycle {
+                out.push(CycleEdge { id, name, parent_id: pid });
+            }
+        }
+        out
+    };
+
+    // ── ⑤ 深度 ≥ 8 的节点（超深子树成员；从根计 0）──
+    let over_deep_subtrees: Vec<i64> = {
+        let mut stmt = conn.prepare(
+            "WITH RECURSIVE depth(id, d) AS (
+               SELECT id, 0 FROM tags WHERE parent_id IS NULL AND status='active'
+               UNION ALL
+               SELECT t.id, d.d + 1 FROM tags t JOIN depth d ON t.parent_id = d.id
+                WHERE t.status='active' AND d.d < 12
+             )
+             SELECT id FROM depth WHERE d >= 8 ORDER BY id",
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, i64>(0))?;
+        rows.filter_map(|r| r.ok()).collect()
+    };
+
+    // ── ⑥ tag_terms.facet_key 与 tags.facet_key 不一致（表不存在 → 空）──
+    let facet_mismatches: Vec<FacetMismatch> = {
+        let table_exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='tag_terms'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        if table_exists == 0 {
+            Vec::new()
+        } else {
+            let mut stmt = conn.prepare(
+                "SELECT tt.tag_id, COALESCE(t.name,''), tt.facet_key, t.facet_key
+                   FROM tag_terms tt JOIN tags t ON t.id = tt.tag_id
+                  WHERE tt.facet_key != t.facet_key
+                  ORDER BY tt.tag_id",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok(FacetMismatch {
+                    tag_id: r.get(0)?,
+                    tag_name: r.get(1)?,
+                    terms_facet: r.get(2)?,
+                    tag_facet: r.get(3)?,
+                })
+            })?;
+            rows.filter_map(|r| r.ok()).collect()
+        }
+    };
+
+    Ok(TagConflictReport {
+        term_conflicts,
+        orphans,
+        cross_facet_children,
+        cycle_edges,
+        over_deep_subtrees,
+        facet_mismatches,
+    })
+}
+
 /// 停用没有任何素材关联的旧预置标签。
 /// 已经被用户使用过的预置标签不删除，保留历史搜索和素材关联。
 pub fn retire_unused_presets(conn: &Connection) -> AppResult<usize> {

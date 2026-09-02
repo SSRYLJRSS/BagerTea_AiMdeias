@@ -24,6 +24,7 @@ import {
 import { listAiConnections, getAiUsageBindings, setAiUsageBinding } from "@/api/connections";
 import { videoProxyCacheStats, clearAllVideoProxies } from "@/api/video";
 import FacetManagePanel from "@/components/settings/FacetManagePanel";
+import DataIntegrityPanel from "@/components/settings/DataIntegrityPanel";
 import ServiceManagement from "@/components/settings/ServiceManagement";
 import { useLibraryStore } from "@/stores/libraryStore";
 import { applyTheme, useSettingsStore, DEFAULT_APPEARANCE } from "@/stores/settingsStore";
@@ -534,6 +535,10 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
                    不再并列「AI 行为配置」独立列表与「分类词条」顶层卡片（§9.3） */}
               <div className="p-2">
                 <FacetManagePanel draft={draft} onPatchAi={patchAi} />
+              </div>
+              {/* F2-e：数据完整性（V22b 约束能力状态 + 预检 + 启用） */}
+              <div className="pt-2">
+                <DataIntegrityPanel />
               </div>
             </Group>
           )}

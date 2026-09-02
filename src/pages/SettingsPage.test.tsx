@@ -75,6 +75,16 @@ vi.mock("@/api/tags", async (importOriginal) => ({
   ...(await importOriginal<Record<string, unknown>>()),
   listAllTagFacets: vi.fn().mockResolvedValue([]),
   listContentDescriptions: vi.fn().mockResolvedValue([]),
+  listTagConstraintFeatures: vi.fn().mockResolvedValue([]),
+  detectTagConstraintsConflicts: vi.fn().mockResolvedValue({
+    termConflicts: [],
+    orphans: [],
+    crossFacetChildren: [],
+    cycleEdges: [],
+    overDeepSubtrees: [],
+    facetMismatches: [],
+  }),
+  applyTagConstraints: vi.fn().mockResolvedValue(undefined),
 }));
 vi.mock("@/api/assets", () => ({
   rescanAssetMetadata: assetMocks.rescanAssetMetadata,
@@ -609,5 +619,75 @@ describe("StrictMode 全路由遍历", () => {
       await waitFor(() => expect(screen.queryByText("加载设置中…")).toBeNull());
     }
     unmount();
+  });
+});
+
+// ── F2-e：标签数据完整性区块 ──
+describe("SettingsPage F2-e 数据完整性", () => {
+  async function openTags() {
+    useSettingsStore.setState({ settings: mkSettings(), loaded: true, loading: false, loadError: null });
+    render(<SettingsPage />);
+    await waitFor(() => expect(screen.getByText("保存设置")).toBeInTheDocument());
+    fireEvent.click(screen.getByText("标签与分类"));
+    await waitFor(() => expect(screen.getByText(/标签数据完整性/)).toBeInTheDocument());
+  }
+
+  it("标签路由展示数据完整性区块，四项能力状态加载自后端", async () => {
+    const { listTagConstraintFeatures } = await import("@/api/tags");
+    vi.mocked(listTagConstraintFeatures).mockResolvedValue([
+      { feature: "tag_cycle_guard", enabled: true, appliedAt: 1, blockedBy: null },
+      { feature: "tag_unique_terms", enabled: false, appliedAt: null, blockedBy: "pending" },
+      { feature: "tag_facet_fk", enabled: false, appliedAt: null, blockedBy: "pending" },
+      { feature: "tag_facet_restrict_delete", enabled: false, appliedAt: null, blockedBy: "pending" },
+    ]);
+    await openTags();
+    expect(screen.getByText("环检测与深度上限")).toBeInTheDocument();
+    // 能力状态摘要显示「1/4 项生效」
+    expect(screen.getByText(/标签数据完整性（1\/4 项生效）/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "检查标签冲突" })).toBeInTheDocument();
+  });
+
+  it("点「检查标签冲突」调用预检；零冲突提示可启用约束", async () => {
+    const { detectTagConstraintsConflicts, applyTagConstraints } = await import("@/api/tags");
+    vi.mocked(detectTagConstraintsConflicts).mockResolvedValue({
+      termConflicts: [],
+      orphans: [],
+      crossFacetChildren: [],
+      cycleEdges: [],
+      overDeepSubtrees: [],
+      facetMismatches: [],
+    });
+    await openTags();
+    fireEvent.click(screen.getByRole("button", { name: "检查标签冲突" }));
+    await waitFor(() => expect(detectTagConstraintsConflicts).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(screen.getByText(/未发现标签数据冲突/)).toBeInTheDocument());
+    // 启用约束走命令
+    fireEvent.click(screen.getByRole("button", { name: "启用约束" }));
+    await waitFor(() => expect(applyTagConstraints).toHaveBeenCalledTimes(1));
+  });
+
+  it("预检发现重名冲突时展示冲突组并禁用提示", async () => {
+    const { detectTagConstraintsConflicts } = await import("@/api/tags");
+    vi.mocked(detectTagConstraintsConflicts).mockResolvedValue({
+      termConflicts: [
+        {
+          facetKey: "scene",
+          term: "海边",
+          entries: [
+            { tagId: 1, name: "海边", kind: "canonical", linkedAssets: 12 },
+            { tagId: 2, name: "海滨", kind: "canonical", linkedAssets: 3 },
+          ],
+        },
+      ],
+      orphans: [],
+      crossFacetChildren: [],
+      cycleEdges: [],
+      overDeepSubtrees: [],
+      facetMismatches: [],
+    });
+    await openTags();
+    fireEvent.click(screen.getByRole("button", { name: "检查标签冲突" }));
+    await waitFor(() => expect(screen.getByText(/「海边」在 scene 分面有 2 个条目/)).toBeInTheDocument());
+    expect(screen.getByText(/发现冲突：分面内重名 1 组/)).toBeInTheDocument();
   });
 });

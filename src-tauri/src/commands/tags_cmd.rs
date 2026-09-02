@@ -330,3 +330,72 @@ pub fn tag_undo_batch(state: State<AppState>, batch_id: i64) -> AppResult<u64> {
     let conn = lock_db(&state)?;
     tag_ops::undo_batch(&conn, batch_id)
 }
+
+/// F2-e：预检 V22b 冲突（只读）—— 设置页「处理冲突」按钮的数据源。
+#[tauri::command]
+pub fn detect_tag_constraints_conflicts(
+    state: State<AppState>,
+) -> AppResult<crate::db::tags::TagConflictReport> {
+    let conn = lock_db(&state)?;
+    crate::db::tags::detect_tag_conflicts(&conn)
+}
+
+/// F2-e：读取 schema_features 能力状态（设置页数据完整性区块展示）。
+#[tauri::command]
+pub fn list_tag_constraint_features(
+    state: State<AppState>,
+) -> AppResult<Vec<crate::db::schema_features::SchemaFeatureStatus>> {
+    // 用缓存（启动/apply 后刷新）；缓存空时回退实时读
+    let cached = state.schema_features.lock().ok().map(|c| c.clone()).unwrap_or_default();
+    if !cached.is_empty() {
+        return Ok(cached);
+    }
+    let conn = lock_db(&state)?;
+    crate::db::schema_features::list_features(&conn)
+}
+
+/// F2-e：apply_tag_constraints —— 重跑预检 → 通过则执行 V22b 全套 SQL →
+/// 登记 schema_features.enabled=1 → 刷新缓存。
+/// 有冲突不强行加约束（止损线 1）：返回错误让设置页展示冲突清单。
+#[tauri::command]
+pub fn apply_tag_constraints(state: State<AppState>) -> AppResult<()> {
+    let report = {
+        let conn = lock_db(&state)?;
+        crate::db::tags::detect_tag_conflicts(&conn)?
+    };
+    if !report.is_clean() {
+        return Err(AppError::msg(format!(
+            "存在 {} 处标签冲突，请先处理：分面内重名 {} / 孤儿 {} / 跨面挂父 {} / 环 {} / 超深 {} / facet 不一致 {}",
+            report.total(),
+            report.term_conflicts.len(),
+            report.orphans.len(),
+            report.cross_facet_children.len(),
+            report.cycle_edges.len(),
+            report.over_deep_subtrees.len(),
+            report.facet_mismatches.len(),
+        )));
+    }
+    {
+        let conn = lock_db(&state)?;
+        crate::db::migrations::apply_v22b_constraints(&conn)?;
+        for feature in [
+            "tag_unique_terms",
+            "tag_facet_fk",
+            "tag_facet_restrict_delete",
+        ] {
+            crate::db::schema_features::set_feature(&conn, feature, true, None)?;
+        }
+    }
+    state.refresh_schema_features();
+    Ok(())
+}
+
+/// F2-c 第四道防线：tag_terms 与 tags 的 facet_key 一致性检查（只读，供设置页「修复」按钮判断）。
+#[tauri::command]
+pub fn check_terms_facet_consistency(
+    state: State<AppState>,
+) -> AppResult<Vec<crate::db::tags::FacetMismatch>> {
+    let conn = lock_db(&state)?;
+    let report = crate::db::tags::detect_tag_conflicts(&conn)?;
+    Ok(report.facet_mismatches)
+}

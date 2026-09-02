@@ -172,3 +172,45 @@ export interface ContentDescription {
 export function listContentDescriptions(limit?: number): Promise<ContentDescription[]> {
   return invoke<ContentDescription[]>("list_content_descriptions", { limit });
 }
+
+// ── F2-e：标签数据完整性（V22b 约束能力）──
+
+/** 单个约束能力状态 */
+export interface SchemaFeatureStatus {
+  feature: string;
+  enabled: boolean;
+  appliedAt: number | null;
+  blockedBy: string | null;
+}
+
+/** term 冲突组（设置页「处理冲突」展示） */
+export interface TermConflictGroup {
+  facetKey: string;
+  term: string;
+  entries: { tagId: number; name: string; kind: string; linkedAssets: number }[];
+}
+
+/** V22b 预检报告（六类冲突） */
+export interface TagConflictReport {
+  termConflicts: TermConflictGroup[];
+  orphans: { id: number; name: string; facetKey: string }[];
+  crossFacetChildren: { id: number; name: string; parentId: number; ownFacet: string; parentFacet: string }[];
+  cycleEdges: { id: number; name: string; parentId: number | null }[];
+  overDeepSubtrees: number[];
+  facetMismatches: { tagId: number; tagName: string; termsFacet: string; tagFacet: string }[];
+}
+
+/** 读取能力状态 */
+export function listTagConstraintFeatures(): Promise<SchemaFeatureStatus[]> {
+  return invoke<SchemaFeatureStatus[]>("list_tag_constraint_features");
+}
+
+/** 预检冲突（只读） */
+export function detectTagConstraintsConflicts(): Promise<TagConflictReport> {
+  return invoke<TagConflictReport>("detect_tag_constraints_conflicts");
+}
+
+/** 启用约束（预检必须干净） */
+export function applyTagConstraints(): Promise<void> {
+  return invoke<void>("apply_tag_constraints");
+}

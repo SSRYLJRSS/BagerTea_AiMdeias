@@ -1460,6 +1460,150 @@ CREATE TABLE IF NOT EXISTS schema_features (
     Ok(())
 }
 
+// ════════════════════════════════════════════════════════════════════
+// V22b（F2）条件迁移段：tag_terms 统一词条表 + facet_key 四道防线 +
+// facet_key 引用完整性 + 分面删除 RESTRICT。
+//   ⚠ 不随 migrate() 自动执行 —— 依赖数据干净，由 apply_tag_constraints
+//     命令在预检通过后调用；全部幂等可重入。
+// ════════════════════════════════════════════════════════════════════
+
+/// F2-b：tag_terms 建表 + 唯一约束 + 索引。
+/// ⚠ normalized_term 必须是默认 BINARY 排序，不许加 COLLATE（next_prefix 依赖字节序）。
+fn create_tag_terms_table(conn: &Connection) -> AppResult<()> {
+    conn.execute_batch(
+        r#"
+CREATE TABLE IF NOT EXISTS tag_terms (
+  tag_id          INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
+  facet_key       TEXT    NOT NULL,
+  normalized_term TEXT    NOT NULL,
+  term            TEXT    NOT NULL,
+  locale          TEXT    NOT NULL DEFAULT '',
+  term_kind       TEXT    NOT NULL,
+  is_searchable   INTEGER NOT NULL DEFAULT 1,
+  created_at      INTEGER NOT NULL,
+  PRIMARY KEY (tag_id, normalized_term, locale),
+  CHECK (term_kind IN ('canonical','synonym','old_name','translation','typo'))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_terms ON tag_terms(facet_key, normalized_term, locale);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_terms_canonical
+  ON tag_terms(tag_id, term_kind) WHERE term_kind = 'canonical';
+CREATE INDEX IF NOT EXISTS ix_terms_lookup
+  ON tag_terms(normalized_term, locale, facet_key);
+"#,
+    )?;
+    Ok(())
+}
+
+/// F2-b：把现有 tags（canonical）与 tag_aliases 灌进 tag_terms。
+/// 单事务。只在 tag_terms 为空（首次 apply）时执行 —— 已有数据说明之前成功过，
+/// 重跑直接跳过（避免与「新写入的词条」混淆；也保证冲突时 INSERT 会真实报错，
+/// 不因 OR IGNORE 静默吞掉 —— 冲突必须让预检拦住，而不是靠 IGNORE 掩盖）。
+fn backfill_tag_terms(conn: &Connection) -> AppResult<()> {
+    let existing: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM tag_terms",
+        [],
+        |r| r.get(0),
+    )?;
+    if existing > 0 {
+        return Ok(());
+    }
+    let now = chrono::Utc::now().timestamp_millis();
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "INSERT INTO tag_terms
+           (tag_id, facet_key, normalized_term, term, locale, term_kind, is_searchable, created_at)
+         SELECT id, facet_key, COALESCE(normalized_name, lower(trim(name))),
+                COALESCE(canonical_name, name), '', 'canonical', 1, ?1
+           FROM tags WHERE status = 'active'",
+        [now],
+    )?;
+    tx.execute(
+        "INSERT INTO tag_terms
+           (tag_id, facet_key, normalized_term, term, locale, term_kind, is_searchable, created_at)
+         SELECT ta.tag_id, t.facet_key, ta.normalized_alias, ta.alias, ta.locale,
+                ta.alias_type, ta.is_searchable, ta.created_at
+           FROM tag_aliases ta JOIN tags t ON t.id = ta.tag_id
+          WHERE t.status = 'active'",
+        [],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// F2-c：facet_key 一致性四道防线（触发器 ①②③；④ check 在 tags.rs 校验层）。
+/// ⚠ 触发器 ① 与 ③ 的交互：① 是 AFTER UPDATE ON tags，它执行的 UPDATE tag_terms
+///    会触发 ③ 的 BEFORE UPDATE —— 此时 tags.facet_key 已是新值，③ 校验通过，顺序安全。
+///    若日后把 ① 改成 BEFORE 就会死锁式互斥（建表 SQL 上写明，防后人调整时机）。
+fn create_terms_facet_defenses(conn: &Connection) -> AppResult<()> {
+    conn.execute_batch(
+        r#"
+-- ① tags.facet_key 改动时自动同步 tag_terms（AFTER）
+CREATE TRIGGER IF NOT EXISTS trg_terms_sync_facet
+  AFTER UPDATE OF facet_key ON tags
+BEGIN UPDATE tag_terms SET facet_key = new.facet_key WHERE tag_id = new.id; END;
+
+-- ② 插入时校验（BEFORE INSERT）
+CREATE TRIGGER IF NOT EXISTS trg_terms_facet_match_ai
+  BEFORE INSERT ON tag_terms
+  WHEN new.facet_key != (SELECT facet_key FROM tags WHERE id = new.tag_id)
+BEGIN SELECT RAISE(ABORT, 'tag_terms.facet_key 必须与 tags.facet_key 一致'); END;
+
+-- ③ 直接改 tag_terms.facet_key 时校验（BEFORE UPDATE）
+CREATE TRIGGER IF NOT EXISTS trg_terms_facet_match_au
+  BEFORE UPDATE OF facet_key ON tag_terms
+  WHEN new.facet_key != (SELECT facet_key FROM tags WHERE id = new.tag_id)
+BEGIN SELECT RAISE(ABORT, 'tag_terms.facet_key 必须与 tags.facet_key 一致'); END;
+"#,
+    )?;
+    Ok(())
+}
+
+/// F2-d：facet_key 引用完整性 + 分面删除 RESTRICT。
+/// ⚠ delete_facet 的级联必须在同一事务内先删 tags 再删 tag_facets（现有顺序已正确），
+///   否则会被 trg_facets_restrict_delete 拦住。
+fn create_facet_fk_guards(conn: &Connection) -> AppResult<()> {
+    conn.execute_batch(
+        r#"
+CREATE TRIGGER IF NOT EXISTS trg_tags_facet_fk_ai
+  BEFORE INSERT ON tags
+  WHEN NOT EXISTS (SELECT 1 FROM tag_facets WHERE key = new.facet_key)
+BEGIN SELECT RAISE(ABORT, '标签的 facet_key 指向不存在的分面'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_tags_facet_fk_au
+  BEFORE UPDATE OF facet_key ON tags
+  WHEN NOT EXISTS (SELECT 1 FROM tag_facets WHERE key = new.facet_key)
+BEGIN SELECT RAISE(ABORT, '标签的 facet_key 指向不存在的分面'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_facets_restrict_delete
+  BEFORE DELETE ON tag_facets
+  WHEN EXISTS (SELECT 1 FROM tags WHERE facet_key = old.key)
+BEGIN SELECT RAISE(ABORT, '该分面下还有标签，请用 delete_tag_facet 命令'); END;
+"#,
+    )?;
+    Ok(())
+}
+
+/// V22b 全套（F2-b/c/d）。调用方必须先跑预检（tags::detect_tag_conflicts）确认干净。
+/// 幂等：全部 IF NOT EXISTS + INSERT OR IGNORE，可安全重跑。
+/// 注：各子步骤内部自带事务（backfill_tag_terms），此处不再包外层事务防嵌套。
+pub fn apply_v22b_constraints(conn: &Connection) -> AppResult<()> {
+    create_tag_terms_table(conn)?;
+    backfill_tag_terms(conn)?;
+    create_terms_facet_defenses(conn)?;
+    create_facet_fk_guards(conn)?;
+    Ok(())
+}
+
+/// 测试辅助：只建 tag_terms 表（不灌数据、不加防御触发器）。
+pub fn create_tag_terms_table_for_test(conn: &Connection) -> AppResult<()> {
+    create_tag_terms_table(conn)
+}
+
+/// 测试辅助：只建 facet_key 防御触发器。
+pub fn create_terms_facet_defenses_for_test(conn: &Connection) -> AppResult<()> {
+    create_terms_facet_defenses(conn)
+}
+
 pub fn migrate(conn: &Connection) -> AppResult<()> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     if version < 1 {
