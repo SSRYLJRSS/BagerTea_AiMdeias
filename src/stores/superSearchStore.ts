@@ -8,7 +8,7 @@ import { listSuperAssets, listSuperAssetIds, aiParseSearchQuery } from "@/api/su
 import { useSelectionStore } from "@/stores/selectionStore";
 import type { Asset, ResolvedSearchQuery, MetadataFilter } from "@/types/asset";
 import type { QueryExpr } from "@/types/queryExpr";
-import type { AiApplyMode, ResolvedTag } from "@/types/superSearch";
+import type { AiApplyMode, ResolvedTag, SearchPlanV3 } from "@/types/superSearch";
 import {
   mergeQueryExpr,
   normalizeExpr,
@@ -93,6 +93,10 @@ export interface SuperSearchState {
   query: ResolvedSearchQuery;
   /** 布尔表达式树：AI 结果 / 构建器产物；存在时优先于 query 的扁平字段（后端 expr 优先） */
   expr?: QueryExpr;
+  /** S1/S6：AI 解析的完整 SearchPlanV3（filter/must_not/should/min_should/ranking）。
+   *  持久化随行（hydrate 版本迁移见 migratePlanV3）；手动编辑条件（setExpr）时清空，
+   *  避免双源 —— 列表执行当前仍走 expr（filter 语义），should 加分在 U 波次 UI 消费。 */
+  plan?: SearchPlanV3 | null;
   items: Asset[];
   total: number;
   loading: boolean;
@@ -130,6 +134,17 @@ export interface SuperSearchState {
   clearQuery: () => void;
 }
 
+/** S6：本地保存的 plan 版本迁移（与后端 db/search_plan.rs migrate_plan 对齐的最小版）。
+ *  planSchemaVersion > 当前（用户降级应用）→ None（丢弃 + 前端可提示）；≤ 当前视为可迁移。
+ *  当前 schema v3 无历史结构差异，恒等返回；未来结构变更在此加分支。 */
+export function migratePlanV3(plan: SearchPlanV3): SearchPlanV3 | null {
+  const CURRENT_PLAN_SCHEMA = 3;
+  if (plan.planSchemaVersion > CURRENT_PLAN_SCHEMA) {
+    return null;
+  }
+  return { ...plan, planSchemaVersion: CURRENT_PLAN_SCHEMA };
+}
+
 // W5f-f6：搜索条件持久化（localStorage）—— 只存 expr + query（带版本号），
 // hydrate 不触发请求；进页走既有代际机制单次查询（partialize 排除 items/loading 等瞬态）。
 export const useSuperSearchStore = create<SuperSearchState>()(
@@ -137,6 +152,7 @@ export const useSuperSearchStore = create<SuperSearchState>()(
     (set, get) => ({
   query: defaultQuery(),
   expr: undefined,
+  plan: null,
   items: [],
   total: 0,
   loading: false,
@@ -155,7 +171,7 @@ export const useSuperSearchStore = create<SuperSearchState>()(
     if (queryEqual(prev, next)) return;
     invalidatePendingRequests();
     // 改扁平查询时清掉表达式树（避免双源）
-    set({ query: next, expr: undefined, warnings: [], aiExplanation: null, aiError: null, aiLoading: false, resolvedTags: [] });
+    set({ query: next, expr: undefined, plan: null, warnings: [], aiExplanation: null, aiError: null, aiLoading: false, resolvedTags: [] });
     useSelectionStore.getState().clear();
     scheduleRefresh(get().refresh);
   },
@@ -167,7 +183,7 @@ export const useSuperSearchStore = create<SuperSearchState>()(
     const query = syncQueryFromExpr(get().query, expr);
     // §9.6.1：expr 更新后清理已不再引用的名称映射
     const resolvedTags = filterResolvedTagsByExpr(get().resolvedTags, expr);
-    set({ query, expr, warnings: [], aiExplanation: null, aiError: null, aiLoading: false, resolvedTags });
+    set({ query, expr, plan: null, warnings: [], aiExplanation: null, aiError: null, aiLoading: false, resolvedTags });
     useSelectionStore.getState().clear();
     scheduleRefresh(get().refresh);
   },
@@ -178,7 +194,7 @@ export const useSuperSearchStore = create<SuperSearchState>()(
     const sameExpr = (!expr && !currentExpr) || (expr && currentExpr && serializeExpr(expr) === serializeExpr(currentExpr));
     if (queryEqual(prev, query) && sameExpr) return;
     invalidatePendingRequests();
-    set({ query, expr, warnings: [], aiExplanation: null, aiError: null, aiLoading: false, resolvedTags: [] });
+    set({ query, expr, plan: null, warnings: [], aiExplanation: null, aiError: null, aiLoading: false, resolvedTags: [] });
     useSelectionStore.getState().clear();
     scheduleRefresh(get().refresh);
   },
@@ -203,11 +219,15 @@ export const useSuperSearchStore = create<SuperSearchState>()(
       if (aiSeq !== requestSeq) return;
       // §9.6：后端返回的 expr 为唯一执行事实源，前端不得从扁平 query 再猜一棵树
       const aiExpr = result.expr ?? undefined;
+      const aiPlan = result.plan ?? null;
       let nextExpr: QueryExpr | undefined;
+      let nextPlan: SearchPlanV3 | null;
       let nextQuery: ResolvedSearchQuery;
       let nextResolvedTags: ResolvedTag[];
       if (mode === "replace") {
         nextExpr = aiExpr;
+        // plan 仅当替换整个条件时携带（append 合并后 plan 不再精确，清空走 expr 链路）
+        nextPlan = aiPlan;
         // query 只同步 sortBy/sortDir，不从复杂 expr 反推扁平条件（§9.6）
         nextQuery = { ...defaultQuery(), sortBy: result.sortBy, sortDir: result.sortDir };
         nextResolvedTags = result.resolvedTags;
@@ -215,6 +235,7 @@ export const useSuperSearchStore = create<SuperSearchState>()(
         // append：两个完整查询组以 AND 合并（不破坏内部 OR 分组）
         const baseExpr = get().expr ?? resolvedQueryToExpr(cur);
         nextExpr = normalizeExpr(mergeQueryExpr(baseExpr, aiExpr) as QueryExpr);
+        nextPlan = null;
         nextQuery = { ...cur, sortBy: result.sortBy, sortDir: result.sortDir };
         nextResolvedTags = mergeResolvedTags(get().resolvedTags, result.resolvedTags);
       }
@@ -223,6 +244,7 @@ export const useSuperSearchStore = create<SuperSearchState>()(
       set({
         query: synced,
         expr: nextExpr,
+        plan: nextPlan,
         aiExplanation: result.explanation,
         warnings: result.warnings,
         parseStatus: result.parseStatus,
@@ -256,7 +278,7 @@ export const useSuperSearchStore = create<SuperSearchState>()(
   clearConditions: () => {
     invalidatePendingRequests();
     const def = defaultQuery();
-    set({ query: def, expr: undefined, warnings: [], aiExplanation: null, aiError: null, aiLoading: false, resolvedTags: [] });
+    set({ query: def, expr: undefined, plan: null, warnings: [], aiExplanation: null, aiError: null, aiLoading: false, resolvedTags: [] });
     useSelectionStore.getState().clear();
     scheduleRefresh(get().refresh);
   },
@@ -311,7 +333,18 @@ export const useSuperSearchStore = create<SuperSearchState>()(
   partialize: (state) => ({
     expr: state.expr,
     query: state.query,
+    // S6：整个 SearchPlanV3 随行持久化（hydrate 时版本迁移见下方 migrate）
+    plan: state.plan,
   }),
+  // S6：hydrate 时 plan_schema_version > 当前（用户降级应用）→ 丢弃；否则保留
+  migrate: (persisted) => {
+    const p = persisted as { plan?: SearchPlanV3 | null };
+    if (p?.plan) {
+      const migrated = migratePlanV3(p.plan);
+      return { ...(persisted as object), plan: migrated } as never;
+    }
+    return persisted as never;
+  },
 },
   ),
 );

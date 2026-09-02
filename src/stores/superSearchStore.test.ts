@@ -90,7 +90,7 @@ describe("superSearchStore", () => {
     vi.mocked(aiParseSearchQuery).mockResolvedValue({
       intent: {
         groups: [
-          { assetType: "all", concepts: [{ text: "海边", role: "scene", facetHint: "scene", confidence: 0.95 }], textTerms: [], metadata: [] },
+          { assetType: "all", concepts: [{ text: "海边", role: "scene", facetHint: "scene", confidence: 0.95 }], textTerms: [], metadata: [], preferred: [] },
         ],
         exclusions: [],
         sortBy: null,
@@ -177,5 +177,77 @@ describe("superSearchStore", () => {
     expect(st.expr).toBeUndefined();
     expect(st.query.search).toBe("");
     expect(st.query.assetType).toBe("all");
+  });
+
+  // ═══════════ S6：SearchPlanV3 persist ═══════════
+
+  it("AI replace：plan 随解析结果保存（含 should 加分），手动编辑清空", async () => {
+    const { aiParseSearchQuery } = await import("@/api/superSearch");
+    const expr: QueryExpr = { op: "leaf", cond: { type: "search", value: "草地" } };
+    const plan = {
+      planSchemaVersion: 3,
+      normalizationVersion: 1,
+      compilerVersion: 1,
+      filter: { op: "leaf" as const, cond: { type: "tag" as const, facetKey: "scene", tagIds: [1], mode: "any" as const, includeDescendants: true } },
+      mustNot: null,
+      should: [{ cond: { type: "tag" as const, facetKey: "scene", tagIds: [2], mode: "any" as const, includeDescendants: true }, weight: 1, label: "蓝天（加分项）" }],
+      minimumShouldMatch: 0,
+      retrievers: { retrievers: [], fusion: "rrf" as const },
+      ranking: { type: "relevance" as const },
+    };
+    vi.mocked(aiParseSearchQuery).mockResolvedValue({
+      intent: { groups: [], exclusions: [], sortBy: null, sortDir: null },
+      expr,
+      plan,
+      sortBy: "created_at",
+      sortDir: "desc",
+      explanation: "",
+      warnings: [],
+      parseStatus: "full",
+      resolvedTags: [],
+    });
+    await useSuperSearchStore.getState().applyAiSearch("草地", "replace");
+    expect(useSuperSearchStore.getState().plan).toEqual(plan);
+    // 手动编辑条件 → plan 清空（回到 expr 链路，避免双源）
+    useSuperSearchStore.getState().setExpr({ op: "leaf", cond: { type: "assetType", value: "image" } });
+    expect(useSuperSearchStore.getState().plan).toBeNull();
+  });
+
+  it("AI append：合并后 plan 清空（不再精确，走 expr 链路）", async () => {
+    const { aiParseSearchQuery } = await import("@/api/superSearch");
+    const newExpr: QueryExpr = { op: "leaf", cond: { type: "tag", facetKey: "subject", tagIds: [2], mode: "any", includeDescendants: true } };
+    vi.mocked(aiParseSearchQuery).mockResolvedValue({
+      intent: { groups: [], exclusions: [], sortBy: null, sortDir: null },
+      expr: newExpr,
+      plan: {
+        planSchemaVersion: 3, normalizationVersion: 1, compilerVersion: 1,
+        filter: null, mustNot: null, should: [], minimumShouldMatch: 0,
+        retrievers: { retrievers: [], fusion: "rrf" as const },
+        ranking: { type: "field", key: "created_at", dir: "desc" },
+      },
+      sortBy: "created_at",
+      sortDir: "desc",
+      explanation: "",
+      warnings: [],
+      parseStatus: "full",
+      resolvedTags: [],
+    });
+    const base: QueryExpr = { op: "leaf", cond: { type: "search", value: "海边" } };
+    useSuperSearchStore.getState().setExpr(base);
+    await useSuperSearchStore.getState().applyAiSearch("树", "append");
+    expect(useSuperSearchStore.getState().plan).toBeNull();
+    expect(useSuperSearchStore.getState().expr).toEqual({ op: "and", children: [base, newExpr] });
+  });
+
+  it("migratePlanV3：未来 schema 版本丢弃（防用户降级应用破数据），当前版本保留", async () => {
+    const { migratePlanV3 } = await import("@/stores/superSearchStore");
+    const base: import("@/types/superSearch").SearchPlanV3 = {
+      planSchemaVersion: 3, normalizationVersion: 1, compilerVersion: 1,
+      filter: null, mustNot: null, should: [], minimumShouldMatch: 0,
+      retrievers: { retrievers: [], fusion: "rrf" },
+      ranking: { type: "field", key: "created_at", dir: "desc" },
+    };
+    expect(migratePlanV3(base)).not.toBeNull();
+    expect(migratePlanV3({ ...base, planSchemaVersion: 99 })).toBeNull();
   });
 });
