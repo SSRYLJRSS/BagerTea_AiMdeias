@@ -294,6 +294,8 @@ pub fn run() {
             commands::clear_all_video_proxies,
             // 超级搜索
             commands::ai_parse_search_query,
+            // C-2：AST 命中诊断（U-6 界面数据前提）
+            commands::diagnose_search_plan_cmd,
             // 入库
             commands::import_files,
             commands::inspect_import,

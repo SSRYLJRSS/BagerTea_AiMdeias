@@ -6,6 +6,7 @@
 use std::sync::Arc;
 use tauri::State;
 
+use crate::db::search_plan::{LeafDiagnostic, ShouldDiagnostic};
 use crate::db::settings;
 use crate::db::tag_facets;
 use crate::error::{AppError, AppResult};
@@ -139,4 +140,19 @@ pub async fn ai_parse_search_query(
     })
     .await
     .map_err(|e| AppError::msg(format!("AI 搜索任务失败: {e}")))?
+}
+
+/// C-2：对当前 SearchPlanV3 做 AST 命中诊断（U-6 数据前提）。
+/// 返回 filter/must_not 叶子的 delta 诊断 + should 命中/总数。
+/// 只读 COUNT（2N+1 次，毫秒级）；无 plan 时返回空。
+#[tauri::command]
+pub fn diagnose_search_plan_cmd(
+    state: State<'_, AppState>,
+    plan: Option<crate::db::search_plan::SearchPlanV3>,
+) -> AppResult<(Vec<LeafDiagnostic>, Vec<ShouldDiagnostic>)> {
+    let conn = lock_db(&state.db)?;
+    let Some(plan) = plan else {
+        return Ok((Vec::new(), Vec::new()));
+    };
+    crate::db::search_plan::diagnose_search_plan(&conn, &plan)
 }
