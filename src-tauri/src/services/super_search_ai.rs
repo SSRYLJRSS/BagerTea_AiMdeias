@@ -332,11 +332,15 @@ pub struct ResolvedFacet {
 
 /// FB5-05（§9.5）：AI 解析结果。expr 为唯一执行事实源；排序单独返回。
 /// W6-5（§W6-5）：parseStatus 供前端区分「完全理解 / 部分理解 / 按关键词搜索」三态。
+/// S3：新增 plan —— V3 解析出 preferred（加分项）时非空，供 U 波次三段式 UI 直接消费；
+/// 无加分项时 plan=None，前端继续用 expr 单链路（保持既有行为）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AiSearchParseResult {
-    pub intent: SearchIntentV2,
+    pub intent: SearchIntentV3,
     pub expr: Option<QueryExpr>,
+    #[serde(default)]
+    pub plan: Option<crate::db::search_plan::SearchPlanV3>,
     pub sort_by: String,
     pub sort_dir: String,
     pub explanation: String,
@@ -1439,7 +1443,7 @@ pub fn request_intent(
     facets: &[FacetPromptContext],
     dict: &[String],
     capabilities: &str,
-) -> AppResult<(SearchIntentV2, Vec<String>)> {
+) -> AppResult<(SearchIntentV3, Vec<String>)> {
     let profile = cfg
         .active()
         .ok_or_else(|| AppError::msg("请先在设置页添加 API 配置"))?;
@@ -1467,14 +1471,21 @@ pub fn request_intent(
     ) {
         Ok(v) => v,
         Err(e) if is_config_error(&e) => return Err(e),
-        Err(_) => return Ok(keyword_fallback(text)),
+        Err(_) => return Ok(keyword_fallback_v3(text)),
     };
     if ai_cloud::is_degenerate_text(&raw) {
         // 持续乱码/复读：属模型能力问题而非配置问题 → 关键词兜底
-        return Ok(keyword_fallback(text));
+        return Ok(keyword_fallback_v3(text));
     }
-    // ②/③/④：解析 + lenient 剔除 + 结构校验，全部失败落第 3 层（永不失败）
-    Ok(degrade_parse(&raw, text, facets))
+    // ②/③/④：V3 解析（含 preferred evidence 守卫）+ lenient + 结构校验，全部失败落第 3 层
+    Ok(degrade_parse_v3(&raw, text, facets))
+}
+
+fn keyword_fallback_v3(text: &str) -> (SearchIntentV3, Vec<String>) {
+    (
+        keyword_intent_v3(text),
+        vec!["未能理解搜索条件，已按关键词搜索。".into()],
+    )
 }
 
 /// W6-2：解析层三层降级的纯函数（不触网，单测直接打）。
@@ -1687,6 +1698,11 @@ pub fn is_keyword_fallback(intent: &SearchIntentV2, text: &str) -> bool {
         && intent.groups[0].text_terms.len() == 1
         && intent.groups[0].text_terms[0].scope == "all"
         && intent.groups[0].text_terms[0].text.trim() == text.trim()
+}
+
+/// S3：V3 intent 的关键词兜底判定（V3 形态 —— 判断逻辑与 V2 相同，组可带空 preferred）。
+pub fn is_keyword_fallback_v3(intent: &SearchIntentV3, text: &str) -> bool {
+    is_keyword_fallback(&v3_to_v2_view(intent), text)
 }
 
 /// W6-3 部分解析剔除规则：能救一条算一条，全部不合法才落第 3 层。
@@ -1960,6 +1976,46 @@ pub fn build_explanation(intent: &SearchIntentV2) -> String {
         }
         for m in &g.metadata {
             inner.push(format!("{} {}", m.key, m.op));
+        }
+        if !inner.is_empty() {
+            parts.push(if intent.groups.len() > 1 {
+                format!("任一组 {}：{}", i + 1, inner.join(" 且 "))
+            } else {
+                inner.join(" 且 ")
+            });
+        }
+    }
+    for c in &intent.exclusions {
+        parts.push(format!("排除「{}」", c.text));
+    }
+    if parts.is_empty() {
+        "未解析出明确条件".into()
+    } else {
+        format!("筛选{}", parts.join("；"))
+    }
+}
+
+/// S3：V3 解释文案 —— V2 语义 + 加分项以「可加分」呈现（与 UI 三段式措辞一致）。
+pub fn build_explanation_v3(intent: &SearchIntentV3) -> String {
+    let mut parts = Vec::new();
+    for (i, g) in intent.groups.iter().enumerate() {
+        let mut inner = Vec::new();
+        match g.asset_type.as_str() {
+            "image" => inner.push("图片".into()),
+            "video" => inner.push("视频".into()),
+            _ => {}
+        }
+        for c in &g.concepts {
+            inner.push(format!("「{}」", c.text));
+        }
+        for tt in &g.text_terms {
+            inner.push(format!("内容「{}」", tt.text));
+        }
+        for m in &g.metadata {
+            inner.push(format!("{} {}", m.key, m.op));
+        }
+        for c in &g.preferred {
+            inner.push(format!("「{}」(可加分)", c.text));
         }
         if !inner.is_empty() {
             parts.push(if intent.groups.len() > 1 {

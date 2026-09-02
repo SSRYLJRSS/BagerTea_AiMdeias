@@ -1,6 +1,7 @@
-//! 超级搜索命令（FB5-05 §9）：AI 自然语言 → SearchIntentV2 → QueryExpr（唯一执行事实源）。
+//! 超级搜索命令（FB5-05 §9）：AI 自然语言 → SearchIntentV3 → QueryExpr + SearchPlanV3。
 //! 薄壳：校验输入长度 → 短锁读配置/分面/标签 → 放锁 → spawn_blocking 网络请求
-//! → 本地守卫 → 短锁生成 expr（标签解析）→ 返回 expr/排序/解释/warnings。
+//! → V3 解析（degrade_parse_v3 内含 evidence 守卫/清洗/校验）→ 短锁生成 expr（V2 视图，
+//! 兼容现有列表链路）+ plan（含 should 加分，供 U 波次三段式 UI）→ 返回。
 
 use std::sync::Arc;
 use tauri::State;
@@ -9,7 +10,7 @@ use crate::db::settings;
 use crate::db::tag_facets;
 use crate::error::{AppError, AppResult};
 use crate::services::super_search_ai;
-use crate::services::super_search_ai::{AiSearchParseResult, SearchIntentV2};
+use crate::services::super_search_ai::{AiSearchParseResult, SearchIntentV3};
 use crate::state::AppState;
 
 fn lock_db(
@@ -18,7 +19,9 @@ fn lock_db(
     db.lock().map_err(|_| AppError::msg("数据库锁中毒"))
 }
 
-/// AI 自然语言 → SearchIntentV2（组内 AND、组间 OR）→ 后端生成 QueryExpr。
+/// AI 自然语言 → SearchIntentV3（required + preferred）→ 后端生成 QueryExpr（必须部分）
+/// 与 SearchPlanV3（filter/must_not/should，加分语义完整）。expr 供现有 UI/列表执行，
+/// plan 在存在加分项时返回给 U 波次三段式界面直接映射。
 /// FB5-05（§9.5）：已删除未使用的 current_query 参数——append 由前端明确合并 expr。
 #[tauri::command]
 pub async fn ai_parse_search_query(
@@ -58,42 +61,57 @@ pub async fn ai_parse_search_query(
                 super_search_ai::library_capabilities(&conn).unwrap_or_default();
             (s.ai, facets, dict, capabilities)
         };
-        // 3. 锁外网络请求 + 三层降级（strict → lenient → 关键词兜底；配置错误仍真报错）
-        let (mut intent, ai_warnings): (SearchIntentV2, Vec<String>) =
+        // 3. 锁外网络请求 + V3 解析（V3→V2→关键词 三层降级；配置错误仍真报错）。
+        //    degrade_parse_v3 已含 sanitize + guard_preferred + validate。
+        let (intent, ai_warnings): (SearchIntentV3, Vec<String>) =
             super_search_ai::request_intent(&cfg, &text, &facets, &dict, &capabilities)?;
         // W6-5：是否落在第 3 层（关键词兜底）→ 解释文案与前端三态据此
-        let keyword_mode = super_search_ai::is_keyword_fallback(&intent, &text);
-        // 4. 本地确定性守卫（§9.3）：OR/assetType/concept 清洗/去重/confidence 钳制
-        let mut warnings = super_search_ai::guard_intent(&text, &mut intent);
-        warnings.extend(ai_warnings);
-        // 5. 短锁：标签解析 + QueryExpr 生成 + 校验（AI 结果唯一执行事实源）
-        let (expr, resolved_tags, resolve_warnings) = {
+        let keyword_mode = super_search_ai::is_keyword_fallback_v3(&intent, &text);
+        let mut warnings = ai_warnings;
+        // 4. 短锁：从 V2 视图生成 expr（现有列表执行事实源）+ 从 V3 生成 plan（加分语义）
+        let (expr, resolved_tags, plan, resolve_warnings) = {
             let conn = lock_db(&db)?;
-            super_search_ai::build_expr_from_v2(&conn, &intent)?
+            let v2_view = super_search_ai::v3_to_v2_view(&intent);
+            let (expr, resolved_tags, ew) =
+                super_search_ai::build_expr_from_v2(&conn, &v2_view)?;
+            let (plan, pr, pw) = super_search_ai::build_plan_from_v3(&conn, &intent)?;
+            let mut all_resolved = resolved_tags.clone();
+            for r in pr {
+                if !all_resolved.iter().any(|x| x.tag_id == r.tag_id) {
+                    all_resolved.push(r);
+                }
+            }
+            let mut all_w = ew;
+            all_w.extend(pw);
+            (expr, all_resolved, Some(plan), all_w)
         };
         warnings.extend(resolve_warnings);
         // §9.7：AI 结果通过后本地再校验一次；失败视为解析错误，不应用部分条件。
         // W6-2：此处失败同样降级为关键词搜索（永不红字报错）。
-        let (expr, resolved_tags) = match &expr {
+        let (expr, resolved_tags, plan) = match &expr {
             Some(e) => match crate::db::query_expr::validate_expr(e) {
-                Ok(()) => (expr, resolved_tags),
+                Ok(()) => (expr, resolved_tags, plan),
                 Err(e) => {
                     warnings.push(format!("解析结果不合规（{e}），已按关键词搜索。"));
-                    let fallback = super_search_ai::keyword_intent(&text);
-                    let (fe, fr, fw) = {
+                    let fallback = super_search_ai::keyword_intent_v3(&text);
+                    let (fe, fr, fw, fp) = {
                         let conn = lock_db(&db)?;
-                        super_search_ai::build_expr_from_v2(&conn, &fallback)?
+                        let v2 = super_search_ai::v3_to_v2_view(&fallback);
+                        let (expr, r, w) =
+                            super_search_ai::build_expr_from_v2(&conn, &v2)?;
+                        let (p, _, _) = super_search_ai::build_plan_from_v3(&conn, &fallback)?;
+                        (expr, r, w, p)
                     };
                     warnings.extend(fw);
-                    (fe, fr)
+                    (fe, fr, Some(fp))
                 }
             },
-            None => (expr, resolved_tags),
+            None => (expr, resolved_tags, plan),
         };
         let explanation = if keyword_mode {
             "按关键词搜索".into()
         } else {
-            super_search_ai::build_explanation(&intent)
+            super_search_ai::build_explanation_v3(&intent)
         };
         let parse_status = if keyword_mode {
             "keyword".to_string()
@@ -110,6 +128,7 @@ pub async fn ai_parse_search_query(
         Ok(AiSearchParseResult {
             intent,
             expr,
+            plan,
             sort_by,
             sort_dir,
             explanation,
