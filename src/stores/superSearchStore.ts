@@ -8,7 +8,7 @@ import { listSuperAssets, listSuperAssetIds, aiParseSearchQuery } from "@/api/su
 import { useSelectionStore } from "@/stores/selectionStore";
 import type { Asset, ResolvedSearchQuery, MetadataFilter } from "@/types/asset";
 import type { QueryExpr } from "@/types/queryExpr";
-import type { AiApplyMode, ResolvedTag, SearchPlanV3 } from "@/types/superSearch";
+import type { AiApplyMode, ResolvedTag, SearchPlanV3, ShouldClause } from "@/types/superSearch";
 import {
   mergeQueryExpr,
   normalizeExpr,
@@ -124,6 +124,11 @@ export interface SuperSearchState {
   applyAiSearch: (text: string, mode?: AiApplyMode) => Promise<void>;
   /** FB5-05（§9.6.1）：按 expr 节点路径删除单个条件（chips 删除用，禁止走 setQuery） */
   removeExprAtPath: (path: ExprPath) => void;
+  /** U-5：加分项（should）编辑 —— 覆盖整个 should 数组与最低命中数。
+   *  加分项是非嵌套叶子（ShouldClause.cond），不改变结果集（expr 单源保持），只参与排序。 */
+  setPlanShould: (should: ShouldClause[], minimumShouldMatch: number) => void;
+  /** U-5：按索引移除单条加分项（chips/加分区删除用） */
+  removePlanShould: (index: number) => void;
   /** FB5-05（§9.6.1）：排序 chip 独立 action（只改 sortBy/sortDir） */
   setSort: (sortBy: ResolvedSearchQuery["sortBy"], sortDir: "desc" | "asc") => void;
   /** FB5-05（§9.6.1）：清除全部——同时清 expr 和兼容扁平筛选 */
@@ -183,7 +188,11 @@ export const useSuperSearchStore = create<SuperSearchState>()(
     const query = syncQueryFromExpr(get().query, expr);
     // §9.6.1：expr 更新后清理已不再引用的名称映射
     const resolvedTags = filterResolvedTagsByExpr(get().resolvedTags, expr);
-    set({ query, expr, plan: null, warnings: [], aiExplanation: null, aiError: null, aiLoading: false, resolvedTags });
+    // U-5：expr 是 filter 的唯一事实源 —— 已存在 plan（AI 加分）时把 plan.filter 同步为 expr，
+    // 不再整棵清空 plan（否则手动改必须区会丢掉加分项）；expr 清空时加分无从依附，plan 一并清。
+    const curPlan = get().plan;
+    const plan = curPlan && expr ? { ...curPlan, filter: expr } : null;
+    set({ query, expr, plan, warnings: [], aiExplanation: null, aiError: null, aiLoading: false, resolvedTags });
     useSelectionStore.getState().clear();
     scheduleRefresh(get().refresh);
   },
@@ -265,6 +274,31 @@ export const useSuperSearchStore = create<SuperSearchState>()(
     if (!expr) return;
     const next = removeExprAtPath(expr, path);
     get().setExpr(next);
+  },
+
+  setPlanShould: (should, minimumShouldMatch) => {
+    const cur = get();
+    const clamped = Math.max(0, Math.min(should.length, Math.floor(minimumShouldMatch)));
+    const plan: SearchPlanV3 = cur.plan ?? {
+      // U-5：手动条件首次加分时，从当前 expr 起一个最小 plan（filter 单源镜像）
+      planSchemaVersion: 3,
+      normalizationVersion: 1,
+      compilerVersion: 1,
+      filter: cur.expr ?? null,
+      mustNot: null,
+      should: [],
+      minimumShouldMatch: 0,
+      retrievers: { retrievers: [] },
+      ranking: { type: "field", key: "created_at", dir: "desc" },
+    };
+    set({ plan: { ...plan, should: should.slice(0, 12), minimumShouldMatch: clamped } });
+  },
+
+  removePlanShould: (index) => {
+    const plan = get().plan;
+    if (!plan) return;
+    const should = plan.should.filter((_, i) => i !== index);
+    get().setPlanShould(should, Math.min(plan.minimumShouldMatch, should.length));
   },
 
   setSort: (sortBy, sortDir) => {

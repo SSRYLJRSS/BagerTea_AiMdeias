@@ -5,6 +5,7 @@ import { useSuperSearchStore } from "@/stores/superSearchStore";
 import { useTagStore } from "@/stores/tagStore";
 import { listSuperAssets } from "@/api/superSearch";
 import type { QueryExpr } from "@/types/queryExpr";
+import type { SearchPlanV3 } from "@/types/superSearch";
 import { shortcutEndMs, shortcutStartMs } from "@/utils/dateShortcuts";
 
 /** U-1：字段下拉已改造成可搜索 combobox —— 打开第 row 行字段列表并点选 label 选项 */
@@ -38,6 +39,7 @@ beforeEach(() => {
   useSuperSearchStore.setState({
     query: { search: "", assetType: "all", untaggedOnly: false, facetFilters: [], excludeTagIds: [], metadataFilters: [], sortBy: "created_at", sortDir: "desc" },
     expr: undefined,
+    plan: null, // U-5 加分项单源：测试间不残留 should
     items: [],
     total: 0,
     loading: false,
@@ -672,5 +674,77 @@ describe("U-4 一层嵌套只读树形视图", () => {
     expect(children).toContainEqual({ op: "leaf", cond: { type: "search", value: "夜景" } });
     const orChild = children.find((c) => c.op === "or") as QueryExpr | undefined;
     expect(orChild).toBeTruthy();
+  });
+});
+
+/** U-5：加分项（should）区 —— 渲染、至少满足下拉、三档权重。加分项直写 store.plan.should，expr（filter）单源保持。 */
+describe("U-5 加分项区", () => {
+  const seedShouldPlan = (weights: number[], min: number) => {
+    const baseExpr: QueryExpr = { op: "leaf", cond: { type: "search", value: "海边" } };
+    const rows = weights.map((w, i) => ({ id: i + 5, name: ["蓝天", "夜景", "女孩"][i] ?? `加分${i}`, weight: w }));
+    const plan: SearchPlanV3 = {
+      planSchemaVersion: 3, normalizationVersion: 1, compilerVersion: 1,
+      filter: baseExpr, mustNot: null,
+      should: rows.map((r) => ({ cond: { type: "tag", facetKey: "scene", tagIds: [r.id], mode: "any", includeDescendants: false }, weight: r.weight, label: r.name })),
+      minimumShouldMatch: min,
+      retrievers: { retrievers: [] },
+      ranking: { type: "field", key: "created_at", dir: "desc" },
+    };
+    useSuperSearchStore.setState({
+      expr: baseExpr,
+      plan,
+      resolvedTags: rows.map((r) => ({ facetKey: "scene", text: r.name, tagId: r.id, path: "" })),
+    });
+  };
+
+  it("queryBuilder_should_section_renders：加分项区显示行编辑 + 空态引导", () => {
+    seedShouldPlan([1, 1, 1], 1);
+    render(<QueryBuilder />);
+    expect(screen.getByText("加分项")).toBeInTheDocument();
+    // 三条加分项各渲染一个值编辑区（chips 显示标签名）
+    expect(screen.getByText(/蓝天/)).toBeInTheDocument();
+    expect(screen.getByText(/夜景/)).toBeInTheDocument();
+    expect(screen.getByText(/女孩/)).toBeInTheDocument();
+    // 权重下拉数量与加分项一致
+    expect(screen.getAllByLabelText("加分权重")).toHaveLength(3);
+    expect(screen.getByRole("button", { name: "＋ 添加加分项" })).toBeInTheDocument();
+  });
+
+  it("queryBuilder_min_should_match_dropdown：下拉 0..N（含全部），变更写入 plan", () => {
+    seedShouldPlan([1, 1, 1], 2);
+    render(<QueryBuilder />);
+    const min = screen.getByLabelText("至少满足") as HTMLSelectElement;
+    expect(min.value).toBe("2");
+    const optionTexts = Array.from(min.options).map((o) => o.textContent ?? "");
+    expect(optionTexts).toContain("0（不限）");
+    expect(optionTexts).toContain("3（全部）");
+    fireEvent.change(min, { target: { value: "0" } });
+    expect(useSuperSearchStore.getState().plan?.minimumShouldMatch).toBe(0);
+    expect((screen.getByLabelText("至少满足") as HTMLSelectElement).value).toBe("0");
+  });
+
+  it("queryBuilder_weight_three_tiers：三档权重下拉 0.5/1.0/2.0，切换写回 should", () => {
+    seedShouldPlan([0.5, 1, 2], 1);
+    render(<QueryBuilder />);
+    const weightSelects = screen.getAllByLabelText("加分权重") as HTMLSelectElement[];
+    expect(weightSelects.map((w) => w.value)).toEqual(["0.5", "1", "2"]);
+    const labels = Array.from(weightSelects[0].options).map((o) => o.textContent ?? "");
+    expect(labels).toEqual(["略微", "一般", "强偏好"]);
+    fireEvent.change(weightSelects[0], { target: { value: "2" } });
+    const should = useSuperSearchStore.getState().plan?.should;
+    expect(should?.[0].weight).toBe(2);
+  });
+
+  it("空 plan 时新增加分项 → store 从当前 expr 建 plan（filter 镜像，should 一条、默认权重 1）", () => {
+    useSuperSearchStore.setState({
+      expr: { op: "leaf", cond: { type: "search", value: "海边" } },
+      plan: null,
+    });
+    render(<QueryBuilder />);
+    fireEvent.click(screen.getByRole("button", { name: "＋ 添加加分项" }));
+    const plan = useSuperSearchStore.getState().plan;
+    expect(plan?.should).toHaveLength(1);
+    expect(plan?.should?.[0].weight).toBe(1);
+    expect(plan?.filter).toEqual({ op: "leaf", cond: { type: "search", value: "海边" } });
   });
 });

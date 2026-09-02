@@ -208,9 +208,11 @@ describe("superSearchStore", () => {
     });
     await useSuperSearchStore.getState().applyAiSearch("草地", "replace");
     expect(useSuperSearchStore.getState().plan).toEqual(plan);
-    // 手动编辑条件 → plan 清空（回到 expr 链路，避免双源）
+    // U-5：手动编辑必须区 → plan 保留并同步 filter 为新 expr（加分项不丢；expr 仍为 filter 唯一事实源）
     useSuperSearchStore.getState().setExpr({ op: "leaf", cond: { type: "assetType", value: "image" } });
-    expect(useSuperSearchStore.getState().plan).toBeNull();
+    const kept = useSuperSearchStore.getState().plan;
+    expect(kept?.should).toEqual(plan.should);
+    expect(kept?.filter).toEqual({ op: "leaf", cond: { type: "assetType", value: "image" } });
   });
 
   it("AI append：合并后 plan 清空（不再精确，走 expr 链路）", async () => {

@@ -132,8 +132,8 @@ describe("SuperSearchPage", () => {
     // 搜索框在标识下方（同一容器内 h1 位于 form 之前）
     expect(titles[0].compareDocumentPosition(searchbox) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     expect(screen.getByRole("region", { name: "条件公式" })).toBeInTheDocument();
-    // 结果计数保留在摘要行
-    expect(screen.getByText(/项/)).toBeInTheDocument();
+    // 结果计数保留在摘要行（U-5 之后「加分项」区标题也含「项」字，计数须为「数字 + 项」形态）
+    expect(screen.getByText(/^\d+ 项$/)).toBeInTheDocument();
   });
 
   function scrollTo(top: number) {

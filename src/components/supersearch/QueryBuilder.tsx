@@ -11,6 +11,7 @@ import { useTagStore } from "@/stores/tagStore";
 import { useSuperSearchStore } from "@/stores/superSearchStore";
 import type { AssetType, MetadataFilter, MetadataFilterKey, MetadataOp } from "@/types/asset";
 import type { LeafCond, QueryExpr } from "@/types/queryExpr";
+import type { ShouldClause } from "@/types/superSearch";
 import { mergeQueryExpr, normalizeExpr, serializeExpr } from "@/utils/queryExprUtils";
 import {
   DATE_SHORTCUT_OPTIONS,
@@ -105,8 +106,8 @@ function tagMatch(opt: FlatTag, qRaw: string, match: TermMatchKey): boolean {
 }
 
 export default function QueryBuilder() {
-  const { expr, setExpr, clearQuery, resolvedTags } = useSuperSearchStore(
-    useShallow((s) => ({ expr: s.expr, setExpr: s.setExpr, clearQuery: s.clearQuery, resolvedTags: s.resolvedTags })),
+  const { expr, setExpr, clearQuery, resolvedTags, plan, setPlanShould } = useSuperSearchStore(
+    useShallow((s) => ({ expr: s.expr, setExpr: s.setExpr, clearQuery: s.clearQuery, resolvedTags: s.resolvedTags, plan: s.plan, setPlanShould: s.setPlanShould })),
   );
   const tagTree = useTagStore((s) => s.tree); const tagsLoading = useTagStore((s) => s.loading);
   const [mode, setMode] = useState<GroupMode>("and"); const [rows, setRows] = useState<Row[]>([]);
@@ -179,6 +180,11 @@ export default function QueryBuilder() {
   const addRow = () => commit([...rows, { id: uid(), negated: false, cond: makeCond("tag", allTagOptions) }]);
   const updateRow = (id: string, patch: Partial<Row>) => commit(rows.map((row) => row.id === id ? { ...row, ...patch } : row));
   const clearAll = () => { if (commitTimer.current) clearTimeout(commitTimer.current); lastLocalSignature.current = ""; setRows([]); setFormulaWarning(null); clearQuery(); };
+  // U-5：加分项（should）只读区所需数据 —— plan.should 为 store 单源；加分项是非嵌套叶子（ShouldClause.cond）
+  const shouldList = plan?.should ?? [];
+  const shouldMin = plan?.minimumShouldMatch ?? 0;
+  const setShould = (next: typeof shouldList, min?: number) => setPlanShould(next, min ?? Math.min(shouldMin, next.length));
+  const patchShould = (index: number, next: ShouldClause) => setShould(shouldList.map((x, i) => (i === index ? next : x)), shouldMin);
 
   return <section className="overflow-hidden rounded-md border border-[var(--color-border)] bg-[var(--color-surface-raised)]" aria-label="条件公式">
     <div className="flex min-h-10 items-center gap-2 border-b border-[var(--color-border)] px-3 py-2"><span className="text-xs font-semibold text-[var(--color-text)]">筛选条件</span><span className="text-[11px] text-[var(--color-text-tertiary)]">AI 生成后可继续修改</span>{rows.length > 0 && <button type="button" onClick={clearAll} className="ml-auto text-xs text-[var(--color-text-secondary)] hover:text-[var(--color-text)]">清除全部</button>}</div>
@@ -213,6 +219,39 @@ export default function QueryBuilder() {
       )}
       {rows.length === 0 ? <button type="button" onClick={addRow} className="flex h-10 w-full items-center justify-center border border-dashed border-[var(--color-border)] text-xs text-[var(--color-text-secondary)] hover:border-[var(--color-border-strong)] hover:bg-[var(--color-surface)] hover:text-[var(--color-text)]">+ 添加第一个条件</button> : <div className="divide-y divide-[var(--color-border)] border-y border-[var(--color-border)]">{rows.map((row, index) => <ConditionRow key={row.id} row={row} prefix={index === 0 ? "当" : mode === "and" ? "并且" : "或者"} allTagOptions={allTagOptions} onChange={(patch) => updateRow(row.id, patch)} onRemove={() => commit(rows.filter((item) => item.id !== row.id))} />)}</div>}
       {rows.length > 0 && <button type="button" onClick={addRow} className="mt-2 h-8 px-1 text-xs font-medium text-[var(--color-status)] hover:opacity-80">+ 添加条件</button>}
+      {/* U-5：加分项（should）区 —— 满足加分不淘汰；仅叶子；行编辑直接写 store.plan.should */}
+      <div className="mt-3 border-t border-[var(--color-border)] pt-2">
+        <div className="mb-1.5 flex flex-wrap items-center gap-2">
+          <span className="text-xs font-semibold text-[var(--color-text)]">加分项</span>
+          <span className="text-[11px] text-[var(--color-text-tertiary)]">满足越多排越前 · 不满足不淘汰</span>
+          {shouldList.length > 0 && (
+            <span className="ml-auto flex items-center gap-1 text-[11px] text-[var(--color-text-secondary)]">
+              至少满足
+              <select aria-label="至少满足" value={shouldMin} onChange={(e) => setShould(shouldList, Number(e.target.value))} className={`${controlClass} w-16`}>
+                {Array.from({ length: shouldList.length + 1 }, (_, i) => <option key={i} value={i}>{i === 0 ? "0（不限）" : i === shouldList.length ? `${i}（全部）` : i}</option>)}
+              </select>
+              项
+            </span>
+          )}
+        </div>
+        {shouldList.map((sc, i) => {
+          const field = fieldFromCond(sc.cond);
+          return (
+            <div key={`should-${i}`} className="mb-1.5 grid grid-cols-[40px_minmax(110px,0.8fr)_minmax(92px,0.55fr)_minmax(150px,1.5fr)_64px_28px] items-center gap-2 max-[900px]:grid-cols-[36px_minmax(100px,1fr)_minmax(88px,1fr)_minmax(130px,1.4fr)_60px_26px]">
+              <span className="pl-1 text-[11px] text-[var(--color-text-tertiary)]">{i === 0 ? "当" : "或"}</span>
+              <FieldSelect value={field} onChange={(next) => patchShould(i, { ...sc, cond: makeCond(next, allTagOptions) })} />
+              <ConditionOperator cond={sc.cond} negated={false} onChange={(p) => { if (p.cond) patchShould(i, { ...sc, cond: p.cond }); }} />
+              <ConditionValue cond={sc.cond} allTagOptions={allTagOptions} onChange={(cond) => patchShould(i, { ...sc, cond })} />
+              <select aria-label="加分权重" value={String(sc.weight)} onChange={(e) => patchShould(i, { ...sc, weight: Number(e.target.value) })} className={`${controlClass} w-full`}>
+                <option value="0.5">略微</option><option value="1">一般</option><option value="2">强偏好</option>
+              </select>
+              <button type="button" aria-label={`移除加分项 ${i + 1}`} onClick={() => setShould(shouldList.filter((_, j) => j !== i))} className="flex size-7 items-center justify-center rounded text-base text-[var(--color-text-tertiary)] hover:bg-[var(--color-surface-hover)] hover:text-[var(--color-danger)]">×</button>
+            </div>
+          );
+        })}
+        {shouldList.length === 0 && <p className="mb-1 text-[11px] text-[var(--color-text-tertiary)]">把「最好有 / 优先」倾向加在这里：只参与排序，不淘汰结果。</p>}
+        <button type="button" onClick={() => setShould([...shouldList, { cond: makeCond("tag", allTagOptions), weight: 1, label: "" }])} className="mt-1 h-7 px-1 text-xs font-medium text-[var(--color-status)] hover:opacity-80">＋ 添加加分项</button>
+      </div>
     </div>
   </section>;
 }
