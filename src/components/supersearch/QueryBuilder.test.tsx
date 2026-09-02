@@ -1,11 +1,19 @@
 import { beforeEach, describe, expect, it, vi, Mock } from "vitest";
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import QueryBuilder from "@/components/supersearch/QueryBuilder";
 import { useSuperSearchStore } from "@/stores/superSearchStore";
 import { useTagStore } from "@/stores/tagStore";
 import { listSuperAssets } from "@/api/superSearch";
 import type { QueryExpr } from "@/types/queryExpr";
 import { shortcutEndMs, shortcutStartMs } from "@/utils/dateShortcuts";
+
+/** U-1：字段下拉已改造成可搜索 combobox —— 打开第 row 行字段列表并点选 label 选项 */
+function pickField(label: string, row = 0) {
+  const combos = screen.getAllByRole("combobox", { name: "条件字段" });
+  fireEvent.focus(combos[row]);
+  const option = screen.getAllByRole("option", { name: label })[0];
+  fireEvent.click(option);
+}
 
 vi.mock("@/api/assets", () => ({
   listAssets: vi.fn().mockResolvedValue({ items: [], total: 0, hasMore: false }),
@@ -25,6 +33,7 @@ vi.mock("@/api/superSearch", () => ({
 
 beforeEach(() => {
   vi.clearAllMocks();
+  localStorage.clear(); // U-1 最近使用字段持久化：测试间互不污染
   useTagStore.setState({ tree: [], loading: false, treesByFacet: {}, expanded: new Set() });
   useSuperSearchStore.setState({
     query: { search: "", assetType: "all", untaggedOnly: false, facetFilters: [], excludeTagIds: [], metadataFilters: [], sortBy: "created_at", sortDir: "desc" },
@@ -52,12 +61,11 @@ describe("QueryBuilder", () => {
     render(<QueryBuilder />);
     fireEvent.click(screen.getByRole("button", { name: "+ 添加第一个条件" }));
     expect(useSuperSearchStore.getState().expr).toBeUndefined();
-    fireEvent.change(screen.getByLabelText("条件字段"), { target: { value: "assetType" } });
+    pickField("素材类型");
     fireEvent.change(screen.getByLabelText("条件值"), { target: { value: "image" } });
     expect(useSuperSearchStore.getState().expr).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "+ 添加条件" }));
-    const fields = screen.getAllByLabelText("条件字段");
-    fireEvent.change(fields[1], { target: { value: "assetType" } });
+    pickField("素材类型", 1);
     const values = screen.getAllByLabelText("条件值");
     fireEvent.change(values[1], { target: { value: "video" } });
     fireEvent.change(screen.getByLabelText("条件连接方式"), { target: { value: "or" } });
@@ -78,7 +86,7 @@ describe("QueryBuilder", () => {
   it("连续输入时保持焦点，不因 store 更新重建输入框", () => {
     render(<QueryBuilder />);
     fireEvent.click(screen.getByRole("button", { name: "+ 添加第一个条件" }));
-    fireEvent.change(screen.getByLabelText("条件字段"), { target: { value: "search" } });
+    pickField("关键词");
     const input = screen.getByPlaceholderText("输入关键词");
     input.focus();
     fireEvent.change(input, { target: { value: "海" } });
@@ -92,7 +100,7 @@ describe("QueryBuilder", () => {
   it("输入过程中不触发后端查询", () => {
     render(<QueryBuilder />);
     fireEvent.click(screen.getByRole("button", { name: "+ 添加第一个条件" }));
-    fireEvent.change(screen.getByLabelText("条件字段"), { target: { value: "search" } });
+    pickField("关键词");
     const input = screen.getByPlaceholderText("输入关键词");
     fireEvent.change(input, { target: { value: "a" } });
     fireEvent.change(input, { target: { value: "ab" } });
@@ -104,7 +112,7 @@ describe("QueryBuilder", () => {
   it("Enter 提交后查询条件正确", () => {
     render(<QueryBuilder />);
     fireEvent.click(screen.getByRole("button", { name: "+ 添加第一个条件" }));
-    fireEvent.change(screen.getByLabelText("条件字段"), { target: { value: "search" } });
+    pickField("关键词");
     const input = screen.getByPlaceholderText("输入关键词");
     fireEvent.change(input, { target: { value: "海边" } });
     expect(useSuperSearchStore.getState().expr).toBeUndefined();
@@ -115,7 +123,7 @@ describe("QueryBuilder", () => {
   it("失焦提交后查询条件正确", () => {
     render(<QueryBuilder />);
     fireEvent.click(screen.getByRole("button", { name: "+ 添加第一个条件" }));
-    fireEvent.change(screen.getByLabelText("条件字段"), { target: { value: "search" } });
+    pickField("关键词");
     const input = screen.getByPlaceholderText("输入关键词");
     fireEvent.change(input, { target: { value: "海边" } });
     expect(useSuperSearchStore.getState().expr).toBeUndefined();
@@ -126,7 +134,7 @@ describe("QueryBuilder", () => {
   it("添加新条件不会破坏已有输入行", () => {
     render(<QueryBuilder />);
     fireEvent.click(screen.getByRole("button", { name: "+ 添加第一个条件" }));
-    fireEvent.change(screen.getByLabelText("条件字段"), { target: { value: "search" } });
+    pickField("关键词");
     const input = screen.getByPlaceholderText("输入关键词");
     fireEvent.change(input, { target: { value: "海边" } });
     fireEvent.click(screen.getByRole("button", { name: "+ 添加条件" }));
@@ -138,7 +146,7 @@ describe("QueryBuilder", () => {
   it("删除条件后其余行焦点和值正常", () => {
     render(<QueryBuilder />);
     fireEvent.click(screen.getByRole("button", { name: "+ 添加第一个条件" }));
-    fireEvent.change(screen.getByLabelText("条件字段"), { target: { value: "search" } });
+    pickField("关键词");
     const input = screen.getByPlaceholderText("输入关键词");
     fireEvent.change(input, { target: { value: "海边" } });
     fireEvent.click(screen.getByRole("button", { name: "+ 添加条件" }));
@@ -154,7 +162,7 @@ describe("QueryBuilder", () => {
   it("数字条件清空后不会生成等于 0", () => {
     render(<QueryBuilder />);
     fireEvent.click(screen.getByRole("button", { name: "+ 添加第一个条件" }));
-    fireEvent.change(screen.getByLabelText("条件字段"), { target: { value: "iso" } });
+    pickField("ISO");
     const input = screen.getByRole("spinbutton", { name: "条件值" });
     fireEvent.change(input, { target: { value: "800" } });
     expect(useSuperSearchStore.getState().expr).toBeUndefined();
@@ -168,7 +176,7 @@ describe("QueryBuilder", () => {
   it("日期条件清空后不会生成 1970 年日期", () => {
     render(<QueryBuilder />);
     fireEvent.click(screen.getByRole("button", { name: "+ 添加第一个条件" }));
-    fireEvent.change(screen.getByLabelText("条件字段"), { target: { value: "taken_at" } });
+    pickField("拍摄时间");
     const input = screen.getByLabelText("条件值");
     fireEvent.change(input, { target: { value: "2025-08-24" } });
     expect(useSuperSearchStore.getState().expr).toBeTruthy();
@@ -193,7 +201,7 @@ describe("QueryBuilder", () => {
     const addBtn = screen.getByRole("button", { name: "+ 添加第一个条件" });
     expect(addBtn).toBeEnabled();
     fireEvent.click(addBtn);
-    fireEvent.change(screen.getByLabelText("条件字段"), { target: { value: "search" } });
+    pickField("关键词");
     const input = screen.getByPlaceholderText("输入关键词");
     fireEvent.change(input, { target: { value: "夜景" } });
     fireEvent.blur(input);
@@ -248,8 +256,7 @@ describe("W0-3 条件公式包含根级标签", () => {
     });
     render(<QueryBuilder />);
     fireEvent.click(screen.getByRole("button", { name: "+ 添加第一个条件" }));
-    const field = screen.getByLabelText("条件字段");
-    fireEvent.change(field, { target: { value: "tag" } });
+    pickField("包含标签");
     // 标签选择框应包含全部三个根级标签（旧代码 walk(root.children) 会漏光）
     const tagSelect = screen.getByLabelText("条件值") as HTMLSelectElement;
     const optionTexts = Array.from(tagSelect.options).map((o) => o.textContent ?? "");
@@ -277,7 +284,7 @@ describe("W3-3 QueryBuilder 三合一", () => {
     });
     render(<QueryBuilder />);
     fireEvent.click(screen.getByRole("button", { name: "+ 添加第一个条件" }));
-    fireEvent.change(screen.getByLabelText("条件字段"), { target: { value: "tag" } });
+    pickField("包含标签");
     const select = screen.getByLabelText("条件值") as HTMLSelectElement;
     const names = Array.from(select.options).map((o) => o.textContent ?? "");
     expect(names.some((t) => t.includes("海边"))).toBe(true);
@@ -295,7 +302,7 @@ describe("W3-3 QueryBuilder 三合一", () => {
     });
     render(<QueryBuilder />);
     fireEvent.click(screen.getByRole("button", { name: "+ 添加第一个条件" }));
-    fireEvent.change(screen.getByLabelText("条件字段"), { target: { value: "tag" } });
+    pickField("包含标签");
     const select = screen.getByLabelText("条件值") as HTMLSelectElement;
     const groups = Array.from(select.querySelectorAll("optgroup"));
     expect(groups.map((g) => g.getAttribute("label"))).toEqual(["scene", "subject"]);
@@ -311,7 +318,7 @@ describe("W3-3 QueryBuilder 三合一", () => {
     });
     render(<QueryBuilder />);
     fireEvent.click(screen.getByRole("button", { name: "+ 添加第一个条件" }));
-    fireEvent.change(screen.getByLabelText("条件字段"), { target: { value: "tag" } });
+    pickField("包含标签");
     const select = screen.getByLabelText("条件值") as HTMLSelectElement;
     expect(select.multiple).toBe(true);
     // 模拟多选两个
@@ -325,12 +332,13 @@ describe("W3-3 QueryBuilder 三合一", () => {
   it("_has_location_field_present：字段下拉含定位组三个字段", () => {
     render(<QueryBuilder />);
     fireEvent.click(screen.getByRole("button", { name: "+ 添加第一个条件" }));
-    const field = screen.getByLabelText("条件字段") as HTMLSelectElement;
-    const texts = Array.from(field.options).map((o) => o.textContent ?? "");
+    const combo = screen.getByRole("combobox", { name: "条件字段" });
+    fireEvent.focus(combo);
+    const texts = screen.getAllByRole("option").map((o) => o.textContent ?? "");
     expect(texts).toContain("纬度");
     expect(texts).toContain("经度");
     expect(texts).toContain("有无定位");
-    const groups = Array.from(field.querySelectorAll("optgroup")).map((g) => g.getAttribute("label"));
+    const groups = screen.getAllByRole("group").map((g) => g.getAttribute("aria-label"));
     expect(groups).toContain("定位");
   });
 });
@@ -340,7 +348,7 @@ describe("U-7 数值单位下拉", () => {
   const openSizeRow = () => {
     render(<QueryBuilder />);
     fireEvent.click(screen.getByRole("button", { name: "+ 添加第一个条件" }));
-    fireEvent.change(screen.getByLabelText("条件字段"), { target: { value: "file_size" } });
+    pickField("文件大小");
   };
 
   it("queryBuilder_unit_dropdown_converts_to_bytes：选 KB 后输入 5 → 5120 字节", () => {
@@ -394,7 +402,7 @@ describe("U-7 日期快捷", () => {
     const now = new Date();
     render(<QueryBuilder />);
     fireEvent.click(screen.getByRole("button", { name: "+ 添加第一个条件" }));
-    fireEvent.change(screen.getByLabelText("条件字段"), { target: { value: "taken_at" } });
+    pickField("拍摄时间");
     fireEvent.change(screen.getByLabelText("日期快捷"), { target: { value: "today" } });
     const expr = useSuperSearchStore.getState().expr;
     expect(expr).toEqual({ op: "leaf", cond: { type: "metadata", filter: { key: "taken_at", op: "gte", value: shortcutStartMs("today", now) } } });
@@ -404,7 +412,7 @@ describe("U-7 日期快捷", () => {
     const now = new Date();
     render(<QueryBuilder />);
     fireEvent.click(screen.getByRole("button", { name: "+ 添加第一个条件" }));
-    fireEvent.change(screen.getByLabelText("条件字段"), { target: { value: "created_at" } });
+    pickField("入库时间");
     fireEvent.change(screen.getByLabelText("条件操作符"), { target: { value: "lte" } });
     fireEvent.change(screen.getByLabelText("日期快捷"), { target: { value: "thisWeek" } });
     const expr = useSuperSearchStore.getState().expr;
@@ -414,7 +422,7 @@ describe("U-7 日期快捷", () => {
   it("选中后快捷下拉回到自定义，可继续手工改日期", () => {
     render(<QueryBuilder />);
     fireEvent.click(screen.getByRole("button", { name: "+ 添加第一个条件" }));
-    fireEvent.change(screen.getByLabelText("条件字段"), { target: { value: "taken_at" } });
+    pickField("拍摄时间");
     const quick = screen.getByLabelText("日期快捷") as HTMLSelectElement;
     fireEvent.change(quick, { target: { value: "thisMonth" } });
     expect((quick as HTMLSelectElement).value).toBe("");
@@ -423,5 +431,63 @@ describe("U-7 日期快捷", () => {
     // 手工改日期会覆盖快捷值
     fireEvent.change(date, { target: { value: "2025-01-01" } });
     expect(useSuperSearchStore.getState().expr).toEqual({ op: "leaf", cond: { type: "metadata", filter: { key: "taken_at", op: "gte", value: new Date("2025-01-01T00:00:00").getTime() } } });
+  });
+});
+
+/** U-1：字段下拉 → 可搜索 combobox（输入过滤 + ↑↓/Enter/Esc + 点外关闭 + 最近使用 5 置顶） */
+describe("U-1 可搜索字段 combobox", () => {
+  it("queryBuilder_field_combobox_searchable：输入过滤 + ↑↓ + Enter 选中", () => {
+    render(<QueryBuilder />);
+    fireEvent.click(screen.getByRole("button", { name: "+ 添加第一个条件" }));
+    const combo = screen.getByRole("combobox", { name: "条件字段" }) as HTMLInputElement;
+    // 未打开时输入框显示当前字段中文标签（默认 tag → 包含标签）
+    expect(combo.value).toBe("包含标签");
+    fireEvent.focus(combo);
+    fireEvent.change(combo, { target: { value: "时长" } });
+    const opts = within(screen.getByRole("listbox", { name: "条件字段列表" })).getAllByRole("option");
+    expect(opts).toHaveLength(1);
+    expect(opts[0]).toHaveTextContent("视频时长");
+    fireEvent.keyDown(combo, { key: "ArrowDown" });
+    fireEvent.keyDown(combo, { key: "Enter" });
+    // 选中后回填中文标签并关闭列表
+    expect(combo.value).toBe("视频时长");
+    expect(combo.getAttribute("aria-expanded")).toBe("false");
+  });
+
+  it("Esc 关闭并回到当前字段标签；无匹配时显示提示", () => {
+    render(<QueryBuilder />);
+    fireEvent.click(screen.getByRole("button", { name: "+ 添加第一个条件" }));
+    const combo = screen.getByRole("combobox", { name: "条件字段" }) as HTMLInputElement;
+    fireEvent.focus(combo);
+    fireEvent.change(combo, { target: { value: "不存在的字段" } });
+    expect(screen.getByText("没有匹配的字段")).toBeInTheDocument();
+    fireEvent.keyDown(combo, { key: "Escape" });
+    expect(combo.getAttribute("aria-expanded")).toBe("false");
+    expect(combo.value).toBe("包含标签");
+  });
+
+  it("最近使用字段置顶（localStorage 5，最新在前，组内去重）", () => {
+    localStorage.setItem("qb:recent-fields", JSON.stringify(["width", "iso"]));
+    render(<QueryBuilder />);
+    fireEvent.click(screen.getByRole("button", { name: "+ 添加第一个条件" }));
+    fireEvent.focus(screen.getByRole("combobox", { name: "条件字段" }));
+    const listbox = within(screen.getByRole("listbox", { name: "条件字段列表" }));
+    const groups = listbox.getAllByRole("group").map((g) => g.getAttribute("aria-label"));
+    expect(groups[0]).toBe("最近使用");
+    const opts = listbox.getAllByRole("option");
+    expect(opts[0]).toHaveTextContent("宽度");
+    expect(opts[1]).toHaveTextContent("ISO");
+    // 最近使用的 key 已从其分组移除（宽度只出现一次）
+    expect(opts.filter((o) => o.textContent === "宽度")).toHaveLength(1);
+    expect(opts.filter((o) => o.textContent === "ISO")).toHaveLength(1);
+  });
+
+  it("选择字段写入最近使用并持久化（最多 5 个）", () => {
+    render(<QueryBuilder />);
+    fireEvent.click(screen.getByRole("button", { name: "+ 添加第一个条件" }));
+    pickField("文件大小");
+    expect(JSON.parse(localStorage.getItem("qb:recent-fields") ?? "[]")).toEqual(["file_size"]);
+    pickField("宽度");
+    expect(JSON.parse(localStorage.getItem("qb:recent-fields") ?? "[]")).toEqual(["width", "file_size"]);
   });
 });

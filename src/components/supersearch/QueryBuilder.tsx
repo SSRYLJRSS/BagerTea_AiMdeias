@@ -4,7 +4,8 @@
  *  新增手动条件时把新 leaf 与整棵现有 expr 以 AND 合并（不破坏内部 OR 分组）。
  *  FB5-05（§9.8）：已有非空 tagId 优先 tagStore options，找不到再从 resolvedTags 注入
  *  synthetic option，两边都找不到时显示「标签 #id」，绝不退回「选择标签」。 */
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { useShallow } from "zustand/react/shallow";
 import { useTagStore } from "@/stores/tagStore";
 import { useSuperSearchStore } from "@/stores/superSearchStore";
@@ -47,6 +48,28 @@ const FIELD_OPTIONS: FieldOption[] = [
   { key: "longitude", label: "经度", group: "定位", kind: "number", ops: NUMERIC_OPS },
   { key: "has_location", label: "有无定位", group: "定位", kind: "text", ops: ENUM_OPS },
 ];
+const FIELD_GROUPS = ["关键词", "标签", "素材", "颜色", "定位", "时间", "拍摄设备", "视频"] as const;
+const RECENT_FIELDS_KEY = "qb:recent-fields";
+const MAX_RECENT_FIELDS = 5;
+/** U-1：最近使用字段持久化（localStorage 最多 5 个，最新在前）；读取容错返回 [] */
+function readRecentFields(): FieldKey[] {
+  try {
+    const raw = localStorage.getItem(RECENT_FIELDS_KEY);
+    if (!raw) return [];
+    const arr: unknown = JSON.parse(raw);
+    if (!Array.isArray(arr)) return [];
+    return arr.filter((k): k is FieldKey => typeof k === "string" && FIELD_OPTIONS.some((o) => o.key === k)).slice(0, MAX_RECENT_FIELDS);
+  } catch {
+    return [];
+  }
+}
+function writeRecentFields(list: FieldKey[]) {
+  try {
+    localStorage.setItem(RECENT_FIELDS_KEY, JSON.stringify(list.slice(0, MAX_RECENT_FIELDS)));
+  } catch {
+    /* localStorage 不可用时最近使用静默降级 */
+  }
+}
 const OP_LABELS: Record<MetadataOp, string> = { eq: "等于", in: "属于任一", contains: "包含", gt: "大于", gte: "大于等于", lt: "小于", lte: "小于等于", between: "介于" };
 let rowSeq = 0;
 const uid = () => `query-row-${++rowSeq}`;
@@ -144,7 +167,178 @@ function ConditionRow({ row, prefix, allTagOptions, onChange, onRemove }: { row:
   const field = fieldFromCond(row.cond);
   return <div className="grid min-h-11 grid-cols-[48px_minmax(120px,0.8fr)_minmax(108px,0.65fr)_minmax(180px,1.6fr)_32px] items-center gap-2 py-1.5 max-[800px]:grid-cols-[44px_minmax(105px,1fr)_minmax(96px,1fr)_minmax(130px,1.4fr)_30px]"><span className="pl-1 text-[11px] text-[var(--color-text-tertiary)]">{prefix}</span><FieldSelect value={field} onChange={(next) => onChange({ cond: makeCond(next, allTagOptions), negated: false })} /><ConditionOperator cond={row.cond} negated={row.negated} onChange={onChange} /><ConditionValue cond={row.cond} allTagOptions={allTagOptions} onChange={(cond) => onChange({ cond })} /><button type="button" onClick={onRemove} className="flex size-7 items-center justify-center rounded text-base text-[var(--color-text-tertiary)] hover:bg-[var(--color-surface-hover)] hover:text-[var(--color-danger)]" aria-label="删除条件" title="删除条件">×</button></div>;
 }
-function FieldSelect({ value, onChange }: { value: FieldKey; onChange: (value: FieldKey) => void }) { const groups = ["关键词", "标签", "素材", "颜色", "定位", "时间", "拍摄设备", "视频"] as const; return <select aria-label="条件字段" value={value} onChange={(e) => onChange(e.target.value as FieldKey)} className={`${controlClass} w-full`}>{groups.map((group) => <optgroup key={group} label={group}>{FIELD_OPTIONS.filter((item) => item.group === group).map((item) => <option key={item.key} value={item.key}>{item.label}</option>)}</optgroup>)}</select>; }
+function FieldSelect({ value, onChange }: { value: FieldKey; onChange: (value: FieldKey) => void }) {
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState("");
+  const [highlight, setHighlight] = useState(-1);
+  const [recent, setRecent] = useState<FieldKey[]>(() => readRecentFields());
+  const [pos, setPos] = useState<{ x: number; width: number; down: number | null; up: number | null } | null>(null);
+  const rootRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
+  const portalHost = useRef<HTMLDivElement | null>(null);
+  const listId = useMemo(() => `field-list-${uid()}`, []);
+
+  useEffect(() => {
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    portalHost.current = host;
+    return () => { host.remove(); };
+  }, []);
+
+  const labelOf = (key: FieldKey) => FIELD_OPTIONS.find((o) => o.key === key)?.label ?? key;
+
+  const choose = (key: FieldKey) => {
+    setRecent((prev) => {
+      const next = [key, ...prev.filter((k) => k !== key)].slice(0, MAX_RECENT_FIELDS);
+      writeRecentFields(next);
+      return next;
+    });
+    setQuery("");
+    setOpen(false);
+    setHighlight(-1);
+    onChange(key);
+  };
+
+  // 锚定到输入框下方（空间不足翻转到上方）；监听滚动/缩放保持贴边
+  const measure = useCallback(() => {
+    const el = inputRef.current;
+    if (!el) return;
+    const rect = el.getBoundingClientRect();
+    const below = window.innerHeight - rect.bottom - 8;
+    const above = rect.top - 8;
+    const flipUp = below < 220 && above > below;
+    setPos({
+      x: rect.left,
+      width: rect.width,
+      down: flipUp ? null : rect.bottom + 4,
+      up: flipUp ? window.innerHeight - rect.top + 4 : null,
+    });
+  }, []);
+
+  useEffect(() => {
+    if (!open) return;
+    measure();
+    window.addEventListener("scroll", measure, true);
+    window.addEventListener("resize", measure);
+    const onDown = (e: MouseEvent) => {
+      if (rootRef.current && !rootRef.current.contains(e.target as Node)) setOpen(false);
+    };
+    document.addEventListener("mousedown", onDown);
+    return () => {
+      window.removeEventListener("scroll", measure, true);
+      window.removeEventListener("resize", measure);
+      document.removeEventListener("mousedown", onDown);
+    };
+  }, [open, measure]);
+
+  // 过滤（label/key 均可匹配）+ 最近使用置顶（去重，避免同 key 出现两处）
+  const q = query.trim().toLowerCase();
+  const visible = useMemo(() => {
+    const matched = FIELD_OPTIONS.filter((o) => !q || o.label.toLowerCase().includes(q) || o.key.toLowerCase().includes(q));
+    const showRecent = !q && recent.length > 0;
+    const recentSet = new Set(showRecent ? recent : []);
+    const recents = matched.filter((o) => recentSet.has(o.key));
+    const groups = new Map<string, FieldOption[]>();
+    for (const group of FIELD_GROUPS) {
+      const items = matched.filter((o) => o.group === group && !recentSet.has(o.key));
+      if (items.length > 0) groups.set(group, items);
+    }
+    return { showRecent, recents, groups, rest: Array.from(groups.values()).flat(), hasMatch: matched.length > 0 };
+  }, [q, recent]);
+  const flat = visible.showRecent ? [...visible.recents, ...visible.rest] : visible.rest;
+
+  const onKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      if (!open) setOpen(true);
+      if (flat.length > 0) setHighlight((h) => Math.min(h + 1, flat.length - 1));
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      if (flat.length > 0) setHighlight((h) => Math.max(h - 1, 0));
+    } else if (e.key === "Enter") {
+      e.preventDefault();
+      if (open && highlight >= 0 && flat[highlight]) choose(flat[highlight].key);
+      else setOpen(false);
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      setQuery("");
+      setOpen(false);
+    }
+  };
+
+  const listStyle: React.CSSProperties | undefined = pos
+    ? { position: "fixed", left: pos.x, width: Math.max(pos.width, 200), maxHeight: 240, ...(pos.down !== null ? { top: pos.down } : { bottom: pos.up ?? 0 }) }
+    : undefined;
+
+  let idx = -1;
+  const renderOption = (o: FieldOption) => {
+    const i = ++idx;
+    const sel = o.key === value;
+    return (
+      <button
+        key={o.key}
+        type="button"
+        role="option"
+        aria-selected={sel}
+        onMouseEnter={() => setHighlight(i)}
+        onClick={() => choose(o.key)}
+        className={`flex w-full items-center gap-1.5 px-3 py-1.5 text-left text-xs transition-colors ${i === highlight ? "bg-[var(--color-surface-hover)] text-[var(--color-text)]" : "text-[var(--color-text)]"}`}
+      >
+        <span className="min-w-0 flex-1 truncate">{o.label}</span>
+        {sel && <span aria-hidden="true" className="shrink-0 text-[var(--color-status)]">✓</span>}
+      </button>
+    );
+  };
+
+  return (
+    <div ref={rootRef} className="relative min-w-0">
+      <input
+        ref={inputRef}
+        role="combobox"
+        aria-label="条件字段"
+        aria-expanded={open}
+        aria-controls={open ? listId : undefined}
+        autoComplete="off"
+        spellCheck={false}
+        value={open ? query : labelOf(value)}
+        placeholder={open ? "输入以过滤…" : ""}
+        onChange={(e) => {
+          setQuery(e.target.value);
+          if (!open) setOpen(true);
+        }}
+        onFocus={() => setOpen(true)}
+        onKeyDown={onKeyDown}
+        className={`${controlClass} w-full`}
+      />
+      {open && portalHost.current && (
+        createPortal(
+          <div
+            id={listId}
+            role="listbox"
+            aria-label="条件字段列表"
+            className="z-50 overflow-y-auto rounded-md border border-[var(--color-border)] bg-[var(--color-surface-raised)] py-1 shadow-lg"
+            style={listStyle}
+          >
+            {visible.showRecent && (
+              <div role="group" aria-label="最近使用">
+                <div className="px-3 pt-1 pb-0.5 text-[10px] font-medium text-[var(--color-text-tertiary)]">最近使用</div>
+                {visible.recents.map(renderOption)}
+              </div>
+            )}
+            {Array.from(visible.groups.entries()).map(([group, items]) => (
+              <div key={group} role="group" aria-label={group}>
+                <div className="px-3 pt-1 pb-0.5 text-[10px] font-medium text-[var(--color-text-tertiary)]">{group}</div>
+                {items.map(renderOption)}
+              </div>
+            ))}
+            {!visible.hasMatch && <div className="px-3 py-2 text-xs text-[var(--color-text-tertiary)]">没有匹配的字段</div>}
+          </div>,
+          portalHost.current,
+        )
+      )}
+    </div>
+  );
+}
 
 function ConditionOperator({ cond, negated, onChange }: { cond: LeafCond; negated: boolean; onChange: (patch: Partial<Row>) => void }) {
   if (cond.type === "facetHasAny" || cond.type === "facetMissing") return <span className="px-2 text-xs text-[var(--color-text-tertiary)]">{cond.type === "facetHasAny" ? "存在" : "缺失"}</span>;
