@@ -114,10 +114,12 @@ pub fn undo_batch(conn: &Connection, batch_id: i64) -> AppResult<u64> {
     for (asset_id, tag_id, op, actor) in &ops {
         match op.as_str() {
             "add" => {
-                // D-3：只删「当前批次写入且非手工」的关联，防误删用户后续手工/重新添加的标签
+                // D-3：只删「当前批次写入且非手工」的关联，防误删用户后续手工/重新添加的标签。
+                // A3：review_state='manual' 的行同时排除（手工来源/手工覆盖都会置 manual，与
+                //     source != 'manual' 双保险）；ai_reviewed 行随批次撤销删除，D-3 语义不变。
                 applied += tx.execute(
                     "DELETE FROM asset_tags WHERE asset_id = ?1 AND tag_id = ?2
-                        AND source_batch_id = ?3 AND source != 'manual'",
+                        AND source_batch_id = ?3 AND source != 'manual' AND review_state != 'manual'",
                     rusqlite::params![asset_id, tag_id, batch_id],
                 )? as u64;
             }

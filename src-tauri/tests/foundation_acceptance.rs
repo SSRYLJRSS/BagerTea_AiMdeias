@@ -1499,3 +1499,168 @@ fn schema_version_allows_old_data() {
         .unwrap();
     assert_eq!(ver2, 1);
 }
+
+// ═══════════════ A3：重跑策略与状态机（asset_tags.review_state 三态） ═══════════════
+
+/// A3 辅助：直接插一条指定 review_state 的 asset_tags 行（模拟各来源路径的落库结果）。
+fn a3_row(
+    c: &rusqlite::Connection,
+    asset_id: i64,
+    tag_id: i64,
+    batch_id: Option<i64>,
+    source: &str,
+    review_state: &str,
+) {
+    c.execute(
+        "INSERT INTO asset_tags (asset_id, tag_id, source, created_at, confirmation,
+                                 confirmed_at, confirmed_by, source_batch_id, review_state)
+         VALUES (?1, ?2, ?3, 1, 'confirmed', 1, ?3, ?4, ?5)",
+        rusqlite::params![asset_id, tag_id, source, batch_id, review_state],
+    )
+    .unwrap();
+}
+
+fn a3_row_state(c: &rusqlite::Connection, asset_id: i64, tag_id: i64) -> String {
+    c.query_row(
+        "SELECT review_state FROM asset_tags WHERE asset_id = ?1 AND tag_id = ?2",
+        rusqlite::params![asset_id, tag_id],
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+
+/// A3：ReplaceAiOnly 重跑清掉「AI 生成且未经审核」的行（review_state='ai_unreviewed' 且
+/// source_batch_id 非空）。附带验证建批入口接线：ReplaceAiOnly 建批即清、Append 不动。
+#[test]
+fn replace_ai_only_deletes_unreviewed() {
+    let c = mem();
+    let aid = f4_insert_asset(&c, "d:/a3_unreviewed.jpg");
+    let tag = tags::create_in_facet(&c, "未审核标签", None, Some("scene")).unwrap();
+    // 旧批次写下的未审核 AI 行
+    let old = ai::create_batch(&c, &[aid], "cloud").unwrap();
+    a3_row(&c, aid, tag.id, Some(old.id), "ai_cloud", "ai_unreviewed");
+    // Append 重跑：不清（默认最安全）
+    ai::create_batch_with_retag(&c, &[aid], "cloud", ai::RetagMode::Append).unwrap();
+    assert_eq!(a3_row_state(&c, aid, tag.id), "ai_unreviewed", "Append 不得清未审核行");
+    // ReplaceAiOnly 重跑：建批同事务清掉未审核 AI 行
+    ai::create_batch_with_retag(&c, &[aid], "cloud", ai::RetagMode::ReplaceAiOnly).unwrap();
+    let left: i64 = c
+        .query_row(
+            "SELECT COUNT(*) FROM asset_tags WHERE asset_id=?1 AND tag_id=?2",
+            rusqlite::params![aid, tag.id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(left, 0, "未审核 AI 行应被重跑删除");
+}
+
+/// A3：ReplaceAiOnly 重跑**不删** ai_reviewed 行（用户已审核，铁律 10）。
+#[test]
+fn replace_ai_only_keeps_reviewed() {
+    use bagertea_ai_media_v2_lib::db::asset_tags;
+    let c = mem();
+    let aid = f4_insert_asset(&c, "d:/a3_reviewed.jpg");
+    let tag = tags::create_in_facet(&c, "已审核标签", None, Some("scene")).unwrap();
+    let batch = ai::create_batch(&c, &[aid], "cloud").unwrap();
+    // 用户已确认 → ai_reviewed（仍带 source_batch_id，语义上属于旧批次）
+    a3_row(&c, aid, tag.id, Some(batch.id), "ai_cloud", "ai_reviewed");
+    let n = asset_tags::retag_clear_unreviewed(&c, &[aid]).unwrap();
+    assert_eq!(n, 0, "ai_reviewed 行不得被 ReplaceAiOnly 清掉");
+    assert_eq!(a3_row_state(&c, aid, tag.id), "ai_reviewed");
+}
+
+/// A3：ReplaceAiOnly 重跑**不删** manual 行（人工确认，铁律 10）。
+#[test]
+fn replace_ai_only_keeps_manual() {
+    use bagertea_ai_media_v2_lib::db::asset_tags;
+    let c = mem();
+    let aid = f4_insert_asset(&c, "d:/a3_manual.jpg");
+    let tag = tags::create_in_facet(&c, "手工标签", None, Some("scene")).unwrap();
+    let batch = ai::create_batch(&c, &[aid], "cloud").unwrap();
+    a3_row(&c, aid, tag.id, Some(batch.id), "manual", "manual");
+    let n = asset_tags::retag_clear_unreviewed(&c, &[aid]).unwrap();
+    assert_eq!(n, 0, "manual 行不得被 ReplaceAiOnly 清掉");
+    assert_eq!(a3_row_state(&c, aid, tag.id), "manual");
+}
+
+/// A3：确认建议 → 该素材本批次的 AI 来源行提升为 ai_reviewed（此后重跑不再清它）。
+#[test]
+fn confirm_promotes_to_ai_reviewed() {
+    use bagertea_ai_media_v2_lib::db::asset_tags;
+    let c = mem();
+    let sug = f6_one_suggestion(&c);
+    let tag = tags::create_in_facet(&c, "海边", None, Some("scene")).unwrap();
+    let tags_map =
+        ai::CategorizedTags::from([("scene".to_string(), vec!["海边".to_string()])]);
+    ai::confirm_suggestion(&c, sug.id, &tags_map).unwrap();
+    assert_eq!(
+        a3_row_state(&c, sug.asset_id, tag.id),
+        "ai_reviewed",
+        "用户确认后行应提升为 ai_reviewed"
+    );
+    // 提升后的行即使带 source_batch_id 也不再被 ReplaceAiOnly 清掉
+    let n = asset_tags::retag_clear_unreviewed(&c, &[sug.asset_id]).unwrap();
+    assert_eq!(n, 0, "确认后的行必须躲过 ReplaceAiOnly");
+    assert_eq!(a3_row_state(&c, sug.asset_id, tag.id), "ai_reviewed");
+}
+
+/// A3：用户手工再打同一个标签 → 该行提升 manual 且清空 source_batch_id
+///（D-1/D-2：撤销 AI 批次不会误删手工确认后的标签）。
+#[test]
+fn manual_override_promotes_to_manual() {
+    use bagertea_ai_media_v2_lib::db::asset_tags;
+    let c = mem();
+    let sug = f6_one_suggestion(&c);
+    let tag = tags::create_in_facet(&c, "海边", None, Some("scene")).unwrap();
+    let tags_map =
+        ai::CategorizedTags::from([("scene".to_string(), vec!["海边".to_string()])]);
+    // 先 AI 确认（ai_reviewed）→ 再手工重打同标签（覆盖）
+    ai::confirm_suggestion(&c, sug.id, &tags_map).unwrap();
+    asset_tags::assign(&c, &[sug.asset_id], &[tag.id], "manual").unwrap();
+    assert_eq!(a3_row_state(&c, sug.asset_id, tag.id), "manual");
+    let (src, sb): (String, Option<i64>) = c
+        .query_row(
+            "SELECT source, source_batch_id FROM asset_tags WHERE asset_id=?1 AND tag_id=?2",
+            rusqlite::params![sug.asset_id, tag.id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(src, "manual");
+    assert_eq!(sb, None, "手工覆盖必须清空 source_batch_id（防撤销误删）");
+}
+
+/// A3：undo_batch 撤销批次 —— ai_reviewed 行随批次删（D-3 语义），manual 行不动。
+#[test]
+fn undo_batch_respects_review_state() {
+    use bagertea_ai_media_v2_lib::db::asset_tags;
+    use bagertea_ai_media_v2_lib::db::tag_ops;
+    let c = mem();
+    let sug = f6_one_suggestion(&c);
+    let t1 = tags::create_in_facet(&c, "AI标签甲", None, Some("scene")).unwrap();
+    let t2 = tags::create_in_facet(&c, "AI标签乙", None, Some("scene")).unwrap();
+    let tags_map = ai::CategorizedTags::from([(
+        "scene".to_string(),
+        vec!["AI标签甲".to_string(), "AI标签乙".to_string()],
+    )]);
+    ai::confirm_suggestion(&c, sug.id, &tags_map).unwrap();
+    assert_eq!(a3_row_state(&c, sug.asset_id, t1.id), "ai_reviewed");
+    // 用户对 t2 手工覆盖 → manual
+    asset_tags::assign(&c, &[sug.asset_id], &[t2.id], "manual").unwrap();
+    assert_eq!(a3_row_state(&c, sug.asset_id, t2.id), "manual");
+    // 撤销批次：ai_reviewed 行（D-3 语义不变）删，manual 行留
+    let applied = tag_ops::undo_batch(&c, sug.batch_id).unwrap();
+    assert_eq!(applied, 1, "只应撤销 1 条（manual 那条被跳过）");
+    let (t1_left, t2_left): (i64, i64) = c
+        .query_row(
+            "SELECT COUNT(*) FILTER (WHERE tag_id=?1), COUNT(*) FILTER (WHERE tag_id=?2)
+               FROM asset_tags WHERE asset_id=?3",
+            rusqlite::params![t1.id, t2.id, sug.asset_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(t1_left, 0, "ai_reviewed 行随批次撤销（D-3 语义不变）");
+    assert_eq!(t2_left, 1, "manual 行在撤销中必须保留");
+    assert_eq!(a3_row_state(&c, sug.asset_id, t2.id), "manual");
+    // D-4：重复撤销幂等返回 0
+    assert_eq!(tag_ops::undo_batch(&c, sug.batch_id).unwrap(), 0);
+}

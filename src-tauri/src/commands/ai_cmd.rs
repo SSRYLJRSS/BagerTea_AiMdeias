@@ -17,11 +17,13 @@ fn lock_db(state: &AppState) -> AppResult<std::sync::MutexGuard<'_, rusqlite::Co
 
 /// 用选中素材创建批次（pending 建议占位）
 /// mode：cloud/local/manual/auto（auto = 按激活档案 kind 解析，P3-01a）
+/// retagMode（A3，可缺省 = append）：append / replaceAiOnly / reviewOnly
 #[tauri::command]
 pub fn ai_create_batch(
     state: State<AppState>,
     asset_ids: Vec<i64>,
     mode: String,
+    retag_mode: Option<String>,
 ) -> AppResult<AiBatch> {
     if asset_ids.is_empty() {
         return Err(AppError::msg("未选择任何素材"));
@@ -29,6 +31,12 @@ pub fn ai_create_batch(
     if !["cloud", "local", "manual", "auto"].contains(&mode.as_str()) {
         return Err(AppError::msg("非法打标模式"));
     }
+    let retag = match retag_mode.as_deref() {
+        None | Some("append") => ai::RetagMode::Append,
+        Some("replaceAiOnly") => ai::RetagMode::ReplaceAiOnly,
+        Some("reviewOnly") => ai::RetagMode::ReviewOnly,
+        Some(other) => return Err(AppError::msg(format!("非法重跑模式: {other}"))),
+    };
     let conn = lock_db(&state)?;
     let mut s = settings::get_settings(&conn)?;
     // §4.4：打标用途绑定优先（影响 auto/cloud 的本地/云端判定）
@@ -50,7 +58,7 @@ pub fn ai_create_batch(
     // 「批量上限」不再作为总批次截断——执行层按「分块大小」内存分块、限流、重试。
     // 若确需保护上限，必须在提交前明确展示与阻断，而非默认取前 N 张。
     let ids: Vec<i64> = asset_ids;
-    ai::create_batch(&conn, &ids, &mode)
+    ai::create_batch_with_retag(&conn, &ids, &mode, retag)
 }
 
 /// 执行批次（云端）：spawn_blocking 工作线程跑，进度走 ai://progress 事件；

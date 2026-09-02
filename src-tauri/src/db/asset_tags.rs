@@ -172,6 +172,43 @@ pub fn remove(conn: &Connection, asset_ids: &[i64], tag_ids: &[i64]) -> AppResul
     Ok(())
 }
 
+/// A3（ReplaceAiOnly 重跑）：清掉「AI 生成且未经审核」的自动标签后重打。
+/// 删除范围 = `review_state='ai_unreviewed' AND source_batch_id IS NOT NULL`；
+/// `ai_reviewed` / `manual` 的行任何重跑都不动（铁律 10）。
+/// 无命中幂等返回 0。真实移除写 remove 流水（actor 沿用原来源，可溯源）。
+pub fn retag_clear_unreviewed(conn: &Connection, asset_ids: &[i64]) -> AppResult<u64> {
+    if asset_ids.is_empty() {
+        return Ok(0);
+    }
+    let placeholders = asset_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let mut stmt = conn.prepare(&format!(
+        "SELECT asset_id, tag_id, source FROM asset_tags
+          WHERE review_state = 'ai_unreviewed' AND source_batch_id IS NOT NULL
+            AND asset_id IN ({placeholders})"
+    ))?;
+    let rows: Vec<(i64, i64, String)> = stmt
+        .query_map(rusqlite::params_from_iter(asset_ids.iter()), |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+    drop(stmt);
+    let mut removed: u64 = 0;
+    for (aid, tid, src) in rows {
+        let n = conn.execute(
+            "DELETE FROM asset_tags WHERE asset_id = ?1 AND tag_id = ?2
+               AND review_state = 'ai_unreviewed' AND source_batch_id IS NOT NULL",
+            rusqlite::params![aid, tid],
+        )?;
+        if n > 0 {
+            // R-25：真实移除记 remove 流水（演员 = 原来源；该批次撤销语义已由本操作消费，batch 记 None）
+            tag_ops::record(conn, aid, tid, "remove", &src, None)?;
+            removed += n as u64;
+        }
+    }
+    Ok(removed)
+}
+
 pub fn get_asset_tags(conn: &Connection, asset_id: i64) -> AppResult<Vec<Tag>> {
     // F4：详情恒显示（不过滤停用分面/标签），facet_effective 供 UI 打「已停用」角标
     let mut stmt = conn.prepare(&format!(

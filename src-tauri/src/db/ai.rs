@@ -88,6 +88,20 @@ fn categorized_tag_ids(conn: &Connection, tags: &CategorizedTags) -> AppResult<V
     Ok(ids)
 }
 
+/// A3：重跑模式。任何模式下都**永不删除** `review_state IN ('ai_reviewed','manual')` 的行（铁律 10）。
+/// 该枚举承载重跑意图；落库语义由 `create_batch_with_retag` 的 ReplaceAiOnly 分支执行。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RetagMode {
+    /// 只加新标签，已有一律不动（默认，最安全）
+    Append,
+    /// 清掉「AI 生成且未经审核」的标签后重打
+    /// （`WHERE review_state = 'ai_unreviewed' AND source_batch_id IS NOT NULL`）
+    ReplaceAiOnly,
+    /// 只生成建议不写入，用户在工作台逐条审核（当前产品即此形态：确认才落库）
+    ReviewOnly,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AiBatch {
@@ -138,6 +152,18 @@ fn batch_from_row(r: &rusqlite::Row) -> rusqlite::Result<AiBatch> {
 const BATCH_COLS: &str = "id, status, mode, total, processed, confirmed, created_at";
 
 pub fn create_batch(conn: &Connection, asset_ids: &[i64], mode: &str) -> AppResult<AiBatch> {
+    create_batch_with_retag(conn, asset_ids, mode, RetagMode::Append)
+}
+
+/// A3：带重跑模式建批。ReplaceAiOnly 在建批同一事务内先清掉这批素材的
+/// 「AI 生成且未经审核」标签（`ai_reviewed`/`manual` 不动）——新一批确认后旧
+/// 候选被替换，而不是叠加成两份同样结论。ReviewOnly/Append 不触碰既有标签。
+pub fn create_batch_with_retag(
+    conn: &Connection,
+    asset_ids: &[i64],
+    mode: &str,
+    retag: RetagMode,
+) -> AppResult<AiBatch> {
     let now = chrono::Utc::now().timestamp_millis();
     let tx = conn.unchecked_transaction()?;
     // W5h-c：同源组内只保留一个代表（非 RAW 优先——JPG 有内嵌预览、解码快）。
@@ -204,6 +230,11 @@ pub fn create_batch(conn: &Connection, asset_ids: &[i64], mode: &str) -> AppResu
              VALUES (?1, ?2, '[]', ?3)",
             rusqlite::params![batch_id, aid, now],
         )?;
+    }
+    // A3：ReplaceAiOnly —— 同事务清旧「未审核 AI 标签」，新批确认后即替换
+    //（ai_reviewed/manual 永不触碰，铁律 10 由 asset_tags::retag_clear_unreviewed 守卫）
+    if retag == RetagMode::ReplaceAiOnly {
+        asset_tags::retag_clear_unreviewed(&tx, &effective_ids)?;
     }
     tx.commit()?;
     get_batch(conn, batch_id)
@@ -649,6 +680,14 @@ fn confirm_suggestion_inner(
         })
         .collect();
     asset_tags::assign_inner(conn, &[asset_id], &tag_ids, source, Some(batch_id))?;
+    // A3：确认 = 用户审核通过 → 本批次该素材的 AI 来源行提升 ai_reviewed
+    //（铁律 10：此后 ReplaceAiOnly / 任何重跑都不再清它）；manual 行保持 manual。
+    conn.execute(
+        "UPDATE asset_tags SET review_state = 'ai_reviewed'
+          WHERE asset_id = ?1 AND source_batch_id = ?2 AND source != 'manual'
+            AND review_state = 'ai_unreviewed'",
+        rusqlite::params![asset_id, batch_id],
+    )?;
     let original: String = conn.query_row(
         "SELECT suggested_tags FROM ai_suggestions WHERE id = ?1",
         [id],
