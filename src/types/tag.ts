@@ -37,12 +37,14 @@ export interface TagFacet {
   updatedAt: number;
 }
 
-/** W2-4：分面影响范围（与后端 FacetImpact 对齐；aiConfigCount 已随 V20 合表删除） */
+/** W2-4：分面影响范围（与后端 FacetImpact 对齐；aiConfigCount 已随 V20 合表删除）。
+ *  R3-3：新增 aliasCount —— delete_facet 会连带删 tag_aliases，报告须覆盖。 */
 export interface TagFacetImpact {
   tagCount: number;
   assetCount: number;
   aiSuggestionItemCount: number;
   tagOpCount: number;
+  aliasCount: number;
 }
 
 /** 打标工作台分面：V20 合表后 tag_facets 单一事实源（inputMode 分组取代 enabledForAi）。 */

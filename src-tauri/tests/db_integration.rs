@@ -2166,7 +2166,7 @@ fn assign_syncs_to_kinship_siblings() -> AppResult<()> {
 #[test]
 fn assign_records_ops_for_both() -> AppResult<()> {
     let conn = setup();
-    let (jpg, raw) = add_kinship_pair(&conn);
+    let (jpg, _raw) = add_kinship_pair(&conn);
     let t = tags::create_in_facet(&conn, "海边", None, Some("scene"))?;
     asset_tags::assign(&conn, &[jpg], &[t.id], "manual")?;
     // tag_ops 两行（每条真实写入各一行 → undo_batch 可对称回滚）
@@ -2176,11 +2176,8 @@ fn assign_records_ops_for_both() -> AppResult<()> {
         |r| r.get(0),
     )?;
     assert_eq!(ops, 2, "同源写入必须各记一行流水（jpg + raw）");
-    void_op(&raw);
     Ok(())
 }
-
-fn void_op(_raw: &i64) {}
 
 #[test]
 fn undo_reverts_both() -> AppResult<()> {
@@ -2254,12 +2251,10 @@ fn create_batch_dedups_kinship() -> AppResult<()> {
 fn batch_total_reflects_dedup() -> AppResult<()> {
     let conn = setup();
     // 两组同源 + 一张独立 = 5 张 → 3 次请求
-    let (j1, r1) = (add_asset(&conn, "d:/a/A.JPG", "A.JPG", "jpg", "image/jpeg"),
-                    add_asset(&conn, "d:/a/A.RW2", "A.RW2", "rw2", "image/x-raw"));
-    void_op(&r1);
-    let (j2, r2) = (add_asset(&conn, "d:/a/B.JPG", "B.JPG", "jpg", "image/jpeg"),
-                    add_asset(&conn, "d:/a/B.RW2", "B.RW2", "rw2", "image/x-raw"));
-    void_op(&r2);
+    let j1 = add_asset(&conn, "d:/a/A.JPG", "A.JPG", "jpg", "image/jpeg");
+    let r1 = add_asset(&conn, "d:/a/A.RW2", "A.RW2", "rw2", "image/x-raw");
+    let j2 = add_asset(&conn, "d:/a/B.JPG", "B.JPG", "jpg", "image/jpeg");
+    let r2 = add_asset(&conn, "d:/a/B.RW2", "B.RW2", "rw2", "image/x-raw");
     let solo = add_asset(&conn, "d:/a/C.JPG", "C.JPG", "jpg", "image/jpeg");
     let batch = ai::create_batch(&conn, &[j1, r1, j2, r2, solo], "cloud")?;
     assert_eq!(batch.total, 3, "5 张（两组同源 + 1 独立）应去重为 3 次请求");

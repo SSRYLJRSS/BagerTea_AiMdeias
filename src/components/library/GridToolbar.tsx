@@ -21,7 +21,7 @@ interface GridToolbarProps {
   onExport: () => void;
   onMove: () => void;
   onDelete: () => void;
-  /** 查找重复入口（暂隐藏，保留接线便于重新开启） */
+  /** W0-7：查找重复入口（hash 精确去重，扫描按钮在库非回收站区） */
   onDedup?: () => void;
   /** R-22：回收站模式下的「彻底删除」（弹窗由 LibraryPage 托管） */
   onPurge: () => void;

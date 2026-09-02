@@ -433,6 +433,7 @@ export default function FacetManagePanel({ draft, onPatchAi }: {
               <li>将删除 {deleteImpact.tagCount} 个标签</li>
               <li>解除 {deleteImpact.assetCount} 个素材的关联</li>
               <li>清除 {deleteImpact.aiSuggestionItemCount} 条 AI 候选记录、{deleteImpact.tagOpCount} 条操作流水</li>
+              {deleteImpact.aliasCount > 0 && <li>删除 {deleteImpact.aliasCount} 条别名</li>}
             </ul>
           )}
           <p className="text-xs text-[var(--color-text-secondary)]">建议改用「停用」：历史标签与查询保留，随时可恢复。</p>

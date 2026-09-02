@@ -183,22 +183,49 @@ pub fn build_user_prompt(facets: &[FacetPromptContext], top_tags: &[(String, Str
             user.push_str(&format!("- {facet}: {words}\n"));
         }
     }
-    let ex_keys: Vec<&str> = facets.iter().take(2).map(|c| c.key.as_str()).collect();
-    let example = if ex_keys.is_empty() {
-        "{}".to_string()
+    // R3-2：a3 真实 few-shot —— 不输出「示例词」占位符，而是完整「画面 → JSON」对。
+    // 示例用词表里的真实词，且画面描述与 tags 自洽；不在画面里的分面给空数组（示范
+    // 「不确定就空，不要猜」），不重复候选词清单（上面已列出）。
+    let ex_keys: Vec<&str> = facets.iter().take(3).map(|c| c.key.as_str()).collect();
+    if !ex_keys.is_empty() {
+        let real_word = |key: &str, alt: bool| -> Option<String> {
+            let table: &[(&str, &str, &str)] = &[
+                ("scene", "海边", "城市"),
+                ("subject", "树", "建筑"),
+                ("people", "多人", "单人"),
+                ("lighting", "夜景", "白天"),
+            ];
+            table
+                .iter()
+                .find(|(k, _, _)| *k == key)
+                .map(|(_, a, b)| (if alt { *b } else { *a }).to_string())
+        };
+        let tags_json = |alt: bool| -> String {
+            // 示例 A：黄昏海边，树下多人 → scene=海边、subject=树、people=多人…
+            // 示例 B：清晨城市建筑，单人 → 对应 alt 词。画面没有的分面输出空数组。
+            let pairs: Vec<String> = ex_keys
+                .iter()
+                .map(|k| {
+                    let w = real_word(k, alt).unwrap_or_default();
+                    format!("\"{k}\": {}", if w.is_empty() { "[]".to_string() } else { format!("[\"{w}\"]") })
+                })
+                .collect();
+            format!("{{{}}}", pairs.join(", "))
+        };
+        user.push_str(&format!(
+            "\n输出示例（真实输入→输出对，结构参考；tags 只含该图真实可观察到的分类）：\n"
+        ));
+        user.push_str(&format!(
+            "示例 A：输入「黄昏的海边，树下有一群人散步」→ 输出 {{\"description\": \"黄昏海边多人散步\", \"tags\": {}}}\n",
+            tags_json(false)
+        ));
+        user.push_str(&format!(
+            "示例 B：输入「清晨的城市建筑，天空晴朗，只有一个行人」→ 输出 {{\"description\": \"清晨城市建筑\", \"tags\": {}}}\n",
+            tags_json(true)
+        ));
     } else {
-        let mut parts: Vec<String> = Vec::new();
-        if let Some(k) = ex_keys.first() {
-            parts.push(format!("\"{k}\": [\"示例词\"]"));
-        }
-        if ex_keys.len() > 1 {
-            parts.push(format!("\"{}\": []", ex_keys[1]));
-        }
-        format!("{{{}}}", parts.join(", "))
-    };
-    user.push_str(&format!(
-        "\n输出示例（结构参考；tags 只含该图真实可观察到的分类）：\n{{\"description\": \"黄昏海边有人散步\", \"tags\": {example}}}\n"
-    ));
+        user.push_str("\n输出示例：{\"description\": \"黄昏海边有人散步\", \"tags\": {}}\n");
+    }
     user
 }
 
@@ -571,7 +598,8 @@ pub fn parse_media_analysis(
                 .iter()
                 .find(|f| f.key == key)
                 .map(|f| (f.selection_mode == "single", f.max_items.map(|n| n as usize)))
-                .unwrap_or((false, Some(5)))
+                // R3-4：分面不在列表 → 该分面不参与 AI，不该裁到 5（max_items=NULL = 不限）
+                .unwrap_or((false, None))
         };
         for (key, list) in tags.iter_mut() {
             let (single, max) = rule_for(key);

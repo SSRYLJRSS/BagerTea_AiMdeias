@@ -92,6 +92,8 @@ pub struct FacetImpact {
     /// V20 合表后 aiFacetConfigs 恒为 0（W2-4：改报 suggestion items / tag_ops 计数）
     pub ai_suggestion_item_count: i64,
     pub tag_op_count: i64,
+    /// R3-3：别名计数 —— delete_facet 会删 tag_aliases（:403），影响报告须含它
+    pub alias_count: i64,
 }
 
 /// 校验稳定 key：小写 snake_case，2–64 字符，只允许字母/数字/下划线，不以数字开头（指导书 §12.3）。
@@ -469,11 +471,19 @@ pub fn get_impact(conn: &Connection, key: &str) -> AppResult<FacetImpact> {
         [key],
         |r| r.get(0),
     )?;
+    // R3-3：别名数（delete_facet 实际会连带删除，报告必须覆盖）
+    let alias_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM tag_aliases a
+          JOIN tags t ON t.id = a.tag_id WHERE t.facet_key = ?1",
+        [key],
+        |r| r.get(0),
+    )?;
     Ok(FacetImpact {
         tag_count,
         asset_count,
         ai_suggestion_item_count,
         tag_op_count,
+        alias_count,
     })
 }
 
@@ -628,6 +638,31 @@ mod tests {
         let impact = get_impact(&c, &f.key).unwrap();
         assert_eq!(impact.tag_count, 1);
         assert_eq!(impact.asset_count, 0);
+        assert_eq!(impact.alias_count, 0, "无别名时 alias_count 应为 0");
+    }
+
+    /// R3-3：delete_facet 会连带删 tag_aliases，影响报告必须含别名计数。
+    #[test]
+    fn impact_counts_aliases_in_facet() {
+        let c = conn();
+        let f = create(&c, "impact_alias_facet", "影响别名", "", "multi", None, "all").unwrap();
+        let tag_id: i64 = c
+            .query_row(
+                "INSERT INTO tags (name, normalized_name, canonical_name, facet_key, is_system, status, sort_order)
+                 VALUES ('红', '红', '红', ?1, 0, 'active', 0) RETURNING id",
+                [&f.key],
+                |r| r.get(0),
+            )
+            .unwrap();
+        c.execute(
+            "INSERT INTO tag_aliases (tag_id, alias, normalized_alias, is_searchable, created_at)
+             VALUES (?1, '赤', '赤', 1, 1)",
+            [tag_id],
+        )
+        .unwrap();
+        let impact = get_impact(&c, &f.key).unwrap();
+        assert_eq!(impact.alias_count, 1, "分面下别名应计入影响报告");
+        assert_eq!(impact.tag_count, 1);
     }
 
     /// 回归（真机：设置页标签与分类 AI/手工两组全空白）：

@@ -139,11 +139,15 @@ export default function TagManageDialog({ open, onClose, title = "标签管理" 
     });
   };
 
-  /** 合并/移动目标选项：排除自身子树（防环，后端也兜底校验） */
+  /** 合并/移动目标选项：排除自身子树（防环）+ 只留同分面标签（R3-1：杜绝把
+   *  scene 标签挂到 people 标签下 —— 与后端 trg_tags_parent_facet_ai 双层防护）。 */
   const optionsFor = (id: number) => {
     const self = rows.find((r) => r.tag.id === id)?.node;
     const excluded = self ? collectSubtree(self, new Set<number>()) : new Set<number>();
-    return rows.filter((r) => !excluded.has(r.tag.id));
+    const selfFacet = self?.tag.facetKey;
+    return rows.filter(
+      (r) => !excluded.has(r.tag.id) && (!selfFacet || r.tag.facetKey === selfFacet),
+    );
   };
 
   return (

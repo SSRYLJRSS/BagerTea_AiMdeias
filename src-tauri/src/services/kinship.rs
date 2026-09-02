@@ -67,7 +67,7 @@ mod tests {
 
         // 同名不同目录：不算同源
         let (k7, _) = kinship_key("d:/a/IMG_0001.RW2");
-        let (k8, _) = kinship_path_diff_dir();
+        let (k8, _) = kinship_key("d:/b/IMG_0001.RW2");
         assert_ne!(k7, k8);
 
         // 两个都是 RAW：key 相同但 is_kinship 为 false
@@ -76,9 +76,5 @@ mod tests {
         assert!(!is_kinship("d:/a/X.JPG", "d:/a/X.PNG"), "两个非 RAW 不算同源");
         // 一 RAW 一 JPG：算
         assert!(is_kinship("d:/a/X.JPG", "d:/a/X.RW2"));
-    }
-
-    fn kinship_path_diff_dir() -> (String, bool) {
-        kinship_key("d:/b/IMG_0001.RW2")
     }
 }
