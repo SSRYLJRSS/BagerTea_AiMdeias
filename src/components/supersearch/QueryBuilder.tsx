@@ -39,6 +39,9 @@ const FIELD_OPTIONS: FieldOption[] = [
   { key: "taken_at", label: "拍摄时间", group: "时间", kind: "date", ops: DATE_OPS }, { key: "created_at", label: "入库时间", group: "时间", kind: "date", ops: DATE_OPS }, { key: "modified_at", label: "修改时间", group: "时间", kind: "date", ops: DATE_OPS },
   { key: "camera", label: "相机", group: "拍摄设备", kind: "text", ops: TEXT_OPS }, { key: "lens", label: "镜头", group: "拍摄设备", kind: "text", ops: TEXT_OPS }, { key: "iso", label: "ISO", group: "拍摄设备", kind: "number", ops: NUMERIC_OPS }, { key: "aperture", label: "光圈", group: "拍摄设备", kind: "number", ops: NUMERIC_OPS }, { key: "shutter", label: "快门", group: "拍摄设备", kind: "text", ops: TEXT_OPS }, { key: "focal", label: "焦距", group: "拍摄设备", kind: "number", ops: NUMERIC_OPS },
   { key: "duration_ms", label: "视频时长", group: "视频", kind: "duration", ops: NUMERIC_OPS }, { key: "video_codec", label: "视频编码", group: "视频", kind: "text", ops: TEXT_OPS }, { key: "audio_codec", label: "音频编码", group: "视频", kind: "text", ops: TEXT_OPS },
+  // U-3：色板关系表 UI —— 只暴露 palette_top3（C-1 的 UI 范围决策：前三色）。
+  // 值 = 折叠色名（12 hue + 黑/灰/白），eq 单选 + 占比阈值（min 0..1）；多选走 in。
+  { key: "palette_top3", label: "前三色包含", group: "颜色", ops: ENUM_OPS },
   // FB2-08（§14.9）：算法主色检索维度。色相是环形量：介于 345 至 15 表示跨过 0° 的红色区间
   // （后端编译为双区间 OR，search_query.rs 对 dominant_hue 的 min>max 特判），其他字段的区间倒置仍是错误。
   { key: "dominant_hue", label: "主色色相（0-359，可跨 0°）", group: "颜色", kind: "number", ops: NUMERIC_OPS },
@@ -478,6 +481,8 @@ function TagValueCell({ isExclude, data, options, onChange }: { isExclude: boole
   );
 }
 function MetadataValue({ filter, onChange }: { filter: MetadataFilter; onChange: (filter: MetadataFilter) => void }) {
+  // U-3：前三色走色块选择器（单选 eq + 占比阈值 / 多选 in）
+  if (filter.key === "palette_top3") return <PaletteValue filter={filter} onChange={onChange} />;
   const kind = FIELD_OPTIONS.find((item) => item.key === filter.key)?.kind ?? "number";
   if (filter.op === "between")
     return (
@@ -490,6 +495,76 @@ function MetadataValue({ filter, onChange }: { filter: MetadataFilter; onChange:
   if (filter.op === "in") return <DraftInput ariaLabel="条件值" placeholder="多个值用逗号分隔" displayValue={(filter.values ?? []).join(", ")} onCommit={(raw) => onChange({ ...filter, values: raw.split(/[,，]/).map((x) => x.trim()).filter(Boolean) })} className={`${controlClass} w-full`} />;
   // U-7 ②：日期快捷的语义与 op 绑定 —— gte/min 侧写期初，lte/max 侧写期末
   return <ValueInput kind={kind} value={filter.value} dateSide={filter.op === "lte" ? "end" : "start"} onChange={(value) => onChange({ ...filter, value })} />;
+}
+// U-3：前三色色块 —— 12 hue（colorName.ts HUE_NAMES 端点中值，与 palette_bucket 桶序一致）+ 黑/灰/白
+const PALETTE_SWATCHES: { name: string; color: string }[] = [
+  { name: "红", color: "hsl(7.5, 90%, 55%)" },
+  { name: "橙", color: "hsl(30, 90%, 55%)" },
+  { name: "黄", color: "hsl(57.5, 90%, 55%)" },
+  { name: "黄绿", color: "hsl(80, 90%, 45%)" },
+  { name: "绿", color: "hsl(122.5, 90%, 45%)" },
+  { name: "青绿", color: "hsl(170, 90%, 45%)" },
+  { name: "青", color: "hsl(205, 90%, 45%)" },
+  { name: "天蓝", color: "hsl(240, 90%, 60%)" },
+  { name: "蓝", color: "hsl(275, 90%, 55%)" },
+  { name: "紫", color: "hsl(307.5, 90%, 55%)" },
+  { name: "品红", color: "hsl(332.5, 90%, 55%)" },
+  { name: "玫红", color: "hsl(352.5, 90%, 55%)" },
+  { name: "黑", color: "hsl(0, 0%, 12%)" },
+  { name: "灰", color: "hsl(0, 0%, 55%)" },
+  { name: "白", color: "hsl(0, 0%, 98%)" },
+];
+function paletteColorsFromFilter(filter: MetadataFilter): string[] {
+  if (filter.op === "in") return (filter.values ?? []).filter((v): v is string => typeof v === "string");
+  const v = filter.value;
+  if (typeof v === "string") return [v];
+  return Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : [];
+}
+/** U-3：色块选择器值单元格 —— 单选色 → eq（带占比阈值 min 0..1）；多选色 → in values。
+ *  色相/饱和度/明度的高级数值输入仍保留在字段下拉「颜色」组（dominant_*）。 */
+function PaletteValue({ filter, onChange }: { filter: MetadataFilter; onChange: (f: MetadataFilter) => void }) {
+  const colors = paletteColorsFromFilter(filter);
+  const single = colors.length === 1;
+  const numMin = typeof filter.min === "number" ? filter.min : typeof filter.min === "string" ? Number(filter.min) : NaN;
+  const pct = single && Number.isFinite(numMin) ? Math.round(numMin * 100) : 0;
+  const commit = (next: string[], ratioPct: number) => {
+    if (next.length === 0) {
+      onChange({ key: filter.key, op: "eq", value: undefined });
+      return;
+    }
+    if (next.length === 1) {
+      onChange(ratioPct > 0 ? { key: filter.key, op: "eq", value: next[0], min: ratioPct / 100 } : { key: filter.key, op: "eq", value: next[0] });
+      return;
+    }
+    onChange({ key: filter.key, op: "in", values: next });
+  };
+  return (
+    <div className="flex min-w-0 flex-col items-start gap-1 self-start">
+      <div className="flex flex-wrap items-center gap-1">
+        {PALETTE_SWATCHES.map((sw) => {
+          const on = colors.includes(sw.name);
+          return (
+            <button
+              key={sw.name}
+              type="button"
+              aria-label={sw.name}
+              aria-pressed={on}
+              title={sw.name}
+              onClick={() => commit(on ? colors.filter((c) => c !== sw.name) : [...colors, sw.name], on ? 0 : pct)}
+              className={`size-6 shrink-0 rounded-full border transition-transform ${on ? "scale-110 ring-2 ring-[var(--color-status)]" : "border-[var(--color-border-strong)]"}`}
+              style={{ backgroundColor: sw.color }}
+            />
+          );
+        })}
+      </div>
+      {single && (
+        <div className="flex w-full items-center gap-2 text-[11px] text-[var(--color-text-secondary)]">
+          <input aria-label="占比阈值" type="range" min={0} max={100} step={5} value={pct} onChange={(e) => commit(colors, Number(e.target.value))} className="h-1 min-w-0 flex-1 accent-[var(--color-accent)]" />
+          <span className="shrink-0 whitespace-nowrap">{pct === 0 ? "不限占比" : `占 ${pct}% 以上`}</span>
+        </div>
+      )}
+    </div>
+  );
 }
 function ValueInput({ kind, value, onChange, dateSide }: { kind: NonNullable<FieldOption["kind"]>; value: string | number | undefined; dateSide?: "start" | "end"; onChange: (value: string | number | undefined) => void }) {
   if (kind === "date") return <DateValue value={value} side={dateSide ?? "start"} onChange={onChange} />;

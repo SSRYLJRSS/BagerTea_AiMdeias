@@ -135,6 +135,10 @@ export type MetadataFilterKey =
   | "dominant_hue"
   | "dominant_sat"
   | "dominant_lum"
+  // C-1/U-3：色板关系表（值 = 折叠色名 eq/in；eq + min = 占比阈值）。UI 只暴露 palette_top3。
+  | "palette_dominant"
+  | "palette_top3"
+  | "palette_any"
   // V18：GPS 定位（带符号十进制度）与定位有无分面（值域 yes/no）
   | "latitude"
   | "rating"

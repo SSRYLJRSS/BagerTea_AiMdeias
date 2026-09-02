@@ -290,6 +290,8 @@ fn next_day_ms(s: &str) -> AppResult<i64> {
 /// C-1：palette_* 编译为对 asset_palette_colors 的 EXISTS（值 = 折叠色名 → 桶 id）。
 /// - palette_dominant → rank=0；palette_top3 → rank<3；palette_any → 不限 rank。
 /// 实测关系表覆盖索引（ix_apc_bucket）；like/字符串列是 SCAN，故不用。
+/// U-3：eq + 数字 min = 占比阈值（「前三色含红且红占 ≥50%」→ bucket=红 AND ratio>=0.5）。
+/// 复用数值条件的 min 字段表达阈值，allowed_ops 仍只 eq/in —— AI schema 与校验面不变。
 fn compile_palette_meta(f: &MetadataFilter) -> AppResult<Option<CompiledMetadata>> {
     let rank_sql = match f.key.as_str() {
         "palette_dominant" => Some(" AND apc.rank = 0"),
@@ -301,21 +303,36 @@ fn compile_palette_meta(f: &MetadataFilter) -> AppResult<Option<CompiledMetadata
         Some(x) => x,
         None => return Ok(None), // 非 palette key
     };
+    let ratio_min = f.min.as_ref().and_then(json_f64);
     let names: Vec<String> = match f.op.as_str() {
         "eq" => {
-            let Some(v) = f.value.as_ref() else {
-                return Err(AppError::msg("palette 等值条件缺少 value"));
-            };
-            match v {
-                serde_json::Value::String(s) => vec![s.clone()],
-                serde_json::Value::Array(a) => a
-                    .iter()
-                    .filter_map(|x| x.as_str().map(String::from))
-                    .collect(),
-                _ => return Err(AppError::msg("palette 等值条件值必须是色名")),
+            if ratio_min.is_some() {
+                // U-3：占比阈值 = 单色 eq + min（避免「多种颜色共享一个阈值」的歧义）
+                let Some(v) = f.value.as_ref() else {
+                    return Err(AppError::msg("palette 等值条件缺少 value"));
+                };
+                match v {
+                    serde_json::Value::String(s) => vec![s.clone()],
+                    _ => return Err(AppError::msg("带占比阈值的色板条件一次只能选一种颜色")),
+                }
+            } else {
+                let Some(v) = f.value.as_ref() else {
+                    return Err(AppError::msg("palette 等值条件缺少 value"));
+                };
+                match v {
+                    serde_json::Value::String(s) => vec![s.clone()],
+                    serde_json::Value::Array(a) => a
+                        .iter()
+                        .filter_map(|x| x.as_str().map(String::from))
+                        .collect(),
+                    _ => return Err(AppError::msg("palette 等值条件值必须是色名")),
+                }
             }
         }
         "in" => {
+            if ratio_min.is_some() {
+                return Err(AppError::msg("带占比阈值的色板条件仅支持等于（eq）单色"));
+            }
             let mut out = Vec::new();
             if let Some(v) = f.value.as_ref() {
                 if let Some(x) = v.as_str() {
@@ -336,12 +353,27 @@ fn compile_palette_meta(f: &MetadataFilter) -> AppResult<Option<CompiledMetadata
         }
         _ => return Err(AppError::msg(format!("色板 key 不支持操作符：{}", f.op))),
     };
-    let mut ids: Vec<rusqlite::types::Value> = Vec::new();
-    for name in names {
-        let id = crate::db::palette_bucket::bucket_id_of_name(&name).ok_or_else(|| {
+    let mut ids: Vec<i64> = Vec::new();
+    for name in &names {
+        let id = crate::db::palette_bucket::bucket_id_of_name(name).ok_or_else(|| {
             AppError::msg(format!("未知色名：{name}（可用：红/橙/黄/黄绿/绿/青绿/青/天蓝/蓝/紫/品红/玫红/黑/灰/白）"))
         })?;
-        ids.push(id.into());
+        ids.push(id);
+    }
+    // U-3：单色 + 阈值 → ratio >= min（先绑定颜色再限定占比，覆盖索引依然可用）
+    if let Some(r) = ratio_min {
+        if ids.len() != 1 {
+            return Err(AppError::msg("带占比阈值的色板条件一次只能选一种颜色"));
+        }
+        if !(0.0..=1.0).contains(&r) {
+            return Err(AppError::msg("色板占比阈值必须在 0..1 之间"));
+        }
+        return Ok(Some(CompiledMetadata {
+            sql: format!(
+                "EXISTS (SELECT 1 FROM asset_palette_colors apc WHERE apc.asset_id = a.id AND apc.color_bucket = ?1 AND apc.ratio >= ?2{rank_sql})"
+            ),
+            params: vec![Value::Integer(ids[0]), Value::Real(r)],
+        }));
     }
     let ph = ids
         .iter()
@@ -349,12 +381,22 @@ fn compile_palette_meta(f: &MetadataFilter) -> AppResult<Option<CompiledMetadata
         .map(|(i, _)| format!("?{}", i + 1))
         .collect::<Vec<_>>()
         .join(",");
+    let params = ids.into_iter().map(Value::Integer).collect::<Vec<_>>();
     Ok(Some(CompiledMetadata {
         sql: format!(
             "EXISTS (SELECT 1 FROM asset_palette_colors apc WHERE apc.asset_id = a.id AND apc.color_bucket IN ({ph}){rank_sql})"
         ),
-        params: ids,
+        params,
     }))
+}
+
+/// JSON 数值（数字字面量或可解析字符串）→ f64。
+fn json_f64(v: &serde_json::Value) -> Option<f64> {
+    match v {
+        serde_json::Value::Number(n) => n.as_f64(),
+        serde_json::Value::String(s) => s.trim().parse::<f64>().ok(),
+        _ => None,
+    }
 }
 
 pub fn dimension_warnings(f: &MetadataFilter) -> Vec<String> {
@@ -869,5 +911,43 @@ mod tests {
             max: None,
         };
         assert!(compile_metadata(&gt).is_err());
+    }
+
+    /// U-3：palette eq + 数字 min = 占比阈值编译（bucket=色 AND ratio>=min + rank 限定）。
+    #[test]
+    fn palette_eq_with_ratio_min_compiles() {
+        let f = MetadataFilter {
+            key: "palette_top3".into(),
+            op: "eq".into(),
+            value: Some(serde_json::json!("红")),
+            values: None,
+            min: Some(serde_json::json!(0.5)),
+            max: None,
+        };
+        let c = compile_metadata(&f).unwrap().unwrap();
+        assert!(c.sql.contains("apc.color_bucket = ?1"), "{}", c.sql);
+        assert!(c.sql.contains("apc.ratio >= ?2"), "{}", c.sql);
+        assert!(c.sql.contains("rank < 3"), "{}", c.sql);
+        assert_eq!(c.params.len(), 2);
+        // in + min 拒绝（阈值只配单色 eq）
+        let in_min = MetadataFilter {
+            key: "palette_top3".into(),
+            op: "in".into(),
+            value: None,
+            values: Some(vec![serde_json::json!("红"), serde_json::json!("蓝")]),
+            min: Some(serde_json::json!(0.5)),
+            max: None,
+        };
+        assert!(compile_metadata(&in_min).is_err());
+        // 阈值越界拒绝
+        let oob = MetadataFilter {
+            key: "palette_top3".into(),
+            op: "eq".into(),
+            value: Some(serde_json::json!("红")),
+            values: None,
+            min: Some(serde_json::json!(1.5)),
+            max: None,
+        };
+        assert!(compile_metadata(&oob).is_err());
     }
 }

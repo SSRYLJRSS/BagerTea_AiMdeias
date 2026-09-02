@@ -19,6 +19,8 @@ const LABELS: Record<string, string> = {
   modified_at: "修改时间", camera: "相机", lens: "镜头", iso: "ISO",
   aperture: "光圈", shutter: "快门", focal: "焦距", video_codec: "视频编码",
   audio_codec: "音频编码", folder: "文件夹",
+  // U-3：色板关系表（前三色 chip 可读展示）
+  palette_top3: "前三色", palette_dominant: "主色", palette_any: "任一色",
 };
 
 /** W3：分面显示名优先读 tagStore.facets（自建分面自动显示中文名）；
@@ -35,6 +37,10 @@ function fmtValue(v: string | number) { return String(v); }
 
 function metaLabel(f: MetadataFilter): string {
   const name = LABELS[f.key] ?? f.key;
+  // U-3：palette_top3 eq + min → 「前三色含 红（占 ≥50%）」
+  if (f.key === "palette_top3" && f.op === "eq" && typeof f.value === "string" && typeof f.min === "number" && f.min > 0) {
+    return `${name}含 ${f.value}（占 ≥${Math.round(f.min * 100)}%）`;
+  }
   if (f.op === "between") return `${name} ${fmtValue(f.min ?? "")}–${fmtValue(f.max ?? "")}`;
   if (f.op === "in") return `${name} ∈ ${(f.values ?? []).map(fmtValue).join("|")}`;
   if (f.op === "eq" && f.value !== undefined) return `${name} = ${fmtValue(f.value)}`;

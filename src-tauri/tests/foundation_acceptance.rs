@@ -2261,3 +2261,33 @@ fn palette_intersect_two_colors() {
     let ids: Vec<i64> = page.items.iter().map(|x| x.id).collect();
     assert_eq!(ids, vec![a], "红∩蓝（前三色）应只有 A：{ids:?}");
 }
+
+/// U-3：palette_top3 eq 红 + min=0.5 → 只命中红占比 ≥50% 的素材（关系表 ratio 维度的编译链路）。
+#[test]
+fn palette_top3_ratio_min_filters() {
+    use bagertea_ai_media_v2_lib::db::search_query::{compile_metadata, MetadataFilter};
+    let c = mem();
+    let hi = f4_insert_asset(&c, "d:/c1_hi.jpg");
+    let lo = f4_insert_asset(&c, "d:/c1_lo.jpg");
+    // hi：前三色 = 红 60% / 蓝 30%；lo：红仅 10%（其余 90% 蓝）
+    c1_set_palette(&c, hi, &c1_palette_json(&[(224, 32, 32, 0.6), (32, 32, 224, 0.3)]));
+    c1_set_palette(&c, lo, &c1_palette_json(&[(224, 32, 32, 0.1), (32, 32, 224, 0.9)]));
+    assets::rescan_palette_colors(&c).unwrap();
+    let f = MetadataFilter {
+        key: "palette_top3".into(),
+        op: "eq".into(),
+        value: Some(serde_json::json!("红")),
+        values: None,
+        min: Some(serde_json::json!(0.5)),
+        max: None,
+    };
+    let compiled = compile_metadata(&f).unwrap().expect("带阈值可编译");
+    assert!(compiled.sql.contains("apc.ratio >= ?2"), "{}", compiled.sql);
+    let filter = assets::AssetFilter {
+        metadata_filters: vec![f],
+        ..Default::default()
+    };
+    let page = assets::list(&c, &filter).unwrap();
+    let ids: Vec<i64> = page.items.iter().map(|x| x.id).collect();
+    assert_eq!(ids, vec![hi], "红占比 ≥50% 应只有 hi：{ids:?}");
+}

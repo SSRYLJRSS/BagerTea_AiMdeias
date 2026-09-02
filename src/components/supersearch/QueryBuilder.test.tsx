@@ -580,3 +580,43 @@ describe("U-2 标签 chip 多选", () => {
     expect(screen.queryByRole("checkbox", { name: "海边" })).not.toBeInTheDocument();
   });
 });
+
+/** U-3：前三色色块选择器 —— 单选 eq（+ 占比阈值 min）/ 多选 in；高级 hue/sat/lum 数值输入仍在颜色组。 */
+describe("U-3 色块选择器", () => {
+  it("queryBuilder_color_swatch_picker：色块单选 + 阈值滑块 → eq 带 min；多选 → in；撤选回 eq", () => {
+    render(<QueryBuilder />);
+    fireEvent.click(screen.getByRole("button", { name: "+ 添加第一个条件" }));
+    pickField("前三色包含");
+    // 单选「红」→ eq 红（无阈值）
+    fireEvent.click(screen.getByRole("button", { name: "红" }));
+    let expr = useSuperSearchStore.getState().expr;
+    expect(expr).toEqual({ op: "leaf", cond: { type: "metadata", filter: { key: "palette_top3", op: "eq", value: "红" } } });
+    // 滑块出现 → 拖到 50 → min=0.5
+    const slider = screen.getByLabelText("占比阈值") as HTMLInputElement;
+    expect(slider.value).toBe("0");
+    fireEvent.change(slider, { target: { value: "50" } });
+    expr = useSuperSearchStore.getState().expr;
+    if (expr?.op === "leaf" && expr.cond.type === "metadata") {
+      expect(expr.cond.filter).toMatchObject({ key: "palette_top3", op: "eq", value: "红", min: 0.5 });
+    } else {
+      throw new Error("expected palette leaf");
+    }
+    // 再选「蓝」→ 多选转 in（阈值不适用）
+    fireEvent.click(screen.getByRole("button", { name: "蓝" }));
+    expr = useSuperSearchStore.getState().expr;
+    if (expr?.op === "leaf" && expr.cond.type === "metadata") {
+      expect(expr.cond.filter).toMatchObject({ key: "palette_top3", op: "in", values: ["红", "蓝"] });
+      expect((expr.cond.filter as { min?: number }).min).toBeUndefined();
+    } else {
+      throw new Error("expected palette leaf");
+    }
+    // 移除「红」→ 单蓝 eq 无阈值
+    fireEvent.click(screen.getByRole("button", { name: "红" }));
+    expr = useSuperSearchStore.getState().expr;
+    if (expr?.op === "leaf" && expr.cond.type === "metadata") {
+      expect(expr.cond.filter).toMatchObject({ key: "palette_top3", op: "eq", value: "蓝" });
+    } else {
+      throw new Error("expected palette leaf");
+    }
+  });
+});
