@@ -21,7 +21,8 @@ import {
 
 type FieldKey = "search" | "tag" | "excludeTag" | "assetType" | "untagged" | "facetHasAny" | "facetMissing" | MetadataFilterKey;
 type GroupMode = "and" | "or";
-type FlatTag = { id: number; name: string; facet: string };
+type FlatTag = { id: number; name: string; facet: string; aliases: string[] };
+type TagCondData = { facetKey: string; tagIds: number[]; mode: "any" | "all"; includeDescendants: boolean };
 type Row = { id: string; negated: boolean; cond: LeafCond };
 type FieldOption = { key: FieldKey; label: string; group: "关键词" | "标签" | "素材" | "颜色" | "定位" | "时间" | "拍摄设备" | "视频"; kind?: "number" | "text" | "date" | "size" | "duration" | "resolution"; ops?: MetadataOp[] };
 
@@ -75,6 +76,31 @@ let rowSeq = 0;
 const uid = () => `query-row-${++rowSeq}`;
 const controlClass = "ui-control h-8 min-w-0 px-2 text-xs";
 
+// U-2：标签面板搜索的匹配模式（默认别名）。模式只影响面板「过滤显示哪些标签」，不改后端条件语义。
+type TermMatchKey = "exact" | "alias" | "prefix" | "contains" | "fuzzy";
+const TERM_MATCH_KEYS: TermMatchKey[] = ["exact", "alias", "prefix", "contains", "fuzzy"];
+const TERM_MATCH_LABELS: Record<TermMatchKey, string> = { exact: "精确", alias: "别名", prefix: "前缀", contains: "包含", fuzzy: "纠错" };
+const DEFAULT_TERM_MATCH: TermMatchKey = "alias";
+function tagMatch(opt: FlatTag, qRaw: string, match: TermMatchKey): boolean {
+  const q = qRaw.trim().toLowerCase();
+  if (!q) return true;
+  const name = opt.name.toLowerCase();
+  const hay = [name, ...(opt.aliases ?? []).map((a) => a.toLowerCase())];
+  const anyHay = (fn: (s: string) => boolean) => hay.some(fn);
+  switch (match) {
+    case "exact":
+      return name === q;
+    case "prefix":
+      return anyHay((s) => s.startsWith(q));
+    case "alias": // 别名：名称或别名包含（默认）
+      return anyHay((s) => s.includes(q));
+    case "contains": // 包含：仅名称包含（比别名严格）
+      return name.includes(q);
+    case "fuzzy": // 纠错：允许漏字/错序（子序列容错）
+      return anyHay((s) => { let i = 0; for (const ch of q) { i = s.indexOf(ch, i); if (i < 0) return false; i += 1; } return true; });
+  }
+}
+
 export default function QueryBuilder() {
   const { expr, setExpr, clearQuery, resolvedTags } = useSuperSearchStore(
     useShallow((s) => ({ expr: s.expr, setExpr: s.setExpr, clearQuery: s.clearQuery, resolvedTags: s.resolvedTags })),
@@ -86,15 +112,15 @@ export default function QueryBuilder() {
   const commitTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(() => { if (tagTree.length === 0 && !tagsLoading) void useTagStore.getState().refresh(); }, [tagTree.length, tagsLoading]);
   const flatTags = useMemo(() => {
-    const out: FlatTag[] = []; const walk = (nodes: import("@/types/tag").TagNode[], facet: string) => { for (const node of nodes) { const nextFacet = node.tag.facetKey || facet; out.push({ id: node.tag.id, name: node.tag.name, facet: nextFacet }); walk(node.children, nextFacet); } };
+    const out: FlatTag[] = []; const walk = (nodes: import("@/types/tag").TagNode[], facet: string) => { for (const node of nodes) { const nextFacet = node.tag.facetKey || facet; out.push({ id: node.tag.id, name: node.tag.name, facet: nextFacet, aliases: node.tag.aliases ?? [] }); walk(node.children, nextFacet); } };
     // W0-3：从根节点自身开始收集（find_or_create_canonical 建的是根级标签，
     // 旧写法 walk(root.children) 会漏掉全部根级标签，导致下拉一个标签都选不到）
-    for (const root of tagTree) { const rootFacet = root.tag.facetKey; out.push({ id: root.tag.id, name: root.tag.name, facet: rootFacet }); walk(root.children, rootFacet); } return out;
+    for (const root of tagTree) { const rootFacet = root.tag.facetKey; out.push({ id: root.tag.id, name: root.tag.name, facet: rootFacet, aliases: root.tag.aliases ?? [] }); walk(root.children, rootFacet); } return out;
   }, [tagTree]);
   // §9.8：resolvedTags 里 tagStore 找不到的 id → synthetic option（保留名称，绝不退回「选择标签」）
   const syntheticTags = useMemo(() => {
     const known = new Set(flatTags.map((t) => t.id));
-    return resolvedTags.filter((r) => !known.has(r.tagId)).map((r) => ({ id: r.tagId, name: r.text, facet: r.facetKey }));
+    return resolvedTags.filter((r) => !known.has(r.tagId)).map((r) => ({ id: r.tagId, name: r.text, facet: r.facetKey, aliases: [] }));
   }, [flatTags, resolvedTags]);
   const allTagOptions = useMemo(() => [...flatTags, ...syntheticTags], [flatTags, syntheticTags]);
   useEffect(() => {
@@ -357,32 +383,99 @@ function ConditionValue({ cond, allTagOptions, onChange }: { cond: LeafCond; all
     return <select aria-label="条件值" value={cond.facetKey} onChange={(e) => onChange({ ...cond, facetKey: e.target.value })} className={`${controlClass} w-full`}>{!known && cond.facetKey ? <option value={cond.facetKey}>{cond.facetKey}</option> : null}{facets.map((f) => <option key={f} value={f}>{f}</option>)}</select>;
   }
   if (cond.type === "tag" || cond.type === "excludeTag") {
-    // W3-3b：optgroup 按分面分组（新建分面自动成为一组，零代码改动）
-    // W3-3c：多选 + 「同时满足」勾选（协议早就支持 mode:all，此前 UI 只取第一个）
-    const selectedIds = new Set(cond.tagIds.map(String));
+    // U-2：chip + 可搜索面板（弃用 <select multiple>——桌面端必须 Ctrl+点击选不中多个）。
     // §9.8：已有非空 tagId 时，两边都找不到 → 显示「标签 #id」，绝不退回「选择标签」
     const options = [...allTagOptions];
     for (const id of cond.tagIds) {
       if (!options.some((t) => t.id === id)) {
-        options.push({ id, name: `标签 #${id}`, facet: cond.facetKey || "custom" });
+        options.push({ id, name: `标签 #${id}`, facet: cond.facetKey || "custom", aliases: [] });
       }
     }
-    const byFacet = new Map<string, FlatTag[]>();
-    for (const t of options) {
-      const list = byFacet.get(t.facet) ?? [];
-      list.push(t);
-      byFacet.set(t.facet, list);
-    }
-    return <div className="grid grid-cols-[minmax(0,1fr)_92px] gap-2">
-      <select aria-label="条件值" multiple value={cond.tagIds.map(String)} onChange={(e) => { const ids = Array.from(e.target.selectedOptions, (o) => Number(o.value)).filter(Boolean); const facets = new Set(ids.map((id) => options.find((t) => t.id === id)?.facet).filter(Boolean) as string[]); onChange({ ...cond, tagIds: ids, facetKey: [...facets][0] ?? cond.facetKey }); }} className={`${controlClass} h-auto max-h-24 w-full`} size={Math.min(4, Math.max(2, options.length))}>
-        {[...byFacet.entries()].map(([facet, tags]) => <optgroup key={facet} label={facet}>{tags.map((tag) => <option key={tag.id} value={tag.id}>{selectedIds.has(String(tag.id)) ? "✓ " : ""}{tag.name}</option>)}</optgroup>)}
-      </select>
-      {cond.type === "tag"
-        ? <select aria-label="标签范围" value={cond.mode === "all" ? "all" : cond.includeDescendants ? "desc" : "self"} onChange={(e) => { const v = e.target.value; onChange(v === "all" ? { ...cond, mode: "all", includeDescendants: false } : { ...cond, mode: "any", includeDescendants: v === "desc" }); }} className={`${controlClass} w-full`}><option value="desc">含子标签</option><option value="self">仅当前</option><option value="all">同时满足</option></select>
-        : <span />}
-    </div>;
+    const data: TagCondData = {
+      facetKey: cond.facetKey,
+      tagIds: cond.tagIds,
+      mode: (cond.type === "tag" ? cond.mode : "any") ?? "any",
+      includeDescendants: cond.type === "tag" ? cond.includeDescendants : false,
+    };
+    return (
+      <div className="flex min-w-0 flex-col items-stretch gap-1 self-start">
+        <TagValueCell
+          isExclude={cond.type === "excludeTag"}
+          data={data}
+          options={options}
+          onChange={(next) => onChange((cond.type === "tag"
+            ? { ...cond, facetKey: next.facetKey, tagIds: next.tagIds, mode: next.mode, includeDescendants: next.includeDescendants }
+            : { ...cond, facetKey: next.facetKey, tagIds: next.tagIds }) as LeafCond)}
+        />
+      </div>
+    );
   }
   return <MetadataValue filter={cond.filter} onChange={(filter) => onChange({ ...cond, filter })} />;
+}
+
+/** U-2：标签值单元格 —— 已选 chip（可单个移除）+ 「＋」按钮展开可搜索面板（按分面分组勾选）。
+ *  面板内搜索框带匹配模式下拉（精确/别名/前缀/包含/纠错，默认别名）；面板展开为行内流式，
+ *  抬高行高即可完整显示，不会被外层 overflow 容器裁切。 */
+function TagValueCell({ isExclude, data, options, onChange }: { isExclude: boolean; data: TagCondData; options: FlatTag[]; onChange: (next: TagCondData) => void }) {
+  const [open, setOpen] = useState(false);
+  const [q, setQ] = useState("");
+  const [match, setMatch] = useState<TermMatchKey>(DEFAULT_TERM_MATCH);
+  const selected = new Set(data.tagIds);
+  const byId = new Map(options.map((t) => [t.id, t]));
+  const byFacet = new Map<string, FlatTag[]>();
+  for (const t of options) {
+    if (!tagMatch(t, q, match)) continue;
+    const list = byFacet.get(t.facet) ?? [];
+    list.push(t);
+    byFacet.set(t.facet, list);
+  }
+  const toggle = (id: number) => {
+    const nextIds = selected.has(id) ? data.tagIds.filter((x) => x !== id) : [...data.tagIds, id];
+    const facets = new Set(nextIds.map((x) => byId.get(x)?.facet).filter(Boolean) as string[]);
+    onChange({ ...data, tagIds: nextIds, facetKey: nextIds.length > 0 ? [...facets][0] ?? data.facetKey : data.facetKey });
+  };
+  return (
+    <div className="flex min-w-0 flex-col items-stretch gap-1">
+      <div className="flex min-w-0 flex-wrap items-center gap-1">
+        {data.tagIds.map((id) => {
+          const tag = byId.get(id);
+          const name = tag?.name ?? `标签 #${id}`;
+          return (
+            <span key={id} className="inline-flex h-6 max-w-full items-center gap-0.5 rounded-full border border-[var(--color-border)] bg-[var(--color-surface)] pr-0.5 pl-2 text-[11px] text-[var(--color-text)]">
+              <span className="truncate">{name}</span>
+              <button type="button" aria-label={`移除 ${name}`} title={`移除 ${name}`} onClick={() => toggle(id)} className="flex size-5 shrink-0 items-center justify-center rounded-full text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-hover)] hover:text-[var(--color-text)]">×</button>
+            </span>
+          );
+        })}
+        <button type="button" aria-expanded={open} aria-label="选择标签" onClick={() => setOpen((o) => !o)} className="inline-flex h-6 items-center gap-1 rounded-full border border-dashed border-[var(--color-border-strong)] px-2 text-[11px] text-[var(--color-text-secondary)] hover:bg-[var(--color-surface)] hover:text-[var(--color-text)]">＋ {data.tagIds.length > 0 ? "添加" : "选择标签"}</button>
+      </div>
+      {!isExclude && (
+        <select aria-label="标签范围" value={data.mode === "all" ? "all" : data.includeDescendants ? "desc" : "self"} onChange={(e) => { const v = e.target.value; onChange(v === "all" ? { ...data, mode: "all", includeDescendants: false } : { ...data, mode: "any", includeDescendants: v === "desc" }); }} className={`${controlClass} w-full`}><option value="desc">含子标签</option><option value="self">仅当前</option><option value="all">同时满足</option></select>
+      )}
+      {open && (
+        <div className="w-full rounded-md border border-[var(--color-border)] bg-[var(--color-surface-raised)]">
+          <div className="flex items-center gap-1.5 border-b border-[var(--color-border)] p-1.5">
+            <input aria-label="搜索标签" value={q} onChange={(e) => setQ(e.target.value)} placeholder="搜索标签…" className="ui-control h-7 min-w-0 flex-1 px-2 text-xs" />
+            <select aria-label="匹配模式" value={match} onChange={(e) => setMatch(e.target.value as TermMatchKey)} className={`${controlClass} w-[72px] shrink-0`}>{TERM_MATCH_KEYS.map((k) => <option key={k} value={k}>{TERM_MATCH_LABELS[k]}</option>)}</select>
+          </div>
+          <div className="max-h-48 overflow-y-auto py-1">
+            {byFacet.size === 0 && <div className="px-3 py-2 text-xs text-[var(--color-text-tertiary)]">没有匹配的标签</div>}
+            {Array.from(byFacet.entries()).map(([facet, tags]) => (
+              <div key={facet}>
+                <div className="px-3 pt-1 pb-0.5 text-[10px] font-medium text-[var(--color-text-tertiary)]">{facet}</div>
+                {tags.map((t) => { const on = selected.has(t.id); return (
+                  <button key={t.id} type="button" role="checkbox" aria-checked={on} aria-label={t.name} onClick={() => toggle(t.id)} className={`flex w-full items-center gap-1.5 px-3 py-1 text-left text-xs ${on ? "text-[var(--color-text)]" : "text-[var(--color-text-secondary)]"}`}>
+                    <span aria-hidden="true" className="w-3 shrink-0 text-[var(--color-status)]">{on ? "✓" : ""}</span>
+                    <span className="truncate">{t.name}</span>
+                  </button>
+                ); })}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
 }
 function MetadataValue({ filter, onChange }: { filter: MetadataFilter; onChange: (filter: MetadataFilter) => void }) {
   const kind = FIELD_OPTIONS.find((item) => item.key === filter.key)?.kind ?? "number";

@@ -219,22 +219,26 @@ describe("QueryBuilder", () => {
     useSuperSearchStore.setState({ resolvedTags: [{ facetKey: "subject", text: "银杏", tagId: 99, path: "" }] });
     render(<QueryBuilder />);
     fireEvent.click(screen.getByRole("button", { name: "+ 添加第一个条件" }));
-    // 默认 tag 条件：synthetic option 可选项（名称来自 resolvedTags，绝无空「选择标签」之外裸奔）
-    const select = screen.getByLabelText("条件值") as HTMLSelectElement;
-    expect(Array.from(select.options).some((o) => o.textContent?.startsWith("银杏"))).toBe(true);
+    // 默认 tag 条件：打开面板出现 synthetic 可选项（名称来自 resolvedTags，绝无「选择标签」裸奔）
+    fireEvent.click(screen.getByRole("button", { name: "选择标签" }));
+    expect(screen.getByRole("checkbox", { name: "银杏" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("checkbox", { name: "银杏" }));
+    const expr = useSuperSearchStore.getState().expr;
+    expect(expr).toEqual({ op: "leaf", cond: { type: "tag", facetKey: "subject", tagIds: [99], mode: "any", includeDescendants: true } });
+    expect(screen.getByRole("button", { name: "移除 银杏" })).toBeInTheDocument();
   });
 
-  it("expr 中已含未知 tagId：下拉显示「标签 #id」占位而非退回空（§9.8；W3-3 多选语义）", () => {
+  it("expr 中已含未知 tagId：chip 显示「标签 #id」而非退回空（§9.8；多选语义）", () => {
     useSuperSearchStore.setState({
       expr: { op: "leaf", cond: { type: "tag", facetKey: "custom", tagIds: [123], mode: "any", includeDescendants: false } },
       resolvedTags: [],
     });
     render(<QueryBuilder />);
-    const select = screen.getByLabelText("条件值") as HTMLSelectElement;
-    // 多选 select：选中的 tagIds 反映在 selectedOptions
-    expect(Array.from(select.selectedOptions).some((o) => o.value === "123")).toBe(true);
-    // W3-3：选中项带 ✓ 前缀
-    expect(Array.from(select.options).some((o) => o.textContent?.includes("标签 #123"))).toBe(true);
+    // 已选 chip 显示未知 id 占位，可单个移除
+    expect(screen.getByRole("button", { name: "移除 标签 #123" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "选择标签" }));
+    const cb = screen.getByRole("checkbox", { name: "标签 #123" });
+    expect(cb).toHaveAttribute("aria-checked", "true");
   });
 });
 
@@ -257,12 +261,11 @@ describe("W0-3 条件公式包含根级标签", () => {
     render(<QueryBuilder />);
     fireEvent.click(screen.getByRole("button", { name: "+ 添加第一个条件" }));
     pickField("包含标签");
-    // 标签选择框应包含全部三个根级标签（旧代码 walk(root.children) 会漏光）
-    const tagSelect = screen.getByLabelText("条件值") as HTMLSelectElement;
-    const optionTexts = Array.from(tagSelect.options).map((o) => o.textContent ?? "");
-    expect(optionTexts.some((t) => t.includes("海边"))).toBe(true);
-    expect(optionTexts.some((t) => t.includes("人像"))).toBe(true);
-    expect(optionTexts.some((t) => t.includes("胶片"))).toBe(true);
+    // 标签面板应包含全部三个根级标签（旧代码 walk(root.children) 会漏光）
+    fireEvent.click(screen.getByRole("button", { name: "选择标签" }));
+    expect(screen.getByRole("checkbox", { name: "海边" })).toBeInTheDocument();
+    expect(screen.getByRole("checkbox", { name: "人像" })).toBeInTheDocument();
+    expect(screen.getByRole("checkbox", { name: "胶片" })).toBeInTheDocument();
   });
 });
 
@@ -274,7 +277,7 @@ describe("W3-3 QueryBuilder 三合一", () => {
     sortOrder: 0, assetCount: 0, totalCount: 0, aliases: [], path: name, facetEffective: true,
   });
 
-  it("_includes_root_tags：根级标签出现在下拉（W0-3 回归守护）", () => {
+  it("_includes_root_tags：根级标签出现在面板（W0-3 回归守护）", () => {
     useTagStore.setState({
       tree: [
         { tag: mkTag(1, "海边", "scene"), children: [] },
@@ -285,13 +288,12 @@ describe("W3-3 QueryBuilder 三合一", () => {
     render(<QueryBuilder />);
     fireEvent.click(screen.getByRole("button", { name: "+ 添加第一个条件" }));
     pickField("包含标签");
-    const select = screen.getByLabelText("条件值") as HTMLSelectElement;
-    const names = Array.from(select.options).map((o) => o.textContent ?? "");
-    expect(names.some((t) => t.includes("海边"))).toBe(true);
-    expect(names.some((t) => t.includes("人像"))).toBe(true);
+    fireEvent.click(screen.getByRole("button", { name: "选择标签" }));
+    expect(screen.getByRole("checkbox", { name: "海边" })).toBeInTheDocument();
+    expect(screen.getByRole("checkbox", { name: "人像" })).toBeInTheDocument();
   });
 
-  it("_groups_by_facet：optgroup 数 == 出现的分面数", () => {
+  it("_groups_by_facet：面板按分面分组显示", () => {
     useTagStore.setState({
       tree: [
         { tag: mkTag(1, "海边", "scene"), children: [] },
@@ -303,12 +305,12 @@ describe("W3-3 QueryBuilder 三合一", () => {
     render(<QueryBuilder />);
     fireEvent.click(screen.getByRole("button", { name: "+ 添加第一个条件" }));
     pickField("包含标签");
-    const select = screen.getByLabelText("条件值") as HTMLSelectElement;
-    const groups = Array.from(select.querySelectorAll("optgroup"));
-    expect(groups.map((g) => g.getAttribute("label"))).toEqual(["scene", "subject"]);
+    fireEvent.click(screen.getByRole("button", { name: "选择标签" }));
+    expect(screen.getByText("scene")).toBeInTheDocument();
+    expect(screen.getByText("subject")).toBeInTheDocument();
   });
 
-  it("_multi_select_tags：select 为 multiple，可多选并写入 tagIds", () => {
+  it("_multi_select_tags：面板逐项勾选，多选写入 tagIds（弃用 Ctrl+点击）", () => {
     useTagStore.setState({
       tree: [
         { tag: mkTag(1, "海边", "scene"), children: [] },
@@ -319,14 +321,17 @@ describe("W3-3 QueryBuilder 三合一", () => {
     render(<QueryBuilder />);
     fireEvent.click(screen.getByRole("button", { name: "+ 添加第一个条件" }));
     pickField("包含标签");
-    const select = screen.getByLabelText("条件值") as HTMLSelectElement;
-    expect(select.multiple).toBe(true);
-    // 模拟多选两个
-    select.options[0].selected = true;
-    select.options[1].selected = true;
-    fireEvent.change(select);
+    fireEvent.click(screen.getByRole("button", { name: "选择标签" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: "海边" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: "公园" }));
     const expr = useSuperSearchStore.getState().expr;
     expect(expr).toBeTruthy();
+    if (expr?.op === "leaf" && expr.cond.type === "tag") {
+      expect(expr.cond.tagIds).toEqual(expect.arrayContaining([1, 2]));
+      expect(expr.cond.facetKey).toBe("scene");
+    } else {
+      throw new Error("expected single tag leaf");
+    }
   });
 
   it("_has_location_field_present：字段下拉含定位组三个字段", () => {
@@ -489,5 +494,89 @@ describe("U-1 可搜索字段 combobox", () => {
     expect(JSON.parse(localStorage.getItem("qb:recent-fields") ?? "[]")).toEqual(["file_size"]);
     pickField("宽度");
     expect(JSON.parse(localStorage.getItem("qb:recent-fields") ?? "[]")).toEqual(["width", "file_size"]);
+  });
+});
+
+/** U-2：标签多选 → chip + 可搜索面板 + 匹配模式（默认别名） */
+describe("U-2 标签 chip 多选", () => {
+  const mkTag = (id: number, name: string, facetKey: string, aliases: string[] = []) => ({
+    id, name, canonicalName: name, normalizedName: name, facetKey,
+    parentId: null, status: "active" as const, isSystem: false, isPreset: false,
+    sortOrder: 0, assetCount: 0, totalCount: 0, aliases, path: name, facetEffective: true,
+  });
+
+  it("queryBuilder_tag_chip_multiselect：chip 展示选中 + 逐条移除", () => {
+    useTagStore.setState({
+      tree: [
+        { tag: mkTag(1, "海边", "scene"), children: [] },
+        { tag: mkTag(2, "人像", "subject", ["肖像"]), children: [] },
+      ],
+      loading: false, treesByFacet: {}, expanded: new Set(),
+    });
+    render(<QueryBuilder />);
+    fireEvent.click(screen.getByRole("button", { name: "+ 添加第一个条件" }));
+    fireEvent.click(screen.getByRole("button", { name: "选择标签" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: "海边" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: "人像" }));
+    // 两个已选 chip
+    expect(screen.getByRole("button", { name: "移除 海边" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "移除 人像" })).toBeInTheDocument();
+    // 移除「海边」→ 只剩 人像
+    fireEvent.click(screen.getByRole("button", { name: "移除 海边" }));
+    const expr = useSuperSearchStore.getState().expr;
+    if (expr?.op === "leaf" && expr.cond.type === "tag") {
+      expect(expr.cond.tagIds).toEqual([2]);
+    } else {
+      throw new Error("expected single tag leaf");
+    }
+  });
+
+  it("queryBuilder_term_match_selector：默认别名，切换精确后别名不可命中", () => {
+    useTagStore.setState({
+      tree: [
+        { tag: mkTag(1, "海边", "scene"), children: [] },
+        { tag: mkTag(2, "人像", "subject", ["肖像"]), children: [] },
+      ],
+      loading: false, treesByFacet: {}, expanded: new Set(),
+    });
+    render(<QueryBuilder />);
+    fireEvent.click(screen.getByRole("button", { name: "+ 添加第一个条件" }));
+    fireEvent.click(screen.getByRole("button", { name: "选择标签" }));
+    const mode = screen.getByLabelText("匹配模式") as HTMLSelectElement;
+    expect(mode.value).toBe("alias");
+    const search = screen.getByLabelText("搜索标签");
+    // 别名默认：搜别名「肖」命中 人像（aliases: ["肖像"]）
+    fireEvent.change(search, { target: { value: "肖" } });
+    expect(screen.getByRole("checkbox", { name: "人像" })).toBeInTheDocument();
+    // 精确：别名不算 → 无匹配提示
+    fireEvent.change(mode, { target: { value: "exact" } });
+    expect(screen.queryByRole("checkbox", { name: "人像" })).not.toBeInTheDocument();
+    expect(screen.getByText("没有匹配的标签")).toBeInTheDocument();
+  });
+
+  it("前缀模式：prefix 命中开头；contains 命中任意位置", () => {
+    useTagStore.setState({
+      tree: [
+        { tag: mkTag(1, "海边", "scene"), children: [] },
+        { tag: mkTag(2, "人像", "subject"), children: [] },
+        { tag: mkTag(3, "海风", "scene"), children: [] },
+      ],
+      loading: false, treesByFacet: {}, expanded: new Set(),
+    });
+    render(<QueryBuilder />);
+    fireEvent.click(screen.getByRole("button", { name: "+ 添加第一个条件" }));
+    fireEvent.click(screen.getByRole("button", { name: "选择标签" }));
+    fireEvent.change(screen.getByLabelText("搜索标签"), { target: { value: "海" } });
+    // alias（默认）同时命中 海边/海风
+    expect(screen.getByRole("checkbox", { name: "海边" })).toBeInTheDocument();
+    expect(screen.getByRole("checkbox", { name: "海风" })).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("匹配模式"), { target: { value: "prefix" } });
+    expect(screen.getByRole("checkbox", { name: "海边" })).toBeInTheDocument();
+    expect(screen.getByRole("checkbox", { name: "海风" })).toBeInTheDocument();
+    // contains 命中任意位置：搜「风」只有 海风
+    fireEvent.change(screen.getByLabelText("匹配模式"), { target: { value: "contains" } });
+    fireEvent.change(screen.getByLabelText("搜索标签"), { target: { value: "风" } });
+    expect(screen.getByRole("checkbox", { name: "海风" })).toBeInTheDocument();
+    expect(screen.queryByRole("checkbox", { name: "海边" })).not.toBeInTheDocument();
   });
 });
