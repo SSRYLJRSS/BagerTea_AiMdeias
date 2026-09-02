@@ -12,7 +12,7 @@ use crate::error::{AppError, AppResult};
 
 /// 当前库结构版本（migrate 链尾）。恢复校验只拒绝**高于**此版本的备份；
 /// 老备份恢复后由 db::init 自动迁移升级。
-pub const LATEST_VERSION: i64 = 21;
+pub const LATEST_VERSION: i64 = 22;
 
 /// 恢复校验必须存在的关键表（防「中途崩溃的库备份」——quick_check 通过不代表结构完整）
 const REQUIRED_TABLES: [&str; 4] = ["assets", "tags", "tag_facets", "assets_fts"];

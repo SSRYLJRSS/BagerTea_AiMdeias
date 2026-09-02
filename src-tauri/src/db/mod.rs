@@ -10,6 +10,7 @@ pub mod export;
 pub mod migrations;
 pub mod query_expr;
 pub mod reset;
+pub mod schema_features;
 pub mod search;
 pub mod search_query;
 pub mod settings;
@@ -44,6 +45,18 @@ pub fn init(path: &Path) -> AppResult<Connection> {
     migrations::migrate(&conn)?;
     // 自愈兜底：历史「重置标签」清空 tag_facets 且未补种的库，启动时重建系统分面
     tag_facets::seed_system_facets_if_empty(&conn)?;
+    // F1-e：schema_features 声称的能力与 DB 实际结构对齐（漂移则修正登记表 + warn）
+    match schema_features::verify_schema_features(&conn) {
+        Ok(diffs) => {
+            for d in &diffs {
+                tracing::warn!("schema_features 自检差异（已按实际修正）: {d}");
+            }
+            if diffs.is_empty() {
+                tracing::debug!("schema_features 自检通过");
+            }
+        }
+        Err(e) => tracing::warn!("schema_features 自检失败（不阻断启动）: {e}"),
+    }
     Ok(conn)
 }
 
@@ -53,5 +66,6 @@ pub fn init_memory() -> AppResult<Connection> {
     configure(&conn)?;
     migrations::migrate(&conn)?;
     tag_facets::seed_system_facets_if_empty(&conn)?;
+    let _ = schema_features::verify_schema_features(&conn);
     Ok(conn)
 }

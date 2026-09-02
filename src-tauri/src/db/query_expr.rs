@@ -306,9 +306,10 @@ pub fn compile_leaf(conn: &Connection, cond: &LeafCond) -> AppResult<(String, Ve
             let mut params: Vec<Value> = Vec::new();
             for &tid in tag_ids {
                 params.push(tid.into());
+                // F1-d：后代递归 CTE 加 d < 12 上限
                 sql.push_str(&format!(
                     " AND NOT EXISTS (SELECT 1 FROM asset_tags ate WHERE ate.asset_id=a.id AND ate.tag_id IN (
-                        WITH RECURSIVE sub(id) AS (SELECT ?{} UNION ALL SELECT t.id FROM tags t JOIN sub s ON t.parent_id=s.id)
+                        WITH RECURSIVE sub(id, d) AS (SELECT ?{}, 0 UNION ALL SELECT t.id, s.d + 1 FROM tags t JOIN sub s ON t.parent_id=s.id WHERE s.d < 12)
                         SELECT id FROM sub))", params.len()
                 ));
             }
@@ -388,7 +389,7 @@ fn compile_tag_leaf(
             if include_descendants {
                 ands.push_str(&format!(
                     "EXISTS (SELECT 1 FROM asset_tags atf WHERE atf.asset_id=a.id AND atf.tag_id IN (
-                        WITH RECURSIVE sub(id) AS (SELECT ?{} UNION ALL SELECT t.id FROM tags t JOIN sub s ON t.parent_id=s.id)
+                        WITH RECURSIVE sub(id, d) AS (SELECT ?{} , 0 UNION ALL SELECT t.id, s.d + 1 FROM tags t JOIN sub s ON t.parent_id=s.id WHERE s.d < 12)
                         SELECT id FROM sub))", params.len()
                 ));
             } else {
@@ -407,12 +408,12 @@ fn compile_tag_leaf(
             if !seeds.is_empty() {
                 seeds.push_str(" UNION ALL");
             }
-            seeds.push_str(&format!(" SELECT ?{}", params.len()));
+            seeds.push_str(&format!(" SELECT ?{}, 0", params.len()));
         }
         Ok((
             format!(
                 "EXISTS (SELECT 1 FROM asset_tags atf WHERE atf.asset_id=a.id AND atf.tag_id IN (
-                    WITH RECURSIVE sub(id) AS ({seeds} UNION ALL SELECT t.id FROM tags t JOIN sub s ON t.parent_id=s.id)
+                    WITH RECURSIVE sub(id, d) AS ({seeds} UNION ALL SELECT t.id, s.d + 1 FROM tags t JOIN sub s ON t.parent_id=s.id WHERE s.d < 12)
                     SELECT id FROM sub))"
             ),
             params,

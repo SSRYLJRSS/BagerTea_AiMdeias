@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 
 use rusqlite::Connection;
 
+use crate::db::schema_features::SchemaFeatureStatus;
 use crate::services::ollama_runtime::OllamaRuntimeState;
 
 pub struct AppState {
@@ -32,6 +33,9 @@ pub struct AppState {
     pub video_proxy_cancel: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
     /// Ollama 本地服务运行态（L2 ownership，§8.2）：External 永不停 / AppOwned 可停
     pub ollama_runtime: Arc<Mutex<OllamaRuntimeState>>,
+    /// F1-e：schema_features 缓存（启动读一次，apply_tag_constraints 后刷新）。
+    /// 命令层读它判断 tag_unique_terms 等能力是否生效（设置页展示 + feature gate）。
+    pub schema_features: Arc<Mutex<Vec<SchemaFeatureStatus>>>,
 }
 
 impl AppState {
@@ -47,6 +51,23 @@ impl AppState {
             refill_running: Arc::new(AtomicBool::new(false)),
             video_proxy_cancel: Arc::new(Mutex::new(HashMap::new())),
             ollama_runtime: Arc::new(Mutex::new(OllamaRuntimeState::new())),
+            schema_features: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    /// F1-e：从库刷新 schema_features 缓存（启动 / apply_tag_constraints 后调用）。
+    pub fn refresh_schema_features(&self) {
+        let snapshot = {
+            let lock = self.db.lock().map_err(|_| crate::error::AppError::msg("数据库锁中毒"));
+            match lock {
+                Ok(conn) => crate::db::schema_features::list_features(&conn).ok(),
+                Err(_) => None,
+            }
+        };
+        if let Some(list) = snapshot {
+            if let Ok(mut cache) = self.schema_features.lock() {
+                *cache = list;
+            }
         }
     }
 }

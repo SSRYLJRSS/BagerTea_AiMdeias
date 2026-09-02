@@ -121,9 +121,13 @@ pub fn run() {
     // asset 协议放行用（data_dir 稍后会 move 进 AppState）
     let scope_dir = data_dir.clone();
 
+    // F1-e：启动时读一次 schema_features（迁移+自检已完成），供命令层判断能力开关
+    let state = AppState::new(conn, data_dir);
+    state.refresh_schema_features();
+
     tauri::Builder::default()
         // B05：先 manage(AppState)，setup 闭包中 app.state::<AppState>() 才可用
-        .manage(AppState::new(conn, data_dir))
+        .manage(state)
         // asset 协议按需放行（安全收敛）：
         // B08：只放行 thumbnails/ + previews/ 子目录，不放行 data_dir 根（含 library.db）
         // 素材原文件由 list/get 命令逐路径放行

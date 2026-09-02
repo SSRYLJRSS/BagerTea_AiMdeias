@@ -378,16 +378,19 @@ fn build_where(
     }
     if let Some(tid) = filter.tag_id {
         params.push(tid.into());
+        // F1-d：后代递归 CTE 加 d < 12 上限
         cond.push_str(&format!(
             " AND a.id IN (SELECT asset_id FROM asset_tags WHERE tag_id IN (
-                WITH RECURSIVE sub(id) AS (
-                  SELECT ?{} UNION ALL
-                  SELECT t.id FROM tags t JOIN sub s ON t.parent_id = s.id
+                WITH RECURSIVE sub(id, d) AS (
+                  SELECT ?{}, 0 UNION ALL
+                  SELECT t.id, s.d + 1 FROM tags t JOIN sub s ON t.parent_id = s.id
+                   WHERE s.d < 12
                 ) SELECT id FROM sub))",
             params.len()
         ));
     }
     // 多标签筛选（R-21）：any = 单 CTE 多 seed；all = 逐标签 EXISTS（防 JOIN 行数爆炸）
+    // F1-d：所有后代递归 CTE 加 d < 12 上限（防环死循环）
     if !filter.tag_ids.is_empty() {
         let all_mode = filter.tags_mode.as_deref() == Some("all");
         if all_mode {
@@ -395,9 +398,10 @@ fn build_where(
                 params.push(tid.into());
                 cond.push_str(&format!(
                     " AND EXISTS (SELECT 1 FROM asset_tags at2 WHERE at2.asset_id = a.id AND at2.tag_id IN (
-                        WITH RECURSIVE sub(id) AS (
-                          SELECT ?{} UNION ALL
-                          SELECT t.id FROM tags t JOIN sub s ON t.parent_id = s.id
+                        WITH RECURSIVE sub(id, d) AS (
+                          SELECT ?{}, 0 UNION ALL
+                          SELECT t.id, s.d + 1 FROM tags t JOIN sub s ON t.parent_id = s.id
+                           WHERE s.d < 12
                         ) SELECT id FROM sub))",
                     params.len()
                 ));
@@ -409,13 +413,14 @@ fn build_where(
                 if !seeds.is_empty() {
                     seeds.push_str(" UNION ALL");
                 }
-                seeds.push_str(&format!(" SELECT ?{}", params.len()));
+                seeds.push_str(&format!(" SELECT ?{}, 0", params.len()));
             }
             cond.push_str(&format!(
                 " AND a.id IN (SELECT asset_id FROM asset_tags WHERE tag_id IN (
-                    WITH RECURSIVE sub(id) AS (
+                    WITH RECURSIVE sub(id, d) AS (
                       {seeds} UNION ALL
-                      SELECT t.id FROM tags t JOIN sub s ON t.parent_id = s.id
+                      SELECT t.id, s.d + 1 FROM tags t JOIN sub s ON t.parent_id = s.id
+                       WHERE s.d < 12
                     ) SELECT id FROM sub))"
             ));
         }
@@ -431,7 +436,7 @@ fn build_where(
             if descendant {
                 cond.push_str(&format!(
                     " AND EXISTS (SELECT 1 FROM asset_tags atf WHERE atf.asset_id = a.id AND atf.tag_id IN (
-                        WITH RECURSIVE sub(id) AS (SELECT ?{} UNION ALL SELECT t.id FROM tags t JOIN sub s ON t.parent_id=s.id)
+                        WITH RECURSIVE sub(id, d) AS (SELECT ?{}, 0 UNION ALL SELECT t.id, s.d + 1 FROM tags t JOIN sub s ON t.parent_id=s.id WHERE s.d < 12)
                         SELECT id FROM sub))", params.len()
                 ));
             } else {
@@ -452,11 +457,11 @@ fn build_where(
                 if !seeds.is_empty() {
                     seeds.push_str(" UNION ALL");
                 }
-                seeds.push_str(&format!(" SELECT ?{}", params.len()));
+                seeds.push_str(&format!(" SELECT ?{}, 0", params.len()));
             }
             cond.push_str(&format!(
                 " AND EXISTS (SELECT 1 FROM asset_tags atf WHERE atf.asset_id=a.id AND atf.tag_id IN (
-                    WITH RECURSIVE sub(id) AS ({seeds} UNION ALL SELECT t.id FROM tags t JOIN sub s ON t.parent_id=s.id)
+                    WITH RECURSIVE sub(id, d) AS ({seeds} UNION ALL SELECT t.id, s.d + 1 FROM tags t JOIN sub s ON t.parent_id=s.id WHERE s.d < 12)
                     SELECT id FROM sub))"
             ));
         } else {
@@ -476,9 +481,10 @@ fn build_where(
     }
     for &tid in &filter.exclude_tag_ids {
         params.push(tid.into());
+        // F1-d：后代递归 CTE 加 d < 12 上限
         cond.push_str(&format!(
             " AND NOT EXISTS (SELECT 1 FROM asset_tags ate WHERE ate.asset_id=a.id AND ate.tag_id IN (
-                WITH RECURSIVE sub(id) AS (SELECT ?{} UNION ALL SELECT t.id FROM tags t JOIN sub s ON t.parent_id=s.id)
+                WITH RECURSIVE sub(id, d) AS (SELECT ?{}, 0 UNION ALL SELECT t.id, s.d + 1 FROM tags t JOIN sub s ON t.parent_id=s.id WHERE s.d < 12)
                 SELECT id FROM sub))", params.len()
         ));
     }

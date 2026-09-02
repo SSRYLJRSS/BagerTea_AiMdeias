@@ -1196,30 +1196,27 @@ fn migrate_v20(conn: &Connection) -> AppResult<()> {
     Ok(())
 }
 
-/// V21：FTS 触发器加分面状态联动（高风险段）。独立版本号使其可单独延后。
-///
-/// 当前缺陷：触发器只看 `tags.status`，不看 `tag_facets.status`。停用分面后，
-/// 该分面下的标签仍能被全文搜到 —— 与「停用标签立即消失」语义不一致。
-///
-/// 两处改动：
-/// ① 聚合子查询加分面条件（trg_at_ai / trg_at_ad / trg_tags_au / trg_tag_alias_* 全部）：
-///    `AND EXISTS (SELECT 1 FROM tag_facets f WHERE f.key = t.facet_key AND f.status = 'active')`
-/// ② 新增分面状态触发器 trg_facet_status_au：分面停用/恢复时刷新其下标签关联的全部素材。
-///
-/// 铁律：①复制现有 SQL 再改（V8 语义逐字保留，只加 EXISTS 条件）②改完立即 rebuild
+/// FTS 触发器重建。facets 条件由调用方传入（V21 用 status='active'；V22a 起用
+/// cfg_searchable=1 —— 语义变更：停用分面的标签仍可搜）。
+/// facet_refresh_col：分面表的哪一列变化需要刷新其下素材的 FTS 词（V21=status，
+/// V22a=cfg_searchable —— 必须与 facet_cond 依赖的列一致，否则刷新时机不对）。
+/// 铁律：①复制现有 SQL 再改（V8 语义逐字保留，只换 EXISTS 条件）②改完立即 rebuild
 /// ③先在内存库跑通全部 FTS 测试再上真库。
-fn rebuild_fts_triggers_with_facet_status(conn: &Connection) -> AppResult<()> {
-    // 聚合子查询模板：与 V8 完全一致的分母 + 分面 active 条件（新增）
-    const FACET_COND: &str = "AND EXISTS (SELECT 1 FROM tag_facets f WHERE f.key = t.facet_key AND f.status = 'active')";
+fn rebuild_fts_triggers_with_cond(
+    conn: &Connection,
+    facet_cond: &str,
+    facet_refresh_col: &str,
+) -> AppResult<()> {
+    // 聚合子查询模板：与 V8 完全一致的分母 + 分面条件（注入）
     let tag_terms = format!(
         r#"SELECT t.name AS term, t.sort_order AS ord, t.id AS tid, 0 AS kind
         FROM asset_tags at JOIN tags t ON t.id = at.tag_id
-       WHERE at.asset_id = {{ASSET_REF}} AND t.status = 'active' {FACET_COND}
+       WHERE at.asset_id = {{ASSET_REF}} AND t.status = 'active' {facet_cond}
       UNION ALL
       SELECT ta.alias AS term, t.sort_order AS ord, t.id AS tid, 1 AS kind
         FROM asset_tags at JOIN tags t ON t.id = at.tag_id
         JOIN tag_aliases ta ON ta.tag_id = t.id AND ta.is_searchable = 1
-       WHERE at.asset_id = {{ASSET_REF}} AND t.status = 'active' {FACET_COND}
+       WHERE at.asset_id = {{ASSET_REF}} AND t.status = 'active' {facet_cond}
       ORDER BY ord, tid, kind, term"#
     );
     let agg = |asset_ref: &str| -> String {
@@ -1279,15 +1276,16 @@ END;"#,
         agg_fc = agg("fts_content.asset_id"),
     ))?;
 
-    // ④ 新增：分面状态变化 → 刷新其下标签关联的全部素材
+    // ④ 分面条件变化 → 刷新其下标签关联的全部素材（列由调用方指定）
     conn.execute_batch(&format!(
-        r#"CREATE TRIGGER trg_facet_status_au AFTER UPDATE OF status ON tag_facets BEGIN
+        r#"CREATE TRIGGER trg_facet_status_au AFTER UPDATE OF {facet_col} ON tag_facets BEGIN
   UPDATE fts_content SET tag_names = ({agg_fc})
    WHERE asset_id IN (
      SELECT at.asset_id FROM asset_tags at JOIN tags t ON t.id = at.tag_id
       WHERE t.facet_key = new.key
    );
 END;"#,
+        facet_col = facet_refresh_col,
         agg_fc = agg("fts_content.asset_id"),
     ))?;
 
@@ -1295,8 +1293,169 @@ END;"#,
 }
 
 /// V21 入口：重建触发器 + 全量 rebuild（FTS 与内容表对齐）。
+/// V21 在 V22a 之前运行（列尚不存在），必须用 status 条件；
+/// V22a 迁移会把 FACET_COND 换成 cfg_searchable 后再次重建。
 fn migrate_v21(conn: &Connection) -> AppResult<()> {
-    rebuild_fts_triggers_with_facet_status(conn)?;
+    rebuild_fts_triggers_with_cond(
+        conn,
+        "AND EXISTS (SELECT 1 FROM tag_facets f WHERE f.key = t.facet_key AND f.status = 'active')",
+        "status",
+    )?;
+    conn.execute_batch("INSERT INTO assets_fts(assets_fts) VALUES('rebuild');")?;
+    Ok(())
+}
+
+// ════════════════════════════════════════════════════════════════════
+// V22a（F1）无条件迁移段：分面能力矩阵 + 环/深度触发器 + review_state
+// + AI 溯源列 + schema_features。不依赖数据干净，任何库都能安全推进。
+//  ⚠ 新列一律 ALTER 追加；FACET_COLS / from_row 的索引跟着追加（铁律 2）
+// ════════════════════════════════════════════════════════════════════
+
+/// V22a 入口。推进 user_version=22 前必须完整成功；失败重启可重跑（幂等）。
+fn migrate_v22a(conn: &Connection) -> AppResult<()> {
+    let now = chrono::Utc::now().timestamp_millis();
+
+    // ── F1-a：tag_facets 配置值列（记录用户意图，生命周期状态永不覆盖它们）──
+    add_column_if_missing(conn, "tag_facets", "cfg_visible_in_navigation", "INTEGER NOT NULL DEFAULT 1")?;
+    add_column_if_missing(conn, "tag_facets", "cfg_manual_assignable", "INTEGER NOT NULL DEFAULT 1")?;
+    add_column_if_missing(conn, "tag_facets", "cfg_ai_assignable", "INTEGER NOT NULL DEFAULT 1")?;
+    add_column_if_missing(conn, "tag_facets", "cfg_searchable", "INTEGER NOT NULL DEFAULT 1")?;
+    add_column_if_missing(conn, "tag_facets", "facet_kind", "TEXT NOT NULL DEFAULT 'tag'")?;
+
+    // 回填：manual_only → 不参与 AI（active 或 inactive 都算，保留用户原配置）
+    conn.execute(
+        "UPDATE tag_facets SET cfg_ai_assignable = 0 WHERE input_mode = 'manual_only'",
+        [],
+    )?;
+
+    // ── F1-c：环检测 + 深度上限 + 父子同分面触发器 ──
+    conn.execute_batch(
+        r#"
+-- 环检测（UPDATE parent_id）
+CREATE TRIGGER IF NOT EXISTS trg_tags_no_cycle
+  BEFORE UPDATE OF parent_id ON tags
+  WHEN new.parent_id IS NOT NULL AND EXISTS (
+    WITH RECURSIVE anc(id, d) AS (
+      SELECT new.parent_id, 0
+      UNION ALL
+      SELECT t.parent_id, a.d + 1 FROM tags t JOIN anc a ON t.id = a.id
+       WHERE t.parent_id IS NOT NULL AND a.d < 12
+    ) SELECT 1 FROM anc WHERE id = new.id
+  )
+BEGIN SELECT RAISE(ABORT, '不能把标签挂到自己的子标签下（会形成循环）'); END;
+
+-- 深度检查（UPDATE）：新父深度 + 被移动子树高度（不能只查新父深度）
+CREATE TRIGGER IF NOT EXISTS trg_tags_max_depth_au
+  BEFORE UPDATE OF parent_id ON tags
+  WHEN new.parent_id IS NOT NULL
+   AND (
+     (WITH RECURSIVE anc(id, d) AS (
+        SELECT new.parent_id, 1
+        UNION ALL SELECT t.parent_id, a.d + 1 FROM tags t JOIN anc a ON t.id = a.id
+         WHERE t.parent_id IS NOT NULL AND a.d < 12
+      ) SELECT MAX(d) FROM anc)
+     +
+     (WITH RECURSIVE des(id, d) AS (
+        SELECT new.id, 0
+        UNION ALL SELECT t.id, s.d + 1 FROM tags t JOIN des s ON t.parent_id = s.id
+         WHERE s.d < 12
+      ) SELECT MAX(d) FROM des)
+   ) > 8
+BEGIN SELECT RAISE(ABORT, '移动后标签层级会超过 8 层（含其下所有子标签）'); END;
+
+-- 深度检查（INSERT）：新节点无子树，只查新父深度 + 1
+CREATE TRIGGER IF NOT EXISTS trg_tags_max_depth_ai
+  BEFORE INSERT ON tags
+  WHEN new.parent_id IS NOT NULL
+   AND (WITH RECURSIVE anc(id, d) AS (
+          SELECT new.parent_id, 1
+          UNION ALL SELECT t.parent_id, a.d + 1 FROM tags t JOIN anc a ON t.id = a.id
+           WHERE t.parent_id IS NOT NULL AND a.d < 12
+        ) SELECT MAX(d) FROM anc) >= 8
+BEGIN SELECT RAISE(ABORT, '标签层级不能超过 8 层'); END;
+
+-- 父子同分面（INSERT + UPDATE 双向）
+CREATE TRIGGER IF NOT EXISTS trg_tags_parent_facet_ai
+  BEFORE INSERT ON tags
+  WHEN new.parent_id IS NOT NULL
+   AND (SELECT facet_key FROM tags WHERE id = new.parent_id) != new.facet_key
+BEGIN SELECT RAISE(ABORT, '子标签必须与父标签属于同一分面'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_tags_parent_facet_au
+  BEFORE UPDATE OF parent_id, facet_key ON tags
+  WHEN new.parent_id IS NOT NULL
+   AND (SELECT facet_key FROM tags WHERE id = new.parent_id) != new.facet_key
+BEGIN SELECT RAISE(ABORT, '子标签必须与父标签属于同一分面'); END;
+"#,
+    )?;
+
+    // ── F1-e：schema_features 能力表 ──
+    conn.execute_batch(
+        r#"
+CREATE TABLE IF NOT EXISTS schema_features (
+  feature     TEXT PRIMARY KEY,
+  enabled     INTEGER NOT NULL,
+  applied_at  INTEGER,
+  blocked_by  TEXT
+);
+"#,
+    )?;
+    conn.execute(
+        "INSERT OR REPLACE INTO schema_features VALUES ('tag_cycle_guard', 1, ?1, NULL)",
+        [now],
+    )?;
+    conn.execute(
+        "INSERT OR IGNORE INTO schema_features VALUES ('tag_unique_terms', 0, NULL, 'pending')",
+        [],
+    )?;
+    conn.execute(
+        "INSERT OR IGNORE INTO schema_features VALUES ('tag_facet_fk', 0, NULL, 'pending')",
+        [],
+    )?;
+    conn.execute(
+        "INSERT OR IGNORE INTO schema_features VALUES ('tag_facet_restrict_delete', 0, NULL, 'pending')",
+        [],
+    )?;
+
+    // ── F1-f：asset_tags.review_state 三态（保守回填：把已确认的当已确认）──
+    add_column_if_missing(conn, "asset_tags", "review_state", "TEXT NOT NULL DEFAULT 'ai_unreviewed'")?;
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS ix_at_review ON asset_tags(review_state, tag_id, asset_id);",
+    )?;
+    // ① 手工的（source='manual' 只在用户确认/手工打标时写，历史也如此）
+    conn.execute(
+        "UPDATE asset_tags SET review_state = 'manual' WHERE source = 'manual'",
+        [],
+    )?;
+    // ② AI 的但有 accepted/modified 的 suggestion item → 用户确认过
+    conn.execute(
+        "UPDATE asset_tags SET review_state = 'ai_reviewed'
+          WHERE source != 'manual' AND review_state = 'ai_unreviewed' AND EXISTS (
+            SELECT 1 FROM ai_suggestion_items i
+              JOIN ai_suggestions s ON s.id = i.suggestion_id
+             WHERE s.asset_id = asset_tags.asset_id AND i.tag_id = asset_tags.tag_id
+               AND i.decision IN ('accepted','modified'))",
+        [],
+    )?;
+
+    // ── F1-g：AI 溯源列（数据层，A2 接线用）──
+    add_column_if_missing(conn, "ai_batches", "model_id", "TEXT NOT NULL DEFAULT ''")?;
+    add_column_if_missing(conn, "ai_batches", "model_version", "TEXT")?;
+    add_column_if_missing(conn, "ai_batches", "profile_id", "TEXT NOT NULL DEFAULT ''")?;
+    add_column_if_missing(conn, "ai_batches", "prompt_version", "TEXT NOT NULL DEFAULT ''")?;
+    add_column_if_missing(conn, "ai_batches", "request_config_hash", "TEXT NOT NULL DEFAULT ''")?;
+    add_column_if_missing(conn, "ai_batches", "request_config_json", "TEXT")?;
+    add_column_if_missing(conn, "ai_suggestions", "raw_response", "TEXT")?;
+    add_column_if_missing(conn, "ai_suggestions", "analysis_json", "TEXT")?;
+    add_column_if_missing(conn, "ai_suggestions", "analysis_schema_version", "INTEGER NOT NULL DEFAULT 1")?;
+
+    // F4（与 F1 同文件，并入 V22a 执行）：FTS 触发器条件从 status 换成
+    // cfg_searchable（停用分面的标签仍可搜 —— 语义变更），改完立即 rebuild（铁律 3）
+    rebuild_fts_triggers_with_cond(
+        conn,
+        "AND EXISTS (SELECT 1 FROM tag_facets f WHERE f.key = t.facet_key AND f.cfg_searchable = 1)",
+        "cfg_searchable",
+    )?;
     conn.execute_batch("INSERT INTO assets_fts(assets_fts) VALUES('rebuild');")?;
     Ok(())
 }
@@ -1404,6 +1563,12 @@ pub fn migrate(conn: &Connection) -> AppResult<()> {
         // V21 = FTS 触发器（高风险）。独立版本号使其可单独延后。
         migrate_v21(conn)?;
         conn.pragma_update(None, "user_version", 21)?;
+    }
+    if version < 22 {
+        // V22a（F1 无条件段）：能力列 + 环/深度触发器 + review_state + 溯源列。
+        // V22b（F2 条件段，冲突跳过）也在 22 内，见 apply_tag_constraints。
+        migrate_v22a(conn)?;
+        conn.pragma_update(None, "user_version", 22)?;
     }
     Ok(())
 }
@@ -2048,4 +2213,269 @@ mod tests {
         );
     }
 
+    // ═══════════════ F1：V22a 无条件迁移段 ═══════════════
+
+    /// V22a 跑两遍结果一致（幂等可重入）。
+    #[test]
+    fn v22a_adds_columns_idempotent() {
+        let c = crate::db::init_memory().unwrap();
+        // 首次已由 migrate() 完成；再跑一次迁移（幂等：列已存在、触发器 IF NOT EXISTS）
+        migrate_v22a(&c).unwrap();
+        // 五列齐备
+        for col in [
+            "cfg_visible_in_navigation",
+            "cfg_manual_assignable",
+            "cfg_ai_assignable",
+            "cfg_searchable",
+            "facet_kind",
+        ] {
+            assert!(has_column(&c, "tag_facets", col).unwrap(), "{col} 应存在");
+        }
+        // asset_tags.review_state + ai_batches/ai_suggestions 溯源列
+        assert!(has_column(&c, "asset_tags", "review_state").unwrap());
+        assert!(has_column(&c, "ai_batches", "model_id").unwrap());
+        assert!(has_column(&c, "ai_suggestions", "raw_response").unwrap());
+        // 触发器存在（环/深度）
+        let n: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger'
+                  AND name IN ('trg_tags_no_cycle','trg_tags_max_depth_au','trg_tags_max_depth_ai')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 3, "三个约束触发器应存在");
+        // schema_features 登记
+        let guard: i64 = c
+            .query_row("SELECT enabled FROM schema_features WHERE feature='tag_cycle_guard'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(guard, 1, "tag_cycle_guard 应登记为启用");
+    }
+
+    /// V22a 回填：input_mode='manual_only' → cfg_ai_assignable=0（active/inactive 都算）。
+    #[test]
+    fn v22a_backfills_cfg_from_input_mode() {
+        let c = crate::db::init_memory().unwrap();
+        // 实测库语义：color 是 inactive + manual_only → cfg_ai_assignable=0
+        let (mode, status, ai): (String, String, i64) = c
+            .query_row(
+                "SELECT input_mode, status, cfg_ai_assignable FROM tag_facets WHERE key='color'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(mode, "manual_only");
+        assert_eq!(status, "inactive");
+        assert_eq!(ai, 0, "manual_only 分面 cfg_ai_assignable 应为 0");
+        // active + ai_and_manual 保持 1
+        let custom_ai: i64 = c
+            .query_row(
+                "SELECT cfg_ai_assignable FROM tag_facets WHERE key='custom'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(custom_ai, 1);
+    }
+
+    /// F1-c：环创建被拒绝（UPDATE parent_id 到自己的后代）。
+    #[test]
+    fn cycle_creation_rejected() {
+        let c = crate::db::init_memory().unwrap();
+        let id_a: i64 = c
+            .query_row("INSERT INTO tags (name, facet_key) VALUES ('A','custom') RETURNING id", [], |r| r.get(0))
+            .unwrap();
+        let id_b: i64 = c
+            .query_row("INSERT INTO tags (name, parent_id, facet_key) VALUES ('B',?1,'custom') RETURNING id", [id_a], |r| r.get(0))
+            .unwrap();
+        let id_c: i64 = c
+            .query_row("INSERT INTO tags (name, parent_id, facet_key) VALUES ('C',?1,'custom') RETURNING id", [id_b], |r| r.get(0))
+            .unwrap();
+        // 把 A 挂到 C 下 → 环
+        let err = c.execute("UPDATE tags SET parent_id=?1 WHERE id=?2", rusqlite::params![id_c, id_a]).unwrap_err();
+        assert!(
+            err.to_string().contains("循环"),
+            "应报环错误：{err}"
+        );
+    }
+
+    /// F1-c：新父深度 6 + 被移动子树高度 4 = 10 层 → 拒绝（不能只查新父深度）。
+    #[test]
+    fn move_subtree_respects_max_depth() {
+        let c = crate::db::init_memory().unwrap();
+        // 深链 6 层（0..=5，anchor0 是根，anchor5 深度 5）作新父的锚
+        let mut anchor: i64 = 0;
+        for i in 0..6 {
+            anchor = c
+                .query_row(
+                    "INSERT INTO tags (name, parent_id, facet_key) VALUES (?1, ?2, 'custom') RETURNING id",
+                    rusqlite::params![format!("anchor{i}"), if i == 0 { Option::<i64>::None } else { Some(anchor) }],
+                    |r| r.get(0),
+                )
+                .unwrap();
+        }
+        // 另起 4 层子树：sub_root（顶部）→ sub1 → sub2 → sub3
+        let sub_root: i64 = c
+            .query_row("INSERT INTO tags (name, facet_key) VALUES ('sub_root','custom') RETURNING id", [], |r| r.get(0))
+            .unwrap();
+        let mut child = sub_root;
+        for i in 1..4 {
+            child = c
+                .query_row(
+                    "INSERT INTO tags (name, parent_id, facet_key) VALUES (?1, ?2, 'custom') RETURNING id",
+                    rusqlite::params![format!("sub{i}"), child],
+                    |r| r.get(0),
+                )
+                .unwrap();
+        }
+        // 把子树**顶部**（sub_root，高 4 含自身）挂到 anchor5（深 6）下
+        // → anc(新父)=6 + des(sub_root 子树)=3 → 6+3=9 > 8 → 拒绝
+        let err = c
+            .execute("UPDATE tags SET parent_id=?1 WHERE id=?2", rusqlite::params![anchor, sub_root])
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("层级") || err.to_string().contains("8 层"),
+            "应报深度错误：{err}"
+        );
+    }
+
+    /// F1-c：新节点插到深 8 的父下 → 拒绝。
+    #[test]
+    fn insert_at_max_depth_rejected() {
+        let c = crate::db::init_memory().unwrap();
+        let mut parent: i64 = 0;
+        for i in 0..8 {
+            parent = c
+                .query_row(
+                    "INSERT INTO tags (name, parent_id, facet_key) VALUES (?1, ?2, 'custom') RETURNING id",
+                    rusqlite::params![format!("n{i}"), if i == 0 { Option::<i64>::None } else { Some(parent) }],
+                    |r| r.get(0),
+                )
+                .unwrap();
+        }
+        // parent 深 8（0..=7 = 8 层，最深的那个 depth=7），子节点 depth=8 ≥ 8 → 拒绝
+        let err = c
+            .execute(
+                "INSERT INTO tags (name, parent_id, facet_key) VALUES ('too_deep', ?1, 'custom')",
+                [parent],
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("8 层") || err.to_string().contains("层级"),
+            "应报深度错误：{err}"
+        );
+    }
+
+    /// F1-c：跨分面挂父被拒绝（INSERT）。
+    #[test]
+    fn parent_facet_mismatch_rejected_on_insert() {
+        let c = crate::db::init_memory().unwrap();
+        let scene_id: i64 = c
+            .query_row("SELECT id FROM tags WHERE facet_key='scene' AND name='scene' OR facet_key='scene' LIMIT 1", [], |r| r.get(0))
+            .ok()
+            .unwrap_or_else(|| {
+                c.query_row(
+                    "INSERT INTO tags (name, facet_key) VALUES ('场景根','scene') RETURNING id",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap()
+            });
+        // 用 people 分面的标签挂到 scene 下
+        let err = c
+            .execute(
+                "INSERT INTO tags (name, parent_id, facet_key) VALUES ('错面', ?1, 'people')",
+                [scene_id],
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("同一分面"),
+            "应报同分面错误：{err}"
+        );
+    }
+
+    /// F1-d 兜底：手工造环（绕过触发器）后 list_tree / total_count 不挂死。
+    #[test]
+    fn recursive_cte_terminates_on_existing_cycle() {
+        let c = crate::db::init_memory().unwrap();
+        let id_a: i64 = c
+            .query_row("INSERT INTO tags (name, facet_key) VALUES ('CA','custom') RETURNING id", [], |r| r.get(0))
+            .unwrap();
+        let id_b: i64 = c
+            .query_row("INSERT INTO tags (name, parent_id, facet_key) VALUES ('CB',?1,'custom') RETURNING id", [id_a], |r| r.get(0))
+            .unwrap();
+        // 直接改 SQL 造环：B 的父已是 A，再把 A 的父改成 B（绕过触发器：先删触发器）
+        c.execute_batch("DROP TRIGGER trg_tags_no_cycle; DROP TRIGGER trg_tags_max_depth_au;").unwrap();
+        c.execute("UPDATE tags SET parent_id=?1 WHERE id=?2", rusqlite::params![id_b, id_a]).unwrap();
+        // 另加一个正常根，保证 list_tree 顶层有内容（环节点成对互为父子，无根）
+        c.execute("INSERT INTO tags (name, facet_key) VALUES ('正常根','custom')", []).unwrap();
+        // list_tree 不应挂死（深度上限让递归终止）
+        let tree = super::super::tags::list_tree(&c).unwrap();
+        assert!(!tree.is_empty(), "至少应有正常根节点");
+        // total_count 也不挂死
+        let _ = super::super::tags::total_count(&c, id_a).unwrap();
+    }
+
+    /// V22a 回填守护：ai_suggestion_items decision in (accepted,modified) 的关联
+    /// → review_state='ai_reviewed'（ReplaceAiOnly 不误删）。
+    #[test]
+    fn v22_backfill_marks_existing_confirmed_as_reviewed() {
+        let c = crate::db::init_memory().unwrap();
+        // 素材 + 标签
+        let asset_id: i64 = c
+            .query_row(
+                "INSERT INTO assets (file_path, file_name, file_ext, file_size, mime_type, created_at, modified_at) VALUES ('/x/1.jpg','1.jpg','jpg',1,'image/jpeg',1,1) RETURNING id",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let tag_id: i64 = c
+            .query_row("INSERT INTO tags (name, normalized_name, facet_key) VALUES ('海边','海边','scene') RETURNING id", [], |r| r.get(0))
+            .unwrap();
+        // 构造「已确认」的 AI 链路：batch + suggestion + item(accepted)
+        let batch: i64 = c
+            .query_row(
+                "INSERT INTO ai_batches (status, mode, total, processed, confirmed, created_at) VALUES ('done','cloud',1,1,1,1) RETURNING id",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let sugg: i64 = c
+            .query_row(
+                "INSERT INTO ai_suggestions (batch_id, asset_id, suggested_tags, status, created_at) VALUES (?1,?2,'[]','confirmed',1) RETURNING id",
+                rusqlite::params![batch, asset_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        c.execute(
+            "INSERT INTO ai_suggestion_items (suggestion_id, facet_key, raw_name, normalized_name, tag_id, decision, created_at) VALUES (?1,'scene','海边','海边',?2,'accepted',1)",
+            rusqlite::params![sugg, tag_id],
+        )
+        .unwrap();
+        // AI 来源关联（review_state 默认 ai_unreviewed）
+        c.execute(
+            "INSERT INTO asset_tags (asset_id, tag_id, source, created_at, source_batch_id) VALUES (?1,?2,'ai_cloud',1,?3)",
+            rusqlite::params![asset_id, tag_id, batch],
+        )
+        .unwrap();
+        // 手工来源另一条 → manual
+        let tag_manual: i64 = c
+            .query_row("INSERT INTO tags (name, normalized_name, facet_key) VALUES ('人像','人像','subject') RETURNING id", [], |r| r.get(0))
+            .unwrap();
+        c.execute(
+            "INSERT INTO asset_tags (asset_id, tag_id, source, created_at) VALUES (?1,?2,'manual',1)",
+            rusqlite::params![asset_id, tag_manual],
+        )
+        .unwrap();
+        // 再跑一次 V22a（幂等）触发回填 UPDATE
+        migrate_v22a(&c).unwrap();
+        let state: String = c
+            .query_row("SELECT review_state FROM asset_tags WHERE tag_id=?1", [tag_id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(state, "ai_reviewed", "已确认的 AI 标签应回填为 ai_reviewed");
+        let manual_state: String = c
+            .query_row("SELECT review_state FROM asset_tags WHERE tag_id=?1", [tag_manual], |r| r.get(0))
+            .unwrap();
+        assert_eq!(manual_state, "manual");
+    }
 }

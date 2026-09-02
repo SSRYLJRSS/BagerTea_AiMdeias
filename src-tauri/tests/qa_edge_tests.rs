@@ -23,8 +23,8 @@ fn count(conn: &rusqlite::Connection, sql: &str) -> i64 {
 // ═══════════════ ① migrations 幂等 ═══════════════
 
 /// 当前迁移链终版 user_version（新迁移追加时同步更新；防止硬编码断言过期）
-/// W1：V19 数据列 / V20 分面合表 / V21 FTS 触发器（计划书 2026-08-31 §6）
-const LATEST_VERSION: i64 = 21;
+/// W1：V19 数据列 / V20 分面合表 / V21 FTS 触发器 / V22a 分面能力矩阵+约束+review_state+溯源
+const LATEST_VERSION: i64 = 22;
 
 #[test]
 fn migrate_twice_is_idempotent() -> AppResult<()> {

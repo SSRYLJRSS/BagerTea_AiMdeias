@@ -53,11 +53,13 @@ pub fn normalize_name(name: &str) -> String {
 }
 
 /// 子孙 id 集合（含自身）—— 递归 CTE
+/// F1-d：WHERE d < 12 防环死循环兜底（环存在时无限递归会被 SQLite 10s timeout 杀）
 fn descendant_ids(conn: &Connection, id: i64) -> AppResult<Vec<i64>> {
     let mut stmt = conn.prepare(
-        "WITH RECURSIVE sub(id) AS (
-           SELECT ?1 UNION ALL
-           SELECT t.id FROM tags t JOIN sub s ON t.parent_id = s.id
+        "WITH RECURSIVE sub(id, d) AS (
+           SELECT ?1, 0 UNION ALL
+           SELECT t.id, s.d + 1 FROM tags t JOIN sub s ON t.parent_id = s.id
+            WHERE s.d < 12
          ) SELECT id FROM sub",
     )?;
     let ids = stmt
@@ -69,9 +71,10 @@ fn descendant_ids(conn: &Connection, id: i64) -> AppResult<Vec<i64>> {
 /// 连带计数：标签及其后代关联的去重素材数
 pub fn total_count(conn: &Connection, id: i64) -> AppResult<i64> {
     let n: i64 = conn.query_row(
-        "WITH RECURSIVE sub(id) AS (
-           SELECT ?1 UNION ALL
-           SELECT t.id FROM tags t JOIN sub s ON t.parent_id = s.id
+        "WITH RECURSIVE sub(id, d) AS (
+           SELECT ?1, 0 UNION ALL
+           SELECT t.id, s.d + 1 FROM tags t JOIN sub s ON t.parent_id = s.id
+            WHERE s.d < 12
          )
          SELECT COUNT(DISTINCT asset_id) FROM asset_tags WHERE tag_id IN (SELECT id FROM sub)",
         [id],
@@ -115,12 +118,14 @@ pub fn list_tree(conn: &Connection) -> AppResult<Vec<TagNode>> {
     for t in &mut tags {
         t.total_count = total_count(conn, t.id)?;
         t.aliases = aliases(conn, t.id)?;
+        // F1-d：chain 递归加 d < 12 上限（防环死循环；path 仅展示用）
         t.path = conn
             .query_row(
                 "WITH RECURSIVE chain(id, name, parent_id, depth) AS (
                SELECT id, name, parent_id, 0 FROM tags WHERE id = ?1
                UNION ALL SELECT t.id, t.name, t.parent_id, c.depth + 1
                  FROM tags t JOIN chain c ON t.id = c.parent_id
+                WHERE c.depth < 12
              ) SELECT group_concat(name, ' / ') FROM (SELECT name FROM chain ORDER BY depth DESC)",
                 [t.id],
                 |r| r.get::<_, Option<String>>(0),
@@ -265,9 +270,11 @@ pub fn update_preserve_alias(
 }
 
 pub fn deactivate(conn: &Connection, id: i64) -> AppResult<()> {
+    // F1-d：递归 CTE 加 d < 12 上限（防环死循环）
     let changed = conn.execute(
-        "WITH RECURSIVE sub(id) AS (
-           SELECT ?1 UNION ALL SELECT t.id FROM tags t JOIN sub s ON t.parent_id = s.id
+        "WITH RECURSIVE sub(id, d) AS (
+           SELECT ?1, 0 UNION ALL SELECT t.id, s.d + 1 FROM tags t JOIN sub s ON t.parent_id = s.id
+            WHERE s.d < 12
          ) UPDATE tags SET status = 'deprecated' WHERE id IN (SELECT id FROM sub)",
         [id],
     )?;
@@ -372,12 +379,14 @@ pub fn aliases(conn: &Connection, tag_id: i64) -> AppResult<Vec<String>> {
 
 pub fn hydrate_metadata(conn: &Connection, tag: &mut Tag) -> AppResult<()> {
     tag.aliases = aliases(conn, tag.id)?;
+    // F1-d：chain 递归加 d < 12 上限（防环死循环；path 仅展示用）
     tag.path = conn
         .query_row(
             "WITH RECURSIVE chain(id, name, parent_id, depth) AS (
                SELECT id, name, parent_id, 0 FROM tags WHERE id = ?1
                UNION ALL SELECT t.id, t.name, t.parent_id, c.depth + 1
                  FROM tags t JOIN chain c ON t.id = c.parent_id
+                WHERE c.depth < 12
              ) SELECT group_concat(name, ' / ') FROM (SELECT name FROM chain ORDER BY depth DESC)",
             [tag.id],
             |r| r.get::<_, Option<String>>(0),

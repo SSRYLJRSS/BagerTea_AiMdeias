@@ -33,9 +33,55 @@ pub struct TagFacet {
     pub applies_to: String,
     pub created_at: i64,
     pub updated_at: i64,
-    /// V20 合表后：ai_and_manual = 参与 AI 打标；manual_only = 只手工填写。
-    /// 前端 FacetManagePanel / Workbench 按它分 AI / 手工两组（W4/W3-2）。
+    /// V22a（F1-b）：`input_mode` 改为**只读派生值** —— 序列化时按
+    /// `cfg_ai_assignable` 计算（`ai_and_manual` / `manual_only`），不再可写。
+    /// 配置的真实事实源是 `cfg_ai_assignable`（F1-a 能力矩阵列）。
     pub input_mode: String,
+    // ── V22a 能力矩阵配置列（记录用户意图；生命周期状态永不覆盖它们）──
+    pub cfg_visible_in_navigation: bool,
+    pub cfg_manual_assignable: bool,
+    pub cfg_ai_assignable: bool,
+    pub cfg_searchable: bool,
+    /// 扩展预留（未来数字型/日期型分面；当前恒 'tag'）
+    pub facet_kind: String,
+}
+
+/// F1-b：有效值派生（SQL 侧四个常量，唯一声明处）。
+/// 注意 EFF_SEARCH 不看 status —— 停用分面的标签仍可搜（F4 语义变更）。
+pub const EFF_VISIBLE: &str = "f.status = 'active' AND f.cfg_visible_in_navigation = 1";
+pub const EFF_MANUAL: &str = "f.status = 'active' AND f.cfg_manual_assignable = 1";
+pub const EFF_AI: &str = "f.status = 'active' AND f.cfg_ai_assignable = 1";
+pub const EFF_SEARCH: &str = "f.cfg_searchable = 1";
+
+/// F1-b：Rust 侧同一规则的有效值派生。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FacetEffective {
+    pub visible: bool,
+    pub manual: bool,
+    pub ai: bool,
+    pub searchable: bool,
+}
+
+impl TagFacet {
+    /// F1-b：单点声明有效值（与 SQL 常量 EFF_* 同规则；cross-test 用 48 组合守护）。
+    pub fn effective(&self) -> FacetEffective {
+        let alive = self.status == "active";
+        FacetEffective {
+            visible: alive && self.cfg_visible_in_navigation,
+            manual: alive && self.cfg_manual_assignable,
+            ai: alive && self.cfg_ai_assignable,
+            searchable: self.cfg_searchable,
+        }
+    }
+
+    /// F1-b：input_mode 只读派生（cfg_ai_assignable 的事实源）。
+    pub fn derived_input_mode(&self) -> &'static str {
+        if self.cfg_ai_assignable {
+            "ai_and_manual"
+        } else {
+            "manual_only"
+        }
+    }
 }
 
 /// 停用/治理前的引用与影响范围（指导书 §12.3）。
@@ -66,6 +112,12 @@ pub fn validate_key(key: &str) -> AppResult<String> {
 }
 
 fn facet_from_row(r: &rusqlite::Row) -> rusqlite::Result<TagFacet> {
+    // FACET_COLS 顺序（追加末尾，铁律 2）：
+    // 0 key / 1 display_name / 2 description / 3 selection_mode / 4 max_items
+    // 5 sort_order / 6 is_system / 7 status / 8 applies_to / 9 created_at / 10 updated_at
+    // 11 cfg_visible_in_navigation / 12 cfg_manual_assignable
+    // 13 cfg_ai_assignable / 14 cfg_searchable / 15 facet_kind
+    let cfg_ai: bool = r.get::<_, i64>(13)? != 0;
     Ok(TagFacet {
         key: r.get(0)?,
         display_name: r.get(1)?,
@@ -78,12 +130,18 @@ fn facet_from_row(r: &rusqlite::Row) -> rusqlite::Result<TagFacet> {
         applies_to: r.get(8)?,
         created_at: r.get(9)?,
         updated_at: r.get(10)?,
-        input_mode: r.get(11)?,
+        // input_mode 已由 DB 列降级为只读派生：按 cfg_ai_assignable 计算
+        input_mode: if cfg_ai { "ai_and_manual" } else { "manual_only" }.to_string(),
+        cfg_visible_in_navigation: r.get::<_, i64>(11)? != 0,
+        cfg_manual_assignable: r.get::<_, i64>(12)? != 0,
+        cfg_ai_assignable: cfg_ai,
+        cfg_searchable: r.get::<_, i64>(14)? != 0,
+        facet_kind: r.get(15)?,
     })
 }
 
 const FACET_COLS: &str =
-    "key, display_name, description, selection_mode, max_items, sort_order, is_system, status, applies_to, created_at, updated_at, input_mode";
+    "key, display_name, description, selection_mode, max_items, sort_order, is_system, status, applies_to, created_at, updated_at, cfg_visible_in_navigation, cfg_manual_assignable, cfg_ai_assignable, cfg_searchable, facet_kind";
 
 /// 系统分面种子清单（migrate_v8 与 reset 后重建共用；key 顺序即 sort_order）。
 /// color 已于 V16 停用（算法主色替代），补种时单独置 inactive。
@@ -319,6 +377,8 @@ pub fn reorder(conn: &Connection, ordered_keys: &[String]) -> AppResult<()> {
 /// selection_mode/max_items/applies_to）。替代 update_display + update_rules 两个
 /// 即时写命令（旧命令保留 deprecated 标记，W4 前端切换完再删）。
 /// 部分字段非法时全部不生效（单一保存通道语义）。
+/// F1-b：input_mode 降级为只读派生 —— 此处按入参换算写 `cfg_ai_assignable`，
+/// 同时回写 input_mode 列保持 DB 内一致（回滚/历史查询可读）。
 pub fn update_facet(
     conn: &Connection,
     key: &str,
@@ -336,6 +396,7 @@ pub fn update_facet(
     if input_mode != "ai_and_manual" && input_mode != "manual_only" {
         return Err(AppError::msg("input_mode 只允许 ai_and_manual | manual_only"));
     }
+    let cfg_ai: i64 = if input_mode == "ai_and_manual" { 1 } else { 0 };
     if selection_mode != "single" && selection_mode != "multi" {
         return Err(AppError::msg("selection_mode 只允许 single | multi"));
     }
@@ -354,10 +415,12 @@ pub fn update_facet(
     let tx = conn.unchecked_transaction()?;
     let n = tx.execute(
         "UPDATE tag_facets SET
-            display_name = ?2, description = ?3, input_mode = ?4,
+            display_name = ?2, description = ?3,
+            cfg_ai_assignable = ?4,
+            input_mode = CASE WHEN ?4 = 1 THEN 'ai_and_manual' ELSE 'manual_only' END,
             selection_mode = ?5, max_items = ?6, applies_to = ?7, updated_at = ?8
           WHERE key = ?1",
-        params![key, display_name, description.trim(), input_mode,
+        rusqlite::params![key, display_name, description.trim(), cfg_ai,
                 selection_mode, max_items, applies_to, now],
     )?;
     if n == 0 {

@@ -83,18 +83,29 @@ pub(crate) fn assign_inner(
         for &tid in tag_ids {
             let n = conn.execute(
                 "INSERT OR IGNORE INTO asset_tags
-                 (asset_id, tag_id, source, created_at, confirmation, confirmed_at, confirmed_by, source_batch_id)
-                 VALUES (?1, ?2, ?3, ?4, 'confirmed', ?4, ?3, ?5)",
-                rusqlite::params![aid, tid, source, now, batch_id],
+                 (asset_id, tag_id, source, created_at, confirmation, confirmed_at, confirmed_by, source_batch_id, review_state)
+                 VALUES (?1, ?2, ?3, ?4, 'confirmed', ?4, ?3, ?5, ?6)",
+                rusqlite::params![
+                    aid,
+                    tid,
+                    source,
+                    now,
+                    batch_id,
+                    // F1-f/A3：source='manual' → manual（永不覆盖语义）；
+                    // AI 写入一律 ai_unreviewed（用户未审核）
+                    if source == "manual" { "manual" } else { "ai_unreviewed" }
+                ],
             )?;
             if n > 0 {
                 tag_ops::record(conn, aid, tid, "add", source, batch_id)?;
             } else if source == "manual" {
                 // 人工确认优先于历史 AI 来源，但关联已存在时不重复记录 add 流水。
                 // D-1/D-2：手工覆盖必须清空 source_batch_id，否则撤销 AI 批次会误删手工确认后的标签。
+                // F1-f/A3：手工覆盖 → manual（绝不因重跑被清）
                 conn.execute(
                     "UPDATE asset_tags SET source='manual', confidence=NULL,
                             source_batch_id=NULL,
+                            review_state='manual',
                             confirmation='confirmed', confirmed_at=?3, confirmed_by='manual'
                       WHERE asset_id=?1 AND tag_id=?2 AND source != 'manual'",
                     rusqlite::params![aid, tid, now],
