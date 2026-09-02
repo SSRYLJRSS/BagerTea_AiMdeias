@@ -122,8 +122,13 @@ export function listTags(): Promise<TagNode[]> {
   return invoke<TagNode[]>("list_tags");
 }
 
-export function createTag(name: string, parentId: number | null): Promise<Tag> {
-  return invoke<Tag>("create_tag", { name, parentId });
+/** F5：创建标签必须归属分面（facetKey 必填；有 parentId 时可按父标签归属推导） */
+export function createTag(
+  name: string,
+  facetKey: string | null,
+  parentId: number | null,
+): Promise<Tag> {
+  return invoke<Tag>("create_tag", { name, facetKey, parentId });
 }
 
 /** parentId 传 undefined 表示不动；传 null 表示移到顶级 */

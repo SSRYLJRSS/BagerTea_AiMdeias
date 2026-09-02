@@ -239,8 +239,16 @@ fn term_alias_equals_other_canonical_rejected() {
     // scene 分面两个标签用同一名（绕过 DB 唯一约束不行 —— tags 无 facet+name 唯一；
     // 根级同名允许？tags UNIQUE(parent_id,name) 只拦同父同名。分面内规范名冲突是
     // 「两个根级标签同名不同 facet」之外的场景 —— 这里造：两个 active 标签规范名相同）
+    // F5：create_in_facet 根级自动查重，重复词只能直插构造（绕过应用层）
     let t1 = tags::create_in_facet(&c, "海边", None, Some("scene")).unwrap();
-    let _t2 = tags::create_in_facet(&c, "海边", None, Some("scene")).unwrap();
+    let _t2: i64 = c
+        .query_row(
+            "INSERT INTO tags (name, canonical_name, normalized_name, facet_key)
+             VALUES ('海边','海边','海边','scene') RETURNING id",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
     let report = tags::detect_tag_conflicts(&c).unwrap();
     assert!(
         report.term_conflicts.iter().any(|g| g.facet_key == "scene" && g.term == "海边" && g.entries.len() >= 2),
@@ -292,7 +300,13 @@ fn term_two_canonicals_per_tag_rejected() {
 fn v22b_skipped_on_conflicts_records_blocked_by() {
     let c = mem();
     tags::create_in_facet(&c, "海边", None, Some("scene")).unwrap();
-    tags::create_in_facet(&c, "海边", None, Some("scene")).unwrap();
+    // F5：重复词直插构造（create_in_facet 根级自动查重）
+    c.execute(
+        "INSERT INTO tags (name, canonical_name, normalized_name, facet_key)
+         VALUES ('海边','海边','海边','scene')",
+        [],
+    )
+    .unwrap();
     let report = tags::detect_tag_conflicts(&c).unwrap();
     assert!(!report.is_clean());
     // apply 会怎样？insert canonical 会在 ux_terms 上撞唯一 → apply 报错（不静默丢）
@@ -415,9 +429,14 @@ fn foreign_keys_pragma_is_on() {
 #[test]
 fn detect_conflicts_finds_all_six_types() {
     let c = mem();
-    // ① term 冲突：同分面两标签同 canonical
+    // ① term 冲突：同分面两标签同 canonical（F5 后重复词直插构造，绕过根级自动查重）
     tags::create_in_facet(&c, "海", None, Some("scene")).unwrap();
-    tags::create_in_facet(&c, "海", None, Some("scene")).unwrap();
+    c.execute(
+        "INSERT INTO tags (name, canonical_name, normalized_name, facet_key)
+         VALUES ('海','海','海','scene')",
+        [],
+    )
+    .unwrap();
     // ② 孤儿：直接插一个 facet_key 不存在分面的标签（此时 F2-d 触发器未启用）
     c.execute("INSERT INTO tags (name, facet_key) VALUES ('孤儿', 'ghost_facet')", []).unwrap();
     // ③ 跨面挂父：把 custom 标签挂到 scene 标签下（绕过 trg_tags_parent_facet_ai）
@@ -570,6 +589,13 @@ fn find_by_term_is_deterministic() {
 }
 
 // ═══════════════ 组 1（F4）：可见性三常量 —— 消费点一致性矩阵 ═══════════════
+
+/// F5/F2 辅助：完整启用 tag_unique_terms（与命令层 apply_tag_constraints 同语义：
+/// 先建约束/灌 canonical，再登记 feature 标志）。
+fn enable_terms(conn: &rusqlite::Connection) {
+    migrations::apply_v22b_constraints(conn).unwrap();
+    schema_features::set_feature(conn, "tag_unique_terms", true, None).unwrap();
+}
 
 /// F4 辅助：插入一张图片素材，返回 id。
 fn f4_insert_asset(conn: &rusqlite::Connection, path: &str) -> i64 {
@@ -758,4 +784,254 @@ fn prompt_context_respects_applies_to() {
     );
     // 非法 media_kind 报错
     assert!(tag_facets::build_prompt_context(&c, "audio").is_err());
+}
+
+// ═══════════════ F5：应用层单点收口 + tag_unique_terms feature gate ═══════════════
+
+/// F5：根级「新词」创建自动查重（find_by_term mode=Alias）——同名/同义词都归并到已有标签。
+#[test]
+fn create_in_facet_dedups_via_find_by_term() {
+    let c = mem();
+    let a = tags::create_in_facet(&c, "海边", None, Some("scene")).unwrap();
+    let b = tags::create_in_facet(&c, "海边", None, Some("scene")).unwrap();
+    assert_eq!(a.id, b.id, "同分面同名根级创建应去重返回同一标签");
+    let n: i64 = c
+        .query_row(
+            "SELECT COUNT(*) FROM tags WHERE facet_key='scene' AND name='海边'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(n, 1, "库里只能有一个「海边」");
+    // 与已有同义词（别名）同名 → 归并到别名归属标签（关闭态走旧表 tag_aliases）
+    let forest = tags::create_in_facet(&c, "森林", None, Some("scene")).unwrap();
+    tags::add_alias(&c, forest.id, "树林", None, "synonym").unwrap();
+    let hit = tags::create_in_facet(&c, "树林", None, Some("scene")).unwrap();
+    assert_eq!(hit.id, forest.id, "「树林」是「森林」的同义词，创建应归并");
+}
+
+/// F5：create_tag 落库入口（tags::create_tag_in_facet）—— 无 parent 且无 facet 时报错，
+/// 不再默默落 custom；有 facet / 有 parent 时正常归属。
+#[test]
+fn create_tag_requires_facet_when_no_parent() {
+    let c = mem();
+    // 无 parent 无 facet → 报错
+    let err = tags::create_tag_in_facet(&c, "新词", None, None).unwrap_err();
+    assert!(err.to_string().contains("分面"), "应提示选择分面: {err}");
+    // 给 facet → 创建成功且归属正确
+    let t = tags::create_tag_in_facet(&c, "新词", Some("scene"), None).unwrap();
+    assert_eq!(t.facet_key, "scene");
+    // 有 parent 无 facet → 按父标签归属分面
+    let child = tags::create_tag_in_facet(&c, "子词", None, Some(t.id)).unwrap();
+    assert_eq!(child.facet_key, "scene", "子标签应继承父标签分面");
+}
+
+/// F5：tags::update 改 parent 时校验同分面（触发器第二层兜底）。
+#[test]
+fn update_rejects_cross_facet_parent() {
+    let c = mem();
+    let subject = tags::create_in_facet(&c, "人像", None, Some("subject")).unwrap();
+    let scene = tags::create_in_facet(&c, "海边", None, Some("scene")).unwrap();
+    let err = tags::update(&c, scene.id, None, Some(Some(subject.id))).unwrap_err();
+    assert!(
+        err.to_string().contains("分面"),
+        "跨分面挂父应报错: {err}"
+    );
+    // 同分面移动成功（防环由触发器守：挂到自己后代仍被拒）
+    let child = tags::create_in_facet(&c, "沙滩", Some(scene.id), Some("scene")).unwrap();
+    tags::update(&c, child.id, None, Some(Some(scene.id))).unwrap();
+    let cycle_err = tags::update(&c, scene.id, None, Some(Some(child.id))).unwrap_err();
+    assert!(!cycle_err.to_string().is_empty(), "挂到自己子标签下应被触发器拒绝");
+}
+
+/// F5：启用 tag_unique_terms 后 add_alias 写 tag_terms，ux_terms 冲突被翻译成人话。
+#[test]
+fn add_alias_conflict_message_is_human_readable() {
+    let c = mem();
+    let t1 = tags::create_in_facet(&c, "海边", None, Some("scene")).unwrap();
+    let t2 = tags::create_in_facet(&c, "森林", None, Some("scene")).unwrap();
+    enable_terms(&c);
+    tags::add_alias(&c, t1.id, "海滨", None, "synonym").unwrap();
+    let err = tags::add_alias(&c, t2.id, "海滨", None, "synonym").unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("海滨") && msg.contains("海边") && msg.contains("已被"), "冲突消息应点明两个词: {msg}");
+    // 同标签幂等：重复添加同一词不报错
+    tags::add_alias(&c, t1.id, "海滨", None, "synonym").unwrap();
+}
+
+/// F5：启用词表后 merge 把 src 全部词条迁到 dst（canonical→old_name，synonym 保留）。
+#[test]
+fn merge_moves_all_terms_to_target() {
+    let c = mem();
+    let src = tags::create_in_facet(&c, "海边", None, Some("scene")).unwrap();
+    let dst = tags::create_in_facet(&c, "海岸", None, Some("scene")).unwrap();
+    enable_terms(&c);
+    tags::add_alias(&c, src.id, "海滨", None, "synonym").unwrap();
+    tags::merge_preserve_alias(&c, src.id, dst.id).unwrap();
+    let rows: Vec<(String, String)> = c
+        .prepare("SELECT term, term_kind FROM tag_terms WHERE tag_id = ?1 ORDER BY term_kind")
+        .unwrap()
+        .query_map([dst.id], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .filter_map(|r| r.ok())
+        .collect();
+    let kinds: Vec<&str> = rows.iter().map(|(_, k)| k.as_str()).collect();
+    assert!(rows.iter().any(|(t, k)| t == "海岸" && k == "canonical"), "目标 canonical 保留: {rows:?}");
+    assert!(rows.iter().any(|(t, k)| t == "海边" && k == "old_name"), "源 canonical 降级 old_name: {rows:?}");
+    assert!(rows.iter().any(|(t, k)| t == "海滨" && k == "synonym"), "源 synonym 保留: {rows:?}");
+    assert_eq!(rows.len(), 3, "词条应完整迁移: {rows:?}");
+}
+
+/// F5：脏库（同分面同词重复）合并时不崩——撞了跳过，目标词优先。
+#[test]
+fn merge_skips_conflicting_term() {
+    let c = mem();
+    let src = tags::create_in_facet(&c, "海边", None, Some("scene")).unwrap();
+    let dst = tags::create_in_facet(&c, "海岸", None, Some("scene")).unwrap();
+    enable_terms(&c);
+    // 造脏：dst 直插一条与 src canonical 同 normalized 的 canonical（先撤两个唯一索引才能插：
+    // ux_terms 管 facet+词唯一，ux_terms_canonical 管同标签单 canonical）
+    c.execute_batch("DROP INDEX ux_terms; DROP INDEX ux_terms_canonical;").unwrap();
+    c.execute(
+        "INSERT INTO tag_terms (tag_id, facet_key, normalized_term, term, locale, term_kind, is_searchable, created_at)
+         VALUES (?1, 'scene', '海边', '海边', '', 'canonical', 1, 1)",
+        [dst.id],
+    )
+    .unwrap();
+    // 合并必须成功（不因 PK/唯一冲突中断），且 dst 仍只有一条「海边」
+    tags::merge_preserve_alias(&c, src.id, dst.id).unwrap();
+    let n: i64 = c
+        .query_row(
+            "SELECT COUNT(*) FROM tag_terms WHERE tag_id=?1 AND normalized_term='海边'",
+            [dst.id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(n, 1, "冲突词条被跳过，不产生重复: dst=海边 rows={n}");
+}
+
+/// F5：合并后源标签 deprecated 且没有任何词条（词已迁走）。
+#[test]
+fn deprecated_tag_has_no_terms() {
+    let c = mem();
+    let src = tags::create_in_facet(&c, "海边", None, Some("scene")).unwrap();
+    let dst = tags::create_in_facet(&c, "海岸", None, Some("scene")).unwrap();
+    enable_terms(&c);
+    tags::add_alias(&c, src.id, "海滨", None, "synonym").unwrap();
+    tags::merge_preserve_alias(&c, src.id, dst.id).unwrap();
+    let status: String = c
+        .query_row("SELECT status FROM tags WHERE id=?1", [src.id], |r| r.get(0))
+        .unwrap();
+    assert_eq!(status, "deprecated", "源标签应置 deprecated");
+    let name: String = c
+        .query_row("SELECT name FROM tags WHERE id=?1", [src.id], |r| r.get(0))
+        .unwrap();
+    assert!(name.contains("原名 #"), "源标签改名避开旧 UNIQUE: {name}");
+    let n: i64 = c
+        .query_row(
+            "SELECT COUNT(*) FROM tag_terms WHERE tag_id=?1",
+            [src.id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(n, 0, "deprecated 标签不应残留词条");
+}
+
+/// F5：合并后旧词仍可搜到目标标签（old_name 词条生效）。
+#[test]
+fn search_old_name_hits_merge_target() {
+    let c = mem();
+    let src = tags::create_in_facet(&c, "海边", None, Some("scene")).unwrap();
+    let dst = tags::create_in_facet(&c, "海岸", None, Some("scene")).unwrap();
+    enable_terms(&c);
+    tags::merge_preserve_alias(&c, src.id, dst.id).unwrap();
+    let lk = tags::find_by_term(&c, "scene", &tags::normalize_name("海边"), tags::TermMatch::Alias)
+        .unwrap();
+    assert_eq!(lk.hits.len(), 1, "旧词应精确命中: {:?}", lk.warnings);
+    assert_eq!(lk.hits[0].tag_id, dst.id, "旧词「海边」应指向合并目标");
+    assert_eq!(lk.hits[0].term_kind, "old_name");
+}
+
+/// F5-d：find_by_term 尊重 feature gate —— 关闭读旧表、开启读 tag_terms，各断言一次。
+#[test]
+fn find_by_term_respects_feature_gate() {
+    // 状态 0：关闭 → 别名事实源 tag_aliases（写入旧表），find_by_term Alias 命中
+    let c0 = mem();
+    let t0 = tags::create_in_facet(&c0, "海边", None, Some("scene")).unwrap();
+    tags::add_alias(&c0, t0.id, "海滨", None, "synonym").unwrap();
+    let lk0 = tags::find_by_term(&c0, "scene", &tags::normalize_name("海滨"), tags::TermMatch::Alias)
+        .unwrap();
+    assert_eq!(lk0.hits.len(), 1, "关闭态别名（tag_aliases）应命中");
+    assert_eq!(lk0.hits[0].tag_id, t0.id);
+    // 关闭态不读 tag_terms：即便手工造了词条行也不参与
+    c0.execute_batch("CREATE TABLE IF NOT EXISTS tag_terms (
+        tag_id INTEGER NOT NULL, facet_key TEXT NOT NULL, normalized_term TEXT NOT NULL,
+        term TEXT NOT NULL, locale TEXT NOT NULL DEFAULT '', term_kind TEXT NOT NULL,
+        is_searchable INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL)").unwrap();
+    let another = tags::create_in_facet(&c0, "森林", None, Some("scene")).unwrap();
+    c0.execute(
+        "INSERT INTO tag_terms (tag_id, facet_key, normalized_term, term, locale, term_kind, is_searchable, created_at)
+         VALUES (?1, 'scene', '森林', '森林', '', 'canonical', 1, 1)",
+        [another.id],
+    )
+    .unwrap();
+    let lk0b = tags::find_by_term(&c0, "scene", &tags::normalize_name("森林"), tags::TermMatch::Exact)
+        .unwrap();
+    assert_eq!(lk0b.hits.len(), 1, "关闭态仍按旧表命中（tags 规范名）");
+
+    // 状态 1：开启 → 别名事实源 tag_terms（写入词条表），find_by_term Alias 命中词条
+    let c1 = mem();
+    let t1 = tags::create_in_facet(&c1, "海边", None, Some("scene")).unwrap();
+    enable_terms(&c1);
+    tags::add_alias(&c1, t1.id, "海滨", None, "synonym").unwrap();
+    let lk1 = tags::find_by_term(&c1, "scene", &tags::normalize_name("海滨"), tags::TermMatch::Alias)
+        .unwrap();
+    assert_eq!(lk1.hits.len(), 1, "开启态别名（tag_terms）应命中");
+    assert_eq!(lk1.hits[0].tag_id, t1.id);
+    let terms_n: i64 = c1
+        .query_row(
+            "SELECT COUNT(*) FROM tag_terms WHERE tag_id=?1",
+            [t1.id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(terms_n, 2, "开启态 canonical+synonym 都在 tag_terms（绝不双写）");
+    let aliases_n: i64 = c1
+        .query_row(
+            "SELECT COUNT(*) FROM tag_aliases WHERE tag_id=?1",
+            [t1.id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(aliases_n, 0, "开启态 tag_aliases 冻结只读，新增别名不得双写");
+}
+
+/// F5-d：未启用词表时 Prefix/Contains/Fuzzy 返回空 + 指引 warning。
+#[test]
+fn prefix_mode_unavailable_without_terms() {
+    let c = mem();
+    tags::create_in_facet(&c, "海边", None, Some("scene")).unwrap();
+    for mode in [
+        tags::TermMatch::Prefix,
+        tags::TermMatch::Contains,
+        tags::TermMatch::Fuzzy,
+    ] {
+        let lk = tags::find_by_term(&c, "scene", "海", mode).unwrap();
+        assert!(lk.hits.is_empty(), "{mode:?} 未启用时应无命中");
+        assert!(
+            lk.warnings.iter().any(|w| w.contains("启用标签约束")),
+            "{mode:?} 应提示启用标签约束: {:?}",
+            lk.warnings
+        );
+    }
+    // 启用后（S5 前未实现模糊匹配）不再报「不可用」指引
+    let c2 = mem();
+    tags::create_in_facet(&c2, "海边", None, Some("scene")).unwrap();
+    enable_terms(&c2);
+    let lk2 = tags::find_by_term(&c2, "scene", "海", tags::TermMatch::Prefix).unwrap();
+    assert!(
+        !lk2.warnings.iter().any(|w| w.contains("启用标签约束")),
+        "启用后不应再提示不可用: {:?}",
+        lk2.warnings
+    );
 }

@@ -216,7 +216,12 @@ pub fn add_tag_alias(
 }
 
 #[tauri::command]
-pub fn create_tag(state: State<AppState>, name: String, parent_id: Option<i64>) -> AppResult<Tag> {
+pub fn create_tag(
+    state: State<AppState>,
+    name: String,
+    facet_key: Option<String>,
+    parent_id: Option<i64>,
+) -> AppResult<Tag> {
     let name = name.trim().to_string();
     if name.is_empty() {
         return Err(AppError::msg("标签名不能为空"));
@@ -228,8 +233,12 @@ pub fn create_tag(state: State<AppState>, name: String, parent_id: Option<i64>) 
     if name.chars().any(|c| c.is_control()) {
         return Err(AppError::msg("标签名不能包含控制字符"));
     }
+    // F5：无 parent 且无 facet 时报错（规则在 db 层 tags::create_tag_in_facet，单一收口）
     let conn = lock_db(&state)?;
-    tags::create(&conn, &name, parent_id)
+    if let Some(fk) = &facet_key {
+        crate::db::tag_facets::get(&conn, fk)?;
+    }
+    tags::create_tag_in_facet(&conn, &name, facet_key.as_deref(), parent_id)
 }
 
 #[tauri::command]

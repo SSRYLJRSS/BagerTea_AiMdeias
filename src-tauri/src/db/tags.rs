@@ -1,6 +1,6 @@
 //! 标签仓储：CRUD + 递归树 + 连带计数（父标签 = 自身+后代去重素材数）
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 use crate::error::AppResult;
@@ -183,6 +183,72 @@ pub fn create(conn: &Connection, name: &str, parent_id: Option<i64>) -> AppResul
     create_in_facet(conn, name, parent_id, None)
 }
 
+/// F5：在调用方已开事务时（如 ai.rs ai_decide_suggestion_item 内调 find_or_create_canonical）
+/// 绝不嵌套开事务；无外层事务时才自己开并 commit，保证多写原子。
+fn transactional<T>(
+    conn: &Connection,
+    f: impl FnOnce(&Connection) -> AppResult<T>,
+) -> AppResult<T> {
+    if conn.is_autocommit() {
+        let tx = conn.unchecked_transaction()?;
+        let out = f(&tx)?;
+        tx.commit()?;
+        Ok(out)
+    } else {
+        f(conn)
+    }
+}
+
+/// F5：create_tag 命令的落库入口 —— 无 parent 且无 facet 时报错（不再默默落 custom）。
+/// 规则收在 db 层单一位置，命令层只做名称校验。
+pub fn create_tag_in_facet(
+    conn: &Connection,
+    name: &str,
+    facet_key: Option<&str>,
+    parent_id: Option<i64>,
+) -> AppResult<Tag> {
+    if facet_key.is_none() && parent_id.is_none() {
+        return Err(crate::error::AppError::msg(
+            "创建标签需要归属分面：请先选择分面再创建",
+        ));
+    }
+    create_in_facet(conn, name, parent_id, facet_key)
+}
+
+/// 按 id 取单标签（F5 查重命中返回；列表场景不要用——逐条查询无批量优势）。
+fn tag_by_id(conn: &Connection, id: i64) -> AppResult<Tag> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT t.id, t.name, COALESCE(t.canonical_name, t.name),
+                COALESCE(t.normalized_name, lower(trim(t.name))),
+                COALESCE(t.facet_key, 'custom'), t.parent_id,
+                COALESCE(t.status, 'active'), COALESCE(t.is_system, 0),
+                t.is_preset, t.sort_order, {FACET_EFFECTIVE} AS facet_effective
+           FROM tags t WHERE t.id = ?1"
+    ))?;
+    let mut tag = stmt.query_row([id], |r| {
+        Ok(Tag {
+            id: r.get(0)?,
+            name: r.get(1)?,
+            canonical_name: r.get(2)?,
+            normalized_name: r.get(3)?,
+            facet_key: r.get(4)?,
+            parent_id: r.get(5)?,
+            status: r.get(6)?,
+            is_system: r.get::<_, i64>(7)? != 0,
+            is_preset: r.get::<_, i64>(8)? != 0,
+            sort_order: r.get(9)?,
+            facet_effective: r.get::<_, i64>(10)? != 0,
+            asset_count: 0,
+            total_count: 0,
+            aliases: Vec::new(),
+            path: String::new(),
+        })
+    })?;
+    tag.total_count = total_count(conn, id)?;
+    hydrate_metadata(conn, &mut tag)?;
+    Ok(tag)
+}
+
 pub fn create_in_facet(
     conn: &Connection,
     name: &str,
@@ -190,6 +256,9 @@ pub fn create_in_facet(
     facet_key: Option<&str>,
 ) -> AppResult<Tag> {
     let name = name.trim();
+    if name.is_empty() {
+        return Err(crate::error::AppError::msg("标签名称不能为空"));
+    }
     let facet = match facet_key {
         Some(key) => key.to_string(),
         None => parent_id
@@ -202,48 +271,66 @@ pub fn create_in_facet(
             .unwrap_or_else(|| "custom".to_string()),
     };
     let normalized = normalize_name(name);
-    conn.execute(
-        "INSERT INTO tags (name, canonical_name, normalized_name, facet_key, parent_id)
-         VALUES (?1, ?1, ?3, ?4, ?2)",
-        rusqlite::params![name, parent_id, normalized, facet],
-    )?;
-    let id = conn.last_insert_rowid();
-    let facet_effective = conn
-        .query_row(
-            "SELECT status = 'active' FROM tag_facets WHERE key = ?1",
-            [&facet],
-            |r| r.get::<_, bool>(0),
-        )
-        .unwrap_or(false);
-    Ok(Tag {
-        id,
-        name: name.to_string(),
-        canonical_name: name.to_string(),
-        normalized_name: normalized,
-        facet_key: facet,
-        parent_id,
-        status: "active".to_string(),
-        is_system: false,
-        is_preset: false,
-        sort_order: 0,
-        asset_count: 0,
-        total_count: 0,
-        aliases: Vec::new(),
-        path: String::new(),
-        facet_effective,
+    // F5：根级「新词」创建自动查重（唯一入口 find_by_term，mode=Alias——同名或同义词都归并）。
+    // 子标签按 (parent, name) 语义由 find_or_create_child 处理，不进此处全局查重。
+    if parent_id.is_none() {
+        let lookup = find_by_term(conn, &facet, &normalized, TermMatch::Alias)?;
+        if let Some(hit) = lookup.hits.first() {
+            if hit.tag_status == "active" {
+                return tag_by_id(conn, hit.tag_id);
+            }
+        }
+    }
+    // F5：tag_unique_terms 启用时，同事务写 tag_terms 的 canonical 行（事实源写入收口）。
+    // 绝不双写：启用时 canonical 唯一事实源是 tag_terms；未启用则完全不碰 tag_terms。
+    transactional(conn, |c| {
+        c.execute(
+            "INSERT INTO tags (name, canonical_name, normalized_name, facet_key, parent_id)
+             VALUES (?1, ?1, ?3, ?4, ?2)",
+            rusqlite::params![name, parent_id, normalized, facet],
+        )?;
+        let id = c.last_insert_rowid();
+        if crate::db::schema_features::feature_enabled(c, "tag_unique_terms").unwrap_or(false) {
+            c.execute(
+                "INSERT INTO tag_terms
+                 (tag_id, facet_key, normalized_term, term, locale, term_kind, is_searchable, created_at)
+                 VALUES (?1, ?2, ?3, ?3, '', 'canonical', 1, ?4)",
+                rusqlite::params![id, facet, normalized, chrono::Utc::now().timestamp_millis()],
+            )?;
+        }
+        let facet_effective = c
+            .query_row(
+                "SELECT status = 'active' FROM tag_facets WHERE key = ?1",
+                [&facet],
+                |r| r.get::<_, bool>(0),
+            )
+            .unwrap_or(false);
+        Ok(Tag {
+            id,
+            name: name.to_string(),
+            canonical_name: name.to_string(),
+            normalized_name: normalized,
+            facet_key: facet,
+            parent_id,
+            status: "active".to_string(),
+            is_system: false,
+            is_preset: false,
+            sort_order: 0,
+            asset_count: 0,
+            total_count: 0,
+            aliases: Vec::new(),
+            path: String::new(),
+            facet_effective,
+        })
     })
 }
 
 /// 新协议使用的规范标签创建：分面是独立实体，标签直接归属分面。
-/// F3-a：查重用 find_by_term(mode=Alias) —— 消灭本函数自写的两表 JOIN + ORDER BY 兜底。
+/// F3-a/F5：查重已收口在 create_in_facet（find_by_term mode=Alias）——本函数直接走它。
 pub fn find_or_create_canonical(conn: &Connection, facet_key: &str, name: &str) -> AppResult<i64> {
     let normalized = normalize_name(name);
     if normalized.is_empty() {
         return Err(crate::error::AppError::msg("标签名称不能为空"));
-    }
-    let lookup = find_by_term(conn, facet_key, &normalized, TermMatch::Alias)?;
-    if let Some(hit) = lookup.hits.first() {
-        return Ok(hit.tag_id);
     }
     Ok(create_in_facet(conn, name, None, Some(facet_key))?.id)
 }
@@ -254,25 +341,50 @@ pub fn update(
     name: Option<&str>,
     parent_id: Option<Option<i64>>,
 ) -> AppResult<()> {
-    if let Some(n) = name {
-        conn.execute(
-            "UPDATE tags SET name = ?1, canonical_name = ?1, normalized_name = ?2 WHERE id = ?3",
-            rusqlite::params![n, normalize_name(n), id],
-        )?;
-    }
-    if let Some(pid) = parent_id {
-        // 防环：新父级不能是自身或自身后代
-        if let Some(new_parent) = pid {
-            if descendant_ids(conn, id)?.contains(&new_parent) {
-                return Err(crate::error::AppError::msg("不能把标签挂到自己的子标签下"));
+    transactional(conn, |c| {
+        if let Some(n) = name {
+            let normalized = normalize_name(n);
+            c.execute(
+                "UPDATE tags SET name = ?1, canonical_name = ?1, normalized_name = ?2 WHERE id = ?3",
+                rusqlite::params![n, normalized, id],
+            )?;
+            // F5：改名同步 tag_terms 的 canonical 行（启用时 tag_terms 是事实源，必须跟着走）
+            if crate::db::schema_features::feature_enabled(c, "tag_unique_terms").unwrap_or(false) {
+                c.execute(
+                    "UPDATE tag_terms SET term = ?1, normalized_term = ?2
+                      WHERE tag_id = ?3 AND term_kind = 'canonical'",
+                    rusqlite::params![n, normalized, id],
+                )?;
             }
         }
-        conn.execute(
-            "UPDATE tags SET parent_id = ?1 WHERE id = ?2",
-            rusqlite::params![pid, id],
-        )?;
-    }
-    Ok(())
+        if let Some(pid) = parent_id {
+            // ① 改 parent 校验同分面（V22a 触发器同规则兜底——双层防护，应用层给清晰报错）
+            if let Some(new_parent) = pid {
+                let cur_facet: Option<String> =
+                    c.query_row("SELECT facet_key FROM tags WHERE id = ?1", [id], |r| r.get(0))
+                        .optional()?;
+                let par_facet: Option<String> = c
+                    .query_row(
+                        "SELECT facet_key FROM tags WHERE id = ?1",
+                        [new_parent],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                if let (Some(cf), Some(pf)) = (cur_facet, par_facet) {
+                    if cf != pf {
+                        return Err(crate::error::AppError::msg("标签不能挂到其他分面下"));
+                    }
+                }
+            }
+            // ③ 防环改由触发器守（V22a trg_tags_no_cycle）——不再自实现 descendant_ids，
+            //    避免「应用层防环逻辑自身被环卡死」；触发器 RAISE 回滚本次 UPDATE。
+            c.execute(
+                "UPDATE tags SET parent_id = ?1 WHERE id = ?2",
+                rusqlite::params![pid, id],
+            )?;
+        }
+        Ok(())
+    })
 }
 
 /// 删除标签：CASCADE 删除子标签与 asset_tags 关联（FTS 由触发器联动）
@@ -374,32 +486,102 @@ pub fn add_alias(
     }
     let normalized = normalize_name(alias);
     let locale = locale.unwrap_or("");
-    let conflict: Option<i64> = conn
-        .query_row(
-            "SELECT tag_id FROM tag_aliases
-              WHERE normalized_alias = ?1 AND locale = ?2 AND tag_id != ?3
-              LIMIT 1",
-            rusqlite::params![normalized, locale, tag_id],
+    // F5-d：tag_unique_terms 是唯一开关，绝不双写。
+    //   =1：只写 tag_terms（tag_aliases 冻结只读），冲突由 ux_terms 唯一索引自动完成，
+    //       应用层把 UNIQUE 错误翻译成人话；
+    //   =0：只写 tag_aliases（tag_terms 不读不写），维持原行为。
+    if crate::db::schema_features::feature_enabled(conn, "tag_unique_terms").unwrap_or(false) {
+        let facet: String = conn.query_row(
+            "SELECT facet_key FROM tags WHERE id = ?1",
+            [tag_id],
             |r| r.get(0),
-        )
-        .ok();
-    if conflict.is_some() {
-        return Err(crate::error::AppError::msg("别名已绑定到其他规范标签"));
+        )?;
+        let result = conn.execute(
+            "INSERT INTO tag_terms
+             (tag_id, facet_key, normalized_term, term, locale, term_kind, is_searchable, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7)",
+            rusqlite::params![
+                tag_id,
+                facet,
+                normalized,
+                alias,
+                locale,
+                alias_type, // synonym / old_name / translation / typo（与旧表 alias_type 同词）
+                chrono::Utc::now().timestamp_millis()
+            ],
+        );
+        match result {
+            Ok(_) => Ok(()),
+            Err(e) if is_unique_violation(&e) => {
+                // 幂等：同一标签重复加同一个词 → 忽略（对应旧表 INSERT OR IGNORE）
+                let self_hit: Option<i64> = conn
+                    .query_row(
+                        "SELECT 1 FROM tag_terms
+                          WHERE tag_id = ?1 AND normalized_term = ?2 AND locale = ?3
+                          LIMIT 1",
+                        rusqlite::params![tag_id, normalized, locale],
+                        |r| r.get(0),
+                    )
+                    .ok();
+                if self_hit.is_some() {
+                    return Ok(());
+                }
+                // ux_terms 已自动拦截冲突；查出占用者给可读消息
+                let conflict_owner: Option<String> = conn
+                    .query_row(
+                        "SELECT t.name FROM tag_terms tt JOIN tags t ON t.id = tt.tag_id
+                          WHERE tt.facet_key = ?1 AND tt.normalized_term = ?2 AND tt.tag_id != ?3
+                          LIMIT 1",
+                        rusqlite::params![facet, normalized, tag_id],
+                        |r| r.get(0),
+                    )
+                    .ok();
+                let message = match conflict_owner {
+                    Some(owner) => format!("「{alias}」已被分面内「{owner}」占用"),
+                    None => format!("「{alias}」已被其他标签占用"),
+                };
+                Err(crate::error::AppError::msg(message))
+            }
+            Err(e) => Err(e.into()),
+        }
+    } else {
+        let conflict: Option<i64> = conn
+            .query_row(
+                "SELECT tag_id FROM tag_aliases
+                  WHERE normalized_alias = ?1 AND locale = ?2 AND tag_id != ?3
+                  LIMIT 1",
+                rusqlite::params![normalized, locale, tag_id],
+                |r| r.get(0),
+            )
+            .ok();
+        if conflict.is_some() {
+            return Err(crate::error::AppError::msg("别名已绑定到其他规范标签"));
+        }
+        conn.execute(
+            "INSERT OR IGNORE INTO tag_aliases
+             (tag_id, alias, normalized_alias, locale, alias_type, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                tag_id,
+                alias,
+                normalized,
+                locale,
+                alias_type,
+                chrono::Utc::now().timestamp_millis()
+            ],
+        )?;
+        Ok(())
     }
-    conn.execute(
-        "INSERT OR IGNORE INTO tag_aliases
-         (tag_id, alias, normalized_alias, locale, alias_type, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        rusqlite::params![
-            tag_id,
-            alias,
-            normalized,
-            locale,
-            alias_type,
-            chrono::Utc::now().timestamp_millis()
-        ],
-    )?;
-    Ok(())
+}
+
+/// rusqlite UNIQUE 约束失败判定（SQLITE_CONSTRAINT_UNIQUE = 2067）。
+fn is_unique_violation(e: &rusqlite::Error) -> bool {
+    match e {
+        rusqlite::Error::SqliteFailure(ferr, _) => {
+            ferr.extended_code == 2067 || ferr.code == rusqlite::ErrorCode::ConstraintViolation
+        }
+        _ => false,
+    }
 }
 
 pub fn aliases(conn: &Connection, tag_id: i64) -> AppResult<Vec<String>> {
@@ -547,6 +729,12 @@ fn tag_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Tag> {
 
 /// 合并标签（M3-01 R-19）：src 的素材关联与子标签全部并入 dst，随后删除 src。
 /// 单事务；走 DELETE+INSERT 而非 UPDATE 改挂，保证 FTS 触发器（trg_at_ai/ad）联动。
+///
+/// F5：tag_unique_terms 启用时，src 的全部词条（canonical + 别名）按关键顺序迁移到 dst：
+///   ① 读出源全部 terms → ② DELETE src 的 terms（释放 ux_terms 唯一空间）→
+///   ③ 逐个写给 dst（源的 canonical 作 old_name、源的别名保留原 term_kind），撞唯一约束跳过 →
+///   ④ src 改名「原名 #<id>」（避开旧 UNIQUE(parent_id,name)）→ ⑤ status 置 deprecated。
+/// 不按此顺序，源的 canonical 与目标既有词条会 UNIQUE constraint failed。
 pub fn merge_preserve_alias(conn: &Connection, src_id: i64, dst_id: i64) -> AppResult<()> {
     if src_id == dst_id {
         return Err(crate::error::AppError::msg("不能把标签合并到它自己"));
@@ -578,35 +766,99 @@ pub fn merge_preserve_alias(conn: &Connection, src_id: i64, dst_id: i64) -> AppR
         ));
     }
 
-    let tx = conn.unchecked_transaction()?;
-    let src_name: String = tx.query_row("SELECT name FROM tags WHERE id = ?1", [src_id], |r| {
-        r.get(0)
-    })?;
-    // ① src 独有素材 → 挂到 dst（INSERT 触发 FTS 更新）
-    tx.execute(
-        "INSERT INTO asset_tags
-         (asset_id, tag_id, source, created_at, confidence, confirmation, confirmed_at, confirmed_by, source_batch_id)
-         SELECT at.asset_id, ?2, at.source, at.created_at, at.confidence, at.confirmation,
-                at.confirmed_at, at.confirmed_by, at.source_batch_id FROM asset_tags at
-          WHERE at.tag_id = ?1
-            AND NOT EXISTS (SELECT 1 FROM asset_tags x WHERE x.asset_id = at.asset_id AND x.tag_id = ?2)",
-        rusqlite::params![src_id, dst_id],
-    )?;
-    // ② 删除 src 全部关联（DELETE 触发 FTS 更新；已挂 dst 的素材去重生效）
-    tx.execute("DELETE FROM asset_tags WHERE tag_id = ?1", [src_id])?;
-    // ③ src 的子标签回挂 dst（保留层级）
-    tx.execute(
-        "UPDATE tags SET parent_id = ?2 WHERE parent_id = ?1",
-        rusqlite::params![src_id, dst_id],
-    )?;
-    // ④ 删除 src 标签本体（关联已清空，CASCADE 无副作用）
-    tx.execute(
-        "UPDATE tags SET status = 'deprecated' WHERE id = ?1",
-        [src_id],
-    )?;
-    add_alias(&tx, dst_id, &src_name, None, "old_name")?;
-    tx.commit()?;
-    Ok(())
+    let terms_enabled =
+        crate::db::schema_features::feature_enabled(conn, "tag_unique_terms").unwrap_or(false);
+    transactional(conn, |c| {
+        let src_name: String =
+            c.query_row("SELECT name FROM tags WHERE id = ?1", [src_id], |r| r.get(0))?;
+        // ① src 独有素材 → 挂到 dst（INSERT 触发 FTS 更新）
+        c.execute(
+            "INSERT INTO asset_tags
+             (asset_id, tag_id, source, created_at, confidence, confirmation, confirmed_at, confirmed_by, source_batch_id)
+             SELECT at.asset_id, ?2, at.source, at.created_at, at.confidence, at.confirmation,
+                    at.confirmed_at, at.confirmed_by, at.source_batch_id FROM asset_tags at
+              WHERE at.tag_id = ?1
+                AND NOT EXISTS (SELECT 1 FROM asset_tags x WHERE x.asset_id = at.asset_id AND x.tag_id = ?2)",
+            rusqlite::params![src_id, dst_id],
+        )?;
+        // ② 删除 src 全部关联（DELETE 触发 FTS 更新；已挂 dst 的素材去重生效）
+        c.execute("DELETE FROM asset_tags WHERE tag_id = ?1", [src_id])?;
+        // ③ src 的子标签回挂 dst（保留层级）
+        c.execute(
+            "UPDATE tags SET parent_id = ?2 WHERE parent_id = ?1",
+            rusqlite::params![src_id, dst_id],
+        )?;
+        if terms_enabled {
+            // ① terms 顺序迁移（F5 关键）：读 → 删（释放唯一空间）→ 写（撞了跳过）
+            struct SrcTerm {
+                normalized_term: String,
+                term: String,
+                locale: String,
+                term_kind: String,
+                is_searchable: i64,
+            }
+            let mut stmt = c.prepare(
+                "SELECT normalized_term, term, locale, term_kind, is_searchable
+                   FROM tag_terms WHERE tag_id = ?1 ORDER BY term_kind, term",
+            )?;
+            let src_terms: Vec<SrcTerm> = stmt
+                .query_map([src_id], |r| {
+                    Ok(SrcTerm {
+                        normalized_term: r.get(0)?,
+                        term: r.get(1)?,
+                        locale: r.get(2)?,
+                        term_kind: r.get(3)?,
+                        is_searchable: r.get(4)?,
+                    })
+                })?
+                .filter_map(|r| r.ok())
+                .collect();
+            drop(stmt);
+            // ② 释放 src 的唯一空间
+            c.execute("DELETE FROM tag_terms WHERE tag_id = ?1", [src_id])?;
+            // ③ 写给 dst：canonical 降级为 old_name，别名保留原 kind
+            for t in &src_terms {
+                let kind = if t.term_kind == "canonical" {
+                    "old_name"
+                } else {
+                    t.term_kind.as_str()
+                };
+                let insert = c.execute(
+                    "INSERT INTO tag_terms
+                     (tag_id, facet_key, normalized_term, term, locale, term_kind, is_searchable, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    rusqlite::params![
+                        dst_id,
+                        dst_facet,
+                        t.normalized_term,
+                        t.term,
+                        t.locale,
+                        kind,
+                        t.is_searchable,
+                        chrono::Utc::now().timestamp_millis()
+                    ],
+                );
+                match insert {
+                    Ok(_) => {}
+                    // 撞了（目标已有同词）→ 跳过：目标词优先
+                    Err(e) if is_unique_violation(&e) => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            // ④ src 改名「原名 #<id>」避开旧 UNIQUE(parent_id,name)；⑤ 置 deprecated
+            let renamed = format!("原名 #{}", src_id);
+            c.execute(
+                "UPDATE tags SET name = ?1, canonical_name = ?1, normalized_name = ?2 WHERE id = ?3",
+                rusqlite::params![renamed, normalize_name(&renamed), src_id],
+            )?;
+            c.execute("UPDATE tags SET status = 'deprecated' WHERE id = ?1", [src_id])?;
+        } else {
+            // 旧表路径：④ src 置 deprecated（物理删除语义由 merge() 兼容包装负责）
+            c.execute("UPDATE tags SET status = 'deprecated' WHERE id = ?1", [src_id])?;
+            add_alias(c, dst_id, &src_name, None, "old_name")?;
+        }
+        Ok(())
+    })
 }
 
 /// 旧版兼容合并：保持原有“源标签物理删除、旧名称不再命中”的语义。
@@ -615,25 +867,29 @@ pub fn merge(conn: &Connection, src_id: i64, dst_id: i64) -> AppResult<()> {
     let src_name: String =
         conn.query_row("SELECT name FROM tags WHERE id=?1", [src_id], |r| r.get(0))?;
     merge_preserve_alias(conn, src_id, dst_id)?;
+    let terms_enabled =
+        crate::db::schema_features::feature_enabled(conn, "tag_unique_terms").unwrap_or(false);
     let tx = conn.unchecked_transaction()?;
     tx.execute("DELETE FROM tags WHERE id=?1", [src_id])?;
-    tx.execute(
-        "DELETE FROM tag_aliases WHERE tag_id=?1 AND alias_type='old_name' AND normalized_alias=?2",
-        rusqlite::params![dst_id, normalize_name(&src_name)],
-    )?;
+    if terms_enabled {
+        // 物理删除语义：dst 上刚挂的 old_name 词条也删掉（旧名称不再命中）
+        tx.execute(
+            "DELETE FROM tag_terms WHERE tag_id=?1 AND term_kind='old_name' AND normalized_term=?2",
+            rusqlite::params![dst_id, normalize_name(&src_name)],
+        )?;
+    } else {
+        tx.execute(
+            "DELETE FROM tag_aliases WHERE tag_id=?1 AND alias_type='old_name' AND normalized_alias=?2",
+            rusqlite::params![dst_id, normalize_name(&src_name)],
+        )?;
+    }
     tx.commit()?;
     Ok(())
 }
 
-/// 按名称查找/创建根级标签（AI 打标确认写入用）
+/// 按名称查找/创建根级标签（AI 打标确认写入用）。
+/// F5：查重/落分面已收口在 create_in_facet（根级同名或同义词直接返回已有标签）。
 pub fn find_or_create_root(conn: &Connection, name: &str) -> AppResult<i64> {
-    let mut stmt = conn.prepare("SELECT id FROM tags WHERE name = ?1 AND parent_id IS NULL")?;
-    let mut rows = stmt.query([name])?;
-    if let Some(row) = rows.next()? {
-        return Ok(row.get(0)?);
-    }
-    drop(rows);
-    drop(stmt);
     Ok(create_in_facet(conn, name, None, Some("custom"))?.id)
 }
 
@@ -1096,6 +1352,12 @@ pub fn find_by_term(
                 tag_status: status,
             });
         }
+    } else if matches!(
+        mode,
+        TermMatch::Prefix | TermMatch::Contains | TermMatch::Fuzzy
+    ) {
+        // F5-d：tag_unique_terms=0 时前缀/包含/纠错匹配不可用（需 tag_terms 事实源 + 区间扫描）
+        warnings.push("前缀/包含/纠错匹配需先在设置页启用标签约束".into());
     } else {
         // 旧表（tags + tag_aliases）。Exact 只查 tags（规范名）；Alias 才并别名
         let sql = if matches!(mode, TermMatch::Exact) {
@@ -1138,9 +1400,6 @@ pub fn find_by_term(
                 tag_status: status,
             });
         }
-    }
-    if !terms_enabled && (matches!(mode, TermMatch::Prefix | TermMatch::Contains | TermMatch::Fuzzy)) {
-        warnings.push("前缀/包含/纠错匹配需先在设置页启用标签约束".into());
     }
     Ok(TermLookup { hits, warnings })
 }
