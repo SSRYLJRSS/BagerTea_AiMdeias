@@ -1269,3 +1269,233 @@ fn top_tags_quota_is_shared_fairly() {
         assert!(!line.is_empty(), "{facet} 至少保留 1 个词");
     }
 }
+
+// ═══════════════ A1：AI 打标强类型协议 ═══════════════
+
+/// A1：TagProposal/AnalysisResult 强类型可往返序列化。
+#[test]
+fn analysis_result_roundtrips() {
+    let ar = ai::AnalysisResult {
+        description: "黄昏海边".to_string(),
+        proposals: vec![
+            ai::TagProposal { facet_key: "scene".into(), raw_name: "海边".into(), confidence: Some(0.9) },
+            ai::TagProposal { facet_key: "scene".into(), raw_name: "日落".into(), confidence: None },
+        ],
+        warnings: vec!["未知分面已归入 custom".into()],
+    };
+    let json = serde_json::to_string(&ar).unwrap();
+    let back: ai::AnalysisResult = serde_json::from_str(&json).unwrap();
+    assert_eq!(back, ar, "AnalysisResult 应无损往返");
+    // camelCase 契约
+    assert!(json.contains("\"facetKey\""), "{json}");
+    // 兼容分类视图
+    let cat = ar.to_categorized();
+    assert_eq!(cat.get("scene").unwrap(), &vec!["海边".to_string(), "日落".to_string()]);
+}
+
+/// A1：对象形态（{"t","c"}）解析 → typed proposals → items 落库 confidence=0.9。
+#[test]
+fn confidence_object_form_reaches_db() {
+    use bagertea_ai_media_v2_lib::services::ai_cloud::parse_media_analysis;
+    let c = mem();
+    let sug = f6_one_suggestion(&c);
+    let ma = parse_media_analysis(r#"{"scene":[{"t":"海边","c":0.9}]}"#, &["scene"], &[], &[]).unwrap();
+    assert_eq!(ma.tags.get("scene").unwrap(), &vec!["海边".to_string()], "对象形态不得丢标签（R0-3 回归）");
+    assert_eq!(ma.proposals.len(), 1);
+    assert_eq!(ma.proposals[0].raw_name, "海边");
+    let conf = ma.proposals[0].confidence.expect("对象形态应带置信度");
+    assert!((conf - 0.9).abs() < 1e-6, "置信度应落 0.9，实际 {conf}");
+    ai::set_suggestion_result_typed(&c, sug.id, &ma.tags, &ma.proposals, &ma.description).unwrap();
+    let items = ai::list_suggestion_items(&c, sug.id).unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].raw_name, "海边");
+    let dbc = items[0].confidence.expect("confidence 应落库");
+    assert!((dbc - 0.9).abs() < 1e-3, "item.confidence={dbc}");
+}
+
+/// A1：纯字符串形态仍是合法回退（confidence 落 NULL，不吞标签）。
+#[test]
+fn legacy_string_form_still_works() {
+    use bagertea_ai_media_v2_lib::services::ai_cloud::parse_media_analysis;
+    let c = mem();
+    let sug = f6_one_suggestion(&c);
+    let ma = parse_media_analysis(r#"{"scene":["海边","沙滩"]}"#, &["scene"], &[], &[]).unwrap();
+    assert_eq!(ma.tags.get("scene").unwrap(), &vec!["海边".to_string(), "沙滩".to_string()]);
+    assert!(ma.proposals.iter().all(|p| p.confidence.is_none()), "纯字符串无置信度");
+    ai::set_suggestion_result_typed(&c, sug.id, &ma.tags, &ma.proposals, &ma.description).unwrap();
+    let items = ai::list_suggestion_items(&c, sug.id).unwrap();
+    assert_eq!(items.len(), 2);
+    assert!(items.iter().all(|i| i.confidence.is_none()));
+}
+
+// ═══════════════ A2：AI 溯源（F1-g 列接线） ═══════════════
+
+/// A2：raw_response 逐字落库（含围栏/首尾空白，一行不动）；
+/// analysis_json 存 AnalysisResult 序列化且可往返。
+#[test]
+fn raw_response_stored_verbatim() {
+    use bagertea_ai_media_v2_lib::services::ai_cloud::parse_media_analysis;
+    let c = mem();
+    let sug = f6_one_suggestion(&c);
+    // 模拟模型原样返回：围栏 + 内部 JSON + 尾部空行。逐字 = 存储不得清洗/裁剪。
+    let raw = "```json\n{\"scene\":[{\"t\":\"海边\",\"c\":0.9}]}\n```\n\n";
+    let ma = parse_media_analysis(raw, &["scene"], &[], &[]).unwrap();
+    assert_eq!(ma.tags.get("scene").unwrap(), &vec!["海边".to_string()]);
+    // runner 顺序：先写 typed 结果，再补溯源
+    ai::set_suggestion_result_typed(&c, sug.id, &ma.tags, &ma.proposals, &ma.description).unwrap();
+    let analysis_json = serde_json::to_string(&ai::AnalysisResult {
+        description: ma.description.clone(),
+        proposals: ma.proposals.clone(),
+        warnings: ma.warnings.clone(),
+    })
+    .unwrap();
+    ai::set_suggestion_provenance(&c, sug.id, raw, &analysis_json).unwrap();
+    let (db_raw, db_analysis): (Option<String>, Option<String>) = c
+        .query_row(
+            "SELECT raw_response, analysis_json FROM ai_suggestions WHERE id = ?1",
+            [sug.id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(db_raw.as_deref(), Some(raw), "raw_response 必须逐字存储");
+    assert_eq!(
+        db_analysis.as_deref(),
+        Some(analysis_json.as_str()),
+        "analysis_json 不得被改写"
+    );
+    // analysis_json 可无损往返回 AnalysisResult
+    let back: ai::AnalysisResult =
+        serde_json::from_str(db_analysis.unwrap().as_str()).unwrap();
+    assert_eq!(back.description, ma.description);
+    assert_eq!(back.proposals.len(), 1);
+    let conf = back.proposals[0].confidence.expect("对象形态应带置信度");
+    assert!((conf - 0.9).abs() < 1e-6, "analysis_json 置信度应保真，实际 {conf}");
+}
+
+/// A2：请求配置 hash —— 同输入同 hash（16 位），改任一项（模型/maxTokens/system）则变。
+#[test]
+fn request_config_hash_is_stable() {
+    use bagertea_ai_media_v2_lib::db::tag_facets::FacetPromptContext;
+    use bagertea_ai_media_v2_lib::services::ai_cloud::{
+        build_batch_request_config, stable_config_hash,
+    };
+    let facets = [FacetPromptContext {
+        key: "scene".into(),
+        display_name: "场景".into(),
+        description: "画面场景".into(),
+        selection_mode: "multi".into(),
+        max_items: Some(3),
+    }];
+    let top = vec![("scene".to_string(), "海边/森林/室内".to_string())];
+    let h = |sys: &str, model: &str, max_tokens: i64| {
+        stable_config_hash(&build_batch_request_config(
+            sys, &facets, &top, model, "image", max_tokens, true,
+        ))
+    };
+    let base = h("你是打标助手", "qwen2.5-vl", 1180);
+    assert_eq!(base.len(), 16, "sha256 前 16 位 hex");
+    assert_eq!(base, h("你是打标助手", "qwen2.5-vl", 1180), "同输入必须同 hash");
+    assert_ne!(base, h("你是打标助手", "qwen2.5-vl-7b", 1180), "改模型必须变");
+    assert_ne!(base, h("你是打标助手", "qwen2.5-vl", 2048), "改 maxTokens 必须变");
+    assert_ne!(base, h("你是打标助手（覆盖版）", "qwen2.5-vl", 1180), "改 system 段必须变");
+}
+
+/// A2：request_config_json 六项全在 —— 顶层字段 + facets 每项六字段（key/displayName/
+/// description/selectionMode/maxItems/appliesTo）+ 忠实记录 system 段与模型参数。
+#[test]
+fn request_config_json_contains_all_inputs() {
+    use bagertea_ai_media_v2_lib::db::tag_facets::FacetPromptContext;
+    use bagertea_ai_media_v2_lib::services::ai_cloud::{
+        build_batch_request_config, PROMPT_VERSION,
+    };
+    let facets = [FacetPromptContext {
+        key: "scene".into(),
+        display_name: "场景".into(),
+        description: "画面的地理或场景".into(),
+        selection_mode: "multi".into(),
+        max_items: Some(3),
+    }];
+    let top = vec![("scene".to_string(), "海边/森林/室内".to_string())];
+    let cfg = build_batch_request_config(
+        "你是图片打标助手（用户覆盖版）",
+        &facets,
+        &top,
+        "qwen2.5-vl",
+        "image",
+        1180,
+        true,
+    );
+    let o = cfg.as_object().expect("配置应为对象");
+    assert_eq!(o["promptVersion"], serde_json::json!(PROMPT_VERSION), "带提示词版本");
+    assert_eq!(
+        o["systemPrompt"],
+        serde_json::json!("你是图片打标助手（用户覆盖版）"),
+        "必须含完整 system 段（含用户覆盖）"
+    );
+    assert_eq!(o["mediaKind"], serde_json::json!("image"));
+    // facets[0] 六字段齐
+    let f0 = o["facets"]
+        .as_array()
+        .and_then(|a| a.first())
+        .expect("facets 非空");
+    for k in ["key", "displayName", "description", "selectionMode", "maxItems", "appliesTo"] {
+        assert!(f0.get(k).is_some(), "facets[0] 缺输入字段 {k}");
+    }
+    assert_eq!(f0["key"], serde_json::json!("scene"));
+    assert_eq!(f0["displayName"], serde_json::json!("场景"));
+    assert_eq!(f0["maxItems"], serde_json::json!(3));
+    // topTagsSnapshot 带候选词快照
+    assert_eq!(
+        o["topTagsSnapshot"][0]["words"],
+        serde_json::json!("海边/森林/室内")
+    );
+    // modelParams：模型与 token 上限；本地档案记录 responseFormat/keepAlive
+    assert_eq!(o["modelParams"]["model"], serde_json::json!("qwen2.5-vl"));
+    assert_eq!(o["modelParams"]["maxTokens"], serde_json::json!(1180));
+    assert_eq!(
+        o["modelParams"]["responseFormat"],
+        serde_json::json!("json_object")
+    );
+    // imagePreprocess 三字段
+    let pre = &o["imagePreprocess"];
+    for k in ["maxPx", "format", "quality"] {
+        assert!(pre.get(k).is_some(), "imagePreprocess 缺 {k}");
+    }
+}
+
+/// A2：旧行（溯源列 NULL / schema 默认 1）仍可被老读者正常读取 —— ALTER 加列不破坏兼容。
+#[test]
+fn schema_version_allows_old_data() {
+    let c = mem();
+    let sug = f6_one_suggestion(&c);
+    // f6_one_suggestion 走 create_batch 的 INSERT —— 未列出溯源列，正是「旧版本写入形态」：
+    // ALTER 默认补 raw_response NULL / analysis_json NULL / analysis_schema_version 1。
+    let ver: i64 = c
+        .query_row(
+            "SELECT analysis_schema_version FROM ai_suggestions WHERE id = ?1",
+            [sug.id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(ver, 1, "旧行 analysis_schema_version 应为默认 1");
+    let nulls: i64 = c
+        .query_row(
+            "SELECT COUNT(*) FROM ai_suggestions WHERE id = ?1 AND raw_response IS NULL AND analysis_json IS NULL",
+            [sug.id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(nulls, 1, "旧行溯源列为 NULL（未写不报错）");
+    // 老读者（list_suggestions / suggestion_from_row）不受新列影响
+    assert_eq!(ai::list_suggestions(&c, sug.batch_id).unwrap().len(), 1);
+    // 新路径写入后 schema 版本仍为 1（无跳版）
+    ai::set_suggestion_provenance(&c, sug.id, "{\"scene\":[]}", "{}").unwrap();
+    let ver2: i64 = c
+        .query_row(
+            "SELECT analysis_schema_version FROM ai_suggestions WHERE id = ?1",
+            [sug.id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(ver2, 1);
+}

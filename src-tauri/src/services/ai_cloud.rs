@@ -18,6 +18,84 @@ use crate::db::{
     assets,
     settings::{AiSettings, ApiProfile},
 };
+
+/// A2：提示词版本（手工维护常量）—— 改提示词时必须递增，随 request_config 一起落库溯源。
+pub const PROMPT_VERSION: &str = "w5a-2026-09";
+
+/// A2：请求配置的稳定序列化（递归按键排序）后 sha256 前 16 位 hex。
+/// 同输入同 hash、改任一项则变（request_config_hash_is_stable 守护）。
+pub fn stable_config_hash(v: &serde_json::Value) -> String {
+    use sha2::{Digest, Sha256};
+    // 稳定序列化：对象键排序（serde_json 在 preserve_order 特性下保持插入序，
+    // 不做显式排序的话同内容不同构建序会得到不同 hash）
+    fn canon(v: &serde_json::Value) -> serde_json::Value {
+        match v {
+            serde_json::Value::Object(m) => {
+                let mut sorted: Vec<(String, serde_json::Value)> = m
+                    .iter()
+                    .map(|(k, val)| (k.clone(), canon(val)))
+                    .collect();
+                sorted.sort_by(|a, b| a.0.cmp(&b.0));
+                serde_json::Value::Object(sorted.into_iter().collect())
+            }
+            serde_json::Value::Array(a) => {
+                serde_json::Value::Array(a.iter().map(canon).collect())
+            }
+            other => other.clone(),
+        }
+    }
+    let canonical = serde_json::to_string(&canon(v)).unwrap_or_default();
+    let mut hasher = Sha256::new();
+    hasher.update(canonical.as_bytes());
+    let out = hasher.finalize();
+    out.iter().take(8).map(|b| format!("{b:02x}")).collect()
+}
+
+/// A2：批次请求配置（溯源用，六项）—— promptVersion / systemPrompt / facets /
+/// topTagsSnapshot / modelParams / mediaKind / imagePreprocess。model = 激活档案模型。
+pub fn build_batch_request_config(
+    system_prompt: &str,
+    facets: &[FacetPromptContext],
+    top_tags: &[(String, String)],
+    model: &str,
+    media_kind: &str,
+    max_tokens: i64,
+    is_local: bool,
+) -> serde_json::Value {
+    let facet_items: Vec<serde_json::Value> = facets
+        .iter()
+        .map(|f| {
+            serde_json::json!({
+                "key": f.key,
+                "displayName": f.display_name,
+                "description": f.description,
+                "selectionMode": f.selection_mode,
+                "maxItems": f.max_items,
+                "appliesTo": "all",
+            })
+        })
+        .collect();
+    let tag_items: Vec<serde_json::Value> = top_tags
+        .iter()
+        .map(|(facet, words)| serde_json::json!({ "facet": facet, "words": words }))
+        .collect();
+    // modelParams 忠实记录实际发出的请求：response_format json_object 与 keep_alive
+    // 仅本地档案会附加（见 request_analysis 两个协议分支），云端按服务商而定不记录。
+    let mut model_params = serde_json::json!({ "model": model, "maxTokens": max_tokens });
+    if is_local {
+        model_params["responseFormat"] = serde_json::json!("json_object");
+        model_params["keepAlive"] = serde_json::json!("5m");
+    }
+    serde_json::json!({
+        "promptVersion": PROMPT_VERSION,
+        "systemPrompt": system_prompt,
+        "facets": facet_items,
+        "topTagsSnapshot": tag_items,
+        "modelParams": model_params,
+        "mediaKind": media_kind,
+        "imagePreprocess": { "maxPx": 1024, "format": "jpeg", "quality": 85 },
+    })
+}
 use crate::error::{AppError, AppResult};
 
 #[derive(Debug, Clone, Serialize)]
@@ -29,13 +107,24 @@ pub struct AiProgress {
     pub current_asset_id: i64,
 }
 
-/// FB5-05（§7.4）：AI 分析结果 = 一句话描述 + 分类标签。
+/// FB5-05（§7.4）+ A1：AI 分析结果 = 一句话描述 + 分类标签 + 强类型提议。
 /// 描述为空但标签非空 / 标签为空但描述非空，都算一次有效分析。
 #[derive(Debug, Clone, Default)]
 pub struct MediaAnalysis {
     /// 画面内容的一句话中文描述（已规范化，最多 20 Unicode 字符；可为空）
     pub description: String,
     pub tags: CategorizedTags,
+    /// A1：typed 提议（facet_key/raw_name/confidence）——与 tags 对齐（同序、同裁剪）。
+    /// 纯字符串回退时 confidence=None。
+    pub proposals: Vec<ai::TagProposal>,
+    /// A2：解析层告警（未知分面 key 等），随 AnalysisResult 的 analysis_json 一并落库溯源。
+    pub warnings: Vec<String>,
+    /// A2：该次请求的模型原始返回（逐字存储，不做任何清洗/剥围栏）
+    pub raw_response: String,
+    /// A2：该次请求的配置 JSON（溯源；批次级另存 request_config_json）
+    pub request_config_json: Option<String>,
+    /// A2：AnalysisResult 的序列化（desc + proposals + warnings）
+    pub analysis_json: Option<String>,
 }
 
 /// 按分面组装提示词（P1B + C-3）：使用稳定英文 facetKey 作为 JSON 键，中文显示名仅作说明；
@@ -58,10 +147,9 @@ fn build_system_prompt() -> String {
     sys.push_str("- 一个标签只归入一个分面；\n");
     sys.push_str("- 多值如实输出：一张图既是「海边」又是「日落」时，scene 里两个都写，不要只挑一个；\n");
     sys.push_str("- 用户给出候选词时，含义相同必须用已有词，不要造近义词（已有「海边」就不要写「海滨」）。\n");
-    // W5a（a9）：置信度内联（审核界面 <0.5 标红；纯字符串仍是合法回退）
-    // R0-3：P0-3（confidence 吞标签）正解在 A1 的强类型改造，在那之前让模型
-    // 不输出对象形式，问题即消失。A1 完成后再取消注释。
-    // sys.push_str("- 标签可带置信度：写成 {\"t\":\"标签\",\"c\":0.9}（c 为 0 到 1 的数字；纯字符串也接受）。\n");
+    // W5a（a9）+ A1：置信度强类型协议 —— 标签可带置信度，写成 {"t":"标签","c":0.9}
+    // （c 为 0 到 1 的数字；纯字符串仍是合法回退）。A1 起解析层强类型处理，不再吞标签。
+    sys.push_str("- 标签可带置信度：写成 {\"t\":\"标签\",\"c\":0.9}（c 为 0 到 1 的数字；纯字符串也接受）。\n");
     sys
 }
 
@@ -119,6 +207,112 @@ fn dynamic_max_tokens(facet_count: usize) -> i64 {
     (300 + 120 * facet_count as i64).clamp(500, 1600)
 }
 
+/// 数组元素 → 标签名（A1：支持纯字符串 与 {"t":"标签","c":0.9} 对象两种形态；对象取 t）。
+/// 置信度由调用方在 typed 路径单独取（parse_media_analysis 的 proposals）。
+fn elem_name(v: &serde_json::Value) -> Option<String> {
+    match v {
+        serde_json::Value::String(s) => {
+            let t = s.trim().to_string();
+            if t.is_empty() { None } else { Some(t) }
+        }
+        serde_json::Value::Object(o) => o
+            .get("t")
+            .and_then(|t| t.as_str())
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty()),
+        _ => None,
+    }
+}
+
+/// A1：数组元素 → (标签名, 置信度)。纯字符串 / {"t","c"} 对象 / 内联对象字符串都接受。
+fn elem_name_conf(v: &serde_json::Value) -> (String, Option<f32>) {
+    match v {
+        serde_json::Value::String(s) => {
+            let t = s.trim();
+            // 兼容旧协议把 {"t","c"} 整个塞成字符串元素
+            if let Ok(inner) = serde_json::from_str::<serde_json::Value>(t) {
+                if let Some(o) = inner.as_object() {
+                    if let Some(name) = o.get("t").and_then(|x| x.as_str()).map(|x| x.trim().to_string()) {
+                        if !name.is_empty() {
+                            let c = o.get("c").and_then(|x| x.as_f64()).map(|f| f.clamp(0.0, 1.0) as f32);
+                            return (name, c);
+                        }
+                    }
+                }
+            }
+            (t.to_string(), None)
+        }
+        serde_json::Value::Object(o) => {
+            let name = o.get("t").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
+            let c = o.get("c").and_then(|x| x.as_f64()).map(|f| f.clamp(0.0, 1.0) as f32);
+            (name, c)
+        }
+        _ => (String::new(), None),
+    }
+}
+
+/// A1：与 parse_categorized_checked_ex 一致的「正向」分面 key 解析（不含 manual/停用分支——
+/// 那些 label 本就不会出现在最终 tags 里）。
+fn resolve_label_key(label: &str, valid_keys: &[&str]) -> Option<String> {
+    let t = label.trim();
+    let m = crate::db::tag_facets::key_for_legacy_name(t);
+    if valid_keys.contains(&t) {
+        Some(t.to_string())
+    } else if valid_keys.contains(&m) {
+        Some(m.to_string())
+    } else if m == "custom" {
+        Some("custom".to_string())
+    } else {
+        None
+    }
+}
+
+/// A1：从 tags JSON 内容里为最终（已裁剪）标签补置信度 → typed 提议。
+/// 按「label 解析到的分面 key == 目标 key 且元素名一致」匹配（跨分面同名不会串）。
+fn collect_proposals(tags_content: &str, tags: &CategorizedTags, valid_keys: &[&str]) -> Vec<ai::TagProposal> {
+    let mut proposals = Vec::new();
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(tags_content) else {
+        return proposals;
+    };
+    let Some(obj) = v.as_object() else {
+        return proposals;
+    };
+    // label → (元素名, 置信度) 原始表
+    let mut raw: Vec<(String, Vec<(String, Option<f32>)>)> = Vec::new();
+    for (label, val) in obj {
+        if let Some(key) = resolve_label_key(label, valid_keys) {
+            let elems: Vec<(String, Option<f32>)> = match val {
+                serde_json::Value::Array(arr) => arr.iter().map(elem_name_conf).collect(),
+                serde_json::Value::String(s) => vec![(s.trim().to_string(), None)],
+                _ => Vec::new(),
+            };
+            raw.push((key, elems));
+        }
+    }
+    for (key, names) in tags {
+        for name in names {
+            let mut conf: Option<f32> = None;
+            'outer: for (raw_key, elems) in &raw {
+                if raw_key != key {
+                    continue;
+                }
+                for (ename, c) in elems {
+                    if ename == name {
+                        conf = *c;
+                        break 'outer;
+                    }
+                }
+            }
+            proposals.push(ai::TagProposal {
+                facet_key: key.clone(),
+                raw_name: name.clone(),
+                confidence: conf,
+            });
+        }
+    }
+    proposals
+}
+
 /// 从模型回复中提取分类标签对象（宽容：先整串 JSON，再退化找 {...} 片段；旧扁平数组收进「未分类」）
 pub fn parse_categorized(content: &str) -> CategorizedTags {
     let trimmed = content.trim();
@@ -134,15 +328,11 @@ pub fn parse_categorized(content: &str) -> CategorizedTags {
     if let Some(obj) = v.as_object() {
         for (k, val) in obj {
             let tags: Vec<String> = match val {
-                serde_json::Value::Array(arr) => arr
-                    .iter()
-                    .filter_map(|t| t.as_str().map(String::from))
-                    .collect(),
-                serde_json::Value::String(s) => vec![s.clone()],
+                serde_json::Value::Array(arr) => arr.iter().filter_map(elem_name).collect(),
+                serde_json::Value::String(s) => vec![s.trim().to_string()],
                 _ => Vec::new(),
             }
             .into_iter()
-            .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty() && s.chars().count() <= 20)
             .take(5)
             .collect();
@@ -151,10 +341,7 @@ pub fn parse_categorized(content: &str) -> CategorizedTags {
             }
         }
     } else if let Some(arr) = v.as_array() {
-        let tags: Vec<String> = arr
-            .iter()
-            .filter_map(|t| t.as_str().map(String::from))
-            .collect();
+        let tags: Vec<String> = arr.iter().filter_map(elem_name).collect();
         if !tags.is_empty() {
             out.insert("未分类".to_string(), tags);
         }
@@ -412,7 +599,18 @@ pub fn parse_media_analysis(
             "模型未返回可解析的标签或描述（可能不支持图片输入或未按提示词输出 JSON）。模型原始返回：{shown}"
         )));
     }
-    Ok(MediaAnalysis { description, tags })
+    // A1：typed 提议（与 tags 同序同裁剪；纯字符串回退 confidence=None）
+    let proposals = collect_proposals(&tags_content, &tags, valid_keys);
+    Ok(MediaAnalysis {
+        description,
+        tags,
+        proposals,
+        warnings,
+        // A2 溯源字段由调用方（request_analysis 的 enrich）补写，纯解析层置空
+        raw_response: String::new(),
+        request_config_json: None,
+        analysis_json: None,
+    })
 }
 
 fn request_analysis(
@@ -460,6 +658,8 @@ fn request_analysis(
     let user = build_user_prompt(facets, top_tags);
     let max_tokens = dynamic_max_tokens(facets.len()); // a7：动态上限防 JSON 截断
     let base = cfg.base_url.trim_end_matches('/');
+    // A2 溯源用（fetch 闭包会 move 走 system，先 clone 一份）
+    let prov_system = system.clone();
 
     // 发起一次请求并取回模型文本回复（不同协议分支各自组包）
     let fetch: Box<dyn Fn() -> AppResult<String>> = if cfg.api_mode == "anthropic" {
@@ -540,8 +740,25 @@ fn request_analysis(
     let mut content = fetch()?;
     // C-4：有效分面 key 集合（稳定 facetKey），用于校验未知 key 并记录 warning
     let valid_keys: Vec<&str> = facets.iter().map(|f| f.key.as_str()).collect();
+    // A2：成功解析后补溯源（raw_response 逐字 + 请求配置 + analysis_json）
+    let enrich = |mut a: MediaAnalysis, used_content: String| -> MediaAnalysis {
+        a.raw_response = used_content;
+        a.request_config_json = Some(
+            build_batch_request_config(&prov_system, facets, top_tags, &cfg.model, "image", max_tokens, cfg.is_local())
+                .to_string(),
+        );
+        a.analysis_json = Some(
+            serde_json::to_string(&ai::AnalysisResult {
+                description: a.description.clone(),
+                proposals: a.proposals.clone(),
+                warnings: a.warnings.clone(),
+            })
+            .unwrap_or_default(),
+        );
+        a
+    };
     if let Ok(a) = parse_media_analysis(&content, &valid_keys, facets, manual_keys) {
-        return Ok(a);
+        return Ok(enrich(a, content));
     }
     // 本地档案失败自愈：任何解析失败（@@@@ 退化 / 乱码 / 答非所问）都先卸载重载一次再重试。
     // Ollama 长驻 runner 状态损坏会污染其后全部请求，卸载重载即恢复（ollama/ollama#8235/#17587 已验证）
@@ -549,7 +766,7 @@ fn request_analysis(
         unload_ollama_model(cfg);
         if let Ok(c) = fetch() {
             if let Ok(a) = parse_media_analysis(&c, &valid_keys, facets, manual_keys) {
-                return Ok(a);
+                return Ok(enrich(a, c));
             }
             content = c;
         }
@@ -562,7 +779,8 @@ fn request_analysis(
         }
     }
     // 非退化（模型正常回复但没按提示词输出 JSON）：保留原始错误信息便于定位
-    parse_media_analysis(&content, &valid_keys, facets, manual_keys)
+    let a = parse_media_analysis(&content, &valid_keys, facets, manual_keys)?;
+    Ok(enrich(a, content))
 }
 
 /// 从 Anthropic Messages 响应中取第一个 text 内容块
@@ -1243,6 +1461,12 @@ fn analyze_video_frames(
     Ok(MediaAnalysis {
         description,
         tags: merged,
+        proposals: Vec::new(),
+        warnings: Vec::new(),
+        // 视频合并路径：单帧溯源已被逐帧 enrich 捕获，合并结果不再重复存储
+        raw_response: String::new(),
+        request_config_json: None,
+        analysis_json: None,
     })
 }
 
@@ -1379,6 +1603,8 @@ pub fn run_cloud_batch<F: Fn(AiProgress)>(
     let mut processed = 0i64;
     // W5a（a12）：连续失败计数（成功清零；≥3 熔断）
     let mut consecutive_failures = 0u32;
+    // A2：批次级请求溯源只写一次（取本批首个成功请求的配置；视频帧合并不携带配置，等待后续成功项）
+    let mut batch_config_written = false;
     for chunk in todo.chunks(chunk_size) {
         for s in chunk {
             if cancel.load(Ordering::Relaxed) {
@@ -1402,7 +1628,34 @@ pub fn run_cloud_batch<F: Fn(AiProgress)>(
                     Ok(a) => {
                         // W5a（a12）：成功清零连续失败计数（单条内的退避重试不计入熔断）
                         consecutive_failures = 0;
-                        ai::set_suggestion_result(&conn, s.id, &a.tags, &a.description)?
+                        // A1：typed 写建议（confidence 经 proposals 落库）
+                        ai::set_suggestion_result_typed(&conn, s.id, &a.tags, &a.proposals, &a.description)?;
+                        // A2：逐字存模型原始返回 + AnalysisResult 序列化（analysis_schema_version 恒 1）
+                        ai::set_suggestion_provenance(
+                            &conn,
+                            s.id,
+                            &a.raw_response,
+                            a.analysis_json.as_deref().unwrap_or(""),
+                        )?;
+                        // A2：批次级溯源（prompt 版本 + 配置 JSON + 稳定 hash + 档案标识）——只写一次
+                        if !batch_config_written {
+                            if let Some(rcj) = &a.request_config_json {
+                                let cfg_val =
+                                    serde_json::from_str::<serde_json::Value>(rcj).unwrap_or_default();
+                                let hash = stable_config_hash(&cfg_val);
+                                ai::set_batch_provenance(
+                                    &conn,
+                                    batch_id,
+                                    &profile.model,
+                                    None,
+                                    &profile.id,
+                                    PROMPT_VERSION,
+                                    &hash,
+                                    rcj,
+                                )?;
+                                batch_config_written = true;
+                            }
+                        }
                     }
                     Err(e) => {
                         // 单条失败不阻塞批次：建议置 rejected 并记录空标签与失败原因（v6 详情落库）

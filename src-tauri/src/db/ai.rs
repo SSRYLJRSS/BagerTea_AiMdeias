@@ -9,6 +9,41 @@ use crate::error::AppResult;
 /// 分类标签：{ 分类名: [标签...] }（PRD 5.5；BTreeMap 保证序列化键序稳定）
 pub type CategorizedTags = std::collections::BTreeMap<String, Vec<String>>;
 
+/// A1：AI 打标的单条标签提议 —— 取代「往 Vec<String> 里塞 JSON 字符串」的隐式协议。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TagProposal {
+    /// 已经过 resolve_facet_key 归一的分面 key
+    pub facet_key: String,
+    /// 模型原始输出（未 normalize）
+    pub raw_name: String,
+    /// None = 模型未给
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f32>,
+}
+
+/// A1：单图分析结果（强类型）。warnings 回传前端（R2-1），不只进日志。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AnalysisResult {
+    pub description: String,
+    pub proposals: Vec<TagProposal>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+}
+
+/// A1：AnalysisResult → 传统 CategorizedTags（描述 + 标签树）。
+/// 仅兼容历史持久化/前端契约；新写入建议用 proposals 的 typed 语义。
+impl AnalysisResult {
+    pub fn to_categorized(&self) -> CategorizedTags {
+        let mut out = CategorizedTags::new();
+        for p in &self.proposals {
+            out.entry(p.facet_key.clone()).or_default().push(p.raw_name.clone());
+        }
+        out
+    }
+}
+
 /// 宽容解析历史数据：旧格式是扁平数组 → 收进「未分类」；新格式是分类对象
 pub fn parse_tags_json(raw: &str) -> CategorizedTags {
     let v: serde_json::Value = serde_json::from_str(raw).unwrap_or_default();
@@ -234,8 +269,36 @@ pub fn set_suggestion_result(
     Ok(())
 }
 
-/// 写/覆盖某条建议的 AI 候选标签（tagging_service 用，T05；描述由 set_suggestion_result 一并写）
+/// 写/覆盖某条建议的 AI 候选标签。
+/// A1：typed 收口 —— items 一律由 proposals 驱动（facet_key/raw_name/confidence 强类型，
+/// 名字字符串里不再二次解析 {"t","c"}，那是隐式协议的死代码，已删除）。
 pub fn set_suggestion_tags(conn: &Connection, id: i64, tags: &CategorizedTags) -> AppResult<()> {
+    // 兼容调用方：把 plain CategorizedTags 转成无置信度提议
+    let mut proposals = Vec::new();
+    for (category, names) in tags {
+        let (facet_key, _) = tag_facets::resolve_facet_key(conn, category)?;
+        for name in names {
+            let n = name.trim();
+            if n.is_empty() {
+                continue;
+            }
+            proposals.push(TagProposal {
+                facet_key: facet_key.clone(),
+                raw_name: n.to_string(),
+                confidence: None,
+            });
+        }
+    }
+    replace_suggestion_items(conn, id, tags, &proposals)
+}
+
+/// 公共 items 写入：suggested_tags JSON + 清空重建 items + tag_id 反查 + 近似提示（F6-b）+ confidence。
+fn replace_suggestion_items(
+    conn: &Connection,
+    id: i64,
+    tags: &CategorizedTags,
+    proposals: &[TagProposal],
+) -> AppResult<()> {
     conn.execute(
         "UPDATE ai_suggestions SET suggested_tags = ?1 WHERE id = ?2",
         rusqlite::params![serde_json::to_string(tags)?, id],
@@ -245,50 +308,100 @@ pub fn set_suggestion_tags(conn: &Connection, id: i64, tags: &CategorizedTags) -
         [id],
     )?;
     let now = chrono::Utc::now().timestamp_millis();
-    for (category, names) in tags {
-        let (facet_key, _resolved) = tag_facets::resolve_facet_key(conn, category)?;
-        for name in names {
-            // W5a（a9）：支持置信度内联格式 {"t":"标签","c":0.9}（纯字符串回退，提示词两种都允许）
-            let (raw, confidence): (String, Option<f64>) =
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(name.trim()) {
-                    let t = v.get("t").and_then(|t| t.as_str()).unwrap_or("").trim().to_string();
-                    let c = v.get("c").and_then(|c| c.as_f64());
-                    (t, c)
-                } else {
-                    (name.trim().to_string(), None)
-                };
-            if raw.is_empty() {
-                continue;
-            }
-            let normalized = tags::normalize_name(&raw);
-            // F3-a：tag_id 反查收敛到 find_by_term（mode=Alias）—— 消灭自写 SQL +
-            // ORDER BY t.is_system DESC 兜底；find_by_term 内部按 feature gate 走
-            // tag_terms（唯一索引保证最多一行）或旧表。
-            let mut decision_reason: Option<String> = None;
-            let tag_id: Option<i64> = tags::find_by_term(conn, &facet_key, &normalized, tags::TermMatch::Alias)
-                .ok()
-                .and_then(|l| l.hits.into_iter().next())
-                .map(|h| h.tag_id);
-            // F6-b：词表里没有精确命中 → 近似匹配「只提示，不自动改写」——
-            // 命中写入 decision_reason（tag_id 仍为 NULL，候选留在 ai_suggestion_items）
-            if tag_id.is_none() {
-                if let Some((_, owner, reason)) =
-                    tags::find_similar_tag(conn, &facet_key, &normalized)?
-                {
-                    decision_reason = Some(match reason {
-                        tags::SimilarReason::Substring => format!("疑似与「{owner}」重复"),
-                        tags::SimilarReason::Spell => format!("拼写相近：「{owner}」"),
-                    });
-                }
-            }
-            conn.execute(
-                "INSERT INTO ai_suggestion_items
-                 (suggestion_id, facet_key, raw_name, normalized_name, tag_id, confidence, decision, decision_reason, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, ?8)",
-                rusqlite::params![id, facet_key, raw, normalized, tag_id, confidence, decision_reason, now],
-            )?;
+    for p in proposals {
+        let raw = p.raw_name.trim();
+        if raw.is_empty() {
+            continue;
         }
+        let normalized = tags::normalize_name(raw);
+        // F3-a：tag_id 反查收敛到 find_by_term（mode=Alias）
+        let mut decision_reason: Option<String> = None;
+        let tag_id: Option<i64> = tags::find_by_term(conn, &p.facet_key, &normalized, tags::TermMatch::Alias)
+            .ok()
+            .and_then(|l| l.hits.into_iter().next())
+            .map(|h| h.tag_id);
+        // F6-b：词表里没有精确命中 → 近似匹配「只提示，不自动改写」
+        if tag_id.is_none() {
+            if let Some((_, owner, reason)) =
+                tags::find_similar_tag(conn, &p.facet_key, &normalized)?
+            {
+                decision_reason = Some(match reason {
+                    tags::SimilarReason::Substring => format!("疑似与「{owner}」重复"),
+                    tags::SimilarReason::Spell => format!("拼写相近：「{owner}」"),
+                });
+            }
+        }
+        let confidence = p.confidence.map(|c| c as f64);
+        conn.execute(
+            "INSERT INTO ai_suggestion_items
+             (suggestion_id, facet_key, raw_name, normalized_name, tag_id, confidence, decision, decision_reason, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, ?8)",
+            rusqlite::params![id, p.facet_key, raw, normalized, tag_id, confidence, decision_reason, now],
+        )?;
     }
+    Ok(())
+}
+
+/// A1：typed 版本的 set_suggestion_result（runner 用）——tags/描述照旧，confidence 走 proposals。
+pub fn set_suggestion_result_typed(
+    conn: &Connection,
+    id: i64,
+    tags: &CategorizedTags,
+    proposals: &[TagProposal],
+    description: &str,
+) -> AppResult<()> {
+    replace_suggestion_items(conn, id, tags, proposals)?;
+    conn.execute(
+        "UPDATE ai_suggestions SET suggested_description = ?1 WHERE id = ?2",
+        rusqlite::params![description, id],
+    )?;
+    Ok(())
+}
+
+/// A2：逐字写模型原始返回 + AnalysisResult 序列化（溯源；analysis_schema_version 恒 1，
+/// 旧行/旧版本默认 1，schema_version_allows_old_data 守护兼容）。
+pub fn set_suggestion_provenance(
+    conn: &Connection,
+    id: i64,
+    raw_response: &str,
+    analysis_json: &str,
+) -> AppResult<()> {
+    conn.execute(
+        "UPDATE ai_suggestions
+            SET raw_response = ?1, analysis_json = ?2, analysis_schema_version = 1
+          WHERE id = ?3",
+        rusqlite::params![raw_response, analysis_json, id],
+    )?;
+    Ok(())
+}
+
+/// A2：写批次级请求溯源（F1-g 列）——档案/模型标识 + 提示词版本 + 请求配置 JSON 及其稳定 hash。
+/// request_config_hash 由服务层对六项配置 JSON 做键排序稳定序列化后 sha256 前 16 位。
+pub fn set_batch_provenance(
+    conn: &Connection,
+    batch_id: i64,
+    model_id: &str,
+    model_version: Option<&str>,
+    profile_id: &str,
+    prompt_version: &str,
+    request_config_hash: &str,
+    request_config_json: &str,
+) -> AppResult<()> {
+    conn.execute(
+        "UPDATE ai_batches
+            SET model_id = ?1, model_version = ?2, profile_id = ?3,
+                prompt_version = ?4, request_config_hash = ?5, request_config_json = ?6
+          WHERE id = ?7",
+        rusqlite::params![
+            model_id,
+            model_version,
+            profile_id,
+            prompt_version,
+            request_config_hash,
+            request_config_json,
+            batch_id
+        ],
+    )?;
     Ok(())
 }
 
