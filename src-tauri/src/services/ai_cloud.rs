@@ -59,8 +59,9 @@ fn build_system_prompt() -> String {
     sys.push_str("- 多值如实输出：一张图既是「海边」又是「日落」时，scene 里两个都写，不要只挑一个；\n");
     sys.push_str("- 用户给出候选词时，含义相同必须用已有词，不要造近义词（已有「海边」就不要写「海滨」）。\n");
     // W5a（a9）：置信度内联（审核界面 <0.5 标红；纯字符串仍是合法回退）
-    sys.push_str("- 标签可带置信度：写成 {\"t\":\"标签\",\"c\":0.9}（c 为 0 到 1 的数字；纯字符串也接受）。
-");
+    // R0-3：P0-3（confidence 吞标签）正解在 A1 的强类型改造，在那之前让模型
+    // 不输出对象形式，问题即消失。A1 完成后再取消注释。
+    // sys.push_str("- 标签可带置信度：写成 {\"t\":\"标签\",\"c\":0.9}（c 为 0 到 1 的数字；纯字符串也接受）。\n");
     sys
 }
 
@@ -184,12 +185,15 @@ pub fn parse_categorized_checked_ex(
     for (k, list) in &raw {
         let trimmed = k.trim();
         let mapped = crate::db::tag_facets::key_for_legacy_name(trimmed);
-        // FB2-08（§14.3②）：已知稳定 key 但该分面已停用（如 color）→ 丢弃，比归 custom 更符合「停用」语义，
-        // 也避免 custom 分面被停用分面的标签污染。完全未知 key 仍归 custom（key_for_legacy_name 已映射为 custom）。
-        let target = if valid_keys.contains(&mapped) {
-            mapped.to_string()
-        } else if valid_keys.contains(&trimmed) {
+        // R0-3：先判「原样 key」—— 自建分面（如 clothing_color）必须原样走这条。
+        // 若先判 mapped，key_for_legacy_name 的 `_ => "custom"` 兜底会把任何自建 key
+        // 变成 "custom"，而 custom 又是 active + ai_and_manual，必然在 valid_keys 里，
+        // 导致自建分面在解析阶段就被整体旁路（resolve_facet_key 被跳过）。
+        // 语义对齐 resolve_facet_key：① 原样（自建分面）② 中文旧名 ③ 兜底/停用。
+        let target = if valid_keys.contains(&trimmed) {
             trimmed.to_string()
+        } else if valid_keys.contains(&mapped) {
+            mapped.to_string()
         } else if mapped == "custom" {
             warnings.push(format!(
                 "未知分面 key「{trimmed}」已归入自定义，建议改用稳定 facetKey"
@@ -1534,6 +1538,26 @@ mod tests {
         assert_eq!(tags.get("lighting").unwrap(), &vec!["黄昏".to_string()]);
         assert_eq!(tags.get("subject").unwrap(), &vec!["树".to_string()]);
         assert!(warnings.is_empty(), "已知中文 key 不应产生 warning");
+    }
+
+    /// R0-3：valid_keys 含 custom 时，自建分面 key（clothing_color）必须原样保留，
+    /// 不能被 key_for_legacy_name 的 `_ => "custom"` 兜底吞掉。
+    /// 真实配置里 custom 是 active + ai_and_manual，必然在 valid_keys 中 ——
+    /// 旧分支顺序（先判 mapped）恰好因此被整体旁路。
+    #[test]
+    fn custom_in_valid_keys_does_not_swallow_user_facet() {
+        let valid = ["subject", "scene", "custom", "clothing_color"];
+        let (tags, warnings) = super::parse_categorized_checked(
+            "{\"clothing_color\":[\"红色\"],\"subject\":[\"人\"]}",
+            &valid,
+        );
+        assert_eq!(
+            tags.get("clothing_color").unwrap(),
+            &vec!["红色".to_string()],
+            "自建分面 key 必须原样保留（R0-3）"
+        );
+        assert_eq!(tags.get("subject").unwrap(), &vec!["人".to_string()]);
+        assert!(warnings.is_empty(), "自建分面命中不应产生 warning：{:?}", warnings);
     }
 
     // FB2-08（§14.3② / §14.14）：color 分面停用后，模型返回 color/色彩 key → 丢弃 + warning，不落回 color 分面。

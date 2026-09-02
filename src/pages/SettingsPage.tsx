@@ -15,6 +15,7 @@ import {
   rescanAssetMetadata,
   rescanAssetPalette,
   rescanAssetPhash,
+  rescanImageDimensions,
   cancelMediaRefill,
   getPaletteStatus,
   type RefillProgress,
@@ -188,6 +189,35 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
       phashUnsub.current?.();
       phashUnsub.current = null;
       setPhashProgress(null);
+    }
+  };
+
+  // ── R1-2：图片宽高存量回填（RAW 分辨率修复；与其它回填共用互斥闸）──
+  const [dimRunning, setDimRunning] = useState(false);
+  const dimUnsub = useRef<(() => void) | null>(null);
+  const [dimProgress, setDimProgress] = useState<RefillProgress | null>(null);
+  const [dimResult, setDimResult] = useState<string | null>(null);
+  useEffect(() => () => dimUnsub.current?.(), []);
+
+  const onRescanDimensions = async (scope: "all" | "missing") => {
+    setDimRunning(true);
+    setDimResult(null);
+    setDimProgress(null);
+    on<RefillProgress>("media_refill://progress", (p) => setDimProgress(p))
+      .then((unsub) => {
+        dimUnsub.current = unsub;
+      })
+      .catch(() => undefined);
+    try {
+      const r = await rescanImageDimensions([], scope);
+      setDimResult(`宽高回填完成：总数 ${r.total}，成功 ${r.success}，跳过 ${r.skipped}，失败 ${r.failed}`);
+    } catch (e) {
+      setDimResult(e instanceof Error ? e.message : String(e));
+    } finally {
+      setDimRunning(false);
+      dimUnsub.current?.();
+      dimUnsub.current = null;
+      setDimProgress(null);
     }
   };
 
@@ -917,6 +947,38 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
               )}
               {phashResult && (
                 <p className="px-4 py-2 text-xs text-[var(--color-text-secondary)]">{phashResult}</p>
+              )}
+              {/* R1-2：图片宽高存量回填（命令已注册但此前前端不可达；与其余回填共用互斥闸） */}
+              <Field
+                label="图片宽高回填"
+                hint="重新探测图片/RAW 的宽高并写入素材记录（分辨率筛选用）。RAW 文件在导入时若分辨率探测失败会留下空宽高，这里只处理存量；新导入的已自动探测。只补缺失＝只处理还没有宽高的图片（快）；全部重算＝覆盖已有宽高（适合探测逻辑升级后）"
+              >
+                <div className="flex items-center gap-2">
+                  <Button disabled={dimRunning || phashRunning || paletteRunning || refilling} onClick={() => void onRescanDimensions("missing")}>
+                    只补缺失宽高
+                  </Button>
+                  <Button disabled={dimRunning || phashRunning || paletteRunning || refilling} onClick={() => void onRescanDimensions("all")}>
+                    全部重算
+                  </Button>
+                  {dimRunning ? (
+                    <Button
+                      onClick={() => {
+                        void cancelMediaRefill().catch(() => undefined);
+                        setDimResult("正在取消…");
+                      }}
+                    >
+                      取消
+                    </Button>
+                  ) : null}
+                </div>
+              </Field>
+              {dimProgress && dimRunning && (
+                <p className="px-4 py-2 text-xs text-[var(--color-text-secondary)]">
+                  宽高回填中 {dimProgress.done}/{dimProgress.total}（成功 {dimProgress.success} · 跳过 {dimProgress.skipped} · 失败 {dimProgress.failed}）
+                </p>
+              )}
+              {dimResult && (
+                <p className="px-4 py-2 text-xs text-[var(--color-text-secondary)]">{dimResult}</p>
               )}
               <Field
                 label="视频代理缓存"

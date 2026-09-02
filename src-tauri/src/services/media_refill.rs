@@ -344,9 +344,9 @@ pub fn rescan_assets_geo_taken_with(
             emit_progress(&mut on_progress, i + 1, &summary, id);
             continue;
         };
-        let is_video = asset.mime_type.starts_with("video/");
+        // R0-2：图片也要补 taken_at（JPG 解析修复前存量全空）
         let need_geo = asset.latitude.is_none();
-        let need_taken = is_video && asset.taken_at.is_none();
+        let need_taken = asset.taken_at.is_none();
         // 已齐全：不再探测（只补空语义）
         if !need_geo && !need_taken {
             summary.skipped += 1;

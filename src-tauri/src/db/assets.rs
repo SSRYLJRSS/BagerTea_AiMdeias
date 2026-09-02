@@ -1162,12 +1162,13 @@ pub fn list_video_ids(conn: &Connection) -> AppResult<Vec<i64>> {
 }
 
 /// 列出缺 GPS 定位 / 拍摄时间的素材 id（定位回填 scope=missing）：
-/// 图片缺 latitude；或视频缺 latitude / taken_at（两者任一缺失即需补）。
+/// 图片缺 latitude / taken_at（R0-2：JPG 拍摄时间解析修复前全部为空，需补）；
+/// 视频缺 latitude / taken_at（两者任一缺失即需补）。
 pub fn list_ids_needing_geo_taken(conn: &Connection) -> AppResult<Vec<i64>> {
     let mut stmt = conn.prepare(
         "SELECT id FROM assets
           WHERE deleted_at IS NULL
-            AND ((mime_type LIKE 'image/%' AND latitude IS NULL)
+            AND ((mime_type LIKE 'image/%' AND (latitude IS NULL OR taken_at IS NULL))
               OR (mime_type LIKE 'video/%' AND (latitude IS NULL OR taken_at IS NULL)))",
     )?;
     let rows = stmt.query_map([], |r| r.get(0))?;
@@ -1712,7 +1713,8 @@ mod tests {
 
     // ── GPS 定位 / 拍摄时间回填辅助 ──
 
-    /// list_ids_needing_geo_taken：图片缺定位 / 视频缺定位或缺 taken_at 才入选。
+    /// list_ids_needing_geo_taken：图片缺定位 / 缺拍摄时间 / 视频缺定位或缺 taken_at 才入选。
+    /// R0-2：图片分支加 taken_at IS NULL —— JPG 解析修复前存量 taken_at 全空必须能入选。
     #[test]
     fn list_ids_needing_geo_taken_selection() {
         let c = mem();
@@ -1726,9 +1728,23 @@ mod tests {
 
         let ids = list_ids_needing_geo_taken(&c).unwrap();
         assert!(ids.contains(&img_no_geo), "图片缺定位应入选");
-        assert!(!ids.contains(&img_geo), "图片已有定位不入选");
+        assert!(ids.contains(&img_geo), "图片有定位但缺 taken_at 应入选（R0-2）");
         assert!(ids.contains(&vid_no_taken), "视频缺 taken_at 应入选");
         assert!(!ids.contains(&vid_full), "视频定位+时间齐全不入选");
+    }
+
+    /// R0-2 新增：图片已有定位但缺 taken_at 也应入选（解析修复前存量全空）。
+    #[test]
+    fn geo_taken_backfill_selects_image_missing_taken_at() {
+        let c = mem();
+        let img_no_taken = ins(&c, "/i3.jpg", "image/jpeg");
+        let img_full = ins(&c, "/i4.jpg", "image/jpeg");
+        set_geo_taken(&c, img_no_taken, Some(30.25), Some(120.16), None).unwrap();
+        set_geo_taken(&c, img_full, Some(30.25), Some(120.16), Some(1_710_484_200_000)).unwrap();
+
+        let ids = list_ids_needing_geo_taken(&c).unwrap();
+        assert!(ids.contains(&img_no_taken), "图片有定位但缺 taken_at 应入选（R0-2）");
+        assert!(!ids.contains(&img_full), "图片定位+时间齐全不入选");
     }
 
     /// set_geo_taken 只补空不覆盖：已有值传新值也不变，空值被补上。

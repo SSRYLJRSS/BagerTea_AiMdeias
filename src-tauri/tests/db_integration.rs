@@ -1759,7 +1759,9 @@ fn user_created_facet_full_pipeline() -> AppResult<()> {
         ctx.iter().map(|f| f.key.clone()).collect::<Vec<_>>()
     );
 
-    // ③ 模拟 AI 返回 {"clothing_color":["红色"]}，确认建议
+    // ③ 模拟 AI 返回 {"clothing_color":["红色"]}，走真实解析函数（R0-3：
+    // 旧测试用 serde_json::from_str::<CategorizedTags> 直接反序列化，跳过
+    // parse_categorized_checked_ex —— 正是它漏掉了「自建 key 被 custom 吞掉」的 bug）
     let id = add_asset(&conn, "d:/p/dress.jpg", "dress.jpg", "jpg", "image/jpeg");
     let batch = ai::create_batch(&conn, &[id], "cloud")?;
     let sid: i64 = conn.query_row(
@@ -1767,9 +1769,19 @@ fn user_created_facet_full_pipeline() -> AppResult<()> {
         [batch.id],
         |r| r.get(0),
     )?;
-    let tags: bagertea_ai_media_v2_lib::db::ai::CategorizedTags =
-        serde_json::from_str(r#"{"clothing_color":["红色"]}"#)?;
-    ai::confirm_suggestion(&conn, sid, &tags)?;
+    let valid_keys: Vec<&str> = ctx.iter().map(|f| f.key.as_str()).collect();
+    let analysis = bagertea_ai_media_v2_lib::services::ai_cloud::parse_media_analysis(
+        r#"{"description":"红裙","tags":{"clothing_color":["红色"]}}"#,
+        &valid_keys,
+        &ctx,
+        &[],
+    )?;
+    assert!(
+        analysis.tags.contains_key("clothing_color"),
+        "自建分面 key 必须原样保留：{:?}",
+        analysis.tags.keys().collect::<Vec<_>>()
+    );
+    ai::confirm_suggestion(&conn, sid, &analysis.tags)?;
 
     // ④ 标签 facet_key == clothing_color（不是 custom！旧代码这里全落 custom）
     let facet: String = conn.query_row(
@@ -1786,10 +1798,9 @@ fn user_created_facet_full_pipeline() -> AppResult<()> {
         "list_by_facet 应能查到「红色」"
     );
 
-    // ⑥ 删分面后残留为 0（W2-3 的级联删除；此处先按现有能力验证 tags/asset_tags 清空）
-    conn.execute("DELETE FROM asset_tags WHERE tag_id IN (SELECT id FROM tags WHERE facet_key='clothing_color')", [])?;
-    conn.execute("DELETE FROM tags WHERE facet_key='clothing_color'", [])?;
-    conn.execute("DELETE FROM tag_facets WHERE key='clothing_color'", [])?;
+    // ⑥ 删分面后残留为 0（W2-3 的级联删除；走真实 delete_facet 命令）
+    let report = tag_facets::delete_facet(&conn, "clothing_color")?;
+    assert!(report.tags_deleted >= 1, "删除报告应含被删标签数: {:?}", report);
     let leftover: i64 = conn.query_row(
         "SELECT COUNT(*) FROM tags WHERE facet_key='clothing_color'",
         [],

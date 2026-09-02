@@ -80,7 +80,9 @@ fn fatal_db_error(db_path: &std::path::Path, logs_dir: &std::path::Path, e: &App
         .set_description(&msg)
         .show();
     eprintln!("{msg}");
-    panic!("{msg}");
+    // R0-6：正常退出而非 panic —— panic 会留下堆栈与「已崩溃」的误导信号，
+    // 弹窗已经给了用户可见出路，进程干净退出即可。
+    std::process::exit(1);
 }
 
 /// 具名后台线程：setup 中的非关键维护任务统一入口。

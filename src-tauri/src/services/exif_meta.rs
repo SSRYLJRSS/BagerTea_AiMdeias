@@ -44,9 +44,14 @@ fn num(ex: &Exif, tag: Tag) -> Option<f64> {
     }
 }
 
-/// "2024:03:15 14:30:00" → 本地时区毫秒时间戳
+/// "2024:03:15 14:30:00" → 本地时区毫秒时间戳。
+/// kamadak-exif 的 display_value() 对 DateTimeOriginal 输出短横线（"2026-07-27 15:01:04"），
+/// 但原始字节层是冒号分隔 —— 两种都要收（R0-1，实测 JPG 0/205 全 NULL 的根因）。
 pub fn parse_exif_datetime(s: &str) -> Option<i64> {
-    let naive = chrono::NaiveDateTime::parse_from_str(s.trim(), "%Y:%m:%d %H:%M:%S").ok()?;
+    let trimmed = s.trim();
+    let naive = chrono::NaiveDateTime::parse_from_str(trimmed, "%Y:%m:%d %H:%M:%S")
+        .or_else(|_| chrono::NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%d %H:%M:%S"))
+        .ok()?;
     Some(
         chrono::Local
             .from_local_datetime(&naive)
@@ -243,6 +248,40 @@ mod tests {
                 .to_string(),
             "2024:03:15 14:30:00"
         );
+    }
+
+    /// R0-1：kamadak-exif 的 display_value() 输出短横线格式（"2026-07-27 15:01:04"），
+    /// 原始字节层是冒号格式 —— 两种都必须解析且得到同一时刻。
+    #[test]
+    fn exif_datetime_accepts_both_formats() {
+        let colon = parse_exif_datetime("2026:07:27 15:01:04");
+        let dash = parse_exif_datetime("2026-07-27 15:01:04");
+        assert!(colon.is_some(), "冒号格式应可解析（实测数据字节层是冒号）");
+        assert!(dash.is_some(), "短横线格式应可解析（kamadak display_value 输出）");
+        assert_eq!(colon, dash, "同一时刻两种写法应得到相同时间戳");
+    }
+
+    /// R0-1 关键：用真实 JPG 样本走完整 extract(path) 路径断言 taken_at 非空。
+    /// 只测纯函数正是漏了三个月的原因 —— display_value() 的输出格式才是真实输入。
+    #[test]
+    fn extract_reads_taken_at_from_real_jpeg() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/camera_sample.jpg");
+        assert!(path.exists(), "fixture 缺失: {}", path.display());
+        let data = extract(&path);
+        assert!(
+            data.taken_at.is_some(),
+            "真实 JPG 应解析出 taken_at（当前 None = 格式解析回归）"
+        );
+    }
+
+    /// R0-1 回归锚点：raw_fallback（RW2 等 RAW）的 taken_at 走 parse_exif_datetime，
+    /// 输入是 rawler 的原始字符串（冒号分隔）。断言该格式仍被接受，
+    /// 防止未来把冒号分支删掉导致 RAW 路径回归。
+    #[test]
+    fn raw_fallback_still_reads_taken_at() {
+        let ts = parse_exif_datetime("2026:07:27 15:01:04");
+        assert!(ts.is_some(), "raw_fallback 依赖冒号格式仍可解析");
     }
 
     #[test]

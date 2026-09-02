@@ -80,6 +80,7 @@ vi.mock("@/api/assets", () => ({
   rescanAssetMetadata: assetMocks.rescanAssetMetadata,
   rescanAssetPalette: assetMocks.rescanAssetPalette,
   rescanAssetPhash: vi.fn().mockResolvedValue({ total: 0, success: 0, failed: 0, skipped: 0 }),
+  rescanImageDimensions: vi.fn().mockResolvedValue({ total: 0, success: 0, failed: 0, skipped: 0 }),
   cancelMediaRefill: assetMocks.cancelMediaRefill,
   getPaletteStatus: assetMocks.getPaletteStatus,
 }));
@@ -329,6 +330,22 @@ describe("SettingsPage 加载与 Hook 安全", () => {
 
     await waitFor(() => expect(rescanAssetMetadata).toHaveBeenCalledWith([], "missing"));
     await waitFor(() => expect(screen.getByText(/回填完成：总数 2，成功 2/)).toBeInTheDocument());
+  });
+
+  it("R1-2 settingsPage_has_dimension_backfill_button：「数据与缓存」提供「图片宽高回填」入口，点「只补缺失宽高」调用 rescanImageDimensions", async () => {
+    const { rescanImageDimensions } = await import("@/api/assets");
+    vi.mocked(rescanImageDimensions).mockResolvedValue({ total: 3, success: 3, failed: 0, skipped: 0 });
+    useSettingsStore.setState({ settings: mkSettings(), loaded: true, loading: false, loadError: null });
+    render(<SettingsPage />);
+    await waitFor(() => expect(screen.getByText("保存设置")).toBeInTheDocument());
+
+    fireEvent.click(screen.getByText("数据与缓存"));
+    const btn = screen.getByRole("button", { name: "只补缺失宽高" });
+    expect(btn).toBeInTheDocument();
+    fireEvent.click(btn);
+
+    await waitFor(() => expect(rescanImageDimensions).toHaveBeenCalledWith([], "missing"));
+    await waitFor(() => expect(screen.getByText(/宽高回填完成：总数 3，成功 3/)).toBeInTheDocument());
   });
 });
 

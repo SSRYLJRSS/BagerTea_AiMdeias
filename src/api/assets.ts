@@ -146,3 +146,8 @@ export function scanDuplicatesSimilar(threshold: number, excludeKinship: boolean
 export function rescanAssetPhash(ids: number[] | null, scope: "all" | "missing" | "ids"): Promise<{ total: number; success: number; failed: number; skipped: number }> {
   return invoke("rescan_asset_phash", { ids, scope });
 }
+
+/** R1-2：图片宽高存量回填（RAW 分辨率修复；命令已注册但此前前端不可达） */
+export function rescanImageDimensions(ids: number[] | null, scope: "all" | "missing" | "ids"): Promise<{ total: number; success: number; failed: number; skipped: number }> {
+  return invoke("rescan_image_dimensions", { ids, scope });
+}

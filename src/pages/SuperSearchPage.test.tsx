@@ -104,6 +104,7 @@ beforeEach(() => {
   useSettingsStore.setState({ settings: null, previewAppearance: null });
   useSuperSearchStore.setState({
     query: { search: "", assetType: "all", untaggedOnly: false, facetFilters: [], excludeTagIds: [], metadataFilters: [], sortBy: "created_at", sortDir: "desc" },
+    expr: undefined,
     items: [],
     total: 0,
     loading: false,
@@ -201,8 +202,7 @@ describe("SuperSearchPage", () => {
   });
 
   describe("FB5-03 中央 Chevron 披露按钮（§3.5/§13.4）", () => {
-    it("披露按钮位于中央独立行，只显示 Chevron 图标（无旧文字按钮）", () => {
-      render(<SuperSearchPage />);
+    it("披露按钮位于中央独立行，只显示 Chevron 图标（无旧文字按钮）", () => {      render(<SuperSearchPage />);
       // 旧文字按钮不复存在
       expect(screen.queryByText(/展开详细条件 ⤵|收起 ⤴/)).not.toBeInTheDocument();
       // 中央披露按钮：仅图标（aria-label 驱动查询）

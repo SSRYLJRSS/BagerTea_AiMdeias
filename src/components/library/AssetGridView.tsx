@@ -36,6 +36,12 @@ export interface AssetGridViewProps extends LibraryGridActions {
   scrollRestoreKey?: string | null;
   /** FB2-08（§14.9）：点击卡片色条主色段以同色系搜索（LibraryPage/SuperSearchPage 提供） */
   onSearchDominant?: (segment: PaletteSegment) => void;
+  /** R0-5：空结果态用哪个筛选源。素材库缺省读 useLibraryStore.filter；
+   *  超级搜索传自身的条件态，否则会误显示「素材库还是空的 / 去导入素材」。 */
+  hasActiveFilter?: boolean;
+  /** R0-5：清除筛选按钮的回调。素材库缺省清 useLibraryStore.filter；
+   *  超级搜索传 clearConditions（否则按钮对超搜条件完全无效）。 */
+  onClearFilter?: () => void;
 }
 
 /** 批量操作入口（顶栏与右键菜单共用） */
@@ -66,6 +72,8 @@ export default function AssetGridView({
   scrollElementRef,
   scrollRestoreKey,
   onSearchDominant,
+  hasActiveFilter: hasActiveFilterProp,
+  onClearFilter,
 }: AssetGridViewProps) {
   const { selected, toggle, rangeTo, clear, setAll, invert } = useSelectionStore(
     useShallow((s) => ({
@@ -356,7 +364,9 @@ export default function AssetGridView({
   }, [selected]);
 
   // W5f-f1：当前是否带任何筛选/搜索条件（区分「库为空」与「筛选无结果」）
-  const hasActiveFilter = useLibraryStore((st) => {
+  // R0-5：超级搜索传自己的条件态（props），缺省才回退读素材库 store ——
+  // 否则超搜 0 结果会误显示「素材库还是空的 / 去导入素材」。
+  const storeHasFilter = useLibraryStore((st) => {
     const f = st.filter;
     return (
       f.assetType !== "all" ||
@@ -368,6 +378,7 @@ export default function AssetGridView({
       f.search.trim() !== ""
     );
   });
+  const hasActiveFilter = hasActiveFilterProp ?? storeHasFilter;
 
   const menuEntries = useMemo((): MenuEntry[] => {
     const common: MenuEntry[] = [
@@ -435,7 +446,11 @@ export default function AssetGridView({
               <span>没有符合条件的素材</span>
               <button
                 type="button"
-                onClick={() => useLibraryStore.getState().setFilter({ assetType: "all", untaggedOnly: false, tagId: null, facetFilters: [], excludeTagIds: [], metadataFilters: [], search: "" })}
+                onClick={() =>
+                  onClearFilter
+                    ? onClearFilter()
+                    : useLibraryStore.getState().setFilter({ assetType: "all", untaggedOnly: false, tagId: null, facetFilters: [], excludeTagIds: [], metadataFilters: [], search: "" })
+                }
                 className="rounded-md border border-[var(--color-border)] px-3 py-1.5 text-xs text-[var(--color-text-secondary)] hover:bg-[var(--color-surface)] hover:text-[var(--color-text)]"
               >
                 清除筛选条件

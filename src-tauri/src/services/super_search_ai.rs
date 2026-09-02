@@ -207,9 +207,11 @@ pub struct AiSearchParseResult {
 /// 本函数收到的 metadata 均视为合法（编译期兜底见 query_expr::validate_expr）。
 pub fn validate_intent(intent: &SearchIntentV2, facets: &[FacetPromptContext]) -> AppResult<()> {
     if let Some(sb) = &intent.sort_by {
+        // R0-4：三份排序白名单之一（assets.rs VALID_SORT / is_valid_sort_by 均含 rating），
+        // validate_intent 必须一致，否则 rating 排序被整单降级为关键词搜索。
         if !matches!(
             sb.as_str(),
-            "created_at" | "taken_at" | "modified_at" | "name" | "size" | "resolution"
+            "created_at" | "taken_at" | "modified_at" | "name" | "size" | "resolution" | "rating"
         ) {
             return Err(AppError::msg(format!("非法排序字段：{sb}")));
         }
@@ -1248,6 +1250,16 @@ mod tests {
         let mut i = SearchIntentV2::default();
         i.sort_by = Some("magic".into());
         assert!(validate_intent(&i, &[]).is_err());
+    }
+
+    /// R0-4：rating 是合法排序字段（assets.rs VALID_SORT 与 is_valid_sort_by 均含），
+    /// validate_intent 不得把它降级 —— 否则 rating 排序整个 intent 变关键词搜索。
+    #[test]
+    fn intent_with_rating_sort_is_not_degraded() {
+        let mut i = SearchIntentV2::default();
+        i.sort_by = Some("rating".into());
+        i.sort_dir = Some("desc".into());
+        assert!(validate_intent(&i, &[]).is_ok(), "rating 排序必须通过校验（R0-4）");
     }
 
     #[test]

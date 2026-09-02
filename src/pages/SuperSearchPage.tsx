@@ -28,7 +28,7 @@ import { dominantFiltersFor } from "@/utils/dominantFilter";
 type DialogKey = "delete" | "export" | "tags" | null;
 
 export default function SuperSearchPage() {
-  const { refresh, error, total, loading, items, loadMore, fetchAllIds, applyAiSearch, query, setQuery } = useSuperSearchStore(
+  const { refresh, error, total, loading, items, loadMore, fetchAllIds, applyAiSearch, query, setQuery, expr, clearConditions } = useSuperSearchStore(
     useShallow((s) => ({
       refresh: s.refresh,
       error: s.error,
@@ -40,12 +40,18 @@ export default function SuperSearchPage() {
       applyAiSearch: s.applyAiSearch,
       query: s.query,
       setQuery: s.setQuery,
+      expr: s.expr,
+      clearConditions: s.clearConditions,
     })),
   );
   const selected = useSelectionStore((s) => s.selected);
   const [dialog, setDialog] = useState<DialogKey>(null);
   const [exportMode, setExportMode] = useState<"copy" | "move">("copy");
   const [preview, setPreview] = useState<Asset | null>(null);
+
+  // R0-5：超搜自己的空结果判定 —— 有 expr（AI/构建器产物）或扁平 query 非默认，
+  // 都算「带条件」，不能显示「素材库还是空的」。清除按钮走 clearConditions。
+  const hasActiveFilter = expr != null || query.search.trim() !== "" || query.assetType !== "all" || query.untaggedOnly || query.facetFilters.length > 0 || query.excludeTagIds.length > 0 || query.metadataFilters.length > 0;
 
   // FB2-06（§7.3 方案 C）：非对称阈值 + 顶部区恒展开 + 手动设定抑制窗
   const [chrome, setNode, setChrome] = useScrollDirection({
@@ -185,6 +191,8 @@ export default function SuperSearchPage() {
           onSearchDominant={onSearchDominant}
           scrollElementRef={scrollRef}
           scrollRestoreKey="superSearch"
+          hasActiveFilter={hasActiveFilter}
+          onClearFilter={clearConditions}
           {...actions}
         />
       </div>
