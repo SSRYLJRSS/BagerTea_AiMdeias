@@ -12,6 +12,7 @@ pub mod query_expr;
 pub mod reset;
 pub mod schema_features;
 pub mod search;
+pub mod search_plan;
 pub mod search_query;
 pub mod settings;
 mod sql_utils;
