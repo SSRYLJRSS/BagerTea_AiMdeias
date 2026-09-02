@@ -2137,8 +2137,10 @@ fn top_tags_respects_char_cap() -> AppResult<()> {
         asset_tags::assign(&conn, &[a1], &[t.id], "manual")?;
     }
     let top = tags::top_tags_per_facet(&conn, 100)?;
-    let total: usize = top.iter().map(|(f, w)| f.chars().count() + w.chars().count() + 2).sum();
-    assert!(total <= 1600, "总字符应受 1500 上限约束（含分面 key），实际 {total}");
+    let words_total: usize = top.iter().map(|(_, w)| w.chars().count()).sum();
+    assert!(words_total <= 1500, "候选词总字符应受 1500 上限约束，实际 {words_total}");
+    // 每个分面至少保留 1 个词（大分面不得把词丢光）
+    assert!(top.iter().all(|(_, w)| !w.is_empty()), "每分面至少 1 个词：{top:?}");
     Ok(())
 }
 
@@ -2185,30 +2187,18 @@ fn undo_reverts_both() -> AppResult<()> {
     let conn = setup();
     let (jpg, raw) = add_kinship_pair(&conn);
     let t = tags::create_in_facet(&conn, "海边", None, Some("scene"))?;
-    // 用 AI 批次路径：assign with batch → undo_batch
+    // R2-4：走真实 assign_inner 同源展开（ai::confirm_suggestion），不手写 INSERT
     let batch = ai::create_batch(&conn, &[jpg], "cloud")?;
-    // 直接模拟确认写入（走 assign_inner 带 batch_id）
-    conn.execute(
-        "INSERT INTO asset_tags (asset_id, tag_id, source, created_at, confirmation, confirmed_at, confirmed_by, source_batch_id)
-         VALUES (?1, ?2, 'ai_cloud', 1, 'confirmed', 1, 'ai_cloud', ?3)",
-        rusqlite::params![jpg, t.id, batch.id],
+    let sug = ai::list_suggestions(&conn, batch.id)?.into_iter().next().unwrap();
+    let tags_map = ai::CategorizedTags::from([("scene".to_string(), vec!["海边".to_string()])]);
+    ai::confirm_suggestion(&conn, sug.id, &tags_map)?;
+    // assign_inner 同源展开写了两条（jpg + raw）且都带本批次流水
+    let ops: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM tag_ops WHERE batch_id = ?1",
+        [batch.id],
+        |r| r.get(0),
     )?;
-    conn.execute(
-        "INSERT INTO tag_ops (asset_id, tag_id, op, actor, batch_id, created_at)
-         VALUES (?1, ?2, 'add', 'ai_cloud', ?3, 1)",
-        rusqlite::params![jpg, t.id, batch.id],
-    )?;
-    // 手动给 raw 也补上同批次流水（模拟 assign_inner 的同源展开）
-    conn.execute(
-        "INSERT INTO asset_tags (asset_id, tag_id, source, created_at, confirmation, confirmed_at, confirmed_by, source_batch_id)
-         VALUES (?1, ?2, 'ai_cloud', 1, 'confirmed', 1, 'ai_cloud', ?3)",
-        rusqlite::params![raw, t.id, batch.id],
-    )?;
-    conn.execute(
-        "INSERT INTO tag_ops (asset_id, tag_id, op, actor, batch_id, created_at)
-         VALUES (?1, ?2, 'add', 'ai_cloud', ?3, 1)",
-        rusqlite::params![raw, t.id, batch.id],
-    )?;
+    assert_eq!(ops, 2, "同源展开应写两条 add 流水");
     let undone = tag_ops::undo_batch(&conn, batch.id)?;
     assert!(undone > 0);
     let jpg_tags = asset_tags::get_asset_tags(&conn, jpg)?;

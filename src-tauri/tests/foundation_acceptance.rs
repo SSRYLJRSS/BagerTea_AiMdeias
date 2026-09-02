@@ -408,13 +408,31 @@ fn delete_facet_cascades_all_refs() {
     tag_facets::create(&c, "tmp_g", "临时", "", "multi", None, "all").unwrap();
     let t = tags::create_in_facet(&c, "标签B", None, Some("tmp_g")).unwrap();
     migrations::apply_v22b_constraints(&c).unwrap();
+    // R2-4：补 ops/items 级联断言 —— 真实造出三类引用再删
+    let aid = f4_insert_asset(&c, "d:/facet_del.jpg");
+    asset_tags::assign(&c, &[aid], &[t.id], "manual").unwrap(); // asset_tags + tag_ops 各 1
+    let batch = ai::create_batch(&c, &[aid], "cloud").unwrap();
+    let sug = ai::list_suggestions(&c, batch.id).unwrap().into_iter().next().unwrap();
+    c.execute(
+        "INSERT INTO ai_suggestion_items (suggestion_id, facet_key, raw_name, normalized_name, tag_id, confidence, decision, created_at)
+         VALUES (?1, 'tmp_g', '标签B', '标签B', ?2, NULL, 'pending', 1)",
+        rusqlite::params![sug.id, t.id],
+    )
+    .unwrap();
     let report = tag_facets::delete_facet(&c, "tmp_g").unwrap();
-    assert!(report.tags_deleted >= 1);
+    assert!(report.tags_deleted >= 1, "标签必须级联删除");
+    assert_eq!(report.ops_deleted, 1, "tag_ops 引用必须等量级联删：{report:?}");
+    assert_eq!(report.items_deleted, 1, "ai_suggestion_items 引用必须等量级联删：{report:?}");
     // tags 已删 → tag_terms 因 FK CASCADE 清空（验证不残留脏词条）
     let terms_left: i64 = c
         .query_row("SELECT COUNT(*) FROM tag_terms WHERE tag_id=?1", [t.id], |r| r.get(0))
         .unwrap();
     assert_eq!(terms_left, 0, "标签删除后其 tag_terms 应 CASCADE 清空");
+    // asset_tags 也随删
+    let at_left: i64 = c
+        .query_row("SELECT COUNT(*) FROM asset_tags WHERE tag_id=?1", [t.id], |r| r.get(0))
+        .unwrap();
+    assert_eq!(at_left, 0);
 }
 
 /// F2 要求：设计书要求的 PRAGMA foreign_keys 测试。
