@@ -37,8 +37,8 @@ pub async fn ai_parse_search_query(
                 super_search_ai::MAX_INPUT_LEN
             )));
         }
-        // 2. 短锁读取 AI 档案（用途绑定优先）+ 分面 + 标签词典，读取后立即放锁
-        let (cfg, facets, dict) = {
+        // 2. 短锁读取 AI 档案（用途绑定优先）+ 分面 + 标签词典 + 库能力摘要，读取后立即放锁
+        let (cfg, facets, dict, capabilities) = {
             let conn = lock_db(&db)?;
             let mut s = settings::get_settings(&conn)?;
             if s.ai.active().is_none() {
@@ -53,11 +53,14 @@ pub async fn ai_parse_search_query(
                     })?;
             let facets = tag_facets::build_prompt_context(&conn, "all")?;
             let dict = super_search_ai::collect_tag_dictionary(&conn, &facets)?;
-            (s.ai, facets, dict)
+            // C-3：实时库能力摘要（缓存 60s，只告知不改写）；失败时静默给空串不阻塞搜索
+            let capabilities =
+                super_search_ai::library_capabilities(&conn).unwrap_or_default();
+            (s.ai, facets, dict, capabilities)
         };
         // 3. 锁外网络请求 + 三层降级（strict → lenient → 关键词兜底；配置错误仍真报错）
         let (mut intent, ai_warnings): (SearchIntentV2, Vec<String>) =
-            super_search_ai::request_intent(&cfg, &text, &facets, &dict)?;
+            super_search_ai::request_intent(&cfg, &text, &facets, &dict, &capabilities)?;
         // W6-5：是否落在第 3 层（关键词兜底）→ 解释文案与前端三态据此
         let keyword_mode = super_search_ai::is_keyword_fallback(&intent, &text);
         // 4. 本地确定性守卫（§9.3）：OR/assetType/concept 清洗/去重/confidence 钳制

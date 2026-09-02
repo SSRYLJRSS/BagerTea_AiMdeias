@@ -13,6 +13,8 @@ use crate::db::tag_facets::FacetPromptContext;
 use crate::db::tags;
 use crate::error::{AppError, AppResult};
 use crate::services::ai_cloud::{self, TextJsonTier};
+use std::sync::Mutex;
+use std::time::Instant;
 
 pub const MAX_INPUT_LEN: usize = 200;
 
@@ -935,26 +937,127 @@ pub fn parse_intent(content: &str) -> AppResult<SearchIntentV2> {
 /// W6-2（§W6-2）三层降级：① strict 正常解析 → ② lenient 剔除非法项保留其余 + warning
 /// → ③ 关键词兜底（永不失败）。唯一例外：配置类错误（鉴权/连不上/超时）仍真报错
 /// —— 配置问题必须让用户知道，而不是假装搜到了。
-pub fn request_intent(
-    cfg: &AiSettings,
-    text: &str,
-    facets: &[FacetPromptContext],
-    dict: &[String],
-) -> AppResult<(SearchIntentV2, Vec<String>)> {
-    let profile = cfg
-        .active()
-        .ok_or_else(|| AppError::msg("请先在设置页添加 API 配置"))?;
-    if profile.base_url.trim().is_empty() {
-        return Err(AppError::msg("当前 API 配置缺少 base_url"));
-    }
+// ═══════════════ C-3：库能力注入（只告知，不改写） ═══════════════
 
-    let schema = intent_schema(facets);
-    // 用户可在设置页覆盖搜索 system prompt（非空优先；空 = 内置默认）
-    let system = if cfg.system_prompt_search.trim().is_empty() {
-        build_system_prompt(facets)
-    } else {
-        cfg.system_prompt_search.clone()
+/// 库能力摘要缓存（60s TTL，全局单库）。措辞必须是陈述事实而非禁令。
+static CAPS_CACHE: Mutex<Option<(Instant, String)>> = Mutex::new(None);
+
+/// 实时库能力摘要 —— 注入 user prompt 让模型预判哪些条件可能 0 结果。
+/// 后端绝不做基于库统计的条件剔除（P5）；用户明确搜无结果条件 → 如实输出，系统解释。
+pub fn library_capabilities(conn: &Connection) -> AppResult<String> {
+    // cfg!(test)：测试构建下不走全局缓存 —— 每个测试是独立内存库，
+    // 共享 static 会把上一个测试库的统计泄漏给下一个测试（并行交错）。
+    if !cfg!(test) {
+        if let Ok(guard) = CAPS_CACHE.lock() {
+            if let Some((at, cached)) = guard.as_ref() {
+                if at.elapsed().as_secs() < 60 {
+                    return Ok(cached.clone());
+                }
+            }
+        }
+    }
+    let (total, imgs, vids): (i64, i64, i64) = conn.query_row(
+        "SELECT COUNT(*),
+                SUM(CASE WHEN mime_type LIKE 'image/%' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN mime_type LIKE 'video/%' THEN 1 ELSE 0 END)
+           FROM assets WHERE deleted_at IS NULL",
+        [],
+        |r| Ok((r.get(0)?, r.get(1).unwrap_or(0), r.get(2).unwrap_or(0))),
+    )?;
+    let gps: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM assets WHERE deleted_at IS NULL AND latitude IS NOT NULL AND longitude IS NOT NULL",
+        [],
+        |r| r.get(0),
+    )?;
+    let (taken_n, min_d, max_d): (i64, Option<String>, Option<String>) = conn.query_row(
+        "SELECT COUNT(*), MIN(strftime('%Y-%m-%d', taken_at/1000,'unixepoch','localtime')),
+                MAX(strftime('%Y-%m-%d', taken_at/1000,'unixepoch','localtime'))
+           FROM assets WHERE deleted_at IS NULL AND taken_at IS NOT NULL",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )?;
+    let (sz_min, sz_max): (Option<i64>, Option<i64>) = conn.query_row(
+        "SELECT MIN(file_size), MAX(file_size) FROM assets WHERE deleted_at IS NULL",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let mut line = String::new();
+    line.push_str("本库现状（供你判断哪些条件可能无结果，但用户明确要求时仍应输出）：\n");
+    line.push_str(&format!("- {total} 张，图片 {imgs} / 视频 {vids}\n"));
+    line.push_str(&format!("- 定位：{gps} 张有 GPS\n"));
+    match (taken_n, min_d, max_d) {
+        (0, _, _) => line.push_str("拍摄时间：0 张有值\n"),
+        (n, Some(a), Some(b)) => {
+            line.push_str(&format!("- 拍摄时间：{n} 张有值，范围 {a} ~ {b}\n"))
+        }
+        _ => line.push_str("- 拍摄时间：少量有值\n"),
+    }
+    match (sz_min, sz_max) {
+        (Some(mn), Some(mx)) => line.push_str(&format!(
+            "- 文件大小：{:.2} MB ~ {:.2} MB（= {} ~ {} 字节）\n",
+            mn as f64 / 1048576.0,
+            mx as f64 / 1048576.0,
+            mn,
+            mx
+        )),
+        _ => line.push_str("- 文件大小：无样本\n"),
+    }
+    let exts: Vec<(String, i64)> = {
+        let mut stmt = conn.prepare(
+            "SELECT COALESCE(lower(file_ext),'?') AS e, COUNT(*) c FROM assets
+              WHERE deleted_at IS NULL GROUP BY e ORDER BY c DESC LIMIT 3",
+        )?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
+            .filter_map(|r| r.ok())
+            .collect();
+        rows
     };
+    if !exts.is_empty() {
+        let fmt = exts
+            .iter()
+            .map(|(e, c)| format!("{e} {c}"))
+            .collect::<Vec<_>>()
+            .join("、");
+        line.push_str(&format!("- 格式：{fmt}\n"));
+    }
+    let tag_rows: Vec<(String, i64)> = {
+        let mut stmt = conn.prepare(
+            "SELECT t.facet_key, COUNT(DISTINCT t.id) c FROM tags t
+              WHERE COALESCE(t.status,'active')='active' GROUP BY t.facet_key ORDER BY c DESC",
+        )?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
+            .filter_map(|r| r.ok())
+            .collect();
+        rows
+    };
+    if !tag_rows.is_empty() {
+        let n: i64 = tag_rows.iter().map(|(_, c)| c).sum();
+        let parts = tag_rows
+            .iter()
+            .map(|(k, c)| format!("{k} {c}"))
+            .collect::<Vec<_>>()
+            .join(" / ");
+        line.push_str(&format!("- 标签 {n} 个：{parts}\n"));
+    }
+    line.push_str("如果用户的条件在本库必然无结果，仍要如实输出该条件 —— 系统会解释原因。");
+    if !cfg!(test) {
+        if let Ok(mut guard) = CAPS_CACHE.lock() {
+            *guard = Some((Instant::now(), line.clone()));
+        }
+    }
+    Ok(line)
+}
+
+/// C-3：组装 user prompt（标签词典 + 分面说明 + 查询 + 库能力摘要）。
+/// 抽成纯函数便于断言注入；capabilities 为空时不注入（短锁失败的静默降级路径）。
+pub fn build_user_prompt(
+    dict: &[String],
+    facets: &[FacetPromptContext],
+    text: &str,
+    capabilities: &str,
+) -> String {
     let mut user = String::from("标签词典（规范名 | aliases: 可搜索别名）\n");
     for t in dict {
         user.push_str(&format!("- {t}\n"));
@@ -973,6 +1076,36 @@ pub fn request_intent(
     user.push_str("\n用户查询：<query>");
     user.push_str(text);
     user.push_str("</query>\n请输出解析结果。");
+    // C-3：库能力注入 —— 放在 prompt 末尾作为独立小节（只告知，不改写）
+    if !capabilities.trim().is_empty() {
+        user.push('\n');
+        user.push_str(capabilities);
+    }
+    user
+}
+
+pub fn request_intent(
+    cfg: &AiSettings,
+    text: &str,
+    facets: &[FacetPromptContext],
+    dict: &[String],
+    capabilities: &str,
+) -> AppResult<(SearchIntentV2, Vec<String>)> {
+    let profile = cfg
+        .active()
+        .ok_or_else(|| AppError::msg("请先在设置页添加 API 配置"))?;
+    if profile.base_url.trim().is_empty() {
+        return Err(AppError::msg("当前 API 配置缺少 base_url"));
+    }
+
+    let schema = intent_schema(facets);
+    // 用户可在设置页覆盖搜索 system prompt（非空优先；空 = 内置默认）
+    let system = if cfg.system_prompt_search.trim().is_empty() {
+        build_system_prompt(facets)
+    } else {
+        cfg.system_prompt_search.clone()
+    };
+    let user = build_user_prompt(dict, facets, text, capabilities);
 
     // ① 网络请求（协议级降级 Structured → JsonObject → Plain 由 request_text_json 内部处理）。
     // 配置类错误（鉴权/连不上/超时）真报错；其他服务异常降级为关键词搜索（不打扰）。
@@ -1154,6 +1287,7 @@ pub fn build_system_prompt(facets: &[FacetPromptContext]) -> String {
     p.push_str("颜色是算法计算的文件属性，用 metadata（dominant_hue 0-359：红色 min=345 max=15 表示跨 0°；橙 15-45、黄 45-70、绿 70-155、青 155-225、蓝 225-295、紫 295-345；dominant_sat/dominant_lum 0-100；灰/黑/白用 dominant_sat lte 10），不写进 tags。\n");
     p.push_str("元数据条件（metadata）能力清单——key 与 op 只能从下面选，单位与格式必须严格遵守：\n");
     p.push_str("- file_size：文件大小，单位字节（1MB=1048576）。op 用 gt/gte/lt/lte/between。示例「10~105MB」→ {\"key\":\"file_size\",\"op\":\"between\",\"min\":10485760,\"max\":110100480}。\n");
+    p.push_str("- file_size 注意：写区间必须换算成字节，禁止输出「5..10」这类 MB 原值（会查不到结果）。换算演示：5~10MB → min=5242880, max=10485760；50~100MB → min=52428800, max=104857600。\n");
     p.push_str("- taken_at：拍摄日期，格式 YYYY-MM-DD，本地时区，区间左闭右开。op 只用 gte/lte/between。「8月份」（当前年份）→ {\"key\":\"taken_at\",\"op\":\"between\",\"min\":\"当年8月1日\",\"max\":\"当年8月31日\"}；「最近一周」按当前日期回推。\n");
     p.push_str("- duration_ms：视频时长，单位毫秒（1秒=1000）。op 用 gt/gte/lt/lte/between；仅对视频有意义。\n");
     p.push_str("- width/height：像素整数；resolution：宽×高总像素；aspect_ratio：宽÷高。均支持数值比较。\n");
@@ -1242,6 +1376,29 @@ fn intent_schema(facets: &[FacetPromptContext]) -> serde_json::Value {
         },
         "required": ["key", "op", "value", "values", "min", "max"]
     });
+    // C-3 单位约束强化：仅当 key=file_size 时数值下限 1024（拦截「5..10」这类 MB 原值）。
+    // 用条件子 schema（if/then），不影响 latitude 等负值/小数 key；支持 json_schema 的服务商在服务端即拒绝。
+    let file_size_numeric = serde_json::json!({
+        "anyOf": [
+            {"type": "number", "minimum": 1024.0},
+            {"type": "string"},
+            {"type": "null"}
+        ]
+    });
+    let metadata_item = {
+        let mut base = metadata_item;
+        base["allOf"] = serde_json::json!([{
+            "if": {"properties": {"key": {"const": "file_size"}}, "required": ["key"]},
+            "then": {
+                "properties": {
+                    "value": file_size_numeric,
+                    "min": file_size_numeric,
+                    "max": file_size_numeric
+                }
+            }
+        }]);
+        base
+    };
     let group = serde_json::json!({
         "type": "object",
         "additionalProperties": false,
@@ -2288,5 +2445,111 @@ mod tests {
         assert!(!g.preferred.iter().any(|c| c.text == "夜景"), "required 不得升级为 preferred");
         // 蓝天（证据合法）保留加分
         assert!(g.preferred.iter().any(|c| c.text == "蓝天"));
+    }
+
+    // ── C-3：库能力注入（只告知，不改写） ──
+
+    fn insert_asset_row(
+        conn: &rusqlite::Connection,
+        path: &str,
+        mime: &str,
+        size: i64,
+        taken: Option<i64>,
+        lat: Option<f64>,
+        lon: Option<f64>,
+    ) {
+        conn.execute(
+            "INSERT INTO assets (file_path, file_name, file_ext, file_size, mime_type, created_at, modified_at, taken_at, latitude, longitude)
+             VALUES (?1, ?2, ?3, ?4, ?5, 1700000000000, 1700000000000, ?6, ?7, ?8)",
+            rusqlite::params![path, path.rsplit('/').next().unwrap(), "jpg", size, mime, taken, lat, lon],
+        )
+        .unwrap();
+    }
+
+    /// C-3：schema 对 file_size 设 minimum:1024（服务端拦截「5..10」这类 MB 原值）。
+    #[test]
+    fn schema_file_size_has_minimum() {
+        let s = intent_schema(&[]);
+        let m = &s["properties"]["groups"]["items"]["properties"]["metadata"]["items"];
+        // allOf[0] = if key==file_size then value/min/max number 需 >= 1024
+        let cond = &m["allOf"][0];
+        assert_eq!(cond["if"]["properties"]["key"]["const"], "file_size", "条件分支必须锁 file_size");
+        let then_props = &cond["then"]["properties"];
+        for field in ["value", "min", "max"] {
+            let anyof = &then_props[field]["anyOf"];
+            let nums = anyof
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|v| v["type"] == "number")
+                .collect::<Vec<_>>();
+            assert!(!nums.is_empty(), "file_size 的 {field} 必须允许数值类型");
+            for n in nums {
+                assert_eq!(n["minimum"], 1024.0, "file_size 的 {field} 数值下限必须 1024 字节");
+            }
+        }
+        // 非 file_size 的 key 不应被该条件误伤（latitude 允许负值/小数）
+        let s2 = intent_schema(&[]);
+        let m2 = &s2["properties"]["groups"]["items"]["properties"]["metadata"]["items"];
+        let cond2 = &m2["allOf"][0];
+        assert_eq!(cond2["if"]["properties"]["key"]["const"], "file_size");
+    }
+
+    /// C-3：库能力摘要是「陈述事实」，不含「不要输出」这类禁令措辞。
+    /// 措辞是给模型判断 0 结果的背景，不是让它删条件的命令。
+    #[test]
+    fn library_stats_injected_as_facts_not_prohibitions() {
+        let conn = init_memory().unwrap();
+        // 小库：2 图 + 1 视频，含 GPS 与时间，验证聚合数字确实进文本
+        insert_asset_row(&conn, "d:/a/1.jpg", "image/jpeg", 6_272_000, Some(1_760_000_000_000), Some(31.2), Some(121.5));
+        insert_asset_row(&conn, "d:/a/2.jpg", "image/jpeg", 36_200_000, Some(1_760_000_000_000), None, None);
+        insert_asset_row(&conn, "d:/a/3.mp4", "video/mp4", 12_000_000, None, None, None);
+        let caps = library_capabilities(&conn).unwrap();
+        // 陈述事实而非禁令：允许「该条件无结果仍输出」，不允许「不要输出 xxx」
+        for banned in ["不要输出", "不要生成", "禁止输出", "绝不能", "只能"] {
+            assert!(!caps.contains(banned), "库能力摘要不得含禁令措辞「{banned}」：\n{caps}");
+        }
+        // 事实数字在文本中
+        assert!(caps.contains("3 张"), "应聚合出总数：{caps}");
+        assert!(caps.contains("图片 2"), "应聚合出图片数：{caps}");
+        assert!(caps.contains("视频 1"), "应聚合出视频数：{caps}");
+        assert!(caps.contains("1 张有 GPS"), "应聚合出 GPS 数：{caps}");
+        assert!(caps.contains("如果用户的条件在本库必然无结果，仍要如实输出该条件"), "{caps}");
+    }
+
+    /// C-3：用户明确搜无 GPS 条件 → 后端绝不因库统计剔除该条件（原则 P5）。
+    /// 库一张 GPS 都没有，用户搜「有定位的照片」仍保留条件并如实返回 0 命中，
+    /// 而不是删掉条件返回全库。
+    #[test]
+    fn gps_condition_survives_when_library_has_none() {
+        let conn = init_memory().unwrap();
+        // 库中没有任何 GPS 数据
+        insert_asset_row(&conn, "d:/a/1.jpg", "image/jpeg", 6_272_000, Some(1_760_000_000_000), None, None);
+        insert_asset_row(&conn, "d:/a/2.jpg", "image/jpeg", 36_200_000, Some(1_760_000_000_000), None, None);
+        let caps = library_capabilities(&conn).unwrap();
+        assert!(caps.contains("0 张有 GPS"), "库能力摘要应如实说明 0 GPS：{caps}");
+        // AI 明确输出「有定位」条件 → 解析层不得剔除（has_location 值域 yes/no）
+        let text = "有定位的照片";
+        let raw = r#"{"groups":[{"assetType":"all","concepts":[],"textTerms":[],"metadata":[{"key":"has_location","op":"eq","value":"yes","values":null,"min":null,"max":null}]}],"exclusions":[],"sortBy":null,"sortDir":null}"#;
+        let (intent, warnings) = degrade_parse(raw, text, &[]);
+        assert!(!is_keyword_fallback(&intent, text), "明确 GPS 条件不应被兜底：{warnings:?}");
+        assert_eq!(intent.groups[0].metadata.len(), 1, "GPS 条件必须保留（绝不做库统计剔除）");
+        assert_eq!(intent.groups[0].metadata[0].key, "has_location");
+        // 该条件真实执行后应为 0 命中 —— 由编译层自然得出，这里验证 key 合法
+        assert!(crate::db::search_query::is_supported_metadata_key("has_location"), "has_location 必须在白名单内");
+    }
+
+    /// C-3：build_user_prompt 把库能力摘要作为独立小节拼到查询之后（注入路径可测）。
+    #[test]
+    fn user_prompt_appends_capabilities_after_query() {
+        let dict = vec!["海边 | aliases: 海滩".to_string()];
+        let facets: Vec<FacetPromptContext> = vec![];
+        let caps = "本库现状：\n- 3 张，图片 2 / 视频 1\n如果用户的条件在本库必然无结果，仍要如实输出该条件 —— 系统会解释原因。";
+        let p = build_user_prompt(&dict, &facets, "海边", caps);
+        assert!(p.contains("用户查询：<query>海边</query>"), "查询块保持完整：{p}");
+        assert!(p.ends_with(caps), "能力摘要应拼在 prompt 最末尾：{p}");
+        // 空 capabilities → 不注入（命令层短锁失败静默降级路径）
+        let p2 = build_user_prompt(&dict, &facets, "海边", "");
+        assert!(!p2.contains("本库现状"), "空能力摘要不应注入：{p2}");
     }
 }
