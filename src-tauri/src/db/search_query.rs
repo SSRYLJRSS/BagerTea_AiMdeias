@@ -275,6 +275,47 @@ fn next_day_ms(s: &str) -> AppResult<i64> {
 }
 
 /// 校验并编译单个元数据条件。校验失败返回 AppError。
+/// R2-2：量纲可疑区间的人话提示（不报错 —— 手填 100 字节是合法的，但值得点一句）。
+/// 把「静默 0 结果」变成「0 结果 + 一句人话」。只对数值型键的单值/min/max 生效。
+pub fn dimension_warnings(f: &MetadataFilter) -> Vec<String> {
+    let mut out = Vec::new();
+    let num = |v: &serde_json::Value| -> Option<f64> {
+        match v {
+            serde_json::Value::Number(n) => n.as_f64(),
+            serde_json::Value::String(s) => s.trim().parse::<f64>().ok(),
+            _ => None,
+        }
+    };
+    let mut probe = |tag: &str, v: &serde_json::Value| {
+        let Some(x) = num(v) else { return };
+        let msg = match f.key.as_str() {
+            "file_size" if x < 1024.0 => {
+                Some("文件大小小于 1 KB，是否想写 MB？已按字节执行。".to_string())
+            }
+            "duration_ms" if x < 100.0 && f.op != "eq" => {
+                Some("时长小于 0.1 秒，单位是毫秒。".to_string())
+            }
+            "resolution" if x < 10000.0 => {
+                Some("分辨率是总像素数（1920×1080 = 2073600），不是边长。".to_string())
+            }
+            _ => None,
+        };
+        if let Some(m) = msg {
+            out.push(if tag.is_empty() { m } else { format!("{tag}：{m}") });
+        }
+    };
+    if let Some(v) = &f.value {
+        probe("", v);
+    }
+    if let Some(v) = &f.min {
+        probe("范围下限", v);
+    }
+    if let Some(v) = &f.max {
+        probe("范围上限", v);
+    }
+    out
+}
+
 pub fn compile_metadata(f: &MetadataFilter) -> AppResult<Option<CompiledMetadata>> {
     let spec =
         key_spec(&f.key).ok_or_else(|| AppError::msg(format!("未知元数据字段：{}", f.key)))?;

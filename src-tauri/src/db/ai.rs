@@ -112,6 +112,9 @@ pub struct AiBatch {
     pub processed: i64,
     pub confirmed: i64,
     pub created_at: i64,
+    /// R2-3：建批时合并的同源组数（原始 ids 数 − 去重后数）；打标页提示「已合并 N 组同源文件」
+    #[serde(default)]
+    pub merged_groups: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -146,6 +149,8 @@ fn batch_from_row(r: &rusqlite::Row) -> rusqlite::Result<AiBatch> {
         processed: r.get(4)?,
         confirmed: r.get(5)?,
         created_at: r.get(6)?,
+        // merged_groups 不落库（派生量）：持久化读取回 0，建批返回时由创建路径填
+        merged_groups: 0,
     })
 }
 
@@ -237,7 +242,10 @@ pub fn create_batch_with_retag(
         asset_tags::retag_clear_unreviewed(&tx, &effective_ids)?;
     }
     tx.commit()?;
-    get_batch(conn, batch_id)
+    let mut batch = get_batch(conn, batch_id)?;
+    // R2-3：合并组数 = 原始选择 − 去重后代表数（让用户知道省了什么）
+    batch.merged_groups = (asset_ids.len() as i64 - effective_ids.len() as i64).max(0);
+    Ok(batch)
 }
 
 pub fn get_batch(conn: &Connection, id: i64) -> AppResult<AiBatch> {

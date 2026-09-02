@@ -2031,3 +2031,102 @@ fn e2e_grass_required_sky_preferred_night_excluded() {
     with_should.sort_unstable();
     assert_eq!(with_should, base_ids, "min=0 时 should 不得改变结果集合");
 }
+
+// ═══════════════ R2-1：编译层 warning 全链路回传（expr → AssetPage.warnings） ═══════════════
+
+/// R2-1：表达式编译 warning（标签不属于声明分面被剔除）→ 到达 list DTO。
+#[test]
+fn dropped_tag_produces_visible_warning() {
+    use bagertea_ai_media_v2_lib::db::query_expr::{LeafCond, QueryExpr};
+    let c = mem();
+    let tag = tags::create_in_facet(&c, "海边", None, Some("scene")).unwrap();
+    // 声明 color 分面但标签属于 scene → 剔除 + warning（不再是静默日志）
+    let expr = QueryExpr::Leaf {
+        cond: LeafCond::Tag {
+            facet_key: "color".into(),
+            tag_ids: vec![tag.id],
+            mode: Some("any".into()),
+            include_descendants: true,
+            term_query: None,
+            term_match: Default::default(),
+        },
+    };
+    let filter = assets::AssetFilter {
+        expr: Some(expr),
+        ..Default::default()
+    };
+    let page = assets::list(&c, &filter).unwrap();
+    assert!(
+        page.warnings.iter().any(|w| w.contains("剔除")),
+        "剔除必须出现在 DTO warnings：{:?}",
+        page.warnings
+    );
+}
+
+/// R2-1：分面不存在/停用（FacetHasAny）→ 编译 warning 进 DTO（用户看得到，不只日志）。
+#[test]
+fn compile_warnings_reach_dto() {
+    use bagertea_ai_media_v2_lib::db::query_expr::{LeafCond, QueryExpr};
+    let c = mem();
+    let expr = QueryExpr::Leaf {
+        cond: LeafCond::FacetHasAny {
+            facet_key: "ghost_facet".into(),
+        },
+    };
+    let filter = assets::AssetFilter {
+        expr: Some(expr),
+        ..Default::default()
+    };
+    let page = assets::list(&c, &filter).unwrap();
+    assert!(
+        page.warnings.iter().any(|w| w.contains("已停用或不存在")),
+        "停用分面警告必须回传：{:?}",
+        page.warnings
+    );
+}
+
+// ═══════════════ R2-2：量纲人话（不阻断执行，把静默 0 结果变 0 结果 + 一句提示） ═══════════════
+
+/// R2-2：file_size 疑似写成 MB（< 1024 字节）→ warning 但仍执行（不报错）。
+#[test]
+fn suspicious_file_size_warns_but_executes() {
+    use bagertea_ai_media_v2_lib::db::search_query::MetadataFilter;
+    let c = mem();
+    let aid = f4_insert_asset(&c, "d:/r22.jpg");
+    let filter = assets::AssetFilter {
+        metadata_filters: vec![MetadataFilter {
+            key: "file_size".into(),
+            op: "gte".into(),
+            value: Some(serde_json::json!(500)), // 500 字节 < 1KB —— 疑似把 MB 写成 500
+            values: None,
+            min: None,
+            max: None,
+        }],
+        ..Default::default()
+    };
+    let page = assets::list(&c, &filter).unwrap(); // 不报错
+    assert!(
+        page.warnings.iter().any(|w| w.contains("小于 1 KB")),
+        "量纲提示必须回传 DTO：{:?}",
+        page.warnings
+    );
+    // 执行不报错且仍按字节语义跑（500B 条件与 1024B 素材的关系留给查询本身决定）
+    assert!(page.total >= 0);
+}
+
+// ═══════════════ R2-3：建批同源合并上报（merged_groups） ═══════════════
+
+/// R2-3：RAW+JPG 同源对只留一个代表 → merged_groups = 原始数 − 去重数。
+#[test]
+fn create_batch_reports_merged_groups() {
+    let c = mem();
+    let raw = f4_insert_asset(&c, "d:/r23/_1091396.RW2");
+    let jpg = f4_insert_asset(&c, "d:/r23/_1091396.JPG");
+    let solo = f4_insert_asset(&c, "d:/r23/_1091397.JPG");
+    let b = ai::create_batch(&c, &[raw, jpg, solo], "cloud").unwrap();
+    assert_eq!(b.total, 2, "同源对去重后应剩 2 条代表");
+    assert_eq!(b.merged_groups, 1, "RAW+JPG 合并 1 组");
+    // 独立素材不误报
+    let b2 = ai::create_batch(&c, &[solo], "cloud").unwrap();
+    assert_eq!(b2.merged_groups, 0);
+}

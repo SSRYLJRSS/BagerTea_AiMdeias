@@ -259,7 +259,17 @@ pub fn from_filter(
 
 /// 编译叶子为可嵌入 WHERE 的片段。素材表别名为 `a`；无搜索时 conn 仅用于 FTS 谓词。
 /// 返回的 SQL 使用从 ?1 起的占位符（与单独编译一致，由上层 offset）。
+/// R2-1 前兼容包装：丢弃 warning 的单条件编译（新调用方请用 compile_leaf_with）。
 pub fn compile_leaf(conn: &Connection, cond: &LeafCond) -> AppResult<(String, Vec<Value>)> {
+    compile_leaf_with(conn, cond, &mut Vec::new())
+}
+
+/// 编译单一叶子 → (sql, params)。warning（剔除/降级）写入 `warnings`（R2-1 回传前端）。
+pub fn compile_leaf_with(
+    conn: &Connection,
+    cond: &LeafCond,
+    warnings: &mut Vec<String>,
+) -> AppResult<(String, Vec<Value>)> {
     match cond {
         LeafCond::Search { value, scope } => {
             let pred = super::search::build_search_predicate(conn, value, *scope)?
@@ -293,7 +303,7 @@ pub fn compile_leaf(conn: &Connection, cond: &LeafCond) -> AppResult<(String, Ve
         } => {
             // W2-6：facet 一致性校验改为「剔除 + warning，不报错整次查询」。
             // 旧语义（一个标签跨分面就拒绝整次查询）在分面删除/重建后会卡死已保存的搜索。
-            let valid_ids = filter_tags_by_facet(conn, facet_key, tag_ids);
+            let valid_ids = filter_tags_by_facet(conn, facet_key, tag_ids, warnings);
             let mut ids = valid_ids;
             // S5：termQuery 先按 term_match 扩展成一组 tag_id，与显式 tag_ids 求并集
             let has_term = term_query.as_deref().map(str::trim).map_or(false, |s| !s.is_empty());
@@ -314,8 +324,8 @@ pub fn compile_leaf(conn: &Connection, cond: &LeafCond) -> AppResult<(String, Ve
                     }
                 }
                 for w in &warns {
-                    // R2-1 起经 &mut Vec<String> 回传前端；目前落日志
                     tracing::warn!("词查「{raw}」({term_match:?}): {w}");
+                    warnings.push(format!("词查「{raw}」：{w}"));
                 }
                 if ids.is_empty() {
                     // 词查明确但一个都没命中 → 条件不可满足（0 结果），
@@ -330,6 +340,7 @@ pub fn compile_leaf(conn: &Connection, cond: &LeafCond) -> AppResult<(String, Ve
         LeafCond::FacetHasAny { facet_key } => {
             if !facet_searchable(conn, facet_key) {
                 tracing::warn!("分面 {facet_key} 不存在或 cfg_searchable=0，剔除该条件（查询继续）");
+                warnings.push(format!("分面「{facet_key}」已停用或不存在，已忽略该条件。"));
                 return Ok(("1=1".to_string(), Vec::new()));
             }
             Ok((
@@ -342,6 +353,7 @@ pub fn compile_leaf(conn: &Connection, cond: &LeafCond) -> AppResult<(String, Ve
         LeafCond::FacetMissing { facet_key } => {
             if !facet_searchable(conn, facet_key) {
                 tracing::warn!("分面 {facet_key} 不存在或 cfg_searchable=0，剔除该条件（查询继续）");
+                warnings.push(format!("分面「{facet_key}」已停用或不存在，已忽略该条件。"));
                 return Ok(("1=1".to_string(), Vec::new()));
             }
             Ok((
@@ -366,6 +378,10 @@ pub fn compile_leaf(conn: &Connection, cond: &LeafCond) -> AppResult<(String, Ve
             Ok((sql.trim_start_matches(" AND ").to_string(), params))
         }
         LeafCond::Metadata { filter } => {
+            // R2-2：量纲人话（expr 路径与扁平路径同规则；不阻断执行）
+            for w in super::search_query::dimension_warnings(filter) {
+                warnings.push(w);
+            }
             let compiled = super::search_query::compile_metadata(filter)?;
             match compiled {
                 Some(c) => Ok((c.sql, c.params)),
@@ -378,7 +394,12 @@ pub fn compile_leaf(conn: &Connection, cond: &LeafCond) -> AppResult<(String, Ve
 /// W2-6：Tag 叶子的 facet 一致性过滤 —— 不属于声明 facet_key 的 tag_id 直接剔除并 warning，
 /// 不再报错整次查询（分面删除/重建后，已保存的搜索不应被一个失效 tag_id 卡死）。
 /// 全部剔除时返回空 Vec，compile_leaf 侧折叠为 1=1（条件恒真，查询继续）。
-fn filter_tags_by_facet(conn: &Connection, facet_key: &str, tag_ids: &[i64]) -> Vec<i64> {
+fn filter_tags_by_facet(
+    conn: &Connection,
+    facet_key: &str,
+    tag_ids: &[i64],
+    warnings: &mut Vec<String>,
+) -> Vec<i64> {
     if facet_key.is_empty() {
         return tag_ids.to_vec();
     }
@@ -401,6 +422,7 @@ fn filter_tags_by_facet(conn: &Connection, facet_key: &str, tag_ids: &[i64]) -> 
     let dropped = tag_ids.len() - valid.len();
     if dropped > 0 {
         tracing::warn!("剔除 {dropped} 个不属于分面 {facet_key} 的标签（查询继续）");
+        warnings.push(format!("有 {dropped} 个标签不属于分面「{facet_key}」，已剔除。"));
     }
     valid
 }
@@ -532,28 +554,39 @@ fn normalize_group(children: Vec<QueryExpr>, is_and: bool) -> Option<QueryExpr> 
     }
 }
 
-/// 递归编译表达式树 → 可嵌入 WHERE 的片段。同样从 ?1 起占位（供上层 offset）。
+/// R2-1 前兼容包装：丢弃 warning 的表达式编译（新调用方请用 compile_expr_with）。
 pub fn compile_expr(conn: &Connection, expr: &QueryExpr) -> AppResult<(String, Vec<Value>)> {
+    compile_expr_with(conn, expr, &mut Vec::new())
+}
+
+/// 递归编译表达式树 → 可嵌入 WHERE 的片段（同样从 ?1 起占位，供上层 offset）。
+/// warning（剔除/降级）写入 `warnings`，回传前端（R2-1）。
+pub fn compile_expr_with(
+    conn: &Connection,
+    expr: &QueryExpr,
+    warnings: &mut Vec<String>,
+) -> AppResult<(String, Vec<Value>)> {
     match expr {
-        QueryExpr::Leaf { cond } => compile_leaf(conn, cond),
-        QueryExpr::And { children } => compile_group(conn, children, "AND"),
-        QueryExpr::Or { children } => compile_group(conn, children, "OR"),
+        QueryExpr::Leaf { cond } => compile_leaf_with(conn, cond, warnings),
+        QueryExpr::And { children } => compile_group_with(conn, children, "AND", warnings),
+        QueryExpr::Or { children } => compile_group_with(conn, children, "OR", warnings),
         QueryExpr::Not { child } => {
-            let (sql, params) = compile_expr(conn, child)?;
+            let (sql, params) = compile_expr_with(conn, child, warnings)?;
             Ok((format!("NOT ({sql})"), params))
         }
     }
 }
 
-fn compile_group(
+fn compile_group_with(
     conn: &Connection,
     children: &[QueryExpr],
     joiner: &str,
+    warnings: &mut Vec<String>,
 ) -> AppResult<(String, Vec<Value>)> {
     let mut parts = Vec::new();
     let mut params: Vec<Value> = Vec::new();
     for c in children {
-        let (sql, p) = compile_expr(conn, c)?;
+        let (sql, p) = compile_expr_with(conn, c, warnings)?;
         let shifted = offset_placeholders(&sql, params.len());
         parts.push(format!("({shifted})"));
         params.extend(p);

@@ -262,6 +262,9 @@ pub struct AssetPage {
     pub items: Vec<Asset>,
     pub total: i64,
     pub has_more: bool,
+    /// R2-1：本次查询编译层 warning（剔除/停用/降级），前端结果区上方黄字
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 pub(crate) const COLUMNS: &str =
@@ -343,6 +346,7 @@ fn build_where(
     conn: &Connection,
     filter: &AssetFilter,
     search_pred: Option<&search::SearchPredicate>,
+    warnings: &mut Vec<String>,
 ) -> AppResult<(String, Vec<Value>)> {
     let mut cond = String::from("1=1");
     let mut params: Vec<Value> = Vec::new();
@@ -355,7 +359,8 @@ fn build_where(
     // 布尔表达式树分支（P4 query_expr）：有 expr 时以表达式为准，忽略扁平字段。
     // 此处仅追加 expr 编译片段；回收站隔离已在上方作为基础条件。
     if let Some(expr) = &filter.expr {
-        match super::query_expr::compile_expr(conn, expr) {
+        // R2-1：编译 warning（标签剔除/分面停用等）回传 DTO，前端黄字展示
+        match super::query_expr::compile_expr_with(conn, expr, warnings) {
             Ok((sql, p)) => {
                 if !sql.trim().is_empty() {
                     cond.push_str(&format!(" AND ({sql})"));
@@ -500,6 +505,12 @@ fn build_where(
             Ok(None) => {}
             Err(e) => return Err(e),
         }
+        // R2-2：量纲人话（不阻断执行 —— 手填 100 字节合法，但把「静默 0 结果」变「0 结果 + 一句提示」）
+        for f in &filter.metadata_filters {
+            for w in search_query::dimension_warnings(f) {
+                warnings.push(w);
+            }
+        }
     }
     if let Some(pred) = search_pred {
         if !pred.sql.is_empty() {
@@ -611,7 +622,8 @@ impl AssetFilter {
 pub fn list_ids(conn: &Connection, filter: &AssetFilter) -> AppResult<Vec<i64>> {
     filter.validate()?;
     let search_pred = build_search_predicate(conn, filter)?;
-    let (cond, params) = build_where(conn, filter, search_pred.as_ref())?;
+    let mut warnings = Vec::new();
+    let (cond, params) = build_where(conn, filter, search_pred.as_ref(), &mut warnings)?;
     let mut stmt = conn.prepare(&format!(
         "SELECT a.id FROM assets a WHERE {cond} ORDER BY {} LIMIT 100000", // B19：上限 100000（全选用，放宽但防滥用）
         order_by(filter)
@@ -627,7 +639,8 @@ pub fn list_ids(conn: &Connection, filter: &AssetFilter) -> AppResult<Vec<i64>> 
 pub fn list(conn: &Connection, filter: &AssetFilter) -> AppResult<AssetPage> {
     filter.validate()?;
     let search_pred = build_search_predicate(conn, filter)?;
-    let (cond, params) = build_where(conn, filter, search_pred.as_ref())?;
+    let mut warnings = Vec::new();
+    let (cond, params) = build_where(conn, filter, search_pred.as_ref(), &mut warnings)?;
     let total: i64 = conn.query_row(
         &format!("SELECT COUNT(*) FROM assets a WHERE {cond}"),
         rusqlite::params_from_iter(params.iter()),
@@ -654,6 +667,7 @@ pub fn list(conn: &Connection, filter: &AssetFilter) -> AppResult<AssetPage> {
         has_more: offset + (items.len() as i64) < total,
         items,
         total,
+        warnings,
     })
 }
 
