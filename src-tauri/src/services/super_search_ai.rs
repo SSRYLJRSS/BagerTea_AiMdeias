@@ -154,9 +154,19 @@ pub struct SearchConceptV3 {
     /// 模型对「为什么判为加分」的**原文依据**。守卫用它做一致性校验。
     #[serde(default)]
     pub evidence: Option<String>,
-    /// 【S5】词匹配方式（默认 Alias；Prefix/Contains/Fuzzy 只在零结果兜底用）
-    #[serde(default)]
+    /// 【S5】词匹配方式（默认 Alias；Prefix/Contains/Fuzzy 只在零结果兜底用）。
+    /// schema 允许 null（模型可省略）；本地以 default = Alias 兜底。
+    #[serde(default, deserialize_with = "de_term_match_nullable")]
     pub term_match: crate::db::tags::TermMatch,
+}
+
+/// serde helper：termMatch 为 null/缺失时按 default（Alias）处理。
+fn de_term_match_nullable<'de, D>(d: D) -> Result<crate::db::tags::TermMatch, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = Option::<crate::db::tags::TermMatch>::deserialize(d)?;
+    Ok(v.unwrap_or_default())
 }
 
 /// V3 组：V2 字段语义不变（全部进 filter），新增 `preferred`（加分项 → should）。
@@ -174,6 +184,21 @@ pub struct SearchGroupV3 {
     /// V3 新增：最好有 / 优先 / 尽量 / 更好 … → should（加分，不淘汰）
     #[serde(default)]
     pub preferred: Vec<SearchConceptV3>,
+}
+
+/// S3：V3 顶层意图 —— 与 V2 同构（组间 OR、组内 AND、全局 exclusions），
+/// 只是组用 V3（concepts 进 filter、preferred 进 should）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchIntentV3 {
+    #[serde(default)]
+    pub groups: Vec<SearchGroupV3>,
+    #[serde(default)]
+    pub exclusions: Vec<SearchConceptV3>,
+    #[serde(default)]
+    pub sort_by: Option<String>,
+    #[serde(default)]
+    pub sort_dir: Option<String>,
 }
 
 /// ③ 兜底用的「强偏好信号词」：只提示不降级。
@@ -772,6 +797,206 @@ pub fn build_expr_from_v2(
     Ok((expr, resolved_tags, warnings))
 }
 
+/// S3：V3 intent → SearchPlanV3（filter=required AND 组间 OR；should=preferred 加权；
+/// must_not=exclusions 的 OR——编译层 NOT()，多排除即 NOT(A OR B) = 全不命中）。
+/// ranking：存在 preferred 或用户显式要相关度 → Relevance；否则 Field(sort_by/dir)。
+/// 返回 plan + resolved_tags + warnings。与 V2 expr 链路并存（前端 persist 波次切换）。
+pub fn build_plan_from_v3(
+    conn: &Connection,
+    intent: &SearchIntentV3,
+) -> AppResult<(
+    crate::db::search_plan::SearchPlanV3,
+    Vec<ResolvedTag>,
+    Vec<String>,
+)> {
+    use crate::db::search_plan::{Ranking, RetrieverPlan, SearchPlanV3, ShouldClause};
+    let mut warnings = Vec::new();
+    let mut resolved_tags: Vec<ResolvedTag> = Vec::new();
+
+    // 把 V3 概念转 V2 引用（resolve_concept 只读 text/role/facet/confidence）
+    let as_v2 = |c: &SearchConceptV3| SearchConceptV2 {
+        text: c.text.clone(),
+        role: c.role.clone(),
+        facet_hint: c.facet_hint.clone(),
+        confidence: c.confidence,
+    };
+    // 概念解析为一个可编译 leaf 的 (QueryExpr, ResolvedTag[], warning[])；不捕获外部可变状态。
+    let concept_leaf = |c: &SearchConceptV3| -> AppResult<(Option<QueryExpr>, Vec<ResolvedTag>, Option<String>)> {
+        match resolve_concept(conn, &as_v2(c), false)? {
+            ConceptOutcome::Tag(r) => Ok((
+                Some(QueryExpr::Leaf {
+                    cond: LeafCond::Tag {
+                        term_query: None,
+                        term_match: c.term_match,
+                        facet_key: r.facet_key.clone(),
+                        tag_ids: vec![r.tag_id],
+                        mode: Some("any".into()),
+                        include_descendants: true,
+                    },
+                }),
+                vec![r],
+                None,
+            )),
+            ConceptOutcome::Content(term) => Ok((
+                Some(QueryExpr::Leaf {
+                    cond: LeafCond::Search {
+                        value: term,
+                        scope: crate::db::query_expr::SearchScope::Content,
+                    },
+                }),
+                Vec::new(),
+                None,
+            )),
+            ConceptOutcome::Dropped(w) => Ok((None, Vec::new(), Some(w))),
+        }
+    };
+    // 结果收集 helper：分离 warning
+    fn collect(
+        out_w: &mut Vec<String>,
+        out_r: &mut Vec<ResolvedTag>,
+        r: (Option<QueryExpr>, Vec<ResolvedTag>, Option<String>),
+    ) -> Option<QueryExpr> {
+        if let Some(w) = r.2 {
+            out_w.push(w);
+        }
+        out_r.extend(r.1);
+        r.0
+    }
+
+    // ── filter：每组 required（assetType/metadata/textTerms/concepts）AND，组间 OR ──
+    let mut group_exprs: Vec<QueryExpr> = Vec::new();
+    for g in &intent.groups {
+        let mut leaves: Vec<QueryExpr> = Vec::new();
+        if g.asset_type != "all" {
+            leaves.push(QueryExpr::Leaf {
+                cond: LeafCond::AssetType {
+                    value: g.asset_type.clone(),
+                },
+            });
+        }
+        for m in &g.metadata {
+            leaves.push(QueryExpr::Leaf {
+                cond: LeafCond::Metadata { filter: m.clone() },
+            });
+        }
+        for tt in &g.text_terms {
+            let scope = match tt.scope.as_str() {
+                "content" => crate::db::query_expr::SearchScope::Content,
+                "description" => crate::db::query_expr::SearchScope::Description,
+                "fileName" => crate::db::query_expr::SearchScope::FileName,
+                _ => crate::db::query_expr::SearchScope::All,
+            };
+            leaves.push(QueryExpr::Leaf {
+                cond: LeafCond::Search {
+                    value: tt.text.trim().to_string(),
+                    scope,
+                },
+            });
+        }
+        for c in &g.concepts {
+            if let Some(leaf) = collect(&mut warnings, &mut resolved_tags, concept_leaf(c)?) {
+                leaves.push(leaf);
+            }
+        }
+        if let Some(e) = pack_and(leaves) {
+            group_exprs.push(e);
+        }
+    }
+    let filter = match group_exprs.len() {
+        0 => None,
+        1 => group_exprs.pop(),
+        _ => Some(QueryExpr::Or {
+            children: group_exprs,
+        }),
+    };
+
+    // ── must_not：exclusions 的 OR（被排除条件命中即整组排除）──
+    let mut excl_exprs: Vec<QueryExpr> = Vec::new();
+    let mut excluded_ids: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    for c in &intent.exclusions {
+        match resolve_concept(conn, &as_v2(c), true)? {
+            ConceptOutcome::Tag(r) => {
+                excluded_ids.insert(r.tag_id);
+                excl_exprs.push(QueryExpr::Leaf {
+                    cond: LeafCond::Tag {
+                        term_query: None,
+                        term_match: c.term_match,
+                        facet_key: r.facet_key.clone(),
+                        tag_ids: vec![r.tag_id],
+                        mode: Some("any".into()),
+                        include_descendants: true,
+                    },
+                });
+                resolved_tags.push(r);
+            }
+            ConceptOutcome::Content(term) => {
+                excl_exprs.push(QueryExpr::Leaf {
+                    cond: LeafCond::Search {
+                        value: term,
+                        scope: crate::db::query_expr::SearchScope::Content,
+                    },
+                });
+            }
+            ConceptOutcome::Dropped(w) => warnings.push(w),
+        }
+    }
+    // filter 与排除撞同一 tagId → 以排除为准移除 filter 内该 leaf（沿用 §9.3 规则）
+    let filter = if excluded_ids.is_empty() {
+        filter
+    } else {
+        match filter {
+            Some(f) => without_tag_leaves(&f, &excluded_ids),
+            None => None,
+        }
+    };
+    let must_not = match excl_exprs.len() {
+        0 => None,
+        1 => excl_exprs.pop(),
+        _ => Some(QueryExpr::Or {
+            children: excl_exprs,
+        }),
+    };
+
+    // ── should：preferred 概念逐个 resolve（不命中不淘汰，只加分）──
+    let mut should: Vec<ShouldClause> = Vec::new();
+    for g in &intent.groups {
+        for c in &g.preferred {
+            if let Some(leaf) = collect(&mut warnings, &mut resolved_tags, concept_leaf(c)?) {
+                let label = format!("{}（加分项）", c.text.trim());
+                let weight = c.weight.unwrap_or(1.0).clamp(0.5, 2.0);
+                let cond = match leaf {
+                    QueryExpr::Leaf { cond } => cond,
+                    _ => continue,
+                };
+                should.push(ShouldClause { cond, weight, label });
+            }
+        }
+    }
+
+    // ranking：有 preferred → 相关度（should 加权）；否则按意图 sort（命令层给默认）
+    let ranking = if !should.is_empty() {
+        Ranking::Relevance {
+            retrievers: RetrieverPlan::default(),
+        }
+    } else {
+        Ranking::Field {
+            key: intent.sort_by.clone().unwrap_or_else(|| "created_at".into()),
+            dir: intent.sort_dir.clone().unwrap_or_else(|| "desc".into()),
+        }
+    };
+    let plan = SearchPlanV3 {
+        filter,
+        must_not,
+        should,
+        minimum_should_match: 0,
+        retrievers: RetrieverPlan::default(),
+        ranking,
+        ..Default::default()
+    };
+    crate::db::search_plan::validate_search_plan(&plan)?;
+    Ok((plan, resolved_tags, warnings))
+}
+
 /// 从表达式树移除包含指定 tagId 的 Tag leaf（排除优先）。返回 None 表示正向部分被清空。
 fn without_tag_leaves(
     expr: &QueryExpr,
@@ -929,6 +1154,130 @@ pub fn parse_intent(content: &str) -> AppResult<SearchIntentV2> {
     };
     serde_json::from_value::<SearchIntentV2>(value)
         .map_err(|e| AppError::msg(format!("AI JSON 校验失败：{e}")))
+}
+
+/// S3：解析模型回复为 SearchIntentV3（含 preferred 加分项）。解包逻辑与 parse_intent 相同。
+pub fn parse_intent_v3(content: &str) -> AppResult<SearchIntentV3> {
+    let trimmed = content.trim();
+    let parsed: Option<serde_json::Value> = serde_json::from_str(trimmed).ok().or_else(|| {
+        let start = trimmed.find('{')?;
+        let end = trimmed.rfind('}')?;
+        serde_json::from_str(&trimmed[start..=end]).ok()
+    });
+    let Some(v) = parsed else {
+        return Err(AppError::msg("AI 未返回可解析的 JSON"));
+    };
+    let value = if v.get("query").is_some() && v.get("groups").is_none() {
+        v.get("query").cloned().unwrap_or(v)
+    } else {
+        v
+    };
+    serde_json::from_value::<SearchIntentV3>(value)
+        .map_err(|e| AppError::msg(format!("AI JSON 校验失败：{e}")))
+}
+
+/// V3 → V2 视图：concepts 降为 V2（丢弃 preferred —— 调用方先跑 guard_preferred，
+/// 不合法 preferred 已并入 concepts）。清洗/守卫复用 V2 全套函数。
+pub fn v3_to_v2_view(intent: &SearchIntentV3) -> SearchIntentV2 {
+    SearchIntentV2 {
+        groups: intent
+            .groups
+            .iter()
+            .map(|g| SearchGroupV2 {
+                asset_type: g.asset_type.clone(),
+                concepts: g
+                    .concepts
+                    .iter()
+                    .map(|c| SearchConceptV2 {
+                        text: c.text.clone(),
+                        role: c.role.clone(),
+                        facet_hint: c.facet_hint.clone(),
+                        confidence: c.confidence,
+                    })
+                    .collect(),
+                text_terms: g.text_terms.clone(),
+                metadata: g.metadata.clone(),
+            })
+            .collect(),
+        exclusions: intent
+            .exclusions
+            .iter()
+            .map(|c| SearchConceptV2 {
+                text: c.text.clone(),
+                role: c.role.clone(),
+                facet_hint: c.facet_hint.clone(),
+                confidence: c.confidence,
+            })
+            .collect(),
+        sort_by: intent.sort_by.clone(),
+        sort_dir: intent.sort_dir.clone(),
+    }
+}
+
+/// V2 → V3 组（concepts 提升为 V3 概念，necessity=Required；preferred 空）。
+pub fn v2_group_to_v3(g: &SearchGroupV2) -> SearchGroupV3 {
+    SearchGroupV3 {
+        asset_type: g.asset_type.clone(),
+        concepts: g
+            .concepts
+            .iter()
+            .map(|c| SearchConceptV3 {
+                text: c.text.clone(),
+                role: c.role.clone(),
+                facet_hint: c.facet_hint.clone(),
+                confidence: c.confidence,
+                necessity: Necessity::Required,
+                weight: None,
+                evidence: None,
+                term_match: crate::db::tags::TermMatch::Alias,
+            })
+            .collect(),
+        text_terms: g.text_terms.clone(),
+        metadata: g.metadata.clone(),
+        preferred: Vec::new(),
+    }
+}
+
+/// S3：V2 intent → V3 intent（不含 preferred；守卫后仍无加分项的路径用）。
+pub fn v2_to_v3(intent: &SearchIntentV2) -> SearchIntentV3 {
+    SearchIntentV3 {
+        groups: intent.groups.iter().map(v2_group_to_v3).collect(),
+        exclusions: intent
+            .exclusions
+            .iter()
+            .map(|c| SearchConceptV3 {
+                text: c.text.clone(),
+                role: c.role.clone(),
+                facet_hint: c.facet_hint.clone(),
+                confidence: c.confidence,
+                necessity: Necessity::Required,
+                weight: None,
+                evidence: None,
+                term_match: crate::db::tags::TermMatch::Alias,
+            })
+            .collect(),
+        sort_by: intent.sort_by.clone(),
+        sort_dir: intent.sort_dir.clone(),
+    }
+}
+
+/// S3 关键词兜底（V3 形态：整句进 textTerms scope=all）。
+pub fn keyword_intent_v3(text: &str) -> SearchIntentV3 {
+    SearchIntentV3 {
+        groups: vec![SearchGroupV3 {
+            asset_type: "all".into(),
+            concepts: vec![],
+            text_terms: vec![IntentTextTerm {
+                text: text.trim().to_string(),
+                scope: "all".into(),
+            }],
+            metadata: vec![],
+            preferred: Vec::new(),
+        }],
+        exclusions: vec![],
+        sort_by: None,
+        sort_dir: None,
+    }
 }
 
 /// 网络 + 解析 + 校验：由调用方在短锁内收集 facets/dict 后，再在锁外调用本函数。
@@ -1152,6 +1501,144 @@ pub fn degrade_parse(
     (intent, warnings)
 }
 
+/// S3：V3 解析层（V3→V2→关键词 三层降级）。
+/// ① strict V3：parse SearchIntentV3（含 preferred）→ 每组跑 guard_preferred（evidence 守卫）
+///    → V3 侧清洗（concepts/preferred 都过 clean_concepts_v3）→ 转 V2 视图跑 sanitize_all +
+///    guard_intent + validate_intent（复用既有确定性守卫）→ 通过则保留 preferred 返回 V3。
+/// ② V3 解析失败 → 试 V2（把 preferred 当 concepts 的语义 = V2 JSON 无 preferred 字段）→ v2_to_v3。
+/// ③ 都失败 → 关键词兜底（V3 形态）。永不 Err。
+pub fn degrade_parse_v3(
+    raw: &str,
+    text: &str,
+    facets: &[FacetPromptContext],
+) -> (SearchIntentV3, Vec<String>) {
+    let mut intent = match parse_intent_v3(raw) {
+        Ok(i) => i,
+        Err(_) => {
+            // ② V3 失败 → V2（V2 JSON 本身无 preferred；degrade_parse 内部再落关键词）
+            let (v2, w) = degrade_parse(raw, text, facets);
+            return (v2_to_v3(&v2), w);
+        }
+    };
+    // ① strict V3 路径
+    let mut warnings: Vec<String> = Vec::new();
+    // evidence 守卫（只降级 preferred → concepts；绝不反向升级）
+    for g in &mut intent.groups {
+        warnings.extend(guard_preferred(text, g));
+    }
+    // V3 侧概念清洗（preferred 与 concepts 同规则；空/句子化/停用词剔除）
+    let mut total = 0usize;
+    for g in &mut intent.groups {
+        clean_concepts_v3(&mut g.concepts, &mut warnings, &mut total);
+        clean_concepts_v3(&mut g.preferred, &mut warnings, &mut total);
+    }
+    clean_concepts_v3(&mut intent.exclusions, &mut warnings, &mut total);
+    if total > 20 {
+        warnings.push(format!("条件概念较多（{total} 个），已按置信度优先截取 20 个。"));
+    }
+    if intent.groups.is_empty() && intent.exclusions.is_empty() {
+        warnings.push("未能理解搜索条件，已按关键词搜索。".into());
+        return (keyword_intent_v3(text), warnings);
+    }
+    // V2 视图确定性守卫（assetType / OR 合并 / 组去重 / metadata 白名单编译）
+    let mut v2_view = v3_to_v2_view(&intent);
+    warnings.extend(sanitize_all(&mut v2_view, facets));
+    warnings.extend(guard_intent(text, &mut v2_view));
+    if let Err(e) = validate_intent(&v2_view, facets) {
+        warnings.push(format!("解析结果不合规（{e}），已按关键词搜索。"));
+        return (keyword_intent_v3(text), warnings);
+    }
+    // 把 V2 视图的清洗结果（组数/assetType/组顺序）映射回 V3，保留 preferred
+    // （sanitize_all 只剔 metadata/组；guard_intent 可能合并 OR 组 —— 按组序映射 concepts）
+    if intent.groups.len() == v2_view.groups.len() {
+        for (g3, g2) in intent.groups.iter_mut().zip(v2_view.groups.iter()) {
+            g3.asset_type = g2.asset_type.clone();
+            // concepts 的 text/facet 已在 V2 清洗中 trim/去停用/去重 —— 直接替换
+            //（preferred 不进 V2 视图，保留原 V3 值）
+            g3.concepts = g2
+                .concepts
+                .iter()
+                .map(|c| SearchConceptV3 {
+                    text: c.text.clone(),
+                    role: c.role.clone(),
+                    facet_hint: c.facet_hint.clone(),
+                    confidence: c.confidence,
+                    necessity: Necessity::Required,
+                    weight: None,
+                    evidence: None,
+                    term_match: crate::db::tags::TermMatch::Alias,
+                })
+                .collect();
+        }
+        intent.exclusions = v2_view
+            .exclusions
+            .iter()
+            .map(|c| SearchConceptV3 {
+                text: c.text.clone(),
+                role: c.role.clone(),
+                facet_hint: c.facet_hint.clone(),
+                confidence: c.confidence,
+                necessity: Necessity::Required,
+                weight: None,
+                evidence: None,
+                term_match: crate::db::tags::TermMatch::Alias,
+            })
+            .collect();
+    } else {
+        // guard_intent 合并了组（无 OR 词多组 → 单 AND 组）：preferred 无法安全映射，丢弃并提示
+        warnings.push("多组条件已合并，加分项分组信息不再精确，已按必须条件执行。".into());
+        intent = v2_to_v3(&v2_view);
+    }
+    (intent, warnings)
+}
+
+/// V3 概念清洗：与 clean_concepts（V2）同规则，保留 V3 特有字段（evidence/weight/term_match）。
+fn clean_concepts_v3(
+    concepts: &mut Vec<SearchConceptV3>,
+    warnings: &mut Vec<String>,
+    total: &mut usize,
+) {
+    let mut kept: Vec<SearchConceptV3> = Vec::new();
+    for c in concepts.drain(..) {
+        let mut text = c.text.trim().to_string();
+        text = text
+            .trim_matches(|ch: char| CONCEPT_EDGE_PUNCT.contains(&ch))
+            .trim()
+            .to_string();
+        if text.is_empty() {
+            continue;
+        }
+        if SEARCH_CONCEPT_STOPWORDS.iter().any(|w| *w == text) {
+            continue;
+        }
+        if text.chars().count() > MAX_CONCEPT_CHARS {
+            warnings.push(format!("「{text}」是句子而非原子概念，已忽略。"));
+            continue;
+        }
+        let confidence = c.confidence.unwrap_or(0.0).clamp(0.0, 1.0);
+        kept.push(SearchConceptV3 {
+            text,
+            role: c.role.trim().to_string(),
+            facet_hint: c
+                .facet_hint
+                .as_ref()
+                .map(|h| h.trim().to_string())
+                .filter(|h| !h.is_empty()),
+            confidence: Some(confidence),
+            necessity: c.necessity,
+            weight: c.weight.map(|w| w.clamp(0.5, 2.0)),
+            evidence: c
+                .evidence
+                .as_ref()
+                .map(|e| e.trim().to_string())
+                .filter(|e| !e.is_empty()),
+            term_match: c.term_match,
+        });
+        *total += 1;
+    }
+    *concepts = kept;
+}
+
 /// W6-2：配置类错误判定（鉴权 / 连不上 / 超时）—— 这类错误必须真报错，不做降级。
 pub fn is_config_error(e: &AppError) -> bool {
     let m = e.to_string().to_lowercase();
@@ -1284,6 +1771,18 @@ pub fn build_system_prompt(facets: &[FacetPromptContext]) -> String {
     p.push_str("9. 「不要/排除/除了」对应的原子概念放入全局 exclusions，不混入正向 group。\n");
     p.push_str("10. 不输出 tagId、SQL、分页、空字符串条件或 schema 之外字段。\n");
     p.push_str("11. confidence 0-1：能从词典精确命中给 0.9+；只能猜测给 0.6 左右；完全不确认给 0.5 以下。\n");
+    // S3：必须 vs 加分的判断（§S3）—— 加分项必须带 evidence（原文摘句），否则归必须。
+    p.push_str("必须 vs 加分的判断：\n");
+    p.push_str("- 「一定要有 / 只要 / 必须」→ concepts（必须）；「不要 / 排除 / 除了」→ 全局 exclusions（排除）。\n");
+    p.push_str("- 「最好有 / 优先 / 尽量 / 更好 / 可有可无 / 倾向 / 接近 / 偏」→ 该 group 的 preferred（加分，不淘汰结果）。\n");
+    p.push_str("- 加分项必须填 evidence：从原句中**逐字摘出**让你判断为「加分」的片段（如 evidence: \"有蓝天更好\"）。摘不出原文片段就归必须。\n");
+    p.push_str("- 权重只给三档：0.5（略微偏好）/ 1.0（一般偏好）/ 2.0（强偏好）。\n");
+    p.push_str("- 不确定时归必须 —— 宁可少给结果，也不要让用户以为条件生效了但其实没生效。\n");
+    p.push_str("词匹配方式（termMatch，默认 alias = 精确匹配规范名或别名）：\n");
+    p.push_str("- 用户给出完整词（「海边」「人像」）→ 不填，用默认 alias。\n");
+    p.push_str("- 用户说「带…的」「关于…的」「跟…有关」→ contains。\n");
+    p.push_str("- 用户明显打错字或用了近义词 → 仍用 alias。系统会在零结果时建议相近词。\n");
+    p.push_str("- 不要主动用 prefix 或 fuzzy —— 那是零结果时的兜底，不是首选。\n");
     p.push_str("颜色是算法计算的文件属性，用 metadata（dominant_hue 0-359：红色 min=345 max=15 表示跨 0°；橙 15-45、黄 45-70、绿 70-155、青 155-225、蓝 225-295、紫 295-345；dominant_sat/dominant_lum 0-100；灰/黑/白用 dominant_sat lte 10），不写进 tags。\n");
     p.push_str("元数据条件（metadata）能力清单——key 与 op 只能从下面选，单位与格式必须严格遵守：\n");
     p.push_str("- file_size：文件大小，单位字节（1MB=1048576）。op 用 gt/gte/lt/lte/between。示例「10~105MB」→ {\"key\":\"file_size\",\"op\":\"between\",\"min\":10485760,\"max\":110100480}。\n");
@@ -1351,6 +1850,26 @@ fn intent_schema(facets: &[FacetPromptContext]) -> serde_json::Value {
         },
         "required": ["text", "role", "facetHint", "confidence"]
     });
+    // S3：加分项概念 —— concepts 同构 + evidence/weight/termMatch（模型可省略 → null）。
+    // 服务端 strict 模式下 required 字段齐全（V2 模型不输出 preferred 数组 → 掉到 JsonObject 层，
+    // 本地解析仍兼容：preferred 缺省为空 = V2 语义）。见 S3「V3→V2→关键词」三层降级。
+    let preferred_concept = serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "text": {"type": "string", "minLength": 1, "maxLength": 12},
+            "role": {"type": "string", "maxLength": 40},
+            "facetHint": facet_hint,
+            "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+            "evidence": {"anyOf": [{"type": "string", "minLength": 1, "maxLength": 40}, {"type": "null"}]},
+            "weight": {"anyOf": [{"type": "number", "enum": [0.5, 1.0, 2.0]}, {"type": "null"}]},
+            "termMatch": {"anyOf": [
+                {"type": "string", "enum": ["exact", "alias", "prefix", "contains", "fuzzy"]},
+                {"type": "null"}
+            ]}
+        },
+        "required": ["text", "role", "facetHint", "confidence", "evidence", "weight", "termMatch"]
+    });
     let text_term = serde_json::json!({
         "type": "object",
         "additionalProperties": false,
@@ -1406,9 +1925,10 @@ fn intent_schema(facets: &[FacetPromptContext]) -> serde_json::Value {
             "assetType": {"type": "string", "enum": ["all", "image", "video"]},
             "concepts": {"type": "array", "maxItems": 20, "items": concept},
             "textTerms": {"type": "array", "maxItems": 10, "items": text_term},
-            "metadata": {"type": "array", "maxItems": 20, "items": metadata_item}
+            "metadata": {"type": "array", "maxItems": 20, "items": metadata_item},
+            "preferred": {"type": "array", "maxItems": 12, "items": preferred_concept}
         },
-        "required": ["assetType", "concepts", "textTerms", "metadata"]
+        "required": ["assetType", "concepts", "textTerms", "metadata", "preferred"]
     });
     serde_json::json!({
         "type": "object",
@@ -2551,5 +3071,175 @@ mod tests {
         // 空 capabilities → 不注入（命令层短锁失败静默降级路径）
         let p2 = build_user_prompt(&dict, &facets, "海边", "");
         assert!(!p2.contains("本库现状"), "空能力摘要不应注入：{p2}");
+    }
+
+    // ═══════════════ S3 解析层接线（V3→V2→关键词 三层） ═══════════════
+
+    /// S3：V3 解析成功且含合法 preferred → 保留加分项，返回 V3 结构。
+    #[test]
+    fn v3_parse_keeps_valid_preferred() {
+        let facets: Vec<FacetPromptContext> = vec![];
+        let raw = r#"{"groups":[{"assetType":"all","concepts":[{"text":"草地","role":"scene","facetHint":null,"confidence":0.9}],"preferred":[{"text":"蓝天","role":"scene","facetHint":null,"confidence":0.8,"evidence":"最好有蓝天","weight":1.0,"termMatch":null}],"textTerms":[],"metadata":[]}],"exclusions":[],"sortBy":null,"sortDir":null}"#;
+        let (intent, warnings) = degrade_parse_v3(raw, "草地，最好有蓝天", &facets);
+        assert_eq!(intent.groups.len(), 1, "应保留单组：{warnings:?}");
+        assert!(
+            intent.groups[0].preferred.iter().any(|c| c.text == "蓝天"),
+            "合法加分项应保留：preferred={:?} warnings={warnings:?}",
+            intent.groups[0].preferred.iter().map(|c| &c.text).collect::<Vec<_>>()
+        );
+    }
+
+    /// S3：V3 解析失败（JSON 结构 V2 合法但 V3 非法，如 preferred 类型错）→ 落 V2 语义。
+    /// 模拟旧模型输出 —— 无 preferred 字段的 V2 JSON 也能被 V3 解析（serde default），
+    /// 真正的「V3 解析失败」= 顶层结构 V3 无法读取 → 降级路径由 request_intent 兜底；
+    /// 本测试验证 V2 JSON 进 V3 管线不炸、结果语义与 V2 一致。
+    #[test]
+    fn v3_parse_failure_falls_back_to_v2() {
+        let facets: Vec<FacetPromptContext> = vec![];
+        // ① 畸形输入（非 JSON）→ V3 管线落关键词（V3 形态）
+        let (i1, w1) = degrade_parse_v3("模型在胡言乱语", "草地", &facets);
+        assert!(i1.groups[0].text_terms.iter().any(|t| t.text.contains("草地")), "应关键词兜底（整句进 textTerms）：{w1:?}");
+        // ② V2 合法 JSON（无 preferred）→ V3 管线解析出与 V2 相同的概念集
+        let v2_raw = r#"{"groups":[{"assetType":"all","concepts":[{"text":"草地","role":"scene","facetHint":null,"confidence":0.9}],"textTerms":[],"metadata":[]}],"exclusions":[],"sortBy":null,"sortDir":null}"#;
+        let (v3i, _) = degrade_parse_v3(v2_raw, "草地", &facets);
+        let v2i = v3_to_v2_view(&v3i);
+        assert_eq!(v2i.groups[0].concepts[0].text, "草地", "V2 JSON 应保持原语义");
+        assert!(v3i.groups[0].preferred.is_empty(), "V2 无加分项");
+    }
+
+    /// S3：schema 已扩展 V3 字段 —— group.preferred 与 evidence/weight/termMatch 可被 json_schema 服务商接受。
+    #[test]
+    fn schema_supports_v3_preferred_field() {
+        let s = intent_schema(&[]);
+        let g = &s["properties"]["groups"]["items"];
+        assert!(
+            g["properties"]["preferred"].is_object(),
+            "group schema 必须声明 preferred 数组"
+        );
+        let pref_items = &g["properties"]["preferred"]["items"];
+        for field in ["evidence", "weight", "termMatch"] {
+            assert!(pref_items["properties"][field].is_object(), "加分项 schema 缺 {field}");
+        }
+    }
+
+    /// S3：V3 概念清洗复用 V2 规则（句子化/停用词/空文本剔除），同时保留 V3 特有字段。
+    #[test]
+    fn v3_clean_concepts_keeps_v3_fields() {
+        let mut warns = Vec::new();
+        let mut total = 0usize;
+        let mut cs = vec![SearchConceptV3 {
+            text: " 最好有蓝天 ".into(),
+            role: "scene".into(),
+            facet_hint: Some("scene".into()),
+            confidence: Some(0.9),
+            necessity: Necessity::Preferred,
+            weight: Some(2.0),
+            evidence: Some("最好有蓝天".into()),
+            term_match: crate::db::tags::TermMatch::Alias,
+        }];
+        clean_concepts_v3(&mut cs, &mut warns, &mut total);
+        assert_eq!(cs.len(), 1);
+        assert_eq!(cs[0].text, "最好有蓝天", "首尾空白应去除");
+        assert_eq!(cs[0].necessity, Necessity::Preferred, "V3 字段不因清洗丢失");
+        assert_eq!(cs[0].weight, Some(2.0));
+        assert_eq!(cs[0].evidence.as_deref(), Some("最好有蓝天"));
+        // 句子化文本剔除（沿用 V2 规则：超过 12 字）
+        let mut long = vec![SearchConceptV3 {
+            text: "这是一个非常长的句子描述画面".into(),
+            role: String::new(),
+            facet_hint: None,
+            confidence: None,
+            necessity: Necessity::Required,
+            weight: None,
+            evidence: None,
+            term_match: crate::db::tags::TermMatch::Alias,
+        }];
+        clean_concepts_v3(&mut long, &mut warns, &mut total);
+        assert!(long.is_empty(), "句子化概念应剔除");
+        assert!(warns.iter().any(|w| w.contains("句子而非原子概念")));
+    }
+
+    // ═══════════════ S3：V3 intent → SearchPlanV3（build_plan_from_v3，真实 DB） ═══════════════
+
+    fn v3_insert_asset(conn: &rusqlite::Connection, path: &str) -> i64 {
+        conn.query_row(
+            "INSERT INTO assets (file_path, file_name, file_ext, file_size, mime_type, created_at, modified_at)
+             VALUES (?1, ?2, 'jpg', 1000, 'image/jpeg', 1700000000000, 1700000000000) RETURNING id",
+            rusqlite::params![path, path.rsplit('/').next().unwrap()],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// S3：required（filter）∧ preferred（should，不淘汰）∧ exclusions（must_not）
+    /// 经 build_plan_from_v3 正确拆分，run_search_plan 可执行且加分不淘汰。
+    #[test]
+    fn build_plan_from_v3_splits_required_preferred_excluded() {
+        use crate::db::query_expr::QueryExpr;
+        use crate::db::search_plan::run_search_plan;
+        use crate::db::tags;
+        let conn = init_memory().unwrap();
+        let grass = tags::create_in_facet(&conn, "草地", None, Some("scene")).unwrap();
+        let sky = tags::create_in_facet(&conn, "蓝天", None, Some("scene")).unwrap();
+        let night = tags::create_in_facet(&conn, "夜景", None, Some("scene")).unwrap();
+        let a = v3_insert_asset(&conn, "d:/s3/grass_sky.jpg");
+        let b = v3_insert_asset(&conn, "d:/s3/grass_only.jpg");
+        let e = v3_insert_asset(&conn, "d:/s3/grass_night.jpg");
+        crate::db::asset_tags::assign(&conn, &[a], &[grass.id, sky.id], "manual").unwrap();
+        crate::db::asset_tags::assign(&conn, &[b], &[grass.id], "manual").unwrap();
+        crate::db::asset_tags::assign(&conn, &[e], &[grass.id, night.id], "manual").unwrap();
+        let c3 = |text: &str, role: &str, necessity: Necessity, ev: Option<&str>, w: Option<f32>| SearchConceptV3 {
+            text: text.into(),
+            role: role.into(),
+            facet_hint: Some("scene".into()),
+            confidence: Some(0.95),
+            necessity,
+            weight: w,
+            evidence: ev.map(String::from),
+            term_match: crate::db::tags::TermMatch::Alias,
+        };
+        let intent = SearchIntentV3 {
+            groups: vec![SearchGroupV3 {
+                asset_type: "all".into(),
+                concepts: vec![c3("草地", "scene", Necessity::Required, None, None)],
+                preferred: vec![c3("蓝天", "scene", Necessity::Preferred, Some("最好有蓝天"), Some(1.0))],
+                text_terms: vec![],
+                metadata: vec![],
+            }],
+            exclusions: vec![c3("夜景", "scene", Necessity::Required, None, None)],
+            sort_by: None,
+            sort_dir: None,
+        };
+        let (plan, resolved, warns) = build_plan_from_v3(&conn, &intent).unwrap();
+        // filter = 草地（required）；must_not = 夜景；should = 蓝天 加分
+        let leaf_ids = |e: &Option<QueryExpr>| -> Vec<i64> {
+            let mut out = Vec::new();
+            if let Some(QueryExpr::Leaf { cond: crate::db::query_expr::LeafCond::Tag { tag_ids, .. } }) = e {
+                out.extend(tag_ids);
+            }
+            out
+        };
+        assert_eq!(leaf_ids(&plan.filter), vec![grass.id], "filter 应只含草地（required）");
+        assert_eq!(plan.should.len(), 1, "蓝天应是唯一加分项：{warns:?}");
+        assert_eq!(leaf_ids(&plan.must_not), vec![night.id], "must_not 应含夜景");
+        assert!(resolved.iter().any(|r| r.tag_id == grass.id));
+        assert!(resolved.iter().any(|r| r.tag_id == sky.id));
+        // 执行：草地照都在（含无蓝天），夜景照被排除，蓝天加分排最前
+        let out = run_search_plan(&conn, &plan, None, 0).unwrap();
+        let ids: Vec<i64> = out.iter().map(|r| r.0).collect();
+        assert!(ids.contains(&b), "无蓝天的草地不得被淘汰：{ids:?}");
+        assert!(!ids.contains(&e), "草地+夜景必须排除");
+        assert_eq!(ids[0], a, "有蓝天应排最前：{ids:?}");
+    }
+
+    /// S3：keyword 兜底形态转 plan 后 filter 含整句 content 搜索（可执行、不 panic）。
+    #[test]
+    fn build_plan_from_v3_keyword_fallback_runs() {
+        use crate::db::search_plan::run_search_plan;
+        let conn = init_memory().unwrap();
+        let v3 = keyword_intent_v3("海边日落");
+        let (plan, _, _) = build_plan_from_v3(&conn, &v3).unwrap();
+        assert!(plan.should.is_empty(), "关键词兜底无加分项");
+        let _ = run_search_plan(&conn, &plan, Some(10), 0).unwrap();
     }
 }
