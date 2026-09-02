@@ -620,3 +620,57 @@ describe("U-3 色块选择器", () => {
     }
   });
 });
+
+/** U-4：一层 OR/AND 嵌套 → 可展开的只读树形视图（不再是「复杂条件（N 项）」一句话）。 */
+describe("U-4 一层嵌套只读树形视图", () => {
+  it("queryBuilder_one_level_nesting：展开后按层显示 OR 组与叶子；只读；追加条件仍 AND 合并", () => {
+    // A 且 (B 或 C)：一层 OR 嵌套
+    const expr: QueryExpr = {
+      op: "and",
+      children: [
+        { op: "leaf", cond: { type: "search", value: "海边", scope: "all" } },
+        {
+          op: "or",
+          children: [
+            { op: "leaf", cond: { type: "tag", facetKey: "subject", tagIds: [1], mode: "any", includeDescendants: false } },
+            { op: "leaf", cond: { type: "tag", facetKey: "subject", tagIds: [2], mode: "any", includeDescendants: false } },
+          ],
+        },
+      ],
+    };
+    useSuperSearchStore.setState({
+      expr,
+      resolvedTags: [
+        { facetKey: "subject", text: "人物", tagId: 1, path: "" },
+        { facetKey: "subject", text: "女孩", tagId: 2, path: "" },
+      ],
+    });
+    render(<QueryBuilder />);
+    // 摘要可见且默认收起
+    expect(screen.getByText(/复杂条件（3 项）/)).toBeInTheDocument();
+    const toggle = screen.getByRole("button", { name: /展开只读树形查看/ });
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    expect(screen.queryByText("海边")).not.toBeInTheDocument();
+    // 展开 → 树形：根叶子 + OR 组行 + 组内叶子（tag 名称经 resolvedTags 解析）
+    fireEvent.click(toggle);
+    expect(toggle.getAttribute("aria-expanded")).toBe("true");
+    expect(screen.getByText(/海边/)).toBeInTheDocument();
+    expect(screen.getAllByText(/或者/)).toHaveLength(1);
+    expect(screen.getByText(/标签：人物/)).toBeInTheDocument();
+    expect(screen.getByText(/标签：女孩/)).toBeInTheDocument();
+    // 只读：不渲染可编辑输入
+    expect(screen.queryByPlaceholderText("输入关键词")).not.toBeInTheDocument();
+    // 追加条件仍与整棵现有树 AND 合并（可折叠回摘要后再加）
+    fireEvent.click(screen.getByRole("button", { name: "+ 添加第一个条件" }));
+    pickField("关键词");
+    const input = screen.getByPlaceholderText("输入关键词");
+    fireEvent.change(input, { target: { value: "夜景" } });
+    fireEvent.blur(input);
+    const merged = useSuperSearchStore.getState().expr;
+    expect(merged?.op).toBe("and");
+    const children = merged && merged.op === "and" ? merged.children : [];
+    expect(children).toContainEqual({ op: "leaf", cond: { type: "search", value: "夜景" } });
+    const orChild = children.find((c) => c.op === "or") as QueryExpr | undefined;
+    expect(orChild).toBeTruthy();
+  });
+});

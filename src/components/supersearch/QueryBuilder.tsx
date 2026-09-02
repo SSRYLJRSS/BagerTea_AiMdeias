@@ -111,6 +111,8 @@ export default function QueryBuilder() {
   const tagTree = useTagStore((s) => s.tree); const tagsLoading = useTagStore((s) => s.loading);
   const [mode, setMode] = useState<GroupMode>("and"); const [rows, setRows] = useState<Row[]>([]);
   const [formulaWarning, setFormulaWarning] = useState<string | null>(null);
+  // U-4：嵌套树的只读树形查看默认收起，可展开
+  const [treeOpen, setTreeOpen] = useState(false);
   const lastLocalSignature = useRef<string | null>(null);
   const commitTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(() => { if (tagTree.length === 0 && !tagsLoading) void useTagStore.getState().refresh(); }, [tagTree.length, tagsLoading]);
@@ -126,6 +128,13 @@ export default function QueryBuilder() {
     return resolvedTags.filter((r) => !known.has(r.tagId)).map((r) => ({ id: r.tagId, name: r.text, facet: r.facetKey, aliases: [] }));
   }, [flatTags, resolvedTags]);
   const allTagOptions = useMemo(() => [...flatTags, ...syntheticTags], [flatTags, syntheticTags]);
+  // U-4：嵌套树（formulaWarning="nested"）的只读展示数据——展开后逐行列出 AND/OR/NOT 与叶子
+  const treeRows = useMemo(() => {
+    if (!expr || formulaWarning !== "nested") return [];
+    const nameOf = (id: number) => allTagOptions.find((t) => t.id === id)?.name ?? `标签 #${id}`;
+    return buildTreeRows(expr, nameOf);
+  }, [expr, formulaWarning, allTagOptions]);
+  const treeLeafCount = useMemo(() => (expr ? countLeafNodes(expr) : 0), [expr]);
   useEffect(() => {
     const signature = expr ? serializeExpr(expr) : "";
     if (lastLocalSignature.current === signature) {
@@ -135,10 +144,11 @@ export default function QueryBuilder() {
     if (commitTimer.current) clearTimeout(commitTimer.current);
     const model = exprToRows(expr);
     if (model.unsupported) {
-      // §9.6.1：嵌套树只显示只读摘要，不渲染可编辑行（防误编辑回写破坏结构）
+      // §9.6.1/U-4：嵌套树只读降级——不渲染可编辑行（防误编辑回写破坏结构），
+      // 摘要改为可展开的树形只读视图；新增条件仍以 AND 与整棵现有树合并。
       setMode("and");
       setRows([]);
-      setFormulaWarning(unsupportedMessage(expr));
+      setFormulaWarning("nested");
       return;
     }
     setMode(model.mode);
@@ -173,17 +183,99 @@ export default function QueryBuilder() {
   return <section className="overflow-hidden rounded-md border border-[var(--color-border)] bg-[var(--color-surface-raised)]" aria-label="条件公式">
     <div className="flex min-h-10 items-center gap-2 border-b border-[var(--color-border)] px-3 py-2"><span className="text-xs font-semibold text-[var(--color-text)]">筛选条件</span><span className="text-[11px] text-[var(--color-text-tertiary)]">AI 生成后可继续修改</span>{rows.length > 0 && <button type="button" onClick={clearAll} className="ml-auto text-xs text-[var(--color-text-secondary)] hover:text-[var(--color-text)]">清除全部</button>}</div>
     <div className="px-3 py-2.5"><div className="mb-2 flex items-center gap-2 text-xs text-[var(--color-text-secondary)]"><span>符合</span><select aria-label="条件连接方式" value={mode} disabled={Boolean(formulaWarning)} onChange={(e) => commit(rows, e.target.value as GroupMode)} className={`${controlClass} w-28 font-medium text-[var(--color-text)]`}><option value="and">全部条件</option><option value="or">任一条件</option></select></div>
-      {formulaWarning && <p className="mb-2 border-l-2 border-[var(--color-status)] pl-2 text-[11px] leading-5 text-[var(--color-status)]">{formulaWarning}</p>}
+      {formulaWarning === "nested" && expr && (
+        <div className="mb-2 overflow-hidden rounded-md border border-[var(--color-border)] bg-[var(--color-surface)]">
+          <button
+            type="button"
+            aria-expanded={treeOpen}
+            aria-controls="nested-condition-tree"
+            onClick={() => setTreeOpen((o) => !o)}
+            className="flex w-full items-center gap-1.5 px-3 py-1.5 text-left text-[11px] font-medium text-[var(--color-status)] hover:bg-[var(--color-surface-hover)]"
+          >
+            <span aria-hidden="true" className="text-[10px]">{treeOpen ? "▾" : "▸"}</span>
+            <span>复杂条件（{treeLeafCount} 项）：{treeOpen ? "收起只读树形查看" : "展开只读树形查看"}</span>
+          </button>
+          {treeOpen && (
+            <div id="nested-condition-tree" className="max-h-56 overflow-y-auto border-t border-[var(--color-border)] px-3 py-1.5 text-[11px] leading-5">
+              {treeRows.map((r) => (
+                <div
+                  key={r.id}
+                  className={r.op ? "font-medium text-[var(--color-text-secondary)]" : "text-[var(--color-text)]"}
+                  style={{ paddingLeft: `${r.depth * 14}px` }}
+                >
+                  {r.op ? r.text : `· ${r.text}`}
+                </div>
+              ))}
+            </div>
+          )}
+          <p className="px-3 py-1 text-[10px] leading-4 text-[var(--color-text-tertiary)]">嵌套树只读：可「并且」追加新条件，或在上方条件条逐项移除。</p>
+        </div>
+      )}
       {rows.length === 0 ? <button type="button" onClick={addRow} className="flex h-10 w-full items-center justify-center border border-dashed border-[var(--color-border)] text-xs text-[var(--color-text-secondary)] hover:border-[var(--color-border-strong)] hover:bg-[var(--color-surface)] hover:text-[var(--color-text)]">+ 添加第一个条件</button> : <div className="divide-y divide-[var(--color-border)] border-y border-[var(--color-border)]">{rows.map((row, index) => <ConditionRow key={row.id} row={row} prefix={index === 0 ? "当" : mode === "and" ? "并且" : "或者"} allTagOptions={allTagOptions} onChange={(patch) => updateRow(row.id, patch)} onRemove={() => commit(rows.filter((item) => item.id !== row.id))} />)}</div>}
       {rows.length > 0 && <button type="button" onClick={addRow} className="mt-2 h-8 px-1 text-xs font-medium text-[var(--color-status)] hover:opacity-80">+ 添加条件</button>}
     </div>
   </section>;
 }
 
-/** §9.6.1：嵌套树只读摘要文案（含条件数量） */
-function unsupportedMessage(expr?: QueryExpr): string {
-  const n = expr ? countLeafNodes(expr) : 0;
-  return `复杂条件（${n} 项）：当前包含 OR / 嵌套排除，无法在简洁模式中展开，原条件仍然有效。可在上方条件条逐项移除；新增条件将以「并且」合并到现有条件。`;
+/** U-4：嵌套树的只读展示行。op 行为组标记（全部满足/并且/或者/排除），叶子行为条件文本。 */
+type TreeRowItem = { id: string; depth: number; op?: "and" | "or" | "not"; text: string };
+
+function buildTreeRows(e: QueryExpr, nameOf: (id: number) => string): TreeRowItem[] {
+  const rows: TreeRowItem[] = [];
+  const push = (n: QueryExpr, depth: number, root: boolean) => {
+    if (n.op === "leaf") {
+      rows.push({ id: `tree-${rows.length}`, depth, text: describeLeafCond(n.cond, nameOf) });
+      return;
+    }
+    if (n.op === "not") {
+      rows.push({ id: `tree-${rows.length}`, depth, op: "not", text: "排除" });
+      push(n.child, depth + 1, false);
+      return;
+    }
+    rows.push({ id: `tree-${rows.length}`, depth, op: n.op, text: n.op === "and" ? (root ? "全部满足" : "并且") : root ? "任一满足" : "或者" });
+    for (const c of n.children) push(c, depth + 1, false);
+  };
+  push(e, 0, true);
+  return rows;
+}
+
+const LEAF_META_LABELS: Record<string, string> = {
+  file_ext: "格式", mime_type: "MIME", width: "宽", height: "高", resolution: "分辨率", aspect_ratio: "宽高比",
+  file_size: "文件大小", duration_ms: "视频时长", taken_at: "拍摄时间", created_at: "入库时间", modified_at: "修改时间",
+  camera: "相机", lens: "镜头", iso: "ISO", aperture: "光圈", shutter: "快门", focal: "焦距",
+  video_codec: "视频编码", audio_codec: "音频编码", folder: "文件夹", palette_top3: "前三色",
+};
+const LEAF_OP_TEXT: Record<string, string> = { eq: "=", in: "属于", contains: "含", gt: ">", gte: "≥", lt: "<", lte: "≤" };
+
+/** 叶子条件 → 树形只读视图的可读文本（tag 名称经 nameOf 解析，找不到显示「标签 #id」）。 */
+function describeLeafCond(cond: LeafCond, nameOf: (id: number) => string): string {
+  switch (cond.type) {
+    case "search":
+      return cond.value;
+    case "assetType":
+      return cond.value === "image" ? "类型：图片" : cond.value === "video" ? "类型：视频" : "类型：全部";
+    case "untagged":
+      return "未打标";
+    case "facetHasAny":
+      return `「${cond.facetKey}」分类有任意标签`;
+    case "facetMissing":
+      return `「${cond.facetKey}」分类没有标签`;
+    case "tag":
+    case "excludeTag": {
+      const names = cond.tagIds.map(nameOf).join("、");
+      return cond.type === "excludeTag" ? `排除：${names || cond.facetKey}` : `标签：${names || "（未选择）"}`;
+    }
+    case "metadata": {
+      const f = cond.filter;
+      const label = LEAF_META_LABELS[f.key] ?? f.key;
+      if (f.key === "palette_top3" && f.op === "eq" && typeof f.value === "string" && typeof f.min === "number" && f.min > 0) {
+        return `${label}含 ${f.value}（占 ≥${Math.round(f.min * 100)}%）`;
+      }
+      if (f.op === "between") return `${label} ${f.min ?? ""}~${f.max ?? ""}`;
+      if (f.op === "in") return `${label} ∈ ${(f.values ?? []).join("、")}`;
+      return `${label} ${LEAF_OP_TEXT[f.op] ?? f.op} ${f.value ?? ""}`;
+    }
+  }
 }
 
 function countLeafNodes(e: QueryExpr): number {
