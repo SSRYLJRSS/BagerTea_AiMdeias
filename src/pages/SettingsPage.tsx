@@ -25,6 +25,7 @@ import { listAiConnections, getAiUsageBindings, setAiUsageBinding } from "@/api/
 import { videoProxyCacheStats, clearAllVideoProxies } from "@/api/video";
 import FacetManagePanel from "@/components/settings/FacetManagePanel";
 import DataIntegrityPanel from "@/components/settings/DataIntegrityPanel";
+import VocabularyGovernancePanel from "@/components/settings/VocabularyGovernancePanel";
 import ServiceManagement from "@/components/settings/ServiceManagement";
 import { useLibraryStore } from "@/stores/libraryStore";
 import { applyTheme, useSettingsStore, DEFAULT_APPEARANCE } from "@/stores/settingsStore";
@@ -539,6 +540,10 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
               {/* F2-e：数据完整性（V22b 约束能力状态 + 预检 + 启用） */}
               <div className="pt-2">
                 <DataIntegrityPanel />
+              </div>
+              {/* F6-d：词表治理（新词待确认 + 疑似重复合并） */}
+              <div className="pt-2">
+                <VocabularyGovernancePanel />
               </div>
             </Group>
           )}

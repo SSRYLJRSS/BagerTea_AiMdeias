@@ -67,6 +67,9 @@ vi.mock("@/api/ollama", () => ({
 }));
 vi.mock("@/api/ai", () => ({
   // FB5-04：aiListModels 已删除（模型发现走 discoverAiModels / connections）
+  // F6-d：词表治理面板（VocabularyGovernancePanel）自动拉取
+  aiListNewWordCandidates: vi.fn().mockResolvedValue([]),
+  aiDecideSuggestionItem: vi.fn().mockResolvedValue(undefined),
 }));
 vi.mock("@/api/thumbnail", () => ({
   clearThumbnailCache: vi.fn().mockResolvedValue(undefined),
@@ -76,6 +79,8 @@ vi.mock("@/api/tags", async (importOriginal) => ({
   listAllTagFacets: vi.fn().mockResolvedValue([]),
   listContentDescriptions: vi.fn().mockResolvedValue([]),
   listTagConstraintFeatures: vi.fn().mockResolvedValue([]),
+  scanDuplicateTags: vi.fn().mockResolvedValue([]),
+  searchTagCandidates: vi.fn().mockResolvedValue([]),
   detectTagConstraintsConflicts: vi.fn().mockResolvedValue({
     termConflicts: [],
     orphans: [],

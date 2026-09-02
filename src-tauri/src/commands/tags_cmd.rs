@@ -161,6 +161,15 @@ pub fn list_tag_governance(state: State<AppState>) -> AppResult<Vec<TagFacetGove
     tags::governance(&conn)
 }
 
+/// F6-d：全库疑似重复组（近似匹配连通分量），设置页据此给「合并到…」下拉。
+#[tauri::command]
+pub fn scan_duplicate_tags(
+    state: State<AppState>,
+) -> AppResult<Vec<crate::db::tags::DuplicateGroup>> {
+    let conn = lock_db(&state)?;
+    crate::db::tags::scan_duplicate_tags(&conn)
+}
+
 #[tauri::command]
 pub fn search_tag_candidates(
     state: State<AppState>,

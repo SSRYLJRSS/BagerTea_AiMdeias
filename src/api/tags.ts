@@ -219,3 +219,22 @@ export function detectTagConstraintsConflicts(): Promise<TagConflictReport> {
 export function applyTagConstraints(): Promise<void> {
   return invoke<void>("apply_tag_constraints");
 }
+
+// ── F6-d：疑似重复扫描 ──
+
+export interface DuplicateMember {
+  tagId: number;
+  name: string;
+  assetCount: number;
+}
+
+export interface DuplicateGroup {
+  facetKey: string;
+  members: DuplicateMember[];
+}
+
+/** F6-d：全库疑似重复组（近似匹配连通分量） */
+export function scanDuplicateTags(): Promise<DuplicateGroup[]> {
+  return invoke<DuplicateGroup[]>("scan_duplicate_tags");
+}
+

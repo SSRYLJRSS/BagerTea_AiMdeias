@@ -264,15 +264,28 @@ pub fn set_suggestion_tags(conn: &Connection, id: i64, tags: &CategorizedTags) -
             // F3-a：tag_id 反查收敛到 find_by_term（mode=Alias）—— 消灭自写 SQL +
             // ORDER BY t.is_system DESC 兜底；find_by_term 内部按 feature gate 走
             // tag_terms（唯一索引保证最多一行）或旧表。
+            let mut decision_reason: Option<String> = None;
             let tag_id: Option<i64> = tags::find_by_term(conn, &facet_key, &normalized, tags::TermMatch::Alias)
                 .ok()
                 .and_then(|l| l.hits.into_iter().next())
                 .map(|h| h.tag_id);
+            // F6-b：词表里没有精确命中 → 近似匹配「只提示，不自动改写」——
+            // 命中写入 decision_reason（tag_id 仍为 NULL，候选留在 ai_suggestion_items）
+            if tag_id.is_none() {
+                if let Some((_, owner, reason)) =
+                    tags::find_similar_tag(conn, &facet_key, &normalized)?
+                {
+                    decision_reason = Some(match reason {
+                        tags::SimilarReason::Substring => format!("疑似与「{owner}」重复"),
+                        tags::SimilarReason::Spell => format!("拼写相近：「{owner}」"),
+                    });
+                }
+            }
             conn.execute(
                 "INSERT INTO ai_suggestion_items
-                 (suggestion_id, facet_key, raw_name, normalized_name, tag_id, confidence, decision, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7)",
-                rusqlite::params![id, facet_key, raw, normalized, tag_id, confidence, now],
+                 (suggestion_id, facet_key, raw_name, normalized_name, tag_id, confidence, decision, decision_reason, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, ?8)",
+                rusqlite::params![id, facet_key, raw, normalized, tag_id, confidence, decision_reason, now],
             )?;
         }
     }
@@ -360,6 +373,35 @@ pub fn list_suggestion_items(
     Ok(rows)
 }
 
+/// F6-d：全库「新词待确认」候选 —— decision='pending' 且 tag_id IS NULL 的条目
+/// （词表里没有的词，留在 ai_suggestion_items；设置页据此列出三动作：采纳/合并/拒绝）。
+pub fn list_new_word_candidates(conn: &Connection) -> AppResult<Vec<AiSuggestionItem>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, suggestion_id, facet_key, raw_name, normalized_name, tag_id,
+                confidence, decision, decision_reason, created_at
+           FROM ai_suggestion_items
+          WHERE decision = 'pending' AND tag_id IS NULL
+          ORDER BY created_at DESC, id",
+    )?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(AiSuggestionItem {
+                id: r.get(0)?,
+                suggestion_id: r.get(1)?,
+                facet_key: r.get(2)?,
+                raw_name: r.get(3)?,
+                normalized_name: r.get(4)?,
+                tag_id: r.get(5)?,
+                confidence: r.get(6)?,
+                decision: r.get(7)?,
+                decision_reason: r.get(8)?,
+                created_at: r.get(9)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
 fn tag_matches_facet(conn: &Connection, tag_id: i64, facet_key: &str) -> AppResult<bool> {
     let found: Option<String> = conn
         .query_row(
@@ -385,30 +427,49 @@ pub fn decide_suggestion_item(
         return Err(crate::error::AppError::msg("无效的候选决策"));
     }
     let tx = conn.unchecked_transaction()?;
-    let (facet_key, current_tag_id): (String, Option<i64>) = tx.query_row(
-        "SELECT facet_key, tag_id FROM ai_suggestion_items WHERE id = ?1",
+    let (facet_key, current_tag_id, raw_name): (String, Option<i64>, String) = tx.query_row(
+        "SELECT facet_key, tag_id, raw_name FROM ai_suggestion_items WHERE id = ?1",
         [item_id],
-        |r| Ok((r.get(0)?, r.get(1)?)),
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
     )?;
+    let merge_name: Option<String> = replacement_name
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(String::from);
     let tag_id = match decision {
         "rejected" => None,
         "accepted" => {
-            let id = replacement_tag_id.or(current_tag_id).ok_or_else(|| {
-                crate::error::AppError::msg("未知候选必须先选择规范标签或明确修改名称")
-            })?;
-            if !tag_matches_facet(&tx, id, &facet_key)? {
-                return Err(crate::error::AppError::msg("候选标签与分面不匹配"));
+            // 采纳：已选规范标签 → 用它；否则用名称（新词 → find_or_create_canonical 真建标签）
+            if let Some(id) = replacement_tag_id.or(current_tag_id) {
+                if !tag_matches_facet(&tx, id, &facet_key)? {
+                    return Err(crate::error::AppError::msg("候选标签与分面不匹配"));
+                }
+                Some(id)
+            } else if let Some(name) = merge_name.clone().or_else(|| {
+                let r = raw_name.trim();
+                if r.is_empty() { None } else { Some(r.to_string()) }
+            }) {
+                Some(tags::find_or_create_canonical(&tx, &facet_key, &name)?)
+            } else {
+                return Err(crate::error::AppError::msg(
+                    "采纳为新词需要有效名称",
+                ));
             }
-            Some(id)
         }
         "modified" => {
             if let Some(id) = replacement_tag_id {
                 if !tag_matches_facet(&tx, id, &facet_key)? {
                     return Err(crate::error::AppError::msg("替换标签与分面不匹配"));
                 }
+                // F6-a/F6-c：用户「合并到已有词」——给目标标签补 synonym 别名（候选词 =
+                // 语义等价词，永久可搜；不是 old_name）。撞词（已被占用）静默跳过，不阻断合并。
+                let alias_src = raw_name.trim();
+                if !alias_src.is_empty() {
+                    let _ = tags::add_alias(&tx, id, alias_src, None, "synonym");
+                }
                 Some(id)
-            } else if let Some(name) = replacement_name.map(str::trim).filter(|v| !v.is_empty()) {
-                Some(tags::find_or_create_canonical(&tx, &facet_key, name)?)
+            } else if let Some(name) = merge_name {
+                Some(tags::find_or_create_canonical(&tx, &facet_key, &name)?)
             } else {
                 return Err(crate::error::AppError::msg(
                     "修改候选时必须提供规范标签或名称",

@@ -34,6 +34,11 @@ export function aiListSuggestionItems(suggestionId: number): Promise<AiSuggestio
   return invoke<AiSuggestionItem[]>("ai_list_suggestion_items", { suggestionId });
 }
 
+/** F6-d：全库「新词待确认」（pending 且词表里没有的候选） */
+export function aiListNewWordCandidates(): Promise<AiSuggestionItem[]> {
+  return invoke<AiSuggestionItem[]>("ai_list_new_word_candidates");
+}
+
 export function aiDecideSuggestionItem(
   itemId: number,
   decision: "accepted" | "modified" | "rejected",

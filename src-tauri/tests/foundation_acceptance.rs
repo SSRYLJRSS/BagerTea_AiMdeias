@@ -6,7 +6,7 @@
 //!   C 波次 → 组 7；全部绿 + 四关全绿 → foundation-verified。
 
 use bagertea_ai_media_v2_lib::db::{
-    init_memory, asset_tags, assets, migrations, query_expr, schema_features, tag_facets, tags,
+    ai, init_memory, asset_tags, assets, migrations, query_expr, schema_features, tag_facets, tags,
 };
 use bagertea_ai_media_v2_lib::error::AppResult;
 
@@ -859,7 +859,8 @@ fn add_alias_conflict_message_is_human_readable() {
     tags::add_alias(&c, t1.id, "海滨", None, "synonym").unwrap();
 }
 
-/// F5：启用词表后 merge 把 src 全部词条迁到 dst（canonical→old_name，synonym 保留）。
+/// F5+F6-c：启用词表后 merge 把 src 全部词条迁到 dst（canonical→synonym——合并=语义等价，
+/// 改名才写 old_name；synonym 保留）。
 #[test]
 fn merge_moves_all_terms_to_target() {
     let c = mem();
@@ -877,7 +878,7 @@ fn merge_moves_all_terms_to_target() {
         .collect();
     let kinds: Vec<&str> = rows.iter().map(|(_, k)| k.as_str()).collect();
     assert!(rows.iter().any(|(t, k)| t == "海岸" && k == "canonical"), "目标 canonical 保留: {rows:?}");
-    assert!(rows.iter().any(|(t, k)| t == "海边" && k == "old_name"), "源 canonical 降级 old_name: {rows:?}");
+    assert!(rows.iter().any(|(t, k)| t == "海边" && k == "synonym"), "源 canonical 合并为 synonym（F6-c）: {rows:?}");
     assert!(rows.iter().any(|(t, k)| t == "海滨" && k == "synonym"), "源 synonym 保留: {rows:?}");
     assert_eq!(rows.len(), 3, "词条应完整迁移: {rows:?}");
 }
@@ -937,7 +938,7 @@ fn deprecated_tag_has_no_terms() {
     assert_eq!(n, 0, "deprecated 标签不应残留词条");
 }
 
-/// F5：合并后旧词仍可搜到目标标签（old_name 词条生效）。
+/// F5+F6-c：合并后旧词仍可搜到目标标签（synonym 词条生效）。
 #[test]
 fn search_old_name_hits_merge_target() {
     let c = mem();
@@ -949,7 +950,7 @@ fn search_old_name_hits_merge_target() {
         .unwrap();
     assert_eq!(lk.hits.len(), 1, "旧词应精确命中: {:?}", lk.warnings);
     assert_eq!(lk.hits[0].tag_id, dst.id, "旧词「海边」应指向合并目标");
-    assert_eq!(lk.hits[0].term_kind, "old_name");
+    assert_eq!(lk.hits[0].term_kind, "synonym", "合并写 synonym（F6-c），改名才写 old_name");
 }
 
 /// F5-d：find_by_term 尊重 feature gate —— 关闭读旧表、开启读 tag_terms，各断言一次。
@@ -1033,5 +1034,141 @@ fn prefix_mode_unavailable_without_terms() {
         !lk2.warnings.iter().any(|w| w.contains("启用标签约束")),
         "启用后不应再提示不可用: {:?}",
         lk2.warnings
+    );
+}
+
+// ═══════════════ F6：词表治理 ═══════════════
+
+/// 辅助：单素材批次 → 返回第一条 suggestion。
+fn f6_one_suggestion(c: &rusqlite::Connection) -> bagertea_ai_media_v2_lib::db::ai::AiSuggestion {
+    use bagertea_ai_media_v2_lib::db::ai;
+    let aid = f4_insert_asset(c, "d:/f6.jpg");
+    let batch = ai::create_batch(c, &[aid], "cloud").unwrap();
+    let s = ai::list_suggestions(c, batch.id).unwrap();
+    assert_eq!(s.len(), 1);
+    s.into_iter().next().unwrap()
+}
+
+/// F6-a：词表里没有的词，候选留在 ai_suggestion_items（tag_id NULL），tags 表不动。
+#[test]
+fn ai_new_term_stays_in_suggestion_items() {
+    use bagertea_ai_media_v2_lib::db::ai;
+    let c = mem();
+    let sug = f6_one_suggestion(&c);
+    let tags = ai::CategorizedTags::from([("scene".to_string(), vec!["太空漫步".to_string()])]);
+    ai::set_suggestion_tags(&c, sug.id, &tags).unwrap();
+    // ① tags 表不新增
+    let n: i64 = c
+        .query_row(
+            "SELECT COUNT(*) FROM tags WHERE name='太空漫步'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(n, 0, "候选词不得提前进入 tags（AI 还没确认）");
+    // ② 候选留在 items：pending + tag_id NULL
+    let items = ai::list_suggestion_items(&c, sug.id).unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].facet_key, "scene");
+    assert!(items[0].tag_id.is_none(), "未命中词表 → tag_id 保持 NULL");
+    assert_eq!(items[0].decision, "pending");
+}
+
+/// F6-a/F6-c：用户把候选「一个人」合并到已有词「单人」→ 目标补 synonym 别名（不是 old_name）。
+#[test]
+fn candidate_merge_writes_synonym_not_old_name() {
+    use bagertea_ai_media_v2_lib::db::ai;
+    let c = mem();
+    let target = tags::create_in_facet(&c, "单人", None, Some("scene")).unwrap();
+    let sug = f6_one_suggestion(&c);
+    let tags = ai::CategorizedTags::from([("scene".to_string(), vec!["一个人".to_string()])]);
+    ai::set_suggestion_tags(&c, sug.id, &tags).unwrap();
+    let item = ai::list_suggestion_items(&c, sug.id).unwrap().into_iter().next().unwrap();
+    assert!(item.tag_id.is_none());
+    // 用户选「合并到单人」
+    ai::decide_suggestion_item(&c, item.id, "modified", Some(target.id), None, None).unwrap();
+    // 目标补 synonym「一个人」（旧表路径 alias_type='synonym'；绝不写 old_name）
+    let row: Option<(String, String)> = c
+        .query_row(
+            "SELECT ta.alias, ta.alias_type FROM tag_aliases ta
+              WHERE ta.tag_id=?1 AND ta.normalized_alias='一个人'",
+            [target.id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .ok();
+    let (alias, kind) = row.expect("合并后目标应有 synonym 别名");
+    assert_eq!(alias, "一个人");
+    assert_eq!(kind, "synonym", "候选合并写 synonym（F6-c），不是 old_name");
+    // item 指向目标
+    let after = ai::list_suggestion_items(&c, sug.id).unwrap();
+    assert_eq!(after[0].tag_id, Some(target.id));
+    assert_eq!(after[0].decision, "modified");
+}
+
+/// F6-b：近似匹配两类都检出 —— 子串（一个 vs 一个人）+ 编辑距离（森材 vs 森林）。
+#[test]
+fn find_similar_detects_substring_and_edit_distance() {
+    let c = mem();
+    tags::create_in_facet(&c, "一个人", None, Some("scene")).unwrap();
+    tags::create_in_facet(&c, "森林", None, Some("scene")).unwrap();
+    // ② 子串：长度差 1，「一个人」含「一个」
+    let sub = tags::find_similar_tag(&c, "scene", &tags::normalize_name("一个"))
+        .unwrap()
+        .expect("应命中「一个人」");
+    assert_eq!(sub.1, "一个人");
+    assert_eq!(sub.2, tags::SimilarReason::Substring);
+    // ③ 编辑距离 ≤ 1：「森材」→「森林」
+    let spell = tags::find_similar_tag(&c, "scene", &tags::normalize_name("森材"))
+        .unwrap()
+        .expect("应命中「森林」");
+    assert_eq!(spell.1, "森林");
+    assert_eq!(spell.2, tags::SimilarReason::Spell);
+    // 不相关的词不误报
+    assert!(tags::find_similar_tag(&c, "scene", &tags::normalize_name("城市")).unwrap().is_none());
+}
+
+/// F6-d：疑似重复扫描 —— 连通分量把 单人/一个人/一个 聚成一组。
+#[test]
+fn scan_duplicate_tags_finds_known_groups() {
+    let c = mem();
+    let a = tags::create_in_facet(&c, "单人", None, Some("scene")).unwrap();
+    let b = tags::create_in_facet(&c, "一个人", None, Some("scene")).unwrap();
+    let d = tags::create_in_facet(&c, "一个", None, Some("scene")).unwrap();
+    let groups = tags::scan_duplicate_tags(&c).unwrap();
+    let names: Vec<String> = groups
+        .iter()
+        .filter(|g| g.facet_key == "scene")
+        .flat_map(|g| g.members.iter().map(|m| m.name.clone()))
+        .collect();
+    for expect in [&a.id, &b.id, &d.id] {
+        let in_group = groups.iter().any(|g| {
+            g.facet_key == "scene" && g.members.iter().any(|m| m.tag_id == *expect)
+        });
+        assert!(in_group, "「{expect}」应出现在疑似重复组");
+    }
+    assert!(
+        names.contains(&"单人".to_string())
+            && names.contains(&"一个人".to_string())
+            && names.contains(&"一个".to_string()),
+        "疑似重复应把 单人/一个人/一个 聚出（实际 scene 组: {names:?}）"
+    );
+}
+
+/// F6-c：别名冲突按分面 —— 跨分面同名允许，同分面拒绝。
+#[test]
+fn alias_same_term_allowed_across_facets() {
+    let c = mem();
+    let people = tags::create_in_facet(&c, "人物", None, Some("people")).unwrap();
+    let subject = tags::create_in_facet(&c, "主体", None, Some("subject")).unwrap();
+    // people 用「一个人」作别名
+    tags::add_alias(&c, people.id, "一个人", None, "synonym").unwrap();
+    // subject 分面再用「一个人」→ 允许
+    tags::add_alias(&c, subject.id, "一个人", None, "synonym").unwrap();
+    // 同分面再用 → 拒绝
+    let other_people = tags::create_in_facet(&c, "人像特写", None, Some("people")).unwrap();
+    let err = tags::add_alias(&c, other_people.id, "一个人", None, "synonym").unwrap_err();
+    assert!(
+        err.to_string().contains("已绑定"),
+        "同分面重词应报错: {err}"
     );
 }

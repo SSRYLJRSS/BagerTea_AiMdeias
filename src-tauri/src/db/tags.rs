@@ -545,10 +545,15 @@ pub fn add_alias(
             Err(e) => Err(e.into()),
         }
     } else {
+        // 旧表路径（F6-c）：冲突按分面 + locale —— 跨分面同名允许
+        // （people 用了「一个人」作别名，不影响 subject 再用「一个人」）。
         let conflict: Option<i64> = conn
             .query_row(
-                "SELECT tag_id FROM tag_aliases
-                  WHERE normalized_alias = ?1 AND locale = ?2 AND tag_id != ?3
+                "SELECT ta.tag_id FROM tag_aliases ta
+                   JOIN tags t ON t.id = ta.tag_id
+                   JOIN tags me ON me.id = ?3
+                  WHERE ta.normalized_alias = ?1 AND ta.locale = ?2
+                    AND ta.tag_id != ?3 AND t.facet_key = me.facet_key
                   LIMIT 1",
                 rusqlite::params![normalized, locale, tag_id],
                 |r| r.get(0),
@@ -730,11 +735,11 @@ fn tag_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Tag> {
 /// 合并标签（M3-01 R-19）：src 的素材关联与子标签全部并入 dst，随后删除 src。
 /// 单事务；走 DELETE+INSERT 而非 UPDATE 改挂，保证 FTS 触发器（trg_at_ai/ad）联动。
 ///
-/// F5：tag_unique_terms 启用时，src 的全部词条（canonical + 别名）按关键顺序迁移到 dst：
+/// F5 + F6-c：tag_unique_terms 启用时，src 的全部词条（canonical + 别名）按关键顺序迁移到 dst：
 ///   ① 读出源全部 terms → ② DELETE src 的 terms（释放 ux_terms 唯一空间）→
-///   ③ 逐个写给 dst（源的 canonical 作 old_name、源的别名保留原 term_kind），撞唯一约束跳过 →
-///   ④ src 改名「原名 #<id>」（避开旧 UNIQUE(parent_id,name)）→ ⑤ status 置 deprecated。
-/// 不按此顺序，源的 canonical 与目标既有词条会 UNIQUE constraint failed。
+///   ③ 逐个写给 dst（源 canonical 作 synonym —— 合并 = 语义等价永久可搜；改名才写 old_name），
+///     撞唯一约束跳过 → ④ src 改名「原名 #<id>」（避开旧 UNIQUE(parent_id,name)）→
+///   ⑤ status 置 deprecated。不按此顺序，源的 canonical 与目标既有词条会 UNIQUE constraint failed。
 pub fn merge_preserve_alias(conn: &Connection, src_id: i64, dst_id: i64) -> AppResult<()> {
     if src_id == dst_id {
         return Err(crate::error::AppError::msg("不能把标签合并到它自己"));
@@ -816,10 +821,11 @@ pub fn merge_preserve_alias(conn: &Connection, src_id: i64, dst_id: i64) -> AppR
             drop(stmt);
             // ② 释放 src 的唯一空间
             c.execute("DELETE FROM tag_terms WHERE tag_id = ?1", [src_id])?;
-            // ③ 写给 dst：canonical 降级为 old_name，别名保留原 kind
+            // ③ 写给 dst（F6-c：合并 = 语义等价 → canonical 降级为 synonym，永久可搜；
+            //    改名才写 old_name）。撞了（目标已有同词）→ 跳过：目标词优先。
             for t in &src_terms {
                 let kind = if t.term_kind == "canonical" {
-                    "old_name"
+                    "synonym"
                 } else {
                     t.term_kind.as_str()
                 };
@@ -872,9 +878,9 @@ pub fn merge(conn: &Connection, src_id: i64, dst_id: i64) -> AppResult<()> {
     let tx = conn.unchecked_transaction()?;
     tx.execute("DELETE FROM tags WHERE id=?1", [src_id])?;
     if terms_enabled {
-        // 物理删除语义：dst 上刚挂的 old_name 词条也删掉（旧名称不再命中）
+        // 物理删除语义：dst 上刚挂的 synonym（src canonical 迁移）删掉（旧名称不再命中）
         tx.execute(
-            "DELETE FROM tag_terms WHERE tag_id=?1 AND term_kind='old_name' AND normalized_term=?2",
+            "DELETE FROM tag_terms WHERE tag_id=?1 AND term_kind='synonym' AND normalized_term=?2",
             rusqlite::params![dst_id, normalize_name(&src_name)],
         )?;
     } else {
@@ -1419,4 +1425,225 @@ pub struct TermHit {
     pub matched_term: String,
     /// active / deprecated（deprecated 不该出现，但要能诊断）
     pub tag_status: String,
+}
+
+// ═══════════════ F6：词表治理 —— 近似匹配（只提示，绝不自动合并） ═══════════════
+
+/// 近似命中的原因（F6-b，按可信度降序）：
+/// - `Substring`：一方是另一方子串且长度差 ≤ 2（「一个」→「一个人」）
+/// - `Spell`：编辑距离 ≤ 1（「女孩」vs「女人」也可能命中——这正是只提示不合并的原因）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SimilarReason {
+    Substring,
+    Spell,
+}
+
+/// 字符级编辑距离（中文按 char 计）。词表规模小（百级），O(m·n) 足够。
+pub fn char_levenshtein(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    if a.is_empty() {
+        return b.len();
+    }
+    if b.is_empty() {
+        return a.len();
+    }
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.iter().enumerate() {
+        let mut cur = vec![i + 1; b.len() + 1];
+        for (j, cb) in b.iter().enumerate() {
+            let cost = if ca == cb { 0 } else { 1 };
+            cur[j + 1] = (prev[j + 1] + 1).min(cur[j] + 1).min(prev[j] + cost);
+        }
+        prev = cur;
+    }
+    prev[b.len()]
+}
+
+/// F6-b：分面内近似匹配 —— 只提示，绝不自动改写/合并。
+/// 三级（调用方已排除精确别名命中）：
+///   ② 一方是另一方子串且长度差 ≤ 2 → Substring
+///   ③ 编辑距离 ≤ 1（char）→ Spell
+/// 候选 = 分面内 active 标签的规范名（feature 启用读 tag_terms canonical，否则读 tags）。
+pub fn find_similar_tag(
+    conn: &Connection,
+    facet_key: &str,
+    normalized: &str,
+) -> AppResult<Option<(i64, String, SimilarReason)>> {
+    if normalized.is_empty() {
+        return Ok(None);
+    }
+    let terms_enabled =
+        crate::db::schema_features::feature_enabled(conn, "tag_unique_terms").unwrap_or(false);
+    let mut cands: Vec<(i64, String)> = if terms_enabled {
+        let mut stmt = conn.prepare(
+            "SELECT tt.tag_id, tt.term FROM tag_terms tt
+               JOIN tags t ON t.id = tt.tag_id
+              WHERE tt.facet_key = ?1 AND tt.term_kind = 'canonical'
+                AND COALESCE(t.status,'active') = 'active'",
+        )?;
+        let rows = stmt
+            .query_map([facet_key], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .filter_map(|r| r.ok())
+            .collect();
+        rows
+    } else {
+        let mut stmt = conn.prepare(
+            "SELECT id, name FROM tags
+              WHERE facet_key = ?1 AND status = 'active'",
+        )?;
+        let rows = stmt
+            .query_map([facet_key], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .filter_map(|r| r.ok())
+            .collect();
+        rows
+    };
+    // 保持确定性：按 tag_id 排序后比较
+    cands.sort_by_key(|(id, _)| *id);
+    // best = (priority, tag_id, display_name, reason)
+    let mut best: Option<(u8, i64, String, SimilarReason)> = None;
+    for (id, name) in &cands {
+        let cnorm = normalize_name(name);
+        if cnorm.is_empty() || cnorm == normalized {
+            continue;
+        }
+        let len_diff = (cnorm.chars().count() as isize - normalized.chars().count() as isize).abs();
+        // ② 子串（长度差 ≤ 2）
+        let substring = len_diff <= 2
+            && (cnorm.contains(normalized) || normalized.contains(cnorm.as_str()));
+        // ③ 编辑距离 ≤ 1
+        let spell = char_levenshtein(&cnorm, normalized) <= 1;
+        if substring {
+            let replace = match &best {
+                None => true,
+                Some((p, ..)) => *p <= 2,
+            };
+            if replace {
+                best = Some((2, *id, name.clone(), SimilarReason::Substring));
+            }
+        } else if spell {
+            let replace = match &best {
+                None => true,
+                Some((p, ..)) => *p <= 1,
+            };
+            if replace {
+                best = Some((1, *id, name.clone(), SimilarReason::Spell));
+            }
+        }
+    }
+    Ok(best.map(|(_, id, name, reason)| (id, name, reason)))
+}
+
+/// F6-d：疑似重复组 —— 对词表跑一遍近似匹配，按连通分量聚合。
+/// 返回可供设置页展示的组（每组给「合并到…」下拉）。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DuplicateGroup {
+    pub facet_key: String,
+    pub members: Vec<DuplicateMember>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DuplicateMember {
+    pub tag_id: i64,
+    pub name: String,
+    pub asset_count: i64,
+}
+
+/// F6-d：每分面内部，把近似词连边后取连通分量。扫描是「疑似」清单（人工再判），阈值放宽松：
+/// 子串差 ≤2 或编辑距离 ≤2 —— 否则「单人/一个人/一个」这类真实重复（距离 2）揪不出来。
+/// （find_similar_tag 的实时提示仍用 ≤1：只提示；扫描清单允许多几条待人工合并。）
+pub fn scan_duplicate_tags(conn: &Connection) -> AppResult<Vec<DuplicateGroup>> {
+    // 每分面的 active 标签（id, name, 关联数）
+    let mut stmt = conn.prepare(
+        "SELECT t.id, t.name, t.facet_key,
+                (SELECT COUNT(*) FROM asset_tags at WHERE at.tag_id = t.id)
+           FROM tags t
+          WHERE COALESCE(t.status,'active') = 'active'
+          ORDER BY t.facet_key, t.id",
+    )?;
+    let all: Vec<(i64, String, String, i64)> = stmt
+        .query_map([], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+    let mut by_facet: std::collections::BTreeMap<String, Vec<(i64, String, i64)>> = Default::default();
+    for (id, name, facet, uses) in all {
+        by_facet.entry(facet).or_default().push((id, name, uses));
+    }
+    let mut groups = Vec::new();
+    for (facet, tags_in) in by_facet {
+        let n = tags_in.len();
+        // 邻接（无向）：similar edge
+        let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for i in 0..n {
+            for j in (i + 1)..n {
+                let (ia, name_a, _) = &tags_in[i];
+                let (ib, name_b, _) = &tags_in[j];
+                if ia == ib {
+                    continue;
+                }
+                let na = normalize_name(name_a);
+                let nb = normalize_name(name_b);
+                if na.is_empty() || nb.is_empty() || na == nb {
+                    continue;
+                }
+                let len_diff =
+                    (na.chars().count() as isize - nb.chars().count() as isize).abs();
+                let similar = (len_diff <= 2
+                    && (na.contains(nb.as_str()) || nb.contains(na.as_str())))
+                    || char_levenshtein(&na, &nb) <= 2;
+                if similar {
+                    adj[i].push(j);
+                    adj[j].push(i);
+                }
+            }
+        }
+        // 连通分量
+        let mut seen = vec![false; n];
+        for start in 0..n {
+            if seen[start] {
+                continue;
+            }
+            let mut comp: Vec<usize> = Vec::new();
+            let mut stack = vec![start];
+            seen[start] = true;
+            while let Some(u) = stack.pop() {
+                comp.push(u);
+                for &v in &adj[u] {
+                    if !seen[v] {
+                        seen[v] = true;
+                        stack.push(v);
+                    }
+                }
+            }
+            if comp.len() < 2 {
+                continue;
+            }
+            let mut members: Vec<DuplicateMember> = comp
+                .iter()
+                .map(|&idx| {
+                    let (id, name, uses) = &tags_in[idx];
+                    DuplicateMember {
+                        tag_id: *id,
+                        name: name.clone(),
+                        asset_count: *uses,
+                    }
+                })
+                .collect();
+            // 稳定展示：关联数降序 → id 升序
+            members.sort_by(|a, b| {
+                b.asset_count
+                    .cmp(&a.asset_count)
+                    .then_with(|| a.tag_id.cmp(&b.tag_id))
+            });
+            groups.push(DuplicateGroup {
+                facet_key: facet.clone(),
+                members,
+            });
+        }
+    }
+    Ok(groups)
 }
