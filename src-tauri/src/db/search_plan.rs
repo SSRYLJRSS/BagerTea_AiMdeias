@@ -352,6 +352,23 @@ pub fn run_search_plan(
     Ok(rows)
 }
 
+/// S2：RRF（Reciprocal Rank Fusion）—— `score = Σ w_i / (k + rank_i)`，k=60。
+/// 只用排名不用原始分数：bm25 是负值（越小越相关）、should 加分任意正数、
+/// 别名命中 0/1 —— 三者的**排名**可比，**分数**不可比，RRF 天然免疫量纲。
+pub fn rrf_fuse(lists: &[(&[i64], f32)]) -> Vec<(i64, f64)> {
+    let k = 60.0f64;
+    let mut acc: std::collections::HashMap<i64, f64> = std::collections::HashMap::new();
+    for (ids, w) in lists {
+        for (rank, &id) in ids.iter().enumerate() {
+            let e = acc.entry(id).or_insert(0.0);
+            *e += *w as f64 / (k + rank as f64);
+        }
+    }
+    let mut out: Vec<(i64, f64)> = acc.into_iter().collect();
+    out.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.0.cmp(&b.0)));
+    out
+}
+
 /// S6：schema 版本迁移（plan_schema_version 3 → 4 时在此加 migrate_plan_v3_to_v4；
 /// 现在结构未变，直接原样返回）。读到旧版本先迁移再执行。
 pub fn migrate_plan(plan: &mut SearchPlanV3) {
@@ -507,5 +524,47 @@ mod tests {
         let mut p2 = SearchPlanV3::default();
         p2.minimum_should_match = 1; // should 空但 min>0
         assert!(validate_search_plan(&p2).is_err());
+    }
+
+    /// S2：RRF 只用排名 —— 把某一路权重全乘 100（等效把该路分数放大），排序不变。
+    #[test]
+    fn rrf_fusion_is_scale_invariant() {
+        let a = [10i64, 20, 30];
+        let b = [25i64, 5];
+        let base = rrf_fuse(&[(&a, 1.0), (&b, 2.0)]);
+        let scaled = rrf_fuse(&[(&a, 100.0), (&b, 200.0)]);
+        let order = |v: &[(i64, f64)]| v.iter().map(|x| x.0).collect::<Vec<_>>();
+        assert_eq!(order(&base), order(&scaled), "整体权重放大不改变排序");
+        // 交集元素按排名融合（id 20 在两路都靠前 → 总分高于只在单路的 30）
+        let score_of = |v: &[(i64, f64)], id: i64| v.iter().find(|x| x.0 == id).map(|x| x.1);
+        let s20 = score_of(&base, 20).unwrap();
+        let s30 = score_of(&base, 30).unwrap();
+        assert!(s20 > s30, "20 两路命中应高于只在单路的 30");
+        // 单路权重缩放不改变内部次序（bm25 负值场景下仍然只用排名）
+        let only = rrf_fuse(&[(&a, 1.0)]);
+        let only_scaled = rrf_fuse(&[(&a, 1000.0)]);
+        assert_eq!(order(&only), order(&only_scaled));
+        assert_eq!(order(&only), vec![10, 20, 30]);
+    }
+
+    /// S2：用户显式选了排序字段 → 不走相关度（should 只影响集合/加分不影响顺序）。
+    #[test]
+    fn field_ranking_overrides_relevance() {
+        let c = init_memory().unwrap();
+        let (grass, sky) = (tag(&c, "scene", "草地"), tag(&c, "scene", "蓝天"));
+        let a = insert_asset(&c, "d:/1.jpg"); // rating 高但无蓝天
+        let b = insert_asset(&c, "d:/2.jpg"); // 低 rating 但有蓝天
+        asset_tags::assign(&c, &[a], &[grass], "manual").unwrap();
+        asset_tags::assign(&c, &[b], &[grass, sky], "manual").unwrap();
+        c.execute("UPDATE assets SET rating = ?1 WHERE id = ?2", rusqlite::params![5, a])
+            .unwrap();
+        c.execute("UPDATE assets SET rating = ?1 WHERE id = ?2", rusqlite::params![1, b])
+            .unwrap();
+        let mut plan = tag_plan("scene", grass, &[("蓝天", sky, 1.0)]);
+        plan.ranking = Ranking::Field { key: "rating".into(), dir: "desc".into() };
+        let out = run_search_plan(&c, &plan, None, 0).unwrap();
+        let ids: Vec<i64> = out.iter().map(|x| x.0).collect();
+        assert_eq!(ids[0], a, "显式 rating desc → 5 星排前（无视应蓝天加分）");
+        assert_eq!(ids.len(), 2, "should 仍不影响集合（min=0）");
     }
 }
