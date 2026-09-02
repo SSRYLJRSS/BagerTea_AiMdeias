@@ -1334,11 +1334,24 @@ pub fn find_by_term(
     let mut warnings = Vec::new();
     let mut hits = Vec::new();
     if terms_enabled {
-        // tag_terms 事实源：精确/别名/前缀/包含/纠错 由 S5 扩展；F3 先实现精确类
+        // tag_terms 事实源：Prefix/Contains/Fuzzy 交给 S5 词扩展（多命中 + 上限 + 文案）
+        if matches!(
+            mode,
+            TermMatch::Prefix | TermMatch::Contains | TermMatch::Fuzzy
+        ) {
+            let cap = match mode {
+                TermMatch::Prefix => PREFIX_EXPAND_CAP,
+                TermMatch::Contains => CONTAINS_EXPAND_CAP,
+                _ => FUZZY_EXPAND_CAP,
+            };
+            let (h, w) = expand_term_query(conn, facet_key, normalized, mode, cap)?;
+            return Ok(TermLookup { hits: h, warnings: w });
+        }
+        // Exact / Alias：精确单点（唯一索引保证最多一行）
         let kind_filter = match mode {
             TermMatch::Exact => "AND term_kind = 'canonical'",
             TermMatch::Alias => "",
-            _ => "", // Prefix/Contains/Fuzzy 在 S5 扩展（需要 next_prefix + 编辑距离）
+            _ => unreachable!(),
         };
         let mut stmt = conn.prepare(&format!(
             "SELECT tag_id, term_kind, term FROM tag_terms
@@ -1478,6 +1491,207 @@ pub fn char_levenshtein(a: &str, b: &str) -> usize {
         prev = cur;
     }
     prev[b.len()]
+}
+
+// ═══════════════ S5：五种匹配模式 —— 词扩展（Prefix / Contains / Fuzzy） ═══════════════
+
+/// S5 词扩展上限：Prefix/Contains 各 10；Fuzzy 5（规范见指导书 S5 规格表）。
+pub const PREFIX_EXPAND_CAP: usize = 10;
+pub const CONTAINS_EXPAND_CAP: usize = 10;
+pub const FUZZY_EXPAND_CAP: usize = 5;
+
+fn like_escape(v: &str) -> String {
+    v.replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
+/// S5：Prefix 范围查询模板 —— `>= :lo AND < :hi`（走 ux_terms 索引；禁止 `LIKE 'x%'`，
+/// 后者实测 5 万行 → SCAN）。facet_key 空 = 跨分面。参数位从 ?1/?2 起（调用方绑定）。
+pub(crate) fn term_prefix_sql(facet_key: &str) -> String {
+    let facet_pred = if facet_key.is_empty() {
+        String::new()
+    } else {
+        "tt.facet_key = ?1 AND ".to_string()
+    };
+    let (a, b) = if facet_key.is_empty() { (1, 2) } else { (2, 3) };
+    format!(
+        "SELECT tt.tag_id, tt.term_kind, tt.term, COALESCE(t.status,'active')
+           FROM tag_terms tt JOIN tags t ON t.id = tt.tag_id
+          WHERE {facet_pred} tt.normalized_term >= ?{a} AND tt.normalized_term < ?{b}
+          ORDER BY length(tt.term) ASC, tt.term, tt.tag_id"
+    )
+}
+
+/// S5：把「按词查」扩展成一组标签命中（`LeafCond::Tag.term_query` 的唯一扩展入口；
+/// find_by_term 的 Prefix/Contains/Fuzzy 也走这里）。
+///
+/// - `Prefix`：**范围查询** `normalized_term >= :lo AND < next_prefix(:lo)`（走 ux_terms
+///   索引；`LIKE 'x%'` 实测不走索引，禁止）→ 名字长度升序。
+/// - `Contains`：`LIKE '%' || ? || '%'`（全表扫，输入先转义）→ 名字长度升序。
+/// - `Fuzzy`：两级 —— ① 首字符相同或 char 长度差 ≤ 1 缩候选（SQL）；② Rust 编辑距离
+///   ≤ 1 → 按距离升序、同距按长度升序，取 cap。
+///
+/// feature gate：tag_unique_terms=0 时前缀/包含/纠错不可用（返回空 + warning，
+/// 与 find_by_term 语义一致）。返回命中 + 给人看的 warning 文案（超 cap / 多命中列举）。
+pub fn expand_term_query(
+    conn: &Connection,
+    facet_key: &str,
+    normalized: &str,
+    mode: TermMatch,
+    cap: usize,
+) -> AppResult<(Vec<TermHit>, Vec<String>)> {
+    let mut warnings = Vec::new();
+    if normalized.is_empty() {
+        return Ok((Vec::new(), warnings));
+    }
+    let terms_enabled =
+        crate::db::schema_features::feature_enabled(conn, "tag_unique_terms").unwrap_or(false);
+    if !terms_enabled {
+        warnings.push("前缀/包含/纠错匹配需先在设置页启用标签约束".into());
+        return Ok((Vec::new(), warnings));
+    }
+    let cap = cap.max(1);
+    // facet_key 空 = 跨全部分面（AI/搜索框不指定分面时）
+    let facet_pred = if facet_key.is_empty() {
+        String::new()
+    } else {
+        "tt.facet_key = ?1 AND ".to_string()
+    };
+    let base = format!(
+        "SELECT tt.tag_id, tt.term_kind, tt.term, COALESCE(t.status,'active')
+           FROM tag_terms tt JOIN tags t ON t.id = tt.tag_id
+          WHERE {facet_pred}"
+    );
+    let mut vals: Vec<rusqlite::types::Value> = Vec::new();
+    if !facet_key.is_empty() {
+        vals.push(facet_key.to_string().into());
+    }
+    let mut rows_sql: Vec<Vec<(i64, String, String, String)>> = Vec::new();
+    match mode {
+        TermMatch::Prefix => {
+            let lo = normalized.to_string();
+            let hi = next_prefix(normalized).unwrap_or_else(|| {
+                // 正常中文不会顶到 char 上界；兜底退化为仅下界
+                lo.clone()
+            });
+            vals.push(lo.into());
+            vals.push(hi.into());
+            let mut stmt = conn.prepare(&term_prefix_sql(facet_key))?;
+            rows_sql.push(
+                stmt.query_map(rusqlite::params_from_iter(vals.iter()), |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                    ))
+                })?
+                .filter_map(|r| r.ok())
+                .collect(),
+            );
+        }
+        TermMatch::Contains => {
+            vals.push(like_escape(normalized).into());
+            let mut stmt = conn.prepare(&format!(
+                "{base} normalized_term LIKE '%' || ?{p} || '%' ESCAPE '\\'
+                  ORDER BY length(tt.term) ASC, tt.term, tt.tag_id",
+                p = vals.len()
+            ))?;
+            rows_sql.push(
+                stmt.query_map(rusqlite::params_from_iter(vals.iter()), |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                    ))
+                })?
+                .filter_map(|r| r.ok())
+                .collect(),
+            );
+        }
+        TermMatch::Fuzzy => {
+            let len = normalized.chars().count() as i64;
+            let first = normalized.chars().next().map(String::from).unwrap_or_default();
+            // ① 首字符相同 或 长度差 ≤ 1 → SQL 缩候选（首字符走前缀可索引扫描）
+            vals.push(first.clone().into());
+            vals.push((len - 1).max(0).into());
+            vals.push((len + 1).into());
+            let mut stmt = conn.prepare(&format!(
+                "{base} (substr(tt.normalized_term,1,1) = ?{fp}
+                     OR length(tt.normalized_term) BETWEEN ?{lp} AND ?{hp})",
+                fp = vals.len() - 2,
+                lp = vals.len() - 1,
+                hp = vals.len()
+            ))?;
+            rows_sql.push(
+                stmt.query_map(rusqlite::params_from_iter(vals.iter()), |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                    ))
+                })?
+                .filter_map(|r| r.ok())
+                .collect(),
+            );
+        }
+        // Exact/Alias 不经扩展（find_by_term 单点处理，最多一行）
+        _ => return Ok((Vec::new(), warnings)),
+    }
+    let loaded = rows_sql.into_iter().flatten().collect::<Vec<_>>();
+    let loaded_len = loaded.len();
+    if loaded_len == 0 {
+        return Ok((Vec::new(), warnings));
+    }
+    // ② Fuzzy 第二阶段：编辑距离 ≤ 1（char），按距离升序、同距按名字长度升序
+    let ordered: Vec<(i64, String, String, String)> = if mode == TermMatch::Fuzzy {
+        let mut scored: Vec<(usize, usize, (i64, String, String, String))> = loaded
+            .into_iter()
+            .filter_map(|row| {
+                let d = char_levenshtein(normalized, &row.2);
+                (d <= 1).then_some((d, row.2.chars().count(), row))
+            })
+            .collect();
+        scored.sort_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then(a.1.cmp(&b.1))
+                .then(a.2 .2.cmp(&b.2 .2))
+                .then(a.2 .0.cmp(&b.2 .0))
+        });
+        scored.into_iter().map(|(_, _, r)| r).collect()
+    } else {
+        loaded
+    };
+    let truncated = ordered.len() > cap;
+    let taken = ordered.into_iter().take(cap).collect::<Vec<_>>();
+    // 超上限 warning（按原始匹配数，不是 cap 后数）
+    if truncated {
+        warnings.push(format!(
+            "「{normalized}」匹配到 {loaded_len} 个，只用了前 {cap} 个"
+        ));
+    }
+    let mut hits = Vec::with_capacity(taken.len());
+    for (tag_id, kind, term, status) in taken {
+        hits.push(TermHit {
+            tag_id,
+            term_kind: kind,
+            matched_term: term,
+            tag_status: status,
+        });
+    }
+    // 命中多个时把名字列给用户看（避免「不知命中什么」的困惑）
+    if hits.len() > 1 && !truncated {
+        let names: Vec<&str> = hits.iter().map(|h| h.matched_term.as_str()).collect();
+        warnings.push(format!(
+            "「{normalized}」匹配到 {} 个：{}",
+            hits.len(),
+            names.join("、")
+        ));
+    }
+    Ok((hits, warnings))
 }
 
 /// F6-b：分面内近似匹配 —— 只提示，绝不自动改写/合并。
@@ -1666,4 +1880,48 @@ pub fn scan_duplicate_tags(conn: &Connection) -> AppResult<Vec<DuplicateGroup>> 
         }
     }
     Ok(groups)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::init_memory;
+    use crate::db::migrations;
+    use crate::db::schema_features;
+
+    fn terms_db() -> Connection {
+        let c = init_memory().unwrap();
+        migrations::apply_v22b_constraints(&c).unwrap();
+        schema_features::set_feature(&c, "tag_unique_terms", true, None).unwrap();
+        c
+    }
+    fn seed_term(c: &Connection, tag_id: i64, facet: &str, term: &str) {
+        c.execute(
+            "INSERT INTO tag_terms (tag_id, facet_key, normalized_term, term, locale, term_kind, is_searchable, created_at)
+             VALUES (?1, ?2, ?3, ?3, '', 'canonical', 1, 1)",
+            rusqlite::params![tag_id, facet, term],
+        )
+        .unwrap();
+    }
+
+    /// S5：Prefix 必须走索引 —— EXPLAIN QUERY PLAN 含 SEARCH 且不含 SCAN。
+    /// 防止有人把范围查询改回 `LIKE 'x%'`（实测 5 万行 → SCAN）。
+    #[test]
+    fn term_match_prefix_uses_index() {
+        let c = terms_db();
+        // feature 开时 create_in_facet 已写 canonical 词条（tag_terms），无需手插
+        create_in_facet(&c, "海边", None, Some("scene")).unwrap();
+        create_in_facet(&c, "海景", None, Some("scene")).unwrap();
+        let mut stmt = c
+            .prepare(&format!("EXPLAIN QUERY PLAN {}", term_prefix_sql("scene")))
+            .unwrap();
+        let plan: String = stmt
+            .query_row(
+                rusqlite::params!["scene", "海", "鸿"],
+                |r| r.get(3),
+            )
+            .unwrap();
+        assert!(plan.contains("SEARCH"), "前缀范围查询必须走索引：{plan}");
+        assert!(!plan.contains("SCAN"), "不得退化全表扫：{plan}");
+    }
 }

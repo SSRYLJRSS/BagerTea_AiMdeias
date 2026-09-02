@@ -18,6 +18,7 @@ use rusqlite::{params_from_iter, Connection, OptionalExtension};
 
 use super::sql_utils::offset_placeholders;
 use super::tag_facets::EFF_SEARCH;
+use super::tags::TermMatch;
 use crate::error::{AppError, AppResult};
 
 /// FB5-05（§8.2/§8.3）：搜索范围。列名只能由本枚举映射，绝不能来自模型或用户字符串。
@@ -41,7 +42,11 @@ pub enum SearchScope {
 #[serde(rename_all = "camelCase")]
 #[serde(tag = "type")]
 pub enum LeafCond {
-    /// 标签分面：facetKey + tagIds，mode any/all，includeDescendants
+    /// 标签分面：facetKey + tagIds，mode any/all，includeDescendants。
+    /// S5：termQuery/termMatch —— 显式 tagIds 与按词查可同时存在；词先按 term_match
+    /// 扩展成一组 tag_id 与 tagIds 求并集，再走 compile_tag_leaf（编译层零改动）。
+    /// 缺省 = Alias（旧数据向后兼容）。
+    #[serde(rename_all = "camelCase")]
     Tag {
         #[serde(default)]
         facet_key: String,
@@ -50,6 +55,12 @@ pub enum LeafCond {
         mode: Option<String>,
         #[serde(default = "default_true")]
         include_descendants: bool,
+        /// 【S5】按词查（AI/搜索框路径）
+        #[serde(default)]
+        term_query: Option<String>,
+        /// 【S5】词查的匹配模式（默认 Alias）
+        #[serde(default)]
+        term_match: TermMatch,
     },
     /// 排除标签（含后代）
     #[serde(rename_all = "camelCase")]
@@ -217,6 +228,8 @@ pub fn from_filter(
         }
         leaves.push(QueryExpr::Leaf {
             cond: LeafCond::Tag {
+                term_query: None,
+                term_match: Default::default(),
                 facet_key: f.facet_key.clone(),
                 tag_ids: f.tag_ids.clone(),
                 mode: f.mode.clone(),
@@ -275,14 +288,44 @@ pub fn compile_leaf(conn: &Connection, cond: &LeafCond) -> AppResult<(String, Ve
             tag_ids,
             mode,
             include_descendants,
+            term_query,
+            term_match,
         } => {
             // W2-6：facet 一致性校验改为「剔除 + warning，不报错整次查询」。
             // 旧语义（一个标签跨分面就拒绝整次查询）在分面删除/重建后会卡死已保存的搜索。
             let valid_ids = filter_tags_by_facet(conn, facet_key, tag_ids);
-            if valid_ids.is_empty() {
+            let mut ids = valid_ids;
+            // S5：termQuery 先按 term_match 扩展成一组 tag_id，与显式 tag_ids 求并集
+            let has_term = term_query.as_deref().map(str::trim).map_or(false, |s| !s.is_empty());
+            if has_term {
+                let raw = term_query.as_deref().unwrap_or("").trim();
+                let normalized = super::tags::normalize_name(raw);
+                let cap = match term_match {
+                    TermMatch::Prefix => super::tags::PREFIX_EXPAND_CAP,
+                    TermMatch::Contains => super::tags::CONTAINS_EXPAND_CAP,
+                    TermMatch::Fuzzy => super::tags::FUZZY_EXPAND_CAP,
+                    _ => 1,
+                };
+                let (hits, warns) =
+                    super::tags::expand_term_query(conn, facet_key, &normalized, *term_match, cap)?;
+                for h in &hits {
+                    if !ids.contains(&h.tag_id) {
+                        ids.push(h.tag_id);
+                    }
+                }
+                for w in &warns {
+                    // R2-1 起经 &mut Vec<String> 回传前端；目前落日志
+                    tracing::warn!("词查「{raw}」({term_match:?}): {w}");
+                }
+                if ids.is_empty() {
+                    // 词查明确但一个都没命中 → 条件不可满足（0 结果），
+                    // 区别于「空 tag_ids = 无约束恒真」——搜索框零结果由此给出
+                    return Ok(("1=0".to_string(), Vec::new()));
+                }
+            } else if ids.is_empty() {
                 return Ok(("1=1".to_string(), Vec::new()));
             }
-            compile_tag_leaf(&valid_ids, mode.as_deref(), *include_descendants)
+            compile_tag_leaf(&ids, mode.as_deref(), *include_descendants)
         }
         LeafCond::FacetHasAny { facet_key } => {
             if !facet_searchable(conn, facet_key) {
@@ -606,6 +649,8 @@ mod tests {
             children: vec![
                 QueryExpr::Leaf {
                     cond: LeafCond::Tag {
+                        term_query: None,
+                        term_match: Default::default(),
                         facet_key: "scene".into(),
                         tag_ids: vec![1, 2],
                         mode: Some("any".into()),
@@ -656,6 +701,8 @@ mod tests {
         let conn = init_memory().unwrap();
         let expr = QueryExpr::Leaf {
             cond: LeafCond::Tag {
+                term_query: None,
+                term_match: Default::default(),
                 facet_key: "nonexistent_facet".into(),
                 tag_ids: vec![1],
                 mode: Some("any".into()),
@@ -680,6 +727,8 @@ mod tests {
         // W2-6：声明为 color 分面但 tag 属于 scene → 剔除该 tag（warning），折叠 1=1
         let expr = QueryExpr::Leaf {
             cond: LeafCond::Tag {
+                term_query: None,
+                term_match: Default::default(),
                 facet_key: "color".into(),
                 tag_ids: vec![1],
                 mode: Some("any".into()),
@@ -702,6 +751,8 @@ mod tests {
         .unwrap();
         let expr = QueryExpr::Leaf {
             cond: LeafCond::Tag {
+                term_query: None,
+                term_match: Default::default(),
                 facet_key: "scene".into(),
                 tag_ids: vec![1],
                 mode: Some("any".into()),

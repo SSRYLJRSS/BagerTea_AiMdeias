@@ -519,6 +519,8 @@ pub fn build_expr_from_v2(
                 ConceptOutcome::Tag(r) => {
                     leaves.push(QueryExpr::Leaf {
                         cond: LeafCond::Tag {
+                            term_query: None,
+                            term_match: Default::default(),
                             facet_key: r.facet_key.clone(),
                             tag_ids: vec![r.tag_id],
                             mode: Some("any".into()),
@@ -563,6 +565,8 @@ pub fn build_expr_from_v2(
                 nots.push(QueryExpr::Not {
                     child: Box::new(QueryExpr::Leaf {
                         cond: LeafCond::Tag {
+                            term_query: None,
+                            term_match: Default::default(),
                             facet_key: r.facet_key.clone(),
                             tag_ids: vec![r.tag_id],
                             mode: Some("any".into()),

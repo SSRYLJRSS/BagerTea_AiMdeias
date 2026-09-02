@@ -1834,3 +1834,120 @@ fn whitelist_single_source() {
     i2.sort_by = Some("magic".into());
     assert!(validate_intent(&i2, &[]).is_err());
 }
+
+// ═══════════════ S5：五种匹配模式（词扩展 Prefix/Contains/Fuzzy + 词查叶子） ═══════════════
+
+/// S5：Exact 只命中 canonical；同一词以 synonym 存在时 Exact 不中、Alias 中。
+#[test]
+fn term_match_exact_only_canonical() {
+    use bagertea_ai_media_v2_lib::db::tags::{find_by_term, TermMatch};
+    let c = mem();
+    enable_terms(&c);
+    let t = tags::create_in_facet(&c, "海边", None, Some("scene")).unwrap();
+    tags::add_alias(&c, t.id, "海滨", None, "synonym").unwrap();
+    // synonym 名精确查（Alias）命中；Exact（仅 canonical）不命中
+    let by_alias = find_by_term(&c, "scene", &tags::normalize_name("海滨"), TermMatch::Alias).unwrap();
+    assert_eq!(by_alias.hits.len(), 1);
+    assert_eq!(by_alias.hits[0].tag_id, t.id);
+    let by_exact = find_by_term(&c, "scene", &tags::normalize_name("海滨"), TermMatch::Exact).unwrap();
+    assert!(by_exact.hits.is_empty(), "Exact 不得命中 synonym：{:?}", by_exact.hits);
+    // canonical 名 Exact 命中
+    let canon = find_by_term(&c, "scene", &tags::normalize_name("海边"), TermMatch::Exact).unwrap();
+    assert_eq!(canon.hits.len(), 1);
+}
+
+/// S5：Contains 上限 10 —— 超出的截断并记 warning（「只用了前 N 个」）。
+#[test]
+fn term_match_contains_respects_cap() {
+    use bagertea_ai_media_v2_lib::db::tags::{expand_term_query, TermMatch};
+    let c = mem();
+    enable_terms(&c);
+    for i in 0..12 {
+        let name = format!("人{i:02}");
+        tags::create_in_facet(&c, &name, None, Some("scene")).unwrap();
+    }
+    let (hits, warns) =
+        expand_term_query(&c, "scene", &tags::normalize_name("人"), TermMatch::Contains, 10).unwrap();
+    assert_eq!(hits.len(), 10, "Contains 必须截断到 10");
+    assert!(
+        warns.iter().any(|w| w.contains("只用了前 10")),
+        "截断必须给出 warning：{warns:?}"
+    );
+    // 名字长度升序（「人」最短的不存在；长度 3 的全部排在长度 3 前）
+    let lens: Vec<usize> = hits.iter().map(|h| h.matched_term.chars().count()).collect();
+    let mut sorted = lens.clone();
+    sorted.sort();
+    assert_eq!(lens, sorted, "Contains 命中按名字长度升序");
+}
+
+/// S5：Fuzzy 两级 —— 缩候选 + 编辑距离 ≤1，命中真实标签（指导书四行真值表）。
+#[test]
+fn term_match_fuzzy_two_stage() {
+    use bagertea_ai_media_v2_lib::db::tags::{expand_term_query, TermMatch};
+    let c = mem();
+    enable_terms(&c);
+    for name in ["一个", "一个人", "单人", "女性", "女孩", "青少年", "森林"] {
+        tags::create_in_facet(&c, name, None, Some("scene")).unwrap();
+    }
+    let names_of = |input: &str| -> Vec<String> {
+        let (hits, _w) = expand_term_query(
+            &c,
+            "scene",
+            &tags::normalize_name(input),
+            TermMatch::Fuzzy,
+            5,
+        )
+        .unwrap();
+        hits.iter().map(|h| h.matched_term.clone()).collect()
+    };
+    let got = names_of("一人");
+    for want in ["一个", "一个人", "单人"] {
+        assert!(got.contains(&want.to_string()), "「一人」应命中 {want}：{got:?}");
+    }
+    assert!(!got.contains(&"森林".to_string()), "无关词不得命中：{got:?}");
+    let got2 = names_of("女该");
+    assert!(got2.contains(&"女孩".to_string()), "「女该」→女孩：{got2:?}");
+    assert!(got2.contains(&"女性".to_string()), "「女该」→女性：{got2:?}");
+    assert!(names_of("青少").contains(&"青少年".to_string()));
+    assert!(names_of("森材").contains(&"森林".to_string()));
+    // 距离升序：距离 0 不应出现在 fuzzy（fuzzy 只管 ≥1；0 由 Alias 精确路径处理）
+    assert!(names_of("女该").iter().all(|n| n != "女该"));
+}
+
+/// S5：LeafCond::Tag.termQuery（词查）在编译层扩展成标签集 ——
+/// 前缀「海」命中「海边/海景」；未命中词查编译为 1=0（0 结果而非全库）。
+#[test]
+fn term_query_expands_in_tag_leaf() {
+    use bagertea_ai_media_v2_lib::db::query_expr::{compile_expr, LeafCond, QueryExpr};
+    use bagertea_ai_media_v2_lib::db::tags::TermMatch;
+    let c = mem();
+    enable_terms(&c);
+    let t1 = tags::create_in_facet(&c, "海边", None, Some("scene")).unwrap();
+    let t2 = tags::create_in_facet(&c, "海景", None, Some("scene")).unwrap();
+    let aid1 = f4_insert_asset(&c, "d:/s5a.jpg");
+    let aid2 = f4_insert_asset(&c, "d:/s5b.jpg");
+    asset_tags::assign(&c, &[aid1], &[t1.id], "manual").unwrap();
+    asset_tags::assign(&c, &[aid2], &[t2.id], "manual").unwrap();
+    let leaf = |term_query: Option<String>, match_mode: TermMatch| {
+        QueryExpr::Leaf {
+            cond: LeafCond::Tag {
+                facet_key: "scene".into(),
+                tag_ids: Vec::new(),
+                mode: Some("any".into()),
+                include_descendants: true,
+                term_query,
+                term_match: match_mode,
+            },
+        }
+    };
+    // 词查前缀「海」→ 命中海边与海景两张
+    let (sql, _) = compile_expr(&c, &leaf(Some("海".into()), TermMatch::Prefix)).unwrap();
+    assert_ne!(sql, "1=0", "「海」前缀应命中标签：{sql}");
+    assert!(sql.contains("EXISTS"));
+    // 未命中的词查 → 1=0（0 结果，与空 tag_ids 的恒真区分）
+    let (sql2, _) = compile_expr(&c, &leaf(Some("不存在的标签".into()), TermMatch::Alias)).unwrap();
+    assert_eq!(sql2, "1=0", "词查未命中必须编译为 0 结果");
+    // 无词查、无 tag_ids → 保持旧语义恒真
+    let (sql3, _) = compile_expr(&c, &leaf(None, TermMatch::Alias)).unwrap();
+    assert_eq!(sql3, "1=1");
+}

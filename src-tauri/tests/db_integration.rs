@@ -1487,6 +1487,8 @@ fn expr_nested_and_or_not_query() -> AppResult<()> {
                 children: vec![
                     QueryExpr::Leaf {
                         cond: LeafCond::Tag {
+                            term_query: None,
+                            term_match: Default::default(),
                             facet_key: "scene".into(),
                             tag_ids: vec![sea],
                             mode: Some("any".into()),
@@ -1495,6 +1497,8 @@ fn expr_nested_and_or_not_query() -> AppResult<()> {
                     },
                     QueryExpr::Leaf {
                         cond: LeafCond::Tag {
+                            term_query: None,
+                            term_match: Default::default(),
                             facet_key: "scene".into(),
                             tag_ids: vec![beach],
                             mode: Some("any".into()),
@@ -1506,6 +1510,8 @@ fn expr_nested_and_or_not_query() -> AppResult<()> {
             QueryExpr::Not {
                 child: Box::new(QueryExpr::Leaf {
                     cond: LeafCond::Tag {
+                        term_query: None,
+                        term_match: Default::default(),
                         facet_key: "lighting".into(),
                         tag_ids: vec![night],
                         mode: Some("any".into()),
@@ -1544,6 +1550,8 @@ fn expr_metadata_combined_with_tag() -> AppResult<()> {
         children: vec![
             QueryExpr::Leaf {
                 cond: LeafCond::Tag {
+                    term_query: None,
+                    term_match: Default::default(),
                     facet_key: "scene".into(),
                     tag_ids: vec![sea],
                     mode: Some("any".into()),
@@ -1592,6 +1600,8 @@ fn expr_invalid_rejected_by_validate() -> AppResult<()> {
     let bad2 = AssetFilter {
         expr: Some(QueryExpr::Leaf {
             cond: LeafCond::Tag {
+                term_query: None,
+                term_match: Default::default(),
                 facet_key: "scene".into(),
                 tag_ids: vec![],
                 mode: Some("any".into()),
@@ -1948,6 +1958,8 @@ fn query_expr_drops_facet_mismatch() -> AppResult<()> {
     let expr = QueryExpr::And {
         children: vec![QueryExpr::Leaf {
             cond: LeafCond::Tag {
+                term_query: None,
+                term_match: Default::default(),
                 facet_key: "scene".into(),
                 tag_ids: vec![t_scene.id, t_subject.id],
                 mode: None,
@@ -1963,6 +1975,8 @@ fn query_expr_drops_facet_mismatch() -> AppResult<()> {
                 tag_ids: vec![t_scene.id, t_subject.id],
                 mode: None,
                 include_descendants: true,
+                term_query: None,
+                term_match: Default::default(),
             },
         )?;
         frag

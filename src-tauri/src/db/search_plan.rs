@@ -398,6 +398,8 @@ mod tests {
     }
     fn tag_leaf(facet: &str, ids: Vec<i64>) -> LeafCond {
         LeafCond::Tag {
+            term_query: None,
+            term_match: Default::default(),
             facet_key: facet.into(),
             tag_ids: ids,
             mode: None,
