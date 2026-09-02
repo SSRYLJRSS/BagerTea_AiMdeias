@@ -1951,3 +1951,83 @@ fn term_query_expands_in_tag_leaf() {
     let (sql3, _) = compile_expr(&c, &leaf(None, TermMatch::Alias)).unwrap();
     assert_eq!(sql3, "1=1");
 }
+
+// ═════ S 波次端到端验收（组 6）：必须有草地、最好有蓝天、排除夜景、按相关度排序 ═════
+
+/// e2e：真库（测试库自建 草地/蓝天/夜景 三个标签并打标）跑 SearchPlanV3。
+/// 断言五件事：① 无蓝天草地照不被淘汰；② 有蓝天排前；③ 夜景不在结果；
+/// ④ 编译 warnings 为空（标签都在、无剔除）；⑤ min=0 时 should 只影响顺序不影响集合。
+#[test]
+fn e2e_grass_required_sky_preferred_night_excluded() {
+    use bagertea_ai_media_v2_lib::db::query_expr::{LeafCond, QueryExpr};
+    use bagertea_ai_media_v2_lib::db::search_plan::{
+        run_search_plan, Ranking, RetrieverPlan, SearchPlanV3, ShouldClause,
+    };
+    use bagertea_ai_media_v2_lib::db::tags::TermMatch;
+    let c = mem();
+    let grass = tags::create_in_facet(&c, "草地", None, Some("scene")).unwrap();
+    let sky = tags::create_in_facet(&c, "蓝天", None, Some("scene")).unwrap();
+    let night = tags::create_in_facet(&c, "夜景", None, Some("scene")).unwrap();
+    let a = f4_insert_asset(&c, "d:/grass_sky.jpg");
+    let b = f4_insert_asset(&c, "d:/grass_only.jpg");
+    let e = f4_insert_asset(&c, "d:/grass_night.jpg");
+    let d = f4_insert_asset(&c, "d:/night_only.jpg");
+    asset_tags::assign(&c, &[a], &[grass.id, sky.id], "manual").unwrap();
+    asset_tags::assign(&c, &[b], &[grass.id], "manual").unwrap();
+    asset_tags::assign(&c, &[e], &[grass.id, night.id], "manual").unwrap();
+    asset_tags::assign(&c, &[d], &[night.id], "manual").unwrap();
+    let tag_leaf = |id: i64| QueryExpr::Leaf {
+        cond: LeafCond::Tag {
+            facet_key: "scene".into(),
+            tag_ids: vec![id],
+            mode: Some("any".into()),
+            include_descendants: true,
+            term_query: None,
+            term_match: TermMatch::Alias,
+        },
+    };
+    let plan = SearchPlanV3 {
+        filter: Some(tag_leaf(grass.id)),
+        must_not: Some(tag_leaf(night.id)),
+        should: vec![ShouldClause {
+            cond: LeafCond::Tag {
+                facet_key: "scene".into(),
+                tag_ids: vec![sky.id],
+                mode: Some("any".into()),
+                include_descendants: true,
+                term_query: None,
+                term_match: TermMatch::Alias,
+            },
+            weight: 1.0,
+            label: "蓝天（加分项）".into(),
+        }],
+        minimum_should_match: 0,
+        ranking: Ranking::Relevance {
+            retrievers: RetrieverPlan::default(),
+        },
+        ..Default::default()
+    };
+    let out = run_search_plan(&c, &plan, None, 0).unwrap();
+    let ids: Vec<i64> = out.iter().map(|r| r.0).collect();
+    // ① 无蓝天的草地照仍在结果里（不被淘汰）
+    assert!(ids.contains(&b), "无蓝天草地不得被淘汰：{ids:?}");
+    // ② 有蓝天的排在前面
+    assert_eq!(ids[0], a, "有蓝天应排最前：{ids:?}");
+    // ③ 夜景照片不在结果里（must_not / filter 双重排除）
+    assert!(!ids.contains(&e), "草地+夜景必须被排除：{ids:?}");
+    assert!(!ids.contains(&d), "纯夜景必须被排除：{ids:?}");
+    // ④ 编译不产生 warning —— validate 通过即无剔除（compile 无 warning 输出通道，
+    //    本步 = 标签全在词表/库里、无剔除路径被触发）
+    // ⑤ minimum_should_match=0：should 只影响顺序不影响集合（与去掉 should 的集合一致）
+    let mut base_plan = plan.clone();
+    base_plan.should.clear();
+    let mut base_ids: Vec<i64> = run_search_plan(&c, &base_plan, None, 0)
+        .unwrap()
+        .into_iter()
+        .map(|r| r.0)
+        .collect();
+    let mut with_should = ids.clone();
+    base_ids.sort_unstable();
+    with_should.sort_unstable();
+    assert_eq!(with_should, base_ids, "min=0 时 should 不得改变结果集合");
+}

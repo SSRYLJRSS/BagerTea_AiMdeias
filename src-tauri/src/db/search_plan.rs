@@ -333,6 +333,12 @@ pub fn run_search_plan(
     limit: Option<i64>,
     offset: i64,
 ) -> AppResult<Vec<(i64, f64, f64)>> {
+    // S2/S4：Relevance 且配了检索器 → should 加权排序转排名，与各路检索器 RRF 融合
+    if matches!(&plan.ranking, Ranking::Relevance { .. })
+        && !plan.retrievers.retrievers.is_empty()
+    {
+        return run_relevance_fused(conn, plan, limit, offset);
+    }
     let compiled = compile_search_plan(conn, plan)?;
     let mut sql = compiled.sql.clone();
     let mut params = compiled.params;
@@ -352,6 +358,55 @@ pub fn run_search_plan(
     Ok(rows)
 }
 
+/// S2/S4：候选集 = filter/must_not/min_should（compile_search_plan 的 WHERE），
+/// should 加权分排序成一路排名；各路检索器（Fts bm25 / TagAlias）各成一排名；
+/// 全部经 RRF 融合 —— 量纲统一（bm25 负值 / should 加分任意正数 / 别名 0-1 只比排名）。
+fn run_relevance_fused(
+    conn: &Connection,
+    plan: &SearchPlanV3,
+    limit: Option<i64>,
+    offset: i64,
+) -> AppResult<Vec<(i64, f64, f64)>> {
+    // ① 候选 + should 相关度顺序（现有 SQL 已按 score DESC, id DESC）
+    let compiled = compile_search_plan(conn, plan)?;
+    let mut stmt = conn.prepare(&compiled.sql)?;
+    let candidates = stmt
+        .query_map(rusqlite::params_from_iter(compiled.params.iter()), |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+    let cand_set: std::collections::HashSet<i64> =
+        candidates.iter().map(|(id, _)| *id).collect();
+    // ② should 一路 = 候选集按 score 排序的排名
+    let should_ranked: Vec<i64> = candidates.iter().map(|(id, _)| *id).collect();
+    // ③ 各路检索器排名（各自 ≥0 条）
+    let mut lists: Vec<(&[i64], f32)> = Vec::new();
+    lists.push((&should_ranked, 1.0));
+    let mut owned: Vec<Vec<i64>> = Vec::new();
+    for wr in &plan.retrievers.retrievers {
+        let ids = run_retriever(conn, &wr.kind)?;
+        owned.push(ids);
+    }
+    for (wr, ids) in plan.retrievers.retrievers.iter().zip(owned.iter()) {
+        if !ids.is_empty() {
+            lists.push((ids.as_slice(), wr.weight));
+        }
+    }
+    let fused = rrf_fuse(&lists);
+    // ④ 结果限制在候选集内（filter 是硬性必须）；分页
+    let page: Vec<(i64, f64, f64)> = fused
+        .into_iter()
+        .filter(|(id, _)| cand_set.contains(id))
+        .skip(offset.max(0) as usize)
+        .take(limit.map(|l| l.clamp(0, 1000) as usize).unwrap_or(usize::MAX))
+        .map(|(id, s)| (id, s, 0.0))
+        .collect();
+    Ok(page)
+}
+
 /// S2：RRF（Reciprocal Rank Fusion）—— `score = Σ w_i / (k + rank_i)`，k=60。
 /// 只用排名不用原始分数：bm25 是负值（越小越相关）、should 加分任意正数、
 /// 别名命中 0/1 —— 三者的**排名**可比，**分数**不可比，RRF 天然免疫量纲。
@@ -367,6 +422,64 @@ pub fn rrf_fuse(lists: &[(&[i64], f32)]) -> Vec<(i64, f64)> {
     let mut out: Vec<(i64, f64)> = acc.into_iter().collect();
     out.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.0.cmp(&b.0)));
     out
+}
+
+/// S4：执行单路检索器 → 该路按相关度排序的素材 id 列表。
+/// - `Fts`：FTS5 bm25 排序（MATCH 词与编译期谓词同一套语义 —— 复用
+///   build_search_predicate 的 MATCH 参数，排名用 bm25(assets_fts)；明确不做向量）。
+/// - `TagAlias`：经 tag_terms 别名扩展命中 tag（受 F5-d feature gate 控制，
+///   关时返回空 + warning）再查素材（≤10 上限语义由调用方在融合前截断）。
+pub fn run_retriever(conn: &Connection, r: &Retriever) -> AppResult<Vec<i64>> {
+    match r {
+        Retriever::Fts { query, scope } => {
+            let Some(pred) = super::search::build_search_predicate(conn, query, *scope)? else {
+                return Ok(Vec::new());
+            };
+            let Some(Value::Text(term)) = pred.params.first() else {
+                return Ok(Vec::new());
+            };
+            let mut stmt = conn.prepare(
+                "SELECT a.id
+                   FROM assets a
+                   JOIN (SELECT rowid FROM assets_fts WHERE assets_fts MATCH ?1
+                          ORDER BY bm25(assets_fts) LIMIT 200) f ON f.rowid = a.id
+                  WHERE a.deleted_at IS NULL",
+            )?;
+            let rows = stmt
+                .query_map([term.as_str()], |r| r.get::<_, i64>(0))?
+                .filter_map(|r| r.ok())
+                .collect();
+            Ok(rows)
+        }
+        Retriever::TagAlias { text, facet_key } => {
+            let terms_enabled =
+                crate::db::schema_features::feature_enabled(conn, "tag_unique_terms")
+                    .unwrap_or(false);
+            if !terms_enabled {
+                tracing::warn!("标签别名检索需先在设置页启用标签约束，已跳过该路召回");
+                return Ok(Vec::new());
+            }
+            let facet = facet_key.as_deref().unwrap_or("");
+            let normalized = crate::db::tags::normalize_name(text);
+            // Alias 单点（canonical/synonym 均命中；cap 1 语义 = 单标签）
+            let lookup =
+                crate::db::tags::find_by_term(conn, facet, &normalized, crate::db::tags::TermMatch::Alias)?;
+            let Some(hit) = lookup.hits.into_iter().next() else {
+                return Ok(Vec::new());
+            };
+            let mut stmt = conn.prepare(
+                "SELECT a.id
+                   FROM assets a JOIN asset_tags at ON at.asset_id = a.id
+                  WHERE at.tag_id = ?1 AND a.deleted_at IS NULL
+                  ORDER BY a.id DESC LIMIT 10",
+            )?;
+            let rows = stmt
+                .query_map([hit.tag_id], |r| r.get::<_, i64>(0))?
+                .filter_map(|r| r.ok())
+                .collect();
+            Ok(rows)
+        }
+    }
 }
 
 /// S6：schema 版本迁移（plan_schema_version 3 → 4 时在此加 migrate_plan_v3_to_v4；
@@ -568,5 +681,97 @@ mod tests {
         let ids: Vec<i64> = out.iter().map(|x| x.0).collect();
         assert_eq!(ids[0], a, "显式 rating desc → 5 星排前（无视应蓝天加分）");
         assert_eq!(ids.len(), 2, "should 仍不影响集合（min=0）");
+    }
+
+    // ═══════════════ S4：两路真实检索器（TagAlias 别名扩展 / Fts bm25） ═══════════════
+
+    fn s4_terms_db() -> Connection {
+        let c = init_memory().unwrap();
+        crate::db::migrations::apply_v22b_constraints(&c).unwrap();
+        crate::db::schema_features::set_feature(&c, "tag_unique_terms", true, None).unwrap();
+        c
+    }
+    fn s4_asset(c: &Connection, file_name: &str) -> i64 {
+        assets::insert(c, &format!("d:/{file_name}"), file_name, "jpg", 1024, "image/jpeg", 1700000000000)
+            .unwrap()
+    }
+
+    /// S4：TagAlias 检索 —— 搜「海滨」经 tag_terms 命中「海边」→ 返回其素材。
+    #[test]
+    fn alias_retriever_expands_via_tag_terms() {
+        let c = s4_terms_db();
+        let t = tags::create_in_facet(&c, "海边", None, Some("scene")).unwrap();
+        tags::add_alias(&c, t.id, "海滨", None, "synonym").unwrap();
+        let aid = s4_asset(&c, "a.jpg");
+        asset_tags::assign(&c, &[aid], &[t.id], "manual").unwrap();
+        let ids = run_retriever(
+            &c,
+            &Retriever::TagAlias {
+                text: "海滨".into(),
+                facet_key: Some("scene".into()),
+            },
+        )
+        .unwrap();
+        assert!(ids.contains(&aid), "搜「海滨」应命中「海边」素材：{ids:?}");
+    }
+
+    /// S4：feature gate 关时 TagAlias 返回空（不误命中旧表别名）。
+    #[test]
+    fn alias_retriever_disabled_without_terms() {
+        let c = init_memory().unwrap(); // tag_unique_terms 默认关
+        let t = tags::create_in_facet(&c, "海边", None, Some("scene")).unwrap();
+        let aid = s4_asset(&c, "a.jpg");
+        asset_tags::assign(&c, &[aid], &[t.id], "manual").unwrap();
+        let ids = run_retriever(
+            &c,
+            &Retriever::TagAlias {
+                text: "海边".into(),
+                facet_key: Some("scene".into()),
+            },
+        )
+        .unwrap();
+        assert!(ids.is_empty(), "gate 关时不得走 tag_terms 扩展：{ids:?}");
+    }
+
+    /// S4：TagAlias 素材上限 ≤10。
+    #[test]
+    fn alias_retriever_respects_cap() {
+        let c = s4_terms_db();
+        let t = tags::create_in_facet(&c, "海边", None, Some("scene")).unwrap();
+        let mut aids = Vec::new();
+        for i in 0..12 {
+            let a = s4_asset(&c, &format!("a{i}.jpg"));
+            asset_tags::assign(&c, &[a], &[t.id], "manual").unwrap();
+            aids.push(a);
+        }
+        let ids = run_retriever(
+            &c,
+            &Retriever::TagAlias {
+                text: "海边".into(),
+                facet_key: Some("scene".into()),
+            },
+        )
+        .unwrap();
+        assert_eq!(ids.len(), 10, "TagAlias 素材上限 10：{ids:?}");
+    }
+
+    /// S4：Fts 检索 —— bm25 相关度排序（命中词素材排前，无关素材不出现）。
+    #[test]
+    fn fts_retriever_exposes_bm25_rank() {
+        let c = init_memory().unwrap();
+        let hit = s4_asset(&c, "wxyzportrait");
+        let miss = s4_asset(&c, "zzqotherimage");
+        let _other = s4_asset(&c, "wxyzportrait2"); // 同词另一张（不同 token：portrait2）
+        let ids = run_retriever(
+            &c,
+            &Retriever::Fts {
+                query: "wxyzportrait".into(),
+                scope: crate::db::query_expr::SearchScope::FileName,
+            },
+        )
+        .unwrap();
+        assert!(!ids.is_empty(), "Fts 检索应命中含词素材");
+        assert_eq!(ids[0], hit, "精确命中素材应排最前：{ids:?}");
+        assert!(!ids.contains(&miss), "无关素材不得出现在 bm25 排序结果里");
     }
 }
