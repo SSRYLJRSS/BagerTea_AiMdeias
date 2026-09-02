@@ -479,12 +479,11 @@ pub fn delete_facet(conn: &Connection, key: &str) -> AppResult<FacetDeleteReport
     })
 }
 
-/// 停用（软停用，保留历史引用）。系统分面默认拒绝停用（可提供 force 以仅停止展示）。
+/// 停用（软停用，保留历史引用与全部 cfg_* 配置）。
+/// F7：允许系统分面停用（设置页「已停用折叠区」就是为 color 这类设计的）；
+/// 「不能删除」仍是唯一保留项（delete_facet 检查 is_system）。
 pub fn deactivate(conn: &Connection, key: &str) -> AppResult<()> {
     let f = get(conn, key)?;
-    if f.is_system {
-        return Err(AppError::msg("系统分面不能停用（仅允许停用展示能力）"));
-    }
     let now = chrono::Utc::now().timestamp_millis();
     let n = conn.execute(
         "UPDATE tag_facets SET status='inactive', updated_at=?1 WHERE key=?2 AND status='active'",
@@ -660,7 +659,7 @@ mod tests {
     }
 
     #[test]
-    fn deactivate_restore_roundtrip_and_system_protected() {
+    fn deactivate_restore_roundtrip_and_system_allowed() {
         let c = conn();
         let f = create(&c, "mood", "氛围", "", "multi", None, "all").unwrap();
         deactivate(&c, &f.key).unwrap();
@@ -669,9 +668,15 @@ mod tests {
         assert!(!list(&c).unwrap().iter().any(|x| x.key == "mood"));
         restore(&c, &f.key).unwrap();
         assert_eq!(get(&c, &f.key).unwrap().status, "active");
-        // 系统分面（is_system=1）不能停用
+        // F7：系统分面允许停用（delete 才拒绝）——去掉了单向陷阱
         let sys = get(&c, "subject").unwrap();
-        assert!(deactivate(&c, &sys.key).is_err());
+        assert!(sys.is_system);
+        deactivate(&c, &sys.key).unwrap();
+        assert_eq!(get(&c, &sys.key).unwrap().status, "inactive");
+        restore(&c, &sys.key).unwrap();
+        assert_eq!(get(&c, &sys.key).unwrap().status, "active", "停用→恢复对称");
+        // 系统分面仍不能物理删除
+        assert!(delete_facet(&c, &sys.key).is_err());
     }
 
     #[test]

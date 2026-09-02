@@ -1172,3 +1172,100 @@ fn alias_same_term_allowed_across_facets() {
         "同分面重词应报错: {err}"
     );
 }
+
+// ═══════════════ F7：分面状态对称性 + top_tags_per_facet 重写 ═══════════════
+
+/// F7：系统分面允许停用（「不能删除」仍是唯一保留项）。
+#[test]
+fn deactivate_system_facet_allowed() {
+    let c = mem();
+    let sys = tag_facets::get(&c, "subject").unwrap();
+    assert!(sys.is_system, "subject 是系统分面");
+    tag_facets::deactivate(&c, "subject").unwrap();
+    assert_eq!(tag_facets::get(&c, "subject").unwrap().status, "inactive");
+    // 系统分面仍不能物理删除
+    assert!(
+        tag_facets::delete_facet(&c, "subject").is_err(),
+        "系统分面只允许停用，不允许删除"
+    );
+}
+
+/// F7：停用 → 恢复 → 再停用（对称；恢复后仍能停用回去——原单向陷阱已消除）。
+#[test]
+fn restore_then_deactivate_roundtrip() {
+    let c = mem();
+    tag_facets::deactivate(&c, "subject").unwrap();
+    tag_facets::restore(&c, "subject").unwrap();
+    assert_eq!(tag_facets::get(&c, "subject").unwrap().status, "active");
+    tag_facets::deactivate(&c, "subject").unwrap();
+    assert_eq!(tag_facets::get(&c, "subject").unwrap().status, "inactive", "恢复后仍能停用回去");
+    // cfg 配置全程不被生命周期覆盖（F1 不变式）
+    let f = tag_facets::get(&c, "subject").unwrap();
+    assert!(f.cfg_visible_in_navigation && f.cfg_ai_assignable && f.cfg_searchable);
+}
+
+/// 辅助：给每个分面造 count 个标签并各挂 1 张素材（名长 12 字内）。
+fn f7_seed_facet(c: &rusqlite::Connection, facet: &str, count: usize) {
+    for i in 0..count {
+        let name = format!("{facet}词{i:02}");
+        let t = tags::create_in_facet(c, &name, None, Some(facet)).unwrap();
+        let aid = f4_insert_asset(c, &format!("d:/f7/{facet}_{i}.jpg"));
+        asset_tags::assign(c, &[aid], &[t.id], "manual").unwrap();
+    }
+}
+
+/// F7：Top-N 是**每分面** Top-N —— 3 个分面各 30 词，n=5 时每个分面都有条目且不超 5 词。
+#[test]
+fn top_tags_per_facet_is_per_facet() {
+    let c = mem();
+    tag_facets::create(&c, "f_a", "A面", "", "multi", None, "all").unwrap();
+    tag_facets::create(&c, "f_b", "B面", "", "multi", None, "all").unwrap();
+    tag_facets::create(&c, "f_c", "C面", "", "multi", None, "all").unwrap();
+    for f in ["f_a", "f_b", "f_c"] {
+        f7_seed_facet(&c, f, 30);
+    }
+    let out = tags::top_tags_per_facet(&c, 5).unwrap();
+    let keys: Vec<&str> = out.iter().map(|(f, _)| f.as_str()).collect();
+    for want in ["f_a", "f_b", "f_c"] {
+        assert!(keys.contains(&want), "每个分面都应有候选词（实际 {keys:?}）");
+    }
+    for (facet, line) in &out {
+        let words: Vec<&str> = line.split('/').filter(|w| !w.is_empty()).collect();
+        assert!(
+            words.len() <= 5,
+            "{facet} 每分面最多 n=5 词（实际 {}）",
+            words.len()
+        );
+        assert!(!words.is_empty(), "{facet} 至少 1 词");
+    }
+}
+
+/// F7：字符配额按分面均摊 —— 一个超大分面不再挤掉小分面（不 break 丢整个分面）。
+#[test]
+fn top_tags_quota_is_shared_fairly() {
+    let c = mem();
+    tag_facets::create(&c, "big_f", "大面", "", "multi", None, "all").unwrap();
+    tag_facets::create(&c, "s1", "小面1", "", "multi", None, "all").unwrap();
+    tag_facets::create(&c, "s2", "小面2", "", "multi", None, "all").unwrap();
+    f7_seed_facet(&c, "big_f", 200);
+    f7_seed_facet(&c, "s1", 2);
+    f7_seed_facet(&c, "s2", 2);
+    let out = tags::top_tags_per_facet(&c, 200).unwrap();
+    let keys: Vec<&str> = out.iter().map(|(f, _)| f.as_str()).collect();
+    for want in ["big_f", "s1", "s2"] {
+        assert!(keys.contains(&want), "小分面不得被大分面挤掉（实际 {keys:?}）");
+    }
+    // 均摊配额 = 1500 / 3 = 500 字符左右；大分面行不应失控（< 520，含分隔符余量）
+    let big = out.iter().find(|(f, _)| f == "big_f").unwrap();
+    let cap_share = 1500usize / keys.len();
+    assert!(
+        big.1.chars().count() <= cap_share + 20,
+        "大分面占用应接近均摊配额 {}（实际 {}）",
+        cap_share,
+        big.1.chars().count()
+    );
+    // 小分面各有条目
+    for (facet, line) in &out {
+        assert!(!line.is_empty(), "{facet} 至少保留 1 个词");
+    }
+}

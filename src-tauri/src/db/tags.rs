@@ -633,40 +633,59 @@ pub fn list_by_facet(conn: &Connection, facet_key: &str) -> AppResult<Vec<TagNod
     Ok(filter(tree, facet_key))
 }
 
-/// W2-9：按使用次数降序取 Top-N 标签（高频词优先 → 标签收敛更快）。
-/// 单条 GROUP BY 走 idx_asset_tags_tag；标签名 >12 字截断；总输出 1500 字符上限。
+/// W2-9 + F7：提示词候选词 —— 高频词优先（标签收敛更快），**按分面各取 Top-n**
+/// （ROW_NUMBER() OVER PARTITION BY facet_key），不再全库 LIMIT n —— 分面多时靠后的分面
+/// 不再拿不到候选词。标签名 >12 字截断；总输出 1500 字符上限按分面数**均摊配额**，
+/// 不再用 break 直接丢弃整个分面（谁被丢不由 facet_key 字母序决定）。
 /// 供 W5a 提示词拼入候选词（「含义相同就用已有的词」约束的事实基础）。
 pub fn top_tags_per_facet(conn: &Connection, n: usize) -> AppResult<Vec<(String, String)>> {
     // F4：AI_ASSIGNABLE_TAG —— 停用分面的标签不得作为「已有候选词」喂给 AI
     let mut stmt = conn.prepare(&format!(
-        "SELECT t.facet_key, t.name, COUNT(at.asset_id) AS uses
-           FROM tags t JOIN asset_tags at ON at.tag_id = t.id
-          WHERE {AI_ASSIGNABLE_TAG}
-          GROUP BY t.id
-          ORDER BY uses DESC, t.sort_order, t.id
-          LIMIT ?1",
+        "SELECT facet_key, name FROM (
+            SELECT t.facet_key, t.name, COUNT(at.asset_id) AS uses,
+                   ROW_NUMBER() OVER (
+                     PARTITION BY t.facet_key
+                     ORDER BY COUNT(at.asset_id) DESC, t.sort_order, t.id
+                   ) AS rn
+              FROM tags t JOIN asset_tags at ON at.tag_id = t.id
+             WHERE {AI_ASSIGNABLE_TAG}
+             GROUP BY t.id
+         ) ranked
+          WHERE rn <= ?1
+          ORDER BY facet_key, rn",
     ))?;
     let rows: Vec<(String, String)> = stmt
-        .query_map([n as i64], |r| {
+        .query_map([n.max(1) as i64], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
         })?
         .filter_map(|r| r.ok())
         .collect();
 
-    // 按分面分组聚合成 "facet_key: 词1/词2/..."，超 12 字的词截断，总量 1500 字符封顶
+    // 按分面分组聚合成 "facet_key: 词1/词2/..."，超 12 字的词截断；
+    // F7：总量 1500 字符上限按分面数均摊（每分面至少保留 1 个词），不再 break 丢整个分面
+    const CAP: usize = 1500;
     let mut by_facet: std::collections::BTreeMap<String, Vec<String>> = Default::default();
     for (facet, name) in rows {
         let short: String = name.chars().take(12).collect();
         by_facet.entry(facet).or_default().push(short);
     }
-    const CAP: usize = 1500;
+    if by_facet.is_empty() {
+        return Ok(Vec::new());
+    }
+    let per_facet_cap = (CAP / by_facet.len()).max(1);
     let mut out: Vec<(String, String)> = Vec::new();
-    let mut total: usize = 0;
     for (facet, words) in by_facet {
-        let line = words.join("/");
-        total += line.chars().count() + facet.len() + 2;
-        if total > CAP {
-            break;
+        // 贪心凑词直到分面配额；超长首词也保留（每分面至少 1 个词）
+        let mut line = String::new();
+        for w in &words {
+            let cost = line.chars().count() + if line.is_empty() { 0 } else { 1 } + w.chars().count();
+            if cost > per_facet_cap && !line.is_empty() {
+                break;
+            }
+            if !line.is_empty() {
+                line.push('/');
+            }
+            line.push_str(w);
         }
         out.push((facet, line));
     }
