@@ -51,6 +51,7 @@ pub struct Tag {
     pub total_count: i64,
     #[serde(default)]
     pub aliases: Vec<String>,
+    /// F8：path 仅展示用（侧栏面包屑），禁止用于身份判断、导出或任何持久化/协议语义。
     #[serde(default)]
     pub path: String,
     /// F4：所在分面生命周期是否有效（存在且 active）。UI 打「已停用」角标用。

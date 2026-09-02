@@ -4,7 +4,6 @@
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
-use crate::db::settings::AiFacetConfig;
 use crate::error::{AppError, AppResult};
 
 /// AI 打标/搜索共享的 FacetPromptContext：稳定 key + 人类可读信息 + 数据库规则
@@ -270,73 +269,9 @@ pub fn create(
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, 'active', ?7, ?8, ?8)",
         params![key, display_name, description, selection_mode, max_items, sort_order, applies_to, now],
     )?;
-    seed_ai_config(conn, &key)?;
+    // F8：V20 合表后 ai_facet_configs 已死（skip_serializing），不再补种子配置；
+    // 参与 AI 语义由 cfg_ai_assignable/input_mode 列承载（新建默认 ai_and_manual）。
     get(conn, &key)
-}
-
-/// 新建分面后同步补建 AI 配置条目（默认参与 AI；已有条目不动）。
-/// build_prompt_context 只遍历 ai_facet_configs —— 缺条目的分面 AI 永远不产出，
-/// 设置页也没法对它勾选（patch 无处可落）。normalize_ai_facet_defaults 只在整份配置
-/// 为空时补默认，覆盖不到「后建分面」，这里补上。
-fn seed_ai_config(conn: &Connection, key: &str) -> AppResult<()> {
-    let mut s = crate::db::settings::get_settings(conn)?;
-    if s.ai_facet_configs.iter().any(|c| c.facet_key == key) {
-        return Ok(());
-    }
-    s.ai_facet_configs.push(AiFacetConfig {
-        facet_key: key.to_string(),
-        hint: String::new(),
-        // color 恒为系统分面且建库即存在，走不到这里；新建用户分面默认参与 AI
-        enabled_for_ai: true,
-        display_name: None,
-        visible_in_workbench: None,
-    });
-    crate::db::settings::save_settings(conn, &s)
-}
-
-/// 修改显示属性（显示名/描述）；key 不可改。
-pub fn update_display(
-    conn: &Connection,
-    key: &str,
-    display_name: &str,
-    description: &str,
-) -> AppResult<()> {
-    let display_name = display_name.trim().to_string();
-    if display_name.is_empty() {
-        return Err(AppError::msg("显示名不能为空"));
-    }
-    let now = chrono::Utc::now().timestamp_millis();
-    let n = conn.execute(
-        "UPDATE tag_facets SET display_name=?1, description=?2, updated_at=?3 WHERE key=?4",
-        params![display_name, description, now, key],
-    )?;
-    if n == 0 {
-        return Err(AppError::msg("分面不存在"));
-    }
-    Ok(())
-}
-
-/// 修改规则（selection_mode / max_items / applies_to）。
-pub fn update_rules(
-    conn: &Connection,
-    key: &str,
-    selection_mode: &str,
-    max_items: Option<i64>,
-    applies_to: &str,
-) -> AppResult<()> {
-    let (selection_mode, max_items) = normalize_selection_mode(selection_mode, max_items)?;
-    if applies_to != "all" && applies_to != "image" && applies_to != "video" {
-        return Err(AppError::msg("applies_to 只允许 all | image | video"));
-    }
-    let now = chrono::Utc::now().timestamp_millis();
-    let n = conn.execute(
-        "UPDATE tag_facets SET selection_mode=?1, max_items=?2, applies_to=?3, updated_at=?4 WHERE key=?5",
-        params![selection_mode, max_items, applies_to, now, key],
-    )?;
-    if n == 0 {
-        return Err(AppError::msg("分面不存在"));
-    }
-    Ok(())
 }
 
 fn normalize_selection_mode(
@@ -373,9 +308,9 @@ pub fn reorder(conn: &Connection, ordered_keys: &[String]) -> AppResult<()> {
     Ok(())
 }
 
-/// W2-2：合并编辑命令 —— 6 字段一个事务（display_name/description/input_mode/
-/// selection_mode/max_items/applies_to）。替代 update_display + update_rules 两个
-/// 即时写命令（旧命令保留 deprecated 标记，W4 前端切换完再删）。
+/// W2-2 + F8：合并编辑命令 —— 6 字段一个事务（display_name/description/input_mode/
+/// selection_mode/max_items/applies_to）。旧的 update_display/update_rules 两个即时写
+/// 命令已在 F8 删除（唯一编辑通道是 update_facet）。
 /// 部分字段非法时全部不生效（单一保存通道语义）。
 /// F1-b：input_mode 降级为只读派生 —— 此处按入参换算写 `cfg_ai_assignable`，
 /// 同时回写 input_mode 列保持 DB 内一致（回滚/历史查询可读）。
@@ -560,7 +495,7 @@ mod tests {
         seed_system_facets(&c).unwrap();
         assert_eq!(list_all(&c).unwrap().len(), n);
         // 已存在的行（含用户改名）不被覆盖
-        update_display(&c, "subject", "我改过的名字", "").unwrap();
+        c.execute("UPDATE tag_facets SET display_name='我改过的名字' WHERE key='subject'", []).unwrap();
         seed_system_facets(&c).unwrap();
         assert_eq!(get(&c, "subject").unwrap().display_name, "我改过的名字");
     }
@@ -695,21 +630,6 @@ mod tests {
         assert_eq!(impact.asset_count, 0);
     }
 
-    #[test]
-    fn update_display_and_rules() {
-        let c = conn();
-        let f = create(&c, "rules_facet", "旧名", "旧描述", "multi", Some(2), "all").unwrap();
-        update_display(&c, &f.key, "新名", "新描述").unwrap();
-        let updated = get(&c, &f.key).unwrap();
-        assert_eq!(updated.display_name, "新名");
-        assert_eq!(updated.description, "新描述");
-        // key 不可改（update 不提供 key 变更）
-        update_rules(&c, &f.key, "single", None, "video").unwrap();
-        let updated2 = get(&c, &f.key).unwrap();
-        assert_eq!(updated2.selection_mode, "single");
-        assert_eq!(updated2.max_items, Some(1));
-        assert_eq!(updated2.applies_to, "video");
-    }
     /// 回归（真机：设置页标签与分类 AI/手工两组全空白）：
     /// list_all 返回的 TagFacet 必须含 input_mode（FACET_COLS 漏列 → 前端 inputMode 恒 undefined → 两组全空）。
     #[test]
@@ -790,21 +710,6 @@ pub fn key_for_legacy_name(name: &str) -> &'static str {
         "人物" | "人物属性" | "人物/主体属性" => "people",
         "技术" | "可用性/技术特征" => "technical",
         _ => "custom",
-    }
-}
-
-pub fn display_name_for_key(key: &str) -> &'static str {
-    match key {
-        "subject" => "主体/对象",
-        "scene" => "场景/地点",
-        "purpose" => "用途",
-        "style" => "风格/氛围",
-        "color" => "色彩",
-        "composition" => "构图/视角",
-        "lighting" => "光线/时间",
-        "people" => "人物属性",
-        "technical" => "可用性/技术特征",
-        _ => "自定义",
     }
 }
 

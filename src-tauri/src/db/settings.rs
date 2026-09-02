@@ -451,12 +451,12 @@ pub struct Settings {
     #[serde(default = "default_cache_mb")]
     pub thumbnail_cache_mb: i64,
     /// 标签分类（PRD 5.5，设置页可管理）
-    /// 已弃用：机器协议迁移到 ai_facet_configs。保留字段作反序列化兼容，仅作迁移输入。
+    /// F8：唯一读者是 migrate_v20（把中文分类迁为稳定分面），新代码禁止读/写此字段。
     #[serde(default, skip_serializing)]
     pub tag_categories: Vec<TagCategory>,
     /// AI 分面配置（P1B 唯一事实源，facet_key 稳定不可修改）
-    /// V20 后语义已搬进 tag_facets.input_mode：本字段只作旧 JSON 反序列化输入
-    /// （migrate_v20 回填读它），此后不再序列化。
+    /// V20 后语义已搬进 tag_facets.input_mode/cfg_*：本字段只作旧 JSON 反序列化输入。
+    /// F8：唯一读者是 migrate_v20（回填），新代码禁止读/写此字段。
     #[serde(default, skip_serializing)]
     pub ai_facet_configs: Vec<AiFacetConfig>,
     /// 总库位置（R-32）；空 = 原位索引模式

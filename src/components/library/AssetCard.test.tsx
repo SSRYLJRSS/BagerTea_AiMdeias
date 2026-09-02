@@ -90,7 +90,6 @@ function mkMinimalSettings(): Settings {
     theme: "system",
     thumbnailCacheMb: 2048,
     tagCategories: [],
-    aiFacetConfigs: [],
     libraryRoot: "",
     trashRetentionDays: 30,
     customDownloadSources: [],

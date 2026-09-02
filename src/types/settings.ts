@@ -37,18 +37,6 @@ export interface AiSettings {
   ollamaSourceId: string;
 }
 
-/** AI 分面配置（P1B：tag_facets 是唯一事实源，facet_key 稳定不可修改）
- *  显示名称可本地化，hint 进 AI 提示词，single/max 以数据库为准（不在此保存第二份）
- *  C-1/C-2：enabledForAi 控制是否参与 AI 打标/搜索提示词；visibleInWorkbench 独立控制是否显示在工作台。 */
-export interface AiFacetConfig {
-  facetKey: string;
-  hint: string;
-  enabledForAi: boolean;
-  displayName?: string;
-  /** 是否显示在人工打标工作台（W3-2 后已死：分面显隐由 input_mode/status 决定） */
-  visibleInWorkbench?: boolean;
-}
-
 /** 标签分类（PRD 5.5，已弃用）：旧 name/机器协议，仅作迁移输入 */
 export interface TagCategory {
   name: string;
@@ -72,9 +60,6 @@ export interface Settings {
   thumbnailCacheMb: number;
   /** 标签分类（已弃用）：仅作迁移输入，后端不再序列化 */
   tagCategories: TagCategory[];
-  /** W3-1（V20 合表）：已删。分面 AI 参与语义在 tag_facets.input_mode；
-   *  保留类型仅为老 JSON 反序列化兼容，后端不再返回此字段。 */
-  aiFacetConfigs?: AiFacetConfig[];
   /** 总库位置（R-32）；空 = 原位索引模式 */
   libraryRoot: string;
   /** 回收站保留天数（R-22）；0 = 不自动清理 */

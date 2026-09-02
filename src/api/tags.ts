@@ -64,24 +64,6 @@ export function deleteTagFacet(key: string): Promise<FacetDeleteReport> {
   return invoke<FacetDeleteReport>("delete_tag_facet", { key });
 }
 
-export function updateTagFacetDisplay(key: string, displayName: string, description?: string): Promise<void> {
-  return invoke<void>("update_tag_facet_display", { key, displayName, description: description ?? "" });
-}
-
-export function updateTagFacetRules(
-  key: string,
-  selectionMode: "single" | "multi",
-  maxItems?: number | null,
-  appliesTo?: "all" | "image" | "video",
-): Promise<void> {
-  return invoke<void>("update_tag_facet_rules", {
-    key,
-    selectionMode,
-    maxItems: maxItems ?? null,
-    appliesTo: appliesTo ?? "all",
-  });
-}
-
 export function reorderTagFacets(orderedKeys: string[]): Promise<void> {
   return invoke<void>("reorder_tag_facets", { orderedKeys });
 }

@@ -128,7 +128,6 @@ describe("ViewerPage 查看器色条（FB3-10 §12.2）", () => {
         theme: "system",
         thumbnailCacheMb: 2048,
         tagCategories: [],
-        aiFacetConfigs: [],
         libraryRoot: "",
         trashRetentionDays: 30,
         customDownloadSources: [],

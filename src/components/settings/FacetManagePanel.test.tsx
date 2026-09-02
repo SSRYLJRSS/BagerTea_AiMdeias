@@ -12,8 +12,6 @@ vi.mock("@/api/tags", () => ({
   listAllTagFacets: vi.fn(),
   createTagFacet: vi.fn(),
   updateTagFacet: vi.fn().mockResolvedValue(undefined),
-  updateTagFacetDisplay: vi.fn().mockResolvedValue(undefined),
-  updateTagFacetRules: vi.fn().mockResolvedValue(undefined),
   reorderTagFacets: vi.fn().mockResolvedValue(undefined),
   deleteTagFacet: vi.fn().mockResolvedValue({ tagsDeleted: 2, unlinked: 3, opsDeleted: 0, itemsDeleted: 0 }),
   deactivateTagFacet: vi.fn().mockResolvedValue(undefined),

@@ -54,8 +54,8 @@ pub fn create_tag_facet(
     )
 }
 
-/// W2-2：合并编辑命令（6 字段一个事务）。旧 update_tag_facet_display /
-/// update_tag_facet_rules 保留 deprecated 标记，W4 前端切换完再删。
+/// W2-2 + F8：合并编辑命令（6 字段一个事务）。旧 update_tag_facet_display /
+/// update_tag_facet_rules 两个即时写命令已在 F8 删除。
 #[tauri::command]
 pub fn update_tag_facet(
     state: State<AppState>,
@@ -82,42 +82,6 @@ pub fn delete_tag_facet(
 ) -> AppResult<crate::db::tag_facets::FacetDeleteReport> {
     let conn = lock_db(&state)?;
     crate::db::tag_facets::delete_facet(&conn, &key)
-}
-
-/// 修改显示属性（显示名/描述；key 不可改）。【deprecated：W2-2 起 W4 前端改走 update_tag_facet】
-#[tauri::command]
-pub fn update_tag_facet_display(
-    state: State<AppState>,
-    key: String,
-    display_name: String,
-    description: Option<String>,
-) -> AppResult<()> {
-    let conn = lock_db(&state)?;
-    crate::db::tag_facets::update_display(
-        &conn,
-        &key,
-        &display_name,
-        description.as_deref().unwrap_or(""),
-    )
-}
-
-/// 修改规则（selection_mode / max_items / applies_to）。
-#[tauri::command]
-pub fn update_tag_facet_rules(
-    state: State<AppState>,
-    key: String,
-    selection_mode: String,
-    max_items: Option<i64>,
-    applies_to: Option<String>,
-) -> AppResult<()> {
-    let conn = lock_db(&state)?;
-    crate::db::tag_facets::update_rules(
-        &conn,
-        &key,
-        &selection_mode,
-        max_items,
-        applies_to.as_deref().unwrap_or("all"),
-    )
 }
 
 /// 分面排序（传入完整有序 key 列表）。

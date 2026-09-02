@@ -326,7 +326,6 @@ describe("AssetGrid FB2-01 档位缩放（Alt/Ctrl+滚轮）", () => {
       theme: "system",
       thumbnailCacheMb: 2048,
       tagCategories: [],
-      aiFacetConfigs: [],
       libraryRoot: "",
       trashRetentionDays: 30,
       customDownloadSources: [],

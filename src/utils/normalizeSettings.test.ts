@@ -14,7 +14,6 @@ describe("normalizeSettings", () => {
     expect(s.ai.videoTagging).toBe(false);
     expect(s.ai.batchLimit).toBe(DEFAULT_BATCH_LIMIT);
     expect(s.ai.activeProfile).toBe("");
-    expect(s.aiFacetConfigs ?? []).toEqual([]);
     expect(s.tagCategories).toEqual([]);
     expect(s.customDownloadSources).toEqual([]);
     expect(s.libraryRoot).toBe("");
@@ -62,16 +61,12 @@ describe("normalizeSettings", () => {
     expect(s.ai.activeProfile).toBe("");
   });
 
-  it("保留合法的 aiFacetConfigs，非法/空 key 被过滤", () => {
+  it("F8：老 JSON 里的 aiFacetConfigs 被直接丢弃（类型层已删）", () => {
     const s = normalizeSettings({
-      aiFacetConfigs: [
-        { facetKey: "color", hint: "主色调", enabledForAi: true },
-        { facetKey: "" },
-        null,
-      ],
-    });
-    // W3-1：aiFacetConfigs 已可选（V20 合表后后端不再返回；normalize 不再重建）
-    expect(s.aiFacetConfigs ?? []).toHaveLength(0);
+      aiFacetConfigs: [{ facetKey: "color", hint: "主色调", enabledForAi: true }],
+    }) as unknown as Record<string, unknown>;
+    expect(s.aiFacetConfigs).toBeUndefined();
+    expect(s.tagCategories).toEqual([]);
   });
 
   it("畸形数字/布尔字段兜底；batchLimit 越界归一到 [10,50] 默认 30（FB3-07）", () => {

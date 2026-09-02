@@ -304,11 +304,9 @@ pub fn run() {
             commands::list_tag_facets,
             commands::list_all_tag_facets,
             commands::create_tag_facet,
-            commands::update_tag_facet_display,
             // W2-2/W2-3：合并编辑 + 级联删除（分面契约）
             commands::update_tag_facet,
             commands::delete_tag_facet,
-            commands::update_tag_facet_rules,
             commands::reorder_tag_facets,
             commands::deactivate_tag_facet,
             commands::restore_tag_facet,

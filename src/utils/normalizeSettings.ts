@@ -1,13 +1,12 @@
 /**
  * 设置运行时归一化（指导书 A-2）：后端设置 JSON 可能缺失字段（旧库 / 部分返回 / 未来字段增减），
- * 前端不能直接访问 draft.ai.xxx / draft.aiFacetConfigs.map(...) 而崩溃白屏。
+ * 前端不能直接访问 draft.ai.xxx 而崩溃白屏。
  * 本函数用类型守卫对 `unknown` 输入提供安全默认值，产生一份可安全渲染的 Settings。
  *
  * 注意：本函数只负责「前端运行时安全」，不取代 Rust 端迁移 —— 迁移仍是单一事实源。
  * 对未知字段尽量保留，不无故丢弃未来配置。
  */
 import type {
-  AiFacetConfig,
   AiSettings,
   ApiProfile,
   Appearance,
@@ -177,14 +176,12 @@ export function normalizeSettings(raw: unknown): Settings {
   if (ai.activeProfile && ai.profiles.length > 0 && !ai.profiles.some((p) => p.id === ai.activeProfile)) {
     ai.activeProfile = "";
   }
-  // W3-1：aiFacetConfigs 已死（V20 合表）——不再归一化重建，直接丢弃（类型可选仅兼容老 JSON）
-  const aiFacetConfigs: AiFacetConfig[] = [];
+  // F8：aiFacetConfigs 已删（V20 合表 + 类型层清理），后端不再返回此字段
   return {
     ai,
     theme: theme === "light" || theme === "dark" ? theme : "system",
     thumbnailCacheMb: Math.max(0, Math.round(asNum(r.thumbnailCacheMb, DEFAULT_CACHE_MB))),
     tagCategories: Array.isArray(r.tagCategories) ? r.tagCategories.map(normalizeCategory) : [],
-    aiFacetConfigs,
     libraryRoot: asStr(r.libraryRoot, ""),
     trashRetentionDays: Math.max(0, Math.round(asNum(r.trashRetentionDays, DEFAULT_TRASH_RETENTION_DAYS))),
     customDownloadSources: Array.isArray(r.customDownloadSources)
