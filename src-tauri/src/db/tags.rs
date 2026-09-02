@@ -194,24 +194,15 @@ pub fn create_in_facet(
 }
 
 /// 新协议使用的规范标签创建：分面是独立实体，标签直接归属分面。
+/// F3-a：查重用 find_by_term(mode=Alias) —— 消灭本函数自写的两表 JOIN + ORDER BY 兜底。
 pub fn find_or_create_canonical(conn: &Connection, facet_key: &str, name: &str) -> AppResult<i64> {
     let normalized = normalize_name(name);
     if normalized.is_empty() {
         return Err(crate::error::AppError::msg("标签名称不能为空"));
     }
-    let existing: Option<i64> = conn
-        .query_row(
-            "SELECT DISTINCT t.id FROM tags t
-               LEFT JOIN tag_aliases ta ON ta.tag_id = t.id AND ta.is_searchable = 1
-              WHERE t.facet_key = ?1 AND t.status = 'active'
-                AND (t.normalized_name = ?2 OR ta.normalized_alias = ?2)
-              ORDER BY t.id LIMIT 1",
-            rusqlite::params![facet_key, normalized],
-            |r| r.get(0),
-        )
-        .ok();
-    if let Some(id) = existing {
-        return Ok(id);
+    let lookup = find_by_term(conn, facet_key, &normalized, TermMatch::Alias)?;
+    if let Some(hit) = lookup.hits.first() {
+        return Ok(hit.tag_id);
     }
     Ok(create_in_facet(conn, name, None, Some(facet_key))?.id)
 }
@@ -956,4 +947,176 @@ pub fn retire_unused_presets(conn: &Connection) -> AppResult<usize> {
         [],
     )?;
     Ok(changed)
+}
+
+// ═══════════════ F3：find_by_term 单一入口 + next_prefix（S5 扩展复用） ═══════════════
+
+/// 词匹配模式（F3 定义；S5 在 LeafCond::Tag 上扩展 term_match 复用同一枚举）。
+/// `serde(rename_all)` 对齐前端 camelCase 契约。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum TermMatch {
+    /// 规范名精确（term_kind='canonical'）
+    Exact,
+    /// 规范名或任意别名精确（默认）
+    #[default]
+    Alias,
+    /// 前缀（「青」→「青少年」）
+    Prefix,
+    /// 包含（「人」→「人物」「单人」「一个人」）
+    Contains,
+    /// 编辑距离 ≤ 1（「森材」→「森林」）
+    Fuzzy,
+}
+
+/// F3-b：字典序的「下一个前缀」，作范围查询开区间上界。
+/// 不变式：所有以 prefix 开头的字符串 s 都满足 prefix <= s < next_prefix(prefix)。
+/// ⚠ 不能用 `prefix + '\u{FFFF}'` —— 实测 UTF-8 下 U+1F600（😀）字节序大于 U+FFFF，
+///   会漏掉含 emoji 的标签。遍历字符递增并自动跳过 surrogate。
+pub fn next_prefix(prefix: &str) -> Option<String> {
+    let mut chars: Vec<char> = prefix.chars().collect();
+    while let Some(last) = chars.pop() {
+        let mut cp = last as u32 + 1;
+        while cp <= 0x10FFFF {
+            if let Some(c) = char::from_u32(cp) {
+                let mut out: String = chars.iter().collect();
+                out.push(c);
+                return Some(out);
+            }
+            cp += 1;
+        }
+        // 该字符已到顶 → 丢掉它，对前一个字符继续
+    }
+    None // 空串或全是 char::MAX → 无上界，调用方只用下界
+}
+
+/// 分面内按 term 查标签的**唯一入口**（F3-a）。
+/// 唯一索引（ux_terms，tag_unique_terms 启用后）保证最多一行 —— 不再需要 ORDER BY 兜底。
+/// 消灭四处重复 SQL 与 `ORDER BY id LIMIT 1`：
+///   - find_or_create_canonical（mode=Alias）
+///   - ai::set_suggestion_tags 的 tag_id 反查（mode=Alias）
+///   - ai::final_pairs 反查（mode=Alias）
+///   - search_candidates 保留（模糊候选，见 F4 的 SEARCHABLE_TAG）
+///
+/// F5-d feature gate：tag_unique_terms=1 时读 tag_terms（事实源），=0 时读旧表
+/// （tags + tag_aliases）。分支收在本函数一处，上层不自己判断 feature。
+pub fn find_by_term(
+    conn: &Connection,
+    facet_key: &str,
+    normalized: &str,
+    mode: TermMatch,
+) -> AppResult<TermLookup> {
+    let terms_enabled =
+        crate::db::schema_features::feature_enabled(conn, "tag_unique_terms").unwrap_or(false);
+    let mut warnings = Vec::new();
+    let mut hits = Vec::new();
+    if terms_enabled {
+        // tag_terms 事实源：精确/别名/前缀/包含/纠错 由 S5 扩展；F3 先实现精确类
+        let kind_filter = match mode {
+            TermMatch::Exact => "AND term_kind = 'canonical'",
+            TermMatch::Alias => "",
+            _ => "", // Prefix/Contains/Fuzzy 在 S5 扩展（需要 next_prefix + 编辑距离）
+        };
+        let mut stmt = conn.prepare(&format!(
+            "SELECT tag_id, term_kind, term FROM tag_terms
+              WHERE facet_key = ?1 AND normalized_term = ?2 {kind_filter}
+              ORDER BY term_kind = 'canonical' DESC, term_kind, term LIMIT 1"
+        ))?;
+        let mut rows = stmt.query(rusqlite::params![facet_key, normalized])?;
+        if let Some(r) = rows.next()? {
+            let tag_id: i64 = r.get(0)?;
+            let term_kind: String = r.get(1)?;
+            let matched: String = r.get(2)?;
+            let status: String = conn
+                .query_row(
+                    "SELECT COALESCE(status,'active') FROM tags WHERE id=?1",
+                    [tag_id],
+                    |r| r.get(0),
+                )
+                .unwrap_or_else(|_| "active".into());
+            if term_kind != "canonical" {
+                let canonical: Option<String> = conn
+                    .query_row(
+                        "SELECT name FROM tags WHERE id=?1",
+                        [tag_id],
+                        |r| r.get(0),
+                    )
+                    .ok();
+                warnings.push(
+                    canonical
+                        .map(|c| format!("「{matched}」已归入「{c}」"))
+                        .unwrap_or_else(|| format!("「{matched}」是别名，已归入其规范标签")),
+                );
+            }
+            hits.push(TermHit {
+                tag_id,
+                term_kind,
+                matched_term: matched,
+                tag_status: status,
+            });
+        }
+    } else {
+        // 旧表（tags + tag_aliases）。Exact 只查 tags（规范名）；Alias 才并别名
+        let sql = if matches!(mode, TermMatch::Exact) {
+            "SELECT t.id, 'canonical', t.name, COALESCE(t.status,'active')
+               FROM tags t
+              WHERE t.facet_key=?1 AND t.status='active' AND t.normalized_name=?2
+              ORDER BY t.id LIMIT 1"
+        } else {
+            "SELECT t.id, 'canonical', t.name, COALESCE(t.status,'active')
+               FROM tags t
+              WHERE t.facet_key=?1 AND t.status='active' AND t.normalized_name=?2
+              UNION ALL
+             SELECT t.id, 'alias', ta.alias, COALESCE(t.status,'active')
+               FROM tag_aliases ta JOIN tags t ON t.id=ta.tag_id
+              WHERE t.facet_key=?1 AND t.status='active' AND ta.is_searchable=1
+                AND ta.normalized_alias=?2
+              ORDER BY 1 LIMIT 1"
+        };
+        let mut stmt = conn.prepare(sql)?;
+        let mut rows = stmt.query(rusqlite::params![facet_key, normalized])?;
+        if let Some(r) = rows.next()? {
+            let tag_id: i64 = r.get(0)?;
+            let term_kind: String = r.get(1)?;
+            let matched: String = r.get(2)?;
+            let status: String = r.get(3)?;
+            if term_kind != "canonical" {
+                let canonical: Option<String> = conn
+                    .query_row("SELECT name FROM tags WHERE id=?1", [tag_id], |r| r.get(0))
+                    .ok();
+                warnings.push(
+                    canonical
+                        .map(|c| format!("「{matched}」已归入「{c}」"))
+                        .unwrap_or_else(|| format!("「{matched}」是别名，已归入其规范标签")),
+                );
+            }
+            hits.push(TermHit {
+                tag_id,
+                term_kind,
+                matched_term: matched,
+                tag_status: status,
+            });
+        }
+    }
+    if !terms_enabled && (matches!(mode, TermMatch::Prefix | TermMatch::Contains | TermMatch::Fuzzy)) {
+        warnings.push("前缀/包含/纠错匹配需先在设置页启用标签约束".into());
+    }
+    Ok(TermLookup { hits, warnings })
+}
+
+/// find_by_term 的返回。
+#[derive(Debug, Clone, Default)]
+pub struct TermLookup {
+    pub hits: Vec<TermHit>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TermHit {
+    pub tag_id: i64,
+    /// canonical 时无需提示；别名命中要告知用户
+    pub term_kind: String,
+    pub matched_term: String,
+    /// active / deprecated（deprecated 不该出现，但要能诊断）
+    pub tag_status: String,
 }

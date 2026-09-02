@@ -261,17 +261,13 @@ pub fn set_suggestion_tags(conn: &Connection, id: i64, tags: &CategorizedTags) -
                 continue;
             }
             let normalized = tags::normalize_name(&raw);
-            let tag_id: Option<i64> = conn
-                .query_row(
-                    "SELECT t.id FROM tags t
-                       LEFT JOIN tag_aliases ta ON ta.tag_id=t.id
-                      WHERE t.facet_key=?1 AND t.status='active'
-                        AND (t.normalized_name=?2 OR ta.normalized_alias=?2)
-                      ORDER BY t.is_system DESC, t.id LIMIT 1",
-                    rusqlite::params![facet_key, normalized],
-                    |r| r.get(0),
-                )
-                .ok();
+            // F3-a：tag_id 反查收敛到 find_by_term（mode=Alias）—— 消灭自写 SQL +
+            // ORDER BY t.is_system DESC 兜底；find_by_term 内部按 feature gate 走
+            // tag_terms（唯一索引保证最多一行）或旧表。
+            let tag_id: Option<i64> = tags::find_by_term(conn, &facet_key, &normalized, tags::TermMatch::Alias)
+                .ok()
+                .and_then(|l| l.hits.into_iter().next())
+                .map(|h| h.tag_id);
             conn.execute(
                 "INSERT INTO ai_suggestion_items
                  (suggestion_id, facet_key, raw_name, normalized_name, tag_id, confidence, decision, created_at)
@@ -468,13 +464,12 @@ fn confirm_suggestion_inner(
             names.iter().filter_map(move |name| {
                 let normalized = tags::normalize_name(name);
                 if normalized.is_empty() { return None; }
-                let id = conn
-                    .query_row(
-                        "SELECT id FROM tags WHERE facet_key = ?1 AND normalized_name = ?2 AND status = 'active' ORDER BY id LIMIT 1",
-                        rusqlite::params![facet_key, normalized],
-                        |r| r.get(0),
-                    )
-                    .ok()?;
+                // F3-a：反查收敛到 find_by_term（mode=Alias）。不需要「跳转」逻辑 ——
+                // 合并时旧词已永久归属目标标签，find_by_term 命中即正确 tag。
+                let id = tags::find_by_term(conn, &facet_key, &normalized, tags::TermMatch::Alias)
+                    .ok()
+                    .and_then(|l| l.hits.into_iter().next())
+                    .map(|h| h.tag_id)?;
                 Some((facet_key.clone(), normalized, id))
             })
         })

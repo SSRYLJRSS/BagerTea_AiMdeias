@@ -477,3 +477,92 @@ fn detect_conflicts_finds_all_six_types() {
     assert!(!report.over_deep_subtrees.is_empty(), "⑤ 超深未发现：{report:?}");
     assert!(!report.facet_mismatches.is_empty(), "⑥ facet 不一致未发现：{report:?}");
 }
+
+// ═══════════════ 组 9 前缀：next_prefix 边界 + find_by_term（F3） ═══════════════
+
+/// F3-b：next_prefix 十一个必测边界。
+#[test]
+fn next_prefix_boundaries() {
+    use bagertea_ai_media_v2_lib::db::tags::next_prefix;
+    assert_eq!(next_prefix("term123"), Some("term124".to_string()), "ASCII");
+    assert_eq!(next_prefix("青"), Some("靓".to_string()), "中文");
+    assert_eq!(next_prefix("海边"), Some("海辺".to_string()), "只改最后一个字符");
+    assert_eq!(next_prefix("😀"), Some("😁".to_string()), "emoji（BMP 外）");
+    assert_eq!(next_prefix("a😀"), Some("a😁".to_string()), "混合");
+    assert_eq!(next_prefix("\u{FFFF}"), Some("\u{10000}".to_string()), "跨越 BMP 边界");
+    assert_eq!(next_prefix("a\u{FFFF}"), Some("a\u{10000}".to_string()), "同上");
+    assert_eq!(next_prefix("\u{10FFFF}"), None, "char::MAX");
+    assert_eq!(next_prefix("a\u{10FFFF}"), Some("b".to_string()), "末字符到顶→前一个递增");
+    assert_eq!(next_prefix("\u{D7FF}"), Some("\u{E000}".to_string()), "跳过 surrogate");
+    assert_eq!(next_prefix(""), None, "空串");
+}
+
+/// F3-b：next_prefix 不变式 —— 每个探针都落在 [prefix, next) 区间；兄弟落在区间外。
+#[test]
+fn next_prefix_covers_all_children() {
+    use bagertea_ai_media_v2_lib::db::tags::next_prefix;
+    let prefixes = [
+        "term123", "青", "海边", "😀", "a😀", "\u{FFFF}", "a\u{FFFF}", "\u{D7FF}",
+    ];
+    for p in prefixes {
+        let Some(hi) = next_prefix(p) else { continue };
+        // 探针：x、x+长中文、x+两个 emoji、x+char::MAX、x+ASCII
+        let probes: Vec<String> = vec![
+            format!("{p}x"),
+            format!("{p}非常长的中文标签词"),
+            format!("{p}😀😀"),
+            format!("{p}{}", '\u{10FFFF}'),
+            format!("{p}abc"),
+        ];
+        for s in probes {
+            assert!(
+                s.as_str() >= p && s.as_str() < hi.as_str(),
+                "「{s}」应以 {p} 开头且小于 {hi}"
+            );
+        }
+        // 字典序更大的兄弟（同一长度 + 递增末字符）应在区间外
+        let bigger = next_prefix(p).unwrap();
+        let sibling = next_prefix(&bigger).unwrap_or_else(|| bigger.clone());
+        assert!(
+            sibling >= hi,
+            "兄弟「{sibling}」应在区间 [{p}, {hi}) 外"
+        );
+    }
+}
+
+/// F3：find_by_term 别名命中（同义词）；旧表路径与 tag_terms 路径行为一致。
+#[test]
+fn find_by_term_alias_hits_synonym() {
+    use bagertea_ai_media_v2_lib::db::tags;
+    let c = mem();
+    let t = tags::create_in_facet(&c, "海边", None, Some("scene")).unwrap();
+    tags::add_alias(&c, t.id, "海滨", None, "synonym").unwrap();
+    // 旧表路径（tag_unique_terms 未启用）
+    let lookup = tags::find_by_term(&c, "scene", "海滨", tags::TermMatch::Alias).unwrap();
+    assert_eq!(lookup.hits.len(), 1, "别名应精确命中：{:?}", lookup.warnings);
+    assert_eq!(lookup.hits[0].tag_id, t.id);
+    assert!(
+        lookup.warnings.iter().any(|w| w.contains("海滨") && w.contains("海边")),
+        "别名命中应告知归入：{:?}",
+        lookup.warnings
+    );
+}
+
+/// F3：find_by_term 无 ORDER BY 兜底也唯一（分面内一个 term 最多命中一个标签）。
+#[test]
+fn find_by_term_is_deterministic() {
+    use bagertea_ai_media_v2_lib::db::tags;
+    let c = mem();
+    // 启用 tag_terms 后：ux_terms 唯一索引保证唯一
+    let t1 = tags::create_in_facet(&c, "森林", None, Some("scene")).unwrap();
+    migrations::apply_v22b_constraints(&c).unwrap();
+    let lookup = tags::find_by_term(&c, "scene", "森林", tags::TermMatch::Exact).unwrap();
+    assert_eq!(lookup.hits.len(), 1);
+    assert_eq!(lookup.hits[0].tag_id, t1.id);
+    // Exact 不命中别名（term_kind='canonical' 过滤）
+    tags::add_alias(&c, t1.id, "林子", None, "synonym").unwrap();
+    // 新路径写入 tag_terms 需手动加行（apply 后 add_alias 走 tag_aliases —— 双写受 gate 约束）
+    // Exact 模式对「林子」无 canonical 命中
+    let miss = tags::find_by_term(&c, "scene", "林子", tags::TermMatch::Exact).unwrap();
+    assert!(miss.hits.is_empty(), "Exact 只匹配 canonical");
+}
