@@ -11,7 +11,8 @@ import { useTagStore } from "@/stores/tagStore";
 import { useSuperSearchStore } from "@/stores/superSearchStore";
 import type { AssetType, MetadataFilter, MetadataFilterKey, MetadataOp } from "@/types/asset";
 import type { LeafCond, QueryExpr } from "@/types/queryExpr";
-import type { ShouldClause } from "@/types/superSearch";
+import type { SearchDiagnostics, SearchPlanV3, ShouldClause } from "@/types/superSearch";
+import { diagnoseSearchPlan } from "@/api/superSearch";
 import { mergeQueryExpr, normalizeExpr, serializeExpr } from "@/utils/queryExprUtils";
 import {
   DATE_SHORTCUT_OPTIONS,
@@ -180,6 +181,34 @@ export default function QueryBuilder() {
   const addRow = () => commit([...rows, { id: uid(), negated: false, cond: makeCond("tag", allTagOptions) }]);
   const updateRow = (id: string, patch: Partial<Row>) => commit(rows.map((row) => row.id === id ? { ...row, ...patch } : row));
   const clearAll = () => { if (commitTimer.current) clearTimeout(commitTimer.current); lastLocalSignature.current = ""; setRows([]); setFormulaWarning(null); clearQuery(); };
+  // U-6：四指标诊断（C-2 diagnose_search_plan_cmd）—— 必须区叶子显示 delta/归零警告，加分区显示命中/总数
+  const [diag, setDiag] = useState<SearchDiagnostics | null>(null);
+  const exprKey = expr ? serializeExpr(expr) : "";
+  useEffect(() => {
+    if (formulaWarning === "nested" || !expr) {
+      setDiag(null);
+      return;
+    }
+    // 无 plan（纯手动条件）时用 expr 合成最小 plan 供后端诊断（filter=expr，加分空）
+    const diagPlan: SearchPlanV3 = plan ?? {
+      planSchemaVersion: 3,
+      normalizationVersion: 1,
+      compilerVersion: 1,
+      filter: expr,
+      mustNot: null,
+      should: [],
+      minimumShouldMatch: 0,
+      retrievers: { retrievers: [] },
+      ranking: { type: "field", key: "created_at", dir: "desc" },
+    };
+    let alive = true;
+    setDiag(null);
+    diagnoseSearchPlan(diagPlan)
+      .then((d) => { if (alive) setDiag(d); })
+      .catch(() => { if (alive) setDiag(null); }); // 诊断只读且可失败：失败静默，不影响条件编辑
+    return () => { alive = false; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [exprKey, plan ? `${plan.minimumShouldMatch}#${plan.should.length}#${plan.mustNot ? serializeExpr(plan.mustNot) : ""}` : "manual", formulaWarning]);
   // U-5：加分项（should）只读区所需数据 —— plan.should 为 store 单源；加分项是非嵌套叶子（ShouldClause.cond）
   const shouldList = plan?.should ?? [];
   const shouldMin = plan?.minimumShouldMatch ?? 0;
@@ -217,7 +246,12 @@ export default function QueryBuilder() {
           <p className="px-3 py-1 text-[10px] leading-4 text-[var(--color-text-tertiary)]">嵌套树只读：可「并且」追加新条件，或在上方条件条逐项移除。</p>
         </div>
       )}
-      {rows.length === 0 ? <button type="button" onClick={addRow} className="flex h-10 w-full items-center justify-center border border-dashed border-[var(--color-border)] text-xs text-[var(--color-text-secondary)] hover:border-[var(--color-border-strong)] hover:bg-[var(--color-surface)] hover:text-[var(--color-text)]">+ 添加第一个条件</button> : <div className="divide-y divide-[var(--color-border)] border-y border-[var(--color-border)]">{rows.map((row, index) => <ConditionRow key={row.id} row={row} prefix={index === 0 ? "当" : mode === "and" ? "并且" : "或者"} allTagOptions={allTagOptions} onChange={(patch) => updateRow(row.id, patch)} onRemove={() => commit(rows.filter((item) => item.id !== row.id))} />)}</div>}
+      {rows.length === 0 ? <button type="button" onClick={addRow} className="flex h-10 w-full items-center justify-center border border-dashed border-[var(--color-border)] text-xs text-[var(--color-text-secondary)] hover:border-[var(--color-border-strong)] hover:bg-[var(--color-surface)] hover:text-[var(--color-text)]">+ 添加第一个条件</button> : <div className="divide-y divide-[var(--color-border)] border-y border-[var(--color-border)]">{rows.map((row, index) => { const rowDiag = diag && expr ? rowDiagFor(diag.leaves, expr, index) : undefined; return (
+        <div key={row.id}>
+          <ConditionRow row={row} prefix={index === 0 ? "当" : mode === "and" ? "并且" : "或者"} allTagOptions={allTagOptions} onChange={(patch) => updateRow(row.id, patch)} onRemove={() => commit(rows.filter((item) => item.id !== row.id))} />
+          {rowDiag && <LeafDiagNote diag={rowDiag} />}
+        </div>
+      ); })}</div>}
       {rows.length > 0 && <button type="button" onClick={addRow} className="mt-2 h-8 px-1 text-xs font-medium text-[var(--color-status)] hover:opacity-80">+ 添加条件</button>}
       {/* U-5：加分项（should）区 —— 满足加分不淘汰；仅叶子；行编辑直接写 store.plan.should */}
       <div className="mt-3 border-t border-[var(--color-border)] pt-2">
@@ -236,16 +270,22 @@ export default function QueryBuilder() {
         </div>
         {shouldList.map((sc, i) => {
           const field = fieldFromCond(sc.cond);
+          const sDiag = diag && diag.should[i];
           return (
-            <div key={`should-${i}`} className="mb-1.5 grid grid-cols-[40px_minmax(110px,0.8fr)_minmax(92px,0.55fr)_minmax(150px,1.5fr)_64px_28px] items-center gap-2 max-[900px]:grid-cols-[36px_minmax(100px,1fr)_minmax(88px,1fr)_minmax(130px,1.4fr)_60px_26px]">
-              <span className="pl-1 text-[11px] text-[var(--color-text-tertiary)]">{i === 0 ? "当" : "或"}</span>
-              <FieldSelect value={field} onChange={(next) => patchShould(i, { ...sc, cond: makeCond(next, allTagOptions) })} />
-              <ConditionOperator cond={sc.cond} negated={false} onChange={(p) => { if (p.cond) patchShould(i, { ...sc, cond: p.cond }); }} />
-              <ConditionValue cond={sc.cond} allTagOptions={allTagOptions} onChange={(cond) => patchShould(i, { ...sc, cond })} />
-              <select aria-label="加分权重" value={String(sc.weight)} onChange={(e) => patchShould(i, { ...sc, weight: Number(e.target.value) })} className={`${controlClass} w-full`}>
-                <option value="0.5">略微</option><option value="1">一般</option><option value="2">强偏好</option>
-              </select>
-              <button type="button" aria-label={`移除加分项 ${i + 1}`} onClick={() => setShould(shouldList.filter((_, j) => j !== i))} className="flex size-7 items-center justify-center rounded text-base text-[var(--color-text-tertiary)] hover:bg-[var(--color-surface-hover)] hover:text-[var(--color-danger)]">×</button>
+            <div key={`should-${i}`} className="mb-1.5">
+              <div className="grid grid-cols-[40px_minmax(110px,0.8fr)_minmax(92px,0.55fr)_minmax(150px,1.5fr)_64px_28px] items-center gap-2 max-[900px]:grid-cols-[36px_minmax(100px,1fr)_minmax(88px,1fr)_minmax(130px,1.4fr)_60px_26px]">
+                <span className="pl-1 text-[11px] text-[var(--color-text-tertiary)]">{i === 0 ? "当" : "或"}</span>
+                <FieldSelect value={field} onChange={(next) => patchShould(i, { ...sc, cond: makeCond(next, allTagOptions) })} />
+                <ConditionOperator cond={sc.cond} negated={false} onChange={(p) => { if (p.cond) patchShould(i, { ...sc, cond: p.cond }); }} />
+                <ConditionValue cond={sc.cond} allTagOptions={allTagOptions} onChange={(cond) => patchShould(i, { ...sc, cond })} />
+                <select aria-label="加分权重" value={String(sc.weight)} onChange={(e) => patchShould(i, { ...sc, weight: Number(e.target.value) })} className={`${controlClass} w-full`}>
+                  <option value="0.5">略微</option><option value="1">一般</option><option value="2">强偏好</option>
+                </select>
+                <button type="button" aria-label={`移除加分项 ${i + 1}`} onClick={() => setShould(shouldList.filter((_, j) => j !== i))} className="flex size-7 items-center justify-center rounded text-base text-[var(--color-text-tertiary)] hover:bg-[var(--color-surface-hover)] hover:text-[var(--color-danger)]">×</button>
+              </div>
+              {sDiag && (
+                <div className="pr-1 text-right text-[10px] text-[var(--color-text-tertiary)]">命中 {sDiag.hitCount}/{sDiag.totalCount}</div>
+              )}
             </div>
           );
         })}
@@ -254,6 +294,28 @@ export default function QueryBuilder() {
       </div>
     </div>
   </section>;
+}
+
+/** U-6：按行的子节点下标（根 leaf → []，根 and/or → [index]）找该行的叶子诊断 */
+function rowDiagFor(leaves: SearchDiagnostics["leaves"], root: QueryExpr, rowIdx: number) {
+  const target = root.op === "leaf" ? [] : [rowIdx];
+  return leaves.find((l) => l.path.length === target.length && target.every((v, i) => l.path[i] === v));
+}
+
+/** U-6：叶子诊断注记 —— delta>0 且 result=0 标红「把结果砍到 0」；否则显示 −delta；self_count=0 额外标注。 */
+function LeafDiagNote({ diag }: { diag: SearchDiagnostics["leaves"][number] }) {
+  const zeroing = diag.delta > 0 && diag.resultCount === 0;
+  const parts: string[] = [];
+  if (zeroing) parts.push("⚠ 这个条件把结果砍到 0");
+  else if (diag.delta > 0) parts.push(`−${diag.delta}`);
+  else if (diag.delta < 0) parts.push(`+${-diag.delta}`);
+  if (diag.selfCount === 0) parts.push("这个条件单独就没有匹配项");
+  if (parts.length === 0) return null;
+  return (
+    <div className={`px-1 pb-1 text-[10px] leading-4 ${zeroing ? "text-[var(--color-danger)]" : "text-[var(--color-text-tertiary)]"}`}>
+      {parts.join(" · ")}
+    </div>
+  );
 }
 
 /** U-4：嵌套树的只读展示行。op 行为组标记（全部满足/并且/或者/排除），叶子行为条件文本。 */

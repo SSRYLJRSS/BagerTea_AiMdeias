@@ -30,6 +30,7 @@ vi.mock("@/api/superSearch", () => ({
   listSuperAssets: vi.fn().mockResolvedValue({ items: [], total: 0, hasMore: false }),
   listSuperAssetIds: vi.fn().mockResolvedValue([]),
   aiParseSearchQuery: vi.fn(),
+  diagnoseSearchPlan: vi.fn().mockResolvedValue({ leaves: [], should: [] }),
 }));
 
 beforeEach(() => {
@@ -746,5 +747,39 @@ describe("U-5 加分项区", () => {
     expect(plan?.should).toHaveLength(1);
     expect(plan?.should?.[0].weight).toBe(1);
     expect(plan?.filter).toEqual({ op: "leaf", cond: { type: "search", value: "海边" } });
+  });
+});
+
+/** U-6：C-2 四指标诊断展示 —— diagnose_search_plan_cmd 结果映射到行级注记。 */
+describe("U-6 四指标诊断", () => {
+  it("queryBuilder_diagnostics_marks_zeroing_leaf：delta>0 且 result=0 标红归零；self_count=0 标注单独无匹配", async () => {
+    const { diagnoseSearchPlan } = await import("@/api/superSearch");
+    const expr: QueryExpr = {
+      op: "and",
+      children: [
+        { op: "leaf", cond: { type: "search", value: "海边" } },
+        { op: "leaf", cond: { type: "search", value: "霓虹" } },
+      ],
+    };
+    useSuperSearchStore.setState({ expr, plan: null });
+    vi.mocked(diagnoseSearchPlan).mockResolvedValue({
+      leaves: [
+        { path: [0], label: "海边", selfCount: 106, resultCount: 0, countWithoutLeaf: 106, delta: 106 },
+        { path: [1], label: "霓虹", selfCount: 0, resultCount: 10, countWithoutLeaf: 15, delta: 5 },
+      ],
+      should: [],
+    });
+    render(<QueryBuilder />);
+    // 诊断经 promise 微任务落 UI；纯微任务轮询（组件/测试不使用真实定时器，避免调度器挂起）
+    let found = false;
+    for (let i = 0; i < 200 && !found; i += 1) {
+      found = screen.queryByText(/这个条件把结果砍到 0/) !== null;
+      if (!found) await Promise.resolve();
+    }
+    expect(found).toBe(true);
+    // 第二行：−5（delta）+ 单独就没有匹配项（self_count=0）
+    expect(screen.getByText(/−5/)).toBeInTheDocument();
+    expect(screen.getAllByText(/单独就没有匹配项/).length).toBeGreaterThan(0);
+    expect(screen.queryByText(/−106/)).not.toBeInTheDocument(); // 归零行走红色文案，不再重复 −delta
   });
 });

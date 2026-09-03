@@ -108,6 +108,32 @@ export interface ResolvedTag {
   path: string;
 }
 
+/** C-2/U-6：AST 命中诊断 —— 单个叶子条件的 4 指标（后端 diagnose_search_plan_cmd 返回） */
+export interface LeafDiagnostic {
+  path: number[];
+  label: string;
+  /** ① 该条件单独执行的命中数 */
+  selfCount: number;
+  /** ② 完整表达式的命中数（所有叶子共享同一个值） */
+  resultCount: number;
+  /** ③ 把该叶子从 AST 中移除后的命中数 */
+  countWithoutLeaf: number;
+  /** ④ delta = countWithoutLeaf - resultCount（AND 下=砍掉多少；OR 下=贡献；NOT 下反转） */
+  delta: number;
+}
+
+/** C-2/U-6：should（加分项）诊断 —— 命中该加分项的素材数 / 结果总数 */
+export interface ShouldDiagnostic {
+  label: string;
+  hitCount: number;
+  totalCount: number;
+}
+
+export interface SearchDiagnostics {
+  leaves: LeafDiagnostic[];
+  should: ShouldDiagnostic[];
+}
+
 /** FB5-05（§9.5）+ S1/S3：AI 解析结果。expr 为必须部分唯一执行事实源；
  *  plan 在存在加分项时返回（U 波次三段式 UI 直接映射）。 */
 export interface AiSearchParseResult {

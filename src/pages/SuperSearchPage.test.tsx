@@ -33,6 +33,7 @@ vi.mock("@/api/superSearch", () => ({
   queryToFilter: vi.fn(),
   listSuperAssets: vi.fn().mockResolvedValue({ items: [], total: 0, hasMore: false }),
   listSuperAssetIds: vi.fn().mockResolvedValue([]),
+  diagnoseSearchPlan: vi.fn().mockResolvedValue({ leaves: [], should: [] }),
 }));
 vi.mock("@/api/thumbnail", () => ({
   getThumbnailUrl: vi.fn().mockResolvedValue("asset://thumb/hd.webp"),
