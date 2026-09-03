@@ -249,3 +249,45 @@ describe("SuperSearchPage", () => {
     });
   });
 });
+
+describe("U-7③ 空结果归零条件", () => {
+  it("0 结果时列出归零条件（诊断叶子），单条移除走 removeExprAtPath", async () => {
+    const { diagnoseSearchPlan } = await import("@/api/superSearch");
+    const expr = {
+      op: "and" as const,
+      children: [
+        { op: "leaf" as const, cond: { type: "search" as const, value: "海边" } },
+        { op: "leaf" as const, cond: { type: "search" as const, value: "霓虹" } },
+      ],
+    };
+    useSuperSearchStore.setState({
+      query: { search: "", assetType: "all", untaggedOnly: false, facetFilters: [], excludeTagIds: [], metadataFilters: [], sortBy: "created_at", sortDir: "desc" },
+      expr,
+      plan: null,
+      items: [],
+      total: 0,
+      loading: false,
+    });
+    vi.mocked(diagnoseSearchPlan).mockResolvedValue({
+      leaves: [
+        { path: [0], label: "海边", selfCount: 106, resultCount: 0, countWithoutLeaf: 106, delta: 106 },
+        { path: [1], label: "霓虹", selfCount: 0, resultCount: 0, countWithoutLeaf: 20, delta: 20 },
+      ],
+      should: [],
+    });
+    render(<SuperSearchPage />);
+    let found = false;
+    for (let i = 0; i < 200 && !found; i += 1) {
+      found = screen.queryByText(/以下条件把结果砍到 0/) !== null;
+      if (!found) await Promise.resolve();
+    }
+    expect(found).toBe(true);
+    expect(screen.getByRole("button", { name: "移除归零条件 海边" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "移除归零条件 海边" }));
+    // 归零条件在 expr 中消失（removeExprAtPath 摘除叶子并 normalize 到剩余 leaf）
+    expect(useSuperSearchStore.getState().expr).toEqual({
+      op: "leaf",
+      cond: { type: "search", value: "霓虹" },
+    });
+  });
+});

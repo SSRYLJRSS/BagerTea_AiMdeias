@@ -42,6 +42,8 @@ export interface AssetGridViewProps extends LibraryGridActions {
   /** R0-5：清除筛选按钮的回调。素材库缺省清 useLibraryStore.filter；
    *  超级搜索传 clearConditions（否则按钮对超搜条件完全无效）。 */
   onClearFilter?: () => void;
+  /** U-7③：空结果时的归零条件列表（来自 C-2 诊断）—— 每条可单点移除 */
+  zeroingActions?: { key: string; label: string; onRemove: () => void }[];
 }
 
 /** 批量操作入口（顶栏与右键菜单共用） */
@@ -74,6 +76,7 @@ export default function AssetGridView({
   onSearchDominant,
   hasActiveFilter: hasActiveFilterProp,
   onClearFilter,
+  zeroingActions,
 }: AssetGridViewProps) {
   const { selected, toggle, rangeTo, clear, setAll, invert } = useSelectionStore(
     useShallow((s) => ({
@@ -444,6 +447,17 @@ export default function AssetGridView({
           hasActiveFilter ? (
             <div className="flex flex-col items-center gap-2">
               <span>没有符合条件的素材</span>
+              {zeroingActions && zeroingActions.length > 0 && (
+                <div className="flex max-w-full flex-wrap items-center justify-center gap-1">
+                  <span className="text-[11px] text-[var(--color-text-tertiary)]">以下条件把结果砍到 0：</span>
+                  {zeroingActions.map((z) => (
+                    <span key={z.key} className="inline-flex h-7 max-w-[260px] items-center gap-1 rounded-full border border-[var(--color-danger)]/40 bg-[var(--color-danger)]/10 pl-2.5 pr-0.5 text-xs text-[var(--color-danger)]">
+                      <span className="truncate">{z.label}</span>
+                      <button type="button" onClick={z.onRemove} aria-label={`移除归零条件 ${z.label}`} title="移除这个把结果砍到 0 的条件" className="flex size-5 shrink-0 items-center justify-center rounded-full hover:bg-[var(--color-surface-hover)]">×</button>
+                    </span>
+                  ))}
+                </div>
+              )}
               <button
                 type="button"
                 onClick={() =>

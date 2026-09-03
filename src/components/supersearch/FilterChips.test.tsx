@@ -139,3 +139,30 @@ describe("FilterChips（FB5-05 §9.6.1 expr 驱动）", () => {
     expect(useSuperSearchStore.getState().query.search).toBe("");
   });
 });
+
+describe("U-5 加分 chips", () => {
+  it("plan.should 渲染为「加分」组 chip，删除按索引调用 removePlanShould", () => {
+    const expr = searchLeaf("海边");
+    useSuperSearchStore.setState({
+      expr,
+      resolvedTags: [{ facetKey: "subject", text: "女孩", tagId: 2, path: "" }],
+      plan: {
+        planSchemaVersion: 3, normalizationVersion: 1, compilerVersion: 1,
+        filter: expr, mustNot: null,
+        should: [{ cond: { type: "tag", facetKey: "subject", tagIds: [2], mode: "any", includeDescendants: true }, weight: 1, label: "" }],
+        minimumShouldMatch: 0,
+        retrievers: { retrievers: [] },
+        ranking: { type: "field", key: "created_at", dir: "desc" },
+      },
+    });
+    render(<FilterChips />);
+    // chip 组标签「加分」+ 可读文案
+    expect(screen.getByText("加分")).toBeInTheDocument();
+    const chip = screen.getByText("标签：女孩");
+    expect(chip).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "取消 标签：女孩" }));
+    const st = useSuperSearchStore.getState();
+    expect(st.plan?.should).toHaveLength(0);
+    expect(st.expr).toEqual(expr);
+  });
+});

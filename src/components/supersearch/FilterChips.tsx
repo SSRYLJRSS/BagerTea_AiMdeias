@@ -7,6 +7,7 @@ import { useShallow } from "zustand/react/shallow";
 import { useSuperSearchStore } from "@/stores/superSearchStore";
 import { useTagStore } from "@/stores/tagStore";
 import type { MetadataFilter } from "@/types/asset";
+import type { LeafCond } from "@/types/queryExpr";
 import {
   flattenExprForDisplay,
   type ExprChipModel,
@@ -47,13 +48,38 @@ function metaLabel(f: MetadataFilter): string {
   return `${name} ${OP_TEXT[f.op] ?? f.op} ${f.value !== undefined ? fmtValue(f.value) : ""}`;
 }
 
+/** U-5：加分项（should）叶子 → chip 可读文案（tag 名称经 resolvedTags 反查）。 */
+function bonusLabel(cond: LeafCond, tagName: Map<number, string>): string {
+  const names = (ids: number[]) => ids.map((id) => tagName.get(id) ?? `标签 #${id}`).join("、");
+  switch (cond.type) {
+    case "search":
+      return `关键词：${cond.value}`;
+    case "assetType":
+      return `类型：${cond.value === "image" ? "图片" : cond.value === "video" ? "视频" : "全部"}`;
+    case "untagged":
+      return "未打标";
+    case "facetHasAny":
+      return `「${cond.facetKey}」有任意标签`;
+    case "facetMissing":
+      return `「${cond.facetKey}」没有标签`;
+    case "tag":
+      return `标签：${names(cond.tagIds) || "未选择"}`;
+    case "excludeTag":
+      return `排除：${names(cond.tagIds) || cond.facetKey}`;
+    case "metadata":
+      return metaLabel(cond.filter);
+  }
+}
+
 export default function FilterChips() {
-  const { query, expr, resolvedTags, removeExprAtPath, setQuery, setSort, clearConditions } = useSuperSearchStore(
+  const { query, expr, plan, resolvedTags, removeExprAtPath, removePlanShould, setQuery, setSort, clearConditions } = useSuperSearchStore(
     useShallow((s) => ({
       query: s.query,
       expr: s.expr,
+      plan: s.plan,
       resolvedTags: s.resolvedTags,
       removeExprAtPath: s.removeExprAtPath,
+      removePlanShould: s.removePlanShould,
       setQuery: s.setQuery,
       setSort: s.setSort,
       clearConditions: s.clearConditions,
@@ -64,7 +90,7 @@ export default function FilterChips() {
   const chips: Chip[] = [];
 
   if (expr) {
-    // §9.6.1：expr 是唯一条件源（AI 树 / 构建器树）
+    // §9.6.1：expr 是唯一条件源（AI 树 / 构建器树）；组标签由 flatten 提供（同时满足/任一组 N/排除）
     const models: ExprChipModel[] = flattenExprForDisplay(expr, resolvedTags);
     for (const m of models) {
       chips.push({ key: m.key, label: m.label, group: m.group, onRemove: () => removeExprAtPath(m.path) });
@@ -116,6 +142,19 @@ export default function FilterChips() {
         onRemove: () => setQuery({ metadataFilters: query.metadataFilters.filter((x) => x !== m) }),
       });
     }
+  }
+
+  // U-5：加分项（should）作为独立「加分」组 chips（按索引单条移除）
+  if (plan && plan.should.length > 0) {
+    const tagName = new Map(resolvedTags.map((rt) => [rt.tagId, rt.text]));
+    plan.should.forEach((sc, i) => {
+      chips.push({
+        key: `bonus:${i}:${JSON.stringify(sc.cond)}:${sc.weight}`,
+        label: bonusLabel(sc.cond, tagName),
+        group: "加分",
+        onRemove: () => removePlanShould(i),
+      });
+    });
   }
 
   // 排序 chip 不属于 expr：独立 setSort

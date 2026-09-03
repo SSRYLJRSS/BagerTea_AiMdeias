@@ -22,13 +22,15 @@ import { useScrollDirection } from "@/hooks/useScrollDirection";
 import { useSuperSearchStore } from "@/stores/superSearchStore";
 import { useSelectionStore } from "@/stores/selectionStore";
 import { useAiStore } from "@/stores/aiStore";
+import { diagnoseSearchPlan } from "@/api/superSearch";
 import type { Asset } from "@/types/asset";
+import type { SearchPlanV3 } from "@/types/superSearch";
 import { dominantFiltersFor } from "@/utils/dominantFilter";
 
 type DialogKey = "delete" | "export" | "tags" | null;
 
 export default function SuperSearchPage() {
-  const { refresh, error, total, loading, items, loadMore, fetchAllIds, applyAiSearch, query, setQuery, expr, clearConditions } = useSuperSearchStore(
+  const { refresh, error, total, loading, items, loadMore, fetchAllIds, applyAiSearch, query, setQuery, expr, plan, clearConditions, removeExprAtPath } = useSuperSearchStore(
     useShallow((s) => ({
       refresh: s.refresh,
       error: s.error,
@@ -41,17 +43,55 @@ export default function SuperSearchPage() {
       query: s.query,
       setQuery: s.setQuery,
       expr: s.expr,
+      plan: s.plan,
       clearConditions: s.clearConditions,
+      removeExprAtPath: s.removeExprAtPath,
     })),
   );
   const selected = useSelectionStore((s) => s.selected);
   const [dialog, setDialog] = useState<DialogKey>(null);
   const [exportMode, setExportMode] = useState<"copy" | "move">("copy");
   const [preview, setPreview] = useState<Asset | null>(null);
+  // U-7③：空结果时列出「把结果砍到 0」的归零条件（C-2 诊断），可单条移除
+  const [zeroing, setZeroing] = useState<{ path: number[]; label: string }[]>([]);
 
   // R0-5：超搜自己的空结果判定 —— 有 expr（AI/构建器产物）或扁平 query 非默认，
   // 都算「带条件」，不能显示「素材库还是空的」。清除按钮走 clearConditions。
   const hasActiveFilter = expr != null || query.search.trim() !== "" || query.assetType !== "all" || query.untaggedOnly || query.facetFilters.length > 0 || query.excludeTagIds.length > 0 || query.metadataFilters.length > 0;
+
+  // U-7③：条件查询 0 结果 → 对当前计划做 AST 诊断，挑出 delta>0 且 result=0 的叶子
+  useEffect(() => {
+    if (loading || total !== 0 || !hasActiveFilter) {
+      setZeroing([]);
+      return;
+    }
+    const diagPlan = (plan ?? (expr
+      ? {
+          planSchemaVersion: 3,
+          normalizationVersion: 1,
+          compilerVersion: 1,
+          filter: expr,
+          mustNot: null,
+          should: [],
+          minimumShouldMatch: 0,
+          retrievers: { retrievers: [] },
+          ranking: { type: "field" as const, key: "created_at", dir: "desc" },
+        }
+      : null)) as SearchPlanV3 | null;
+    if (!diagPlan) {
+      setZeroing([]);
+      return;
+    }
+    let alive = true;
+    setZeroing([]);
+    diagnoseSearchPlan(diagPlan)
+      .then((d) => {
+        if (!alive) return;
+        setZeroing(d.leaves.filter((l) => l.delta > 0 && l.resultCount === 0).map((l) => ({ path: l.path, label: l.label })));
+      })
+      .catch(() => { if (alive) setZeroing([]); }); // 诊断只读可失败：失败只少展示归零提示
+    return () => { alive = false; };
+  }, [loading, total, hasActiveFilter, expr, plan]);
 
   // FB2-06（§7.3 方案 C）：非对称阈值 + 顶部区恒展开 + 手动设定抑制窗
   const [chrome, setNode, setChrome] = useScrollDirection({
@@ -193,6 +233,7 @@ export default function SuperSearchPage() {
           scrollRestoreKey="superSearch"
           hasActiveFilter={hasActiveFilter}
           onClearFilter={clearConditions}
+          zeroingActions={zeroing.map((z) => ({ key: z.path.join("."), label: z.label, onRemove: () => removeExprAtPath(z.path) }))}
           {...actions}
         />
       </div>
