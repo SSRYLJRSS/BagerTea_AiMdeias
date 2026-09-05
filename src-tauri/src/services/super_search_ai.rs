@@ -830,7 +830,12 @@ pub fn build_plan_from_v3(
             ConceptOutcome::Tag(r) => Ok((
                 Some(QueryExpr::Leaf {
                     cond: LeafCond::Tag {
-                        term_query: None,
+                        // S5 5-3：回填 term_query —— termMatch（contains/prefix/fuzzy）
+                        // 只有在词查在场时才会被编译层扩展；恒发 None 会让五种匹配永远不可达。
+                        term_query: {
+                            let t = c.text.trim();
+                            (!t.is_empty()).then(|| t.to_string())
+                        },
                         term_match: c.term_match,
                         facet_key: r.facet_key.clone(),
                         tag_ids: vec![r.tag_id],
@@ -923,7 +928,11 @@ pub fn build_plan_from_v3(
                 excluded_ids.insert(r.tag_id);
                 excl_exprs.push(QueryExpr::Leaf {
                     cond: LeafCond::Tag {
-                        term_query: None,
+                        // S5 5-3：排除路径同样回填词查（termMatch 语义一致）
+                        term_query: {
+                            let t = c.text.trim();
+                            (!t.is_empty()).then(|| t.to_string())
+                        },
                         term_match: c.term_match,
                         facet_key: r.facet_key.clone(),
                         tag_ids: vec![r.tag_id],
@@ -967,21 +976,27 @@ pub fn build_plan_from_v3(
         for c in &g.preferred {
             if let Some(leaf) = collect(&mut warnings, &mut resolved_tags, concept_leaf(c)?) {
                 let label = format!("{}（加分项）", c.text.trim());
-                let weight = c.weight.unwrap_or(1.0).clamp(0.5, 2.0);
+                // §4.3：权重收拢到三档 0.5/1.0/2.0（后端校验只认这三档）
+                let weight = snap_to_allowed_weight(c.weight.unwrap_or(1.0));
                 let cond = match leaf {
                     QueryExpr::Leaf { cond } => cond,
                     _ => continue,
                 };
-                should.push(ShouldClause { cond, weight, label });
+                should.push(ShouldClause {
+                    cond,
+                    weight,
+                    label,
+                    // §4.8：evidence 原文回显（不拼进 label 丢失）
+                    evidence: c.evidence.clone(),
+                });
             }
         }
     }
 
-    // ranking：有 preferred → 相关度（should 加权）；否则按意图 sort（命令层给默认）
+    // ranking：有 preferred → 相关度（should 加权）；否则按意图 sort（命令层给默认）。
+    // B10：Ranking::Relevance 无载荷 —— plan.retrievers 是唯一来源。
     let ranking = if !should.is_empty() {
-        Ranking::Relevance {
-            retrievers: RetrieverPlan::default(),
-        }
+        Ranking::Relevance
     } else {
         Ranking::Field {
             key: intent.sort_by.clone().unwrap_or_else(|| "created_at".into()),
@@ -1047,6 +1062,25 @@ fn pack_and(leaves: Vec<QueryExpr>) -> Option<QueryExpr> {
         1 => leaves.into_iter().next(),
         _ => Some(QueryExpr::And { children: leaves }),
     }
+}
+
+/// §4.3：AI 权重收拢到三档（轻微 0.5 / 一般 1.0 / 强烈 2.0）。
+/// 后端 validate_search_plan 只认这三档（0.5/1.0/2.0），非有限值回退 1.0。
+fn snap_to_allowed_weight(w: f32) -> f32 {
+    const ALLOWED: [f32; 3] = [0.5, 1.0, 2.0];
+    if !w.is_finite() {
+        return 1.0;
+    }
+    ALLOWED
+        .iter()
+        .copied()
+        .min_by(|x, y| {
+            (x - w)
+                .abs()
+                .partial_cmp(&(y - w).abs())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .unwrap_or(1.0)
 }
 
 // ═══════════════ 词典（§9.2.1） ═══════════════
@@ -1417,12 +1451,17 @@ pub fn build_user_prompt(
     }
     user.push_str("\n分面说明\n");
     for f in facets {
+        // P1：max_items=None = 数量不限 —— 必须与打标侧（ai_cloud build_user_prompt 的
+        // 「数量不限」）同语义，绝不能把「不限」渲染成 max=3（模型会照抄成硬上限）。
+        let max_desc = match f.max_items {
+            Some(n) => format!("max={n}"),
+            None => "max=不限（无数量上限）".to_string(),
+        };
         user.push_str(&format!(
-            "- {}(key={}) selection={} max={}: {}\n",
+            "- {}(key={}) selection={} {max_desc}: {}\n",
             f.display_name,
             f.key,
             f.selection_mode,
-            f.max_items.unwrap_or(3),
             f.description // W2-1：hint 已并入 description（V20 合表）
         ));
     }
@@ -1911,11 +1950,15 @@ fn intent_schema(facets: &[FacetPromptContext]) -> serde_json::Value {
         },
         "required": ["key", "op", "value", "values", "min", "max"]
     });
-    // C-3 单位约束强化：仅当 key=file_size 时数值下限 1024（拦截「5..10」这类 MB 原值）。
+    // C-3 单位约束强化：仅当 key=file_size 时数值下限拦截「5..10」这类 MB 原值。
+    // 阈值以 NumericDomain.suspicious_below 为单一事实源（§5.3 ④），此处不再写死 1024。
     // 用条件子 schema（if/then），不影响 latitude 等负值/小数 key；支持 json_schema 的服务商在服务端即拒绝。
+    let file_size_floor = crate::db::search_query::numeric_domain("file_size")
+        .and_then(|d| d.suspicious_below)
+        .unwrap_or(1024.0);
     let file_size_numeric = serde_json::json!({
         "anyOf": [
-            {"type": "number", "minimum": 1024.0},
+            {"type": "number", "minimum": file_size_floor},
             {"type": "string"},
             {"type": "null"}
         ]
@@ -2568,6 +2611,7 @@ mod tests {
             description: String::new(),
             selection_mode: "multi".into(),
             max_items: Some(5),
+            ..Default::default()
         }];
         let dict = collect_tag_dictionary(&conn, &facets).unwrap();
         let line = dict
@@ -2769,14 +2813,16 @@ mod tests {
                 selection_mode: "single".into(),
                 max_items: Some(3),
                 description: String::new(),
-            },
+            ..Default::default()
+        },
             FacetPromptContext {
                 key: "mood".into(),
                 display_name: "氛围".into(),
                 selection_mode: "multi".into(),
                 max_items: None,
                 description: String::new(),
-            },
+            ..Default::default()
+        },
         ];
         let schema = intent_schema(&facets);
         let hint_enum = &schema["properties"]["groups"]["items"]["properties"]["concepts"]["items"]["properties"]["facetHint"]["anyOf"][0]["enum"];
@@ -3129,6 +3175,30 @@ mod tests {
         assert!(!p2.contains("本库现状"), "空能力摘要不应注入：{p2}");
     }
 
+    /// P1：搜索侧与打标侧同语义 —— max_items=None（不限）渲染成「不限」而非 max=3，
+    /// 否则模型会照抄硬上限（与 ai_cloud 的「数量不限」对着干）。
+    #[test]
+    fn search_prompt_renders_unlimited_not_max3() {
+        let dict: Vec<String> = vec![];
+        let unlimited = FacetPromptContext {
+            key: "people".into(),
+            display_name: "人物".into(),
+            description: "画面里的人".into(),
+            selection_mode: "multi".into(),
+            max_items: None,
+            ..Default::default()
+        };
+        let capped = FacetPromptContext {
+            max_items: Some(5),
+            ..unlimited.clone()
+        };
+        let facets = vec![capped, unlimited];
+        let p = build_user_prompt(&dict, &facets, "人", "");
+        assert!(p.contains("max=5"), "有上限要如实写 max=5：{p}");
+        assert!(!p.contains("max=3"), "None 不限绝不能渲染成 max=3：{p}");
+        assert!(p.contains("max=不限（无数量上限）"), "不限要写明：{p}");
+    }
+
     // ═══════════════ S3 解析层接线（V3→V2→关键词 三层） ═══════════════
 
     /// S3：V3 解析成功且含合法 preferred → 保留加分项，返回 V3 结构。
@@ -3297,5 +3367,83 @@ mod tests {
         let (plan, _, _) = build_plan_from_v3(&conn, &v3).unwrap();
         assert!(plan.should.is_empty(), "关键词兜底无加分项");
         let _ = run_search_plan(&conn, &plan, Some(10), 0).unwrap();
+    }
+
+    /// S5 5-3：concept_leaf 必须回填 term_query（c.text），不得恒发 None ——
+    /// 否则 termMatch（contains/prefix/fuzzy）永远不可达，AI 端「带…的」措辞失效。
+    /// 同时验证：模型 termMatch=contains 时，同一概念经扩展命中多个标签并执行成功。
+    #[test]
+    fn concept_leaf_fills_term_query_for_term_match() {
+        use crate::db::query_expr::{LeafCond, QueryExpr};
+        use crate::db::search_plan::run_search_plan;
+        use crate::db::tags;
+        let conn = init_memory().unwrap();
+        // contains 扩展需 tag_terms 事实源（S5 前提：V22b 约束 + feature gate）
+        crate::db::migrations::apply_v22b_constraints(&conn).unwrap();
+        crate::db::schema_features::set_feature(&conn, "tag_unique_terms", true, None).unwrap();
+        let forest = tags::create_in_facet(&conn, "森林", None, Some("scene")).unwrap();
+        let person = tags::create_in_facet(&conn, "人物", None, Some("subject")).unwrap();
+        let single = tags::create_in_facet(&conn, "单人", None, Some("subject")).unwrap();
+        let a = v3_insert_asset(&conn, "d:/s5/forest.jpg");
+        let b = v3_insert_asset(&conn, "d:/s5/person.jpg");
+        let c_img = v3_insert_asset(&conn, "d:/s5/single.jpg");
+        crate::db::asset_tags::assign(&conn, &[a], &[forest.id], "manual").unwrap();
+        crate::db::asset_tags::assign(&conn, &[b], &[person.id], "manual").unwrap();
+        crate::db::asset_tags::assign(&conn, &[c_img], &[single.id], "manual").unwrap();
+        let mk = |text: &str, m: crate::db::tags::TermMatch| SearchConceptV3 {
+            text: text.into(),
+            role: "scene".into(),
+            facet_hint: None,
+            confidence: Some(0.9),
+            necessity: Necessity::Required,
+            weight: None,
+            evidence: None,
+            term_match: m,
+        };
+        // contains「人」→ 命中「人物」+「单人」（多命中，cap 内）；termQuery 回填原文
+        let intent = SearchIntentV3 {
+            groups: vec![SearchGroupV3 {
+                asset_type: "all".into(),
+                concepts: vec![mk("人", crate::db::tags::TermMatch::Contains)],
+                preferred: vec![],
+                text_terms: vec![],
+                metadata: vec![],
+            }],
+            exclusions: vec![],
+            sort_by: None,
+            sort_dir: None,
+        };
+        let (plan, _resolved, warns) = build_plan_from_v3(&conn, &intent).unwrap();
+        match &plan.filter {
+            Some(QueryExpr::Leaf { cond: LeafCond::Tag { term_query, term_match, .. } }) => {
+                assert_eq!(term_query.as_deref(), Some("人"), "concept_leaf 必须回填 term_query");
+                assert_eq!(*term_match, crate::db::tags::TermMatch::Contains);
+            }
+            other => panic!("filter 应为 Tag leaf：{other:?}"),
+        }
+        // 扩展发生在编译层：contains「人」应命中 人物+单人两张照，森林不命中
+        let out = run_search_plan(&conn, &plan, None, 0).unwrap();
+        let ids: Vec<i64> = out.iter().map(|r| r.0).collect();
+        assert!(ids.contains(&b) && ids.contains(&c_img), "contains 应命中 人物+单人：{ids:?} {warns:?}");
+        assert!(!ids.contains(&a), "森林不得命中");
+
+        // 对照：默认 alias 时同概念走精确解析（resolve_concept 直接映射不到 → content 搜索），
+        // 但只要落到 Tag leaf 就必须带 term_query（这是本条锁定的不变式）。
+        let intent2 = SearchIntentV3 {
+            groups: vec![SearchGroupV3 {
+                asset_type: "all".into(),
+                concepts: vec![mk("人", crate::db::tags::TermMatch::Alias)],
+                preferred: vec![],
+                text_terms: vec![],
+                metadata: vec![],
+            }],
+            exclusions: vec![],
+            sort_by: None,
+            sort_dir: None,
+        };
+        let (plan2, _, _) = build_plan_from_v3(&conn, &intent2).unwrap();
+        if let Some(QueryExpr::Leaf { cond: LeafCond::Tag { term_query, .. } }) = &plan2.filter {
+            assert_eq!(term_query.as_deref(), Some("人"), "alias 也回填 term_query");
+        }
     }
 }

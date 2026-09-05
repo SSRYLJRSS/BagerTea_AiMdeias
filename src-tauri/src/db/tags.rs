@@ -591,6 +591,17 @@ fn is_unique_violation(e: &rusqlite::Error) -> bool {
 }
 
 pub fn aliases(conn: &Connection, tag_id: i64) -> AppResult<Vec<String>> {
+    // P0-4（铁律 9）：tag_unique_terms=1 后 tag_aliases 冻结只读、新词全写 tag_terms ——
+    // Tag.aliases 必须同 gate 读 tag_terms，否则 gate 开启后别名列表恒空。
+    if crate::db::schema_features::feature_enabled(conn, "tag_unique_terms").unwrap_or(false) {
+        let mut stmt = conn.prepare(
+            "SELECT term FROM tag_terms
+              WHERE tag_id = ?1 AND term_kind != 'canonical'
+              ORDER BY created_at, term",
+        )?;
+        let rows = stmt.query_map([tag_id], |r| r.get(0))?;
+        return Ok(rows.collect::<Result<Vec<_>, _>>()?);
+    }
     let mut stmt = conn.prepare("SELECT alias FROM tag_aliases WHERE tag_id = ?1 ORDER BY id")?;
     let rows = stmt.query_map([tag_id], |r| r.get(0))?;
     let aliases = rows.collect::<Result<Vec<_>, _>>()?;
@@ -1923,5 +1934,64 @@ mod tests {
             .unwrap();
         assert!(plan.contains("SEARCH"), "前缀范围查询必须走索引：{plan}");
         assert!(!plan.contains("SCAN"), "不得退化全表扫：{plan}");
+    }
+
+    /// S5 5-5：SQL 前缀范围与 Rust 字节序判断必须一致（BINARY 排序是 next_prefix
+    /// 不变式的前提；含 emoji / BMP 边界词一并进行）。
+    #[test]
+    fn prefix_range_matches_rust_ordering() {
+        let c = terms_db();
+        let t1 = create_in_facet(&c, "海边", None, Some("scene")).unwrap();
+        let t2 = create_in_facet(&c, "😀", None, Some("scene")).unwrap();
+        let t3 = create_in_facet(&c, "a\u{FFFF}", None, Some("scene")).unwrap();
+        // 兄弟词（同前缀但区间外）：「海上」> next_prefix("海边")，不应命中前缀「海边」
+        create_in_facet(&c, "海上", None, Some("scene")).unwrap();
+        for term in ["海边x", "😀😀", "a\u{FFFF}x"] {
+            let id = create_in_facet(&c, term, None, Some("scene")).unwrap();
+            let _ = id;
+        }
+        let _ = (t1, t2, t3);
+        for prefix in ["海", "海边", "😀", "a\u{FFFF}"] {
+            let normalized = normalize_name(prefix);
+            let hi = next_prefix(&normalized);
+            // SQL 侧：真实范围查询（走 expand_term_query 同一 SQL）
+            let cap = PREFIX_EXPAND_CAP;
+            let (hits, _w) =
+                expand_term_query(&c, "scene", &normalized, TermMatch::Prefix, cap).unwrap();
+            // Rust 侧：读全部词，按 str 字节序判断「以 prefix 开头」
+            let mut stmt = c
+                .prepare("SELECT DISTINCT normalized_term FROM tag_terms WHERE facet_key='scene'")
+                .unwrap();
+            let all: Vec<String> = stmt
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .collect();
+            let rust_hits: Vec<&String> = all.iter().filter(|t| t.starts_with(&normalized)).collect();
+            assert_eq!(
+                hits.len(),
+                rust_hits.len(),
+                "SQL 与 Rust 前缀命中数不一致：prefix={prefix} sql={:?} rust={:?}",
+                hits.iter().map(|h| h.matched_term.as_str()).collect::<Vec<_>>(),
+                rust_hits
+            );
+            // 区间不变式：SQL 每个命中都满足 Rust 的 starts_with
+            for h in &hits {
+                assert!(
+                    h.matched_term.starts_with(&normalized),
+                    "SQL 命中「{}」不满足 Rust 前缀判断 {}",
+                    h.matched_term,
+                    normalized
+                );
+            }
+            // 兄弟词不在区间内：「海上」不属于「海边」前缀
+            if prefix == "海边" {
+                assert!(
+                    !hits.iter().any(|h| h.matched_term.contains("海上")),
+                    "兄弟词「海上」不得命中前缀「海边」"
+                );
+            }
+            let _ = hi;
+        }
     }
 }

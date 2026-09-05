@@ -56,7 +56,9 @@ export default function GridToolbar({ onAiTag, onAssignTags, onExport, onMove, o
       removeLocal: s.removeLocal,
     })),
   );
-  const { selected, clear } = useSelectionStore(useShallow((s) => ({ selected: s.selected, clear: s.clear })));
+  const { selected, truncated, selectionTotal, clear } = useSelectionStore(
+    useShallow((s) => ({ selected: s.selected, truncated: s.truncated, selectionTotal: s.selectionTotal, clear: s.clear })),
+  );
   const [restoring, setRestoring] = useState(false);
   // FB2-01 可发现入口：素材库顶栏三态大小切换（小/中/大 = 档位 1/3/5）
   const { grid } = useAppearance();
@@ -93,7 +95,10 @@ export default function GridToolbar({ onAiTag, onAssignTags, onExport, onMove, o
         /* R-22 回收站操作条：恢复 / 彻底删除 */
         selected.size > 0 ? (
           <div className="flex min-w-0 items-center gap-0.5">
-            <span className="shrink-0 text-xs text-[var(--color-text-secondary)]">已选中 {selected.size} 项</span>
+            {/* §4.6：截断时选择栏恒显示「已选 N / total」 */}
+            <span className="shrink-0 text-xs text-[var(--color-text-secondary)]">
+              {truncated ? `已选中 ${selected.size} / ${selectionTotal} 项` : `已选中 ${selected.size} 项`}
+            </span>
             <span className="mx-1 h-4 w-px shrink-0 bg-[var(--color-border)]" />
             <Button onClick={() => void restore()} disabled={restoring}>
               {restoring ? "恢复中…" : "恢复"}

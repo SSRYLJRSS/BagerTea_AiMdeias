@@ -1,6 +1,6 @@
 /** 素材相关命令封装（对应 commands/assets_cmd.rs） */
 import { invoke } from "./client";
-import type { Asset, AssetFilter, AssetPage, DupGroup, MetadataFacet } from "@/types/asset";
+import type { Asset, AssetFilter, AssetPage, DupGroup, MetadataFacet, NumericDomain } from "@/types/asset";
 
 export type DeleteStrategy = "remove_from_library" | "delete_file";
 
@@ -23,6 +23,11 @@ export function listAssetIds(filter: AssetFilter): Promise<number[]> {
 /** 文件自身携带的格式、时间、设备和拍摄参数分面。 */
 export function listMetadataFacets(): Promise<MetadataFacet[]> {
   return invoke<MetadataFacet[]>("list_metadata_facets");
+}
+
+/** Phase 4（§5.3）：数值字段的 NumericDomain 单一事实源（含预设/单位/边界/量纲阈值/运算符）。 */
+export function getNumericDomains(): Promise<NumericDomain[]> {
+  return invoke<NumericDomain[]>("get_numeric_domains");
 }
 
 export function getAsset(id: number): Promise<Asset> {
@@ -150,4 +155,11 @@ export function rescanAssetPhash(ids: number[] | null, scope: "all" | "missing" 
 /** R1-2：图片宽高存量回填（RAW 分辨率修复；命令已注册但此前前端不可达） */
 export function rescanImageDimensions(ids: number[] | null, scope: "all" | "missing" | "ids"): Promise<{ total: number; success: number; failed: number; skipped: number }> {
   return invoke("rescan_image_dimensions", { ids, scope });
+}
+
+/** R1-2（真库缺表回填）：从 palette_json 全量重建 asset_palette_colors（不解码图片，毫秒级，幂等）。
+ *  命令已注册（media_cmd.rs rescan_palette_colors）但此前前端不可达 —— 色板关系表空时
+ *  「前三色包含红」这类筛选永远 0 结果，导入素材后点一次即可补齐。返回写入的行数。 */
+export function rescanPaletteColors(): Promise<number> {
+  return invoke<number>("rescan_palette_colors");
 }

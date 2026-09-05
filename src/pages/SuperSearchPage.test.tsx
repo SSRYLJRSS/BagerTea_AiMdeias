@@ -260,34 +260,73 @@ describe("U-7③ 空结果归零条件", () => {
         { op: "leaf" as const, cond: { type: "search" as const, value: "霓虹" } },
       ],
     };
-    useSuperSearchStore.setState({
-      query: { search: "", assetType: "all", untaggedOnly: false, facetFilters: [], excludeTagIds: [], metadataFilters: [], sortBy: "created_at", sortDir: "desc" },
-      expr,
-      plan: null,
-      items: [],
-      total: 0,
-      loading: false,
-    });
+    // §3.7：条件经 setExpr 写入 plan.filter（plan 唯一事实源），expr 是其派生视图
+    useSuperSearchStore.getState().setExpr(expr);
+    useSuperSearchStore.setState({ planRevision: 0, items: [], total: 0, loading: false });
     vi.mocked(diagnoseSearchPlan).mockResolvedValue({
       leaves: [
-        { path: [0], label: "海边", selfCount: 106, resultCount: 0, countWithoutLeaf: 106, delta: 106 },
-        { path: [1], label: "霓虹", selfCount: 0, resultCount: 0, countWithoutLeaf: 20, delta: 20 },
+        { zone: "filter", path: [0], planRevision: 0, label: "海边", selfCount: 106, resultCount: 0, countWithoutLeaf: 106, delta: 106 },
+        { zone: "filter", path: [1], planRevision: 0, label: "霓虹", selfCount: 0, resultCount: 0, countWithoutLeaf: 20, delta: 20 },
       ],
       should: [],
+      warnings: [],
     });
     render(<SuperSearchPage />);
     let found = false;
     for (let i = 0; i < 200 && !found; i += 1) {
       found = screen.queryByText(/以下条件把结果砍到 0/) !== null;
-      if (!found) await Promise.resolve();
+      if (!found && i % 20 === 0) await new Promise((r) => setTimeout(r, 20));
+      else if (!found) await Promise.resolve();
     }
     expect(found).toBe(true);
     expect(screen.getByRole("button", { name: "移除归零条件 海边" })).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "移除归零条件 海边" }));
-    // 归零条件在 expr 中消失（removeExprAtPath 摘除叶子并 normalize 到剩余 leaf）
+    // 归零条件在 expr（plan.filter 派生视图）中消失（removeAtZonePath("filter", path) 摘除叶子并 normalize）
     expect(useSuperSearchStore.getState().expr).toEqual({
       op: "leaf",
       cond: { type: "search", value: "霓虹" },
     });
+    expect(useSuperSearchStore.getState().plan?.filter).toEqual({
+      op: "leaf",
+      cond: { type: "search", value: "霓虹" },
+    });
+  });
+});
+
+describe("S5 5-4 零结果相近词建议", () => {
+  it("执行 warning 建议渲染为可点 chip，点击才把按词查加进必须区（不变量 11）", async () => {
+    const { listSuperAssets } = await import("@/api/superSearch");
+    const expr = {
+      op: "leaf" as const,
+      cond: { type: "tag" as const, facetKey: "scene", tagIds: [], mode: "any" as const, includeDescendants: true, termQuery: "森材", termMatch: "alias" as const },
+    };
+    // 后端返回带零结果建议的 warnings（refresh 响应会写入 executionWarnings —— 真实数据流）
+    vi.mocked(listSuperAssets).mockResolvedValue({
+      items: [],
+      total: 0,
+      hasMore: false,
+      warnings: [{ source: "plan", zone: "filter", message: "词查「森材」没有命中。试试相近的词：森林、丛林" }],
+    });
+    useSuperSearchStore.getState().setExpr(expr);
+    render(<SuperSearchPage />);
+    const chip = await screen.findByRole("button", { name: /试试「森林」/ });
+    // 未点击前：条件保持原样
+    const before = useSuperSearchStore.getState().plan?.filter;
+    expect(before).toEqual(expr);
+    // 点击建议 → 词查 leaf AND 进必须区
+    fireEvent.click(chip);
+    const after = useSuperSearchStore.getState().plan?.filter;
+    expect(after?.op).toBe("and");
+    const children = after?.op === "and" ? after.children : [];
+    expect(children).toHaveLength(2);
+    const added = children[1];
+    expect(added.op).toBe("leaf");
+    if (added.op === "leaf") {
+      const cond = added.cond as { termQuery?: string; termMatch?: string };
+      expect(cond.termQuery).toBe("森林");
+      expect(cond.termMatch).toBe("fuzzy");
+    }
+    // 第二个建议也在（丛林），可继续点
+    expect(screen.getByRole("button", { name: /试试「丛林」/ })).toBeInTheDocument();
   });
 });

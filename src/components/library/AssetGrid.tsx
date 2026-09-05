@@ -50,7 +50,12 @@ export default function AssetGrid({ onPreview, onAiTag, onAssignTags, onExport, 
       total={total}
       loading={loading}
       loadMore={loadMore}
-      fetchAllIds={fetchAllIds}
+      // §4.6：素材库旧链路只返回 number[]，包成 FetchAllIdsResult（触顶 100000 标记 truncated）
+      fetchAllIds={async () => {
+        const ids = await fetchAllIds();
+        const truncated = ids.length >= 100_000;
+        return { ids, total: truncated ? total : ids.length, truncated, warnings: [] };
+      }}
       onPreview={onPreview}
       onAiTag={onAiTag}
       onAssignTags={onAssignTags}

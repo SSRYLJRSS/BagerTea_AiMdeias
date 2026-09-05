@@ -1,26 +1,41 @@
-/** 网格多选状态：单击 / Ctrl 切换 / Shift 范围选（PRD 5.4-2） */
+/** 网格多选状态：单击 / Ctrl 切换 / Shift 范围选（PRD 5.4-2）。
+ *  §4.6：全选/反选触顶 100000（truncated）时记录截断标记与匹配总数，
+ *  供 AssetGridView 按策略表禁用删除/反选、二次确认导出/批量打标、选择栏显示「已选 N / total」。
+ *  truncated 在 clear() 或一次未截断的 setAll 前保持粘性（截断集合上的手动增删仍是残缺集）。 */
 import { create } from "zustand";
+
+/** setAll/invert 的元数据（来自 PlanIdsResult） */
+export interface SelectionMeta {
+  truncated: boolean;
+  total: number;
+}
 
 interface SelectionState {
   selected: ReadonlySet<number>;
   /** Shift 范围选锚点（网格扁平索引） */
   anchorIndex: number | null;
+  /** §4.6：最近一次全选/反选是否触顶 100000（截断集合 → 删除/反选禁用） */
+  truncated: boolean;
+  /** §4.6：匹配总数（未截断前），供选择栏显示「已选 N / total」 */
+  selectionTotal: number;
   count: () => number;
   isSelected: (id: number) => boolean;
   /** 单击/Ctrl：toggle 单张 */
   toggle: (id: number, index: number, additive: boolean) => void;
   /** Shift：按网格索引范围选中 */
   rangeTo: (index: number, orderedIds: number[]) => void;
-  /** Ctrl+A：全选给定 id 集（当前筛选结果） */
-  setAll: (ids: number[]) => void;
-  /** Ctrl+I：反选 */
-  invert: (allIds: number[]) => void;
+  /** Ctrl+A：全选给定 id 集（当前筛选结果）；meta 携带截断信息（§4.6） */
+  setAll: (ids: number[], meta?: SelectionMeta) => void;
+  /** Ctrl+I：反选；meta 携带截断信息（§4.6，截断时调用方应禁止） */
+  invert: (allIds: number[], meta?: SelectionMeta) => void;
   clear: () => void;
 }
 
 export const useSelectionStore = create<SelectionState>((set, get) => ({
   selected: new Set<number>(),
   anchorIndex: null,
+  truncated: false,
+  selectionTotal: 0,
 
   count: () => get().selected.size,
   isSelected: (id) => get().selected.has(id),
@@ -55,14 +70,20 @@ export const useSelectionStore = create<SelectionState>((set, get) => ({
       return { selected: next, anchorIndex: index };
     }),
 
-  setAll: (ids) => set({ selected: new Set(ids), anchorIndex: ids.length ? ids.length - 1 : null }),
+  setAll: (ids, meta) =>
+    set((s) => ({
+      selected: new Set(ids),
+      anchorIndex: ids.length ? ids.length - 1 : null,
+      truncated: meta?.truncated ?? s.truncated,
+      selectionTotal: meta?.total ?? ids.length,
+    })),
 
-  invert: (allIds) =>
+  invert: (allIds, meta) =>
     set((s) => {
       const next = new Set<number>();
       for (const id of allIds) if (!s.selected.has(id)) next.add(id);
-      return { selected: next };
+      return { selected: next, truncated: meta?.truncated ?? s.truncated, selectionTotal: meta?.total ?? allIds.length };
     }),
 
-  clear: () => set({ selected: new Set<number>(), anchorIndex: null }),
+  clear: () => set({ selected: new Set<number>(), anchorIndex: null, truncated: false, selectionTotal: 0 }),
 }));

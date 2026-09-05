@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::{AppError, AppResult};
 
 /// AI 打标/搜索共享的 FacetPromptContext：稳定 key + 人类可读信息 + 数据库规则
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FacetPromptContext {
     pub key: String,
@@ -16,6 +16,15 @@ pub struct FacetPromptContext {
     pub description: String,
     pub selection_mode: String,
     pub max_items: Option<i64>,
+    /// V24（§6.4）：tag | number —— 数值分面不发词表，发「输出一个 min–max 的数字」
+    #[serde(default)]
+    pub facet_kind: String,
+    #[serde(default)]
+    pub num_min: Option<f64>,
+    #[serde(default)]
+    pub num_max: Option<f64>,
+    #[serde(default)]
+    pub num_unit: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,8 +50,19 @@ pub struct TagFacet {
     pub cfg_manual_assignable: bool,
     pub cfg_ai_assignable: bool,
     pub cfg_searchable: bool,
-    /// 扩展预留（未来数字型/日期型分面；当前恒 'tag'）
+    /// 扩展预留（未来数字型/日期型分面；'tag' | 'number'）
     pub facet_kind: String,
+    // ── V24（§6.3①）：数值分面配置五列（facet_kind='number' 时生效）──
+    /// 数值下界（NULL = 不限）
+    pub num_min: Option<f64>,
+    /// 数值上界（NULL = 不限）
+    pub num_max: Option<f64>,
+    /// 展示后缀（「人」「mm」）
+    pub num_unit: String,
+    /// 小数位
+    pub num_decimals: i64,
+    /// 步进
+    pub num_step: f64,
 }
 
 /// F1-b：有效值派生（SQL 侧四个常量，唯一声明处）。
@@ -94,6 +114,8 @@ pub struct FacetImpact {
     pub tag_op_count: i64,
     /// R3-3：别名计数 —— delete_facet 会删 tag_aliases（:403），影响报告须含它
     pub alias_count: i64,
+    /// V24（§6.5）：数值行计数 —— 删除分面会级联删 asset_facet_numbers
+    pub number_count: i64,
 }
 
 /// 校验稳定 key：小写 snake_case，2–64 字符，只允许字母/数字/下划线，不以数字开头（指导书 §12.3）。
@@ -138,11 +160,17 @@ fn facet_from_row(r: &rusqlite::Row) -> rusqlite::Result<TagFacet> {
         cfg_ai_assignable: cfg_ai,
         cfg_searchable: r.get::<_, i64>(14)? != 0,
         facet_kind: r.get(15)?,
+        // V24（铁律 2：追加末尾，索引 16–20 与 FACET_COLS 一一对应）
+        num_min: r.get(16)?,
+        num_max: r.get(17)?,
+        num_unit: r.get(18)?,
+        num_decimals: r.get(19)?,
+        num_step: r.get(20)?,
     })
 }
 
 const FACET_COLS: &str =
-    "key, display_name, description, selection_mode, max_items, sort_order, is_system, status, applies_to, created_at, updated_at, cfg_visible_in_navigation, cfg_manual_assignable, cfg_ai_assignable, cfg_searchable, facet_kind";
+    "key, display_name, description, selection_mode, max_items, sort_order, is_system, status, applies_to, created_at, updated_at, cfg_visible_in_navigation, cfg_manual_assignable, cfg_ai_assignable, cfg_searchable, facet_kind, num_min, num_max, num_unit, num_decimals, num_step";
 
 /// 系统分面种子清单（migrate_v8 与 reset 后重建共用；key 顺序即 sort_order）。
 /// color 已于 V16 停用（算法主色替代），补种时单独置 inactive。
@@ -375,6 +403,8 @@ pub struct FacetDeleteReport {
     pub unlinked: i64,
     pub ops_deleted: i64,
     pub items_deleted: i64,
+    /// V24：级联删除的数值行数（asset_facet_numbers）
+    pub numbers_deleted: i64,
 }
 
 /// W2-3：物理删除分面 + 全级联。删除顺序（不可调换）：
@@ -389,6 +419,8 @@ pub fn delete_facet(conn: &Connection, key: &str) -> AppResult<FacetDeleteReport
         return Err(AppError::msg("系统分面不能删除（只允许停用）"));
     }
     let tx = conn.unchecked_transaction()?;
+    // V24（§6.5）：数值级联 —— 必须在同一事务内先删 asset_facet_numbers（铁律 6：先删引用再删主体）
+    let numbers_deleted = crate::db::facet_numbers::delete_facet_numbers(&tx, key)?;
     let unlinked = tx.execute(
         "DELETE FROM asset_tags WHERE tag_id IN (SELECT id FROM tags WHERE facet_key = ?1)",
         [key],
@@ -413,6 +445,7 @@ pub fn delete_facet(conn: &Connection, key: &str) -> AppResult<FacetDeleteReport
         unlinked,
         ops_deleted,
         items_deleted,
+        numbers_deleted: numbers_deleted as i64,
     })
 }
 
@@ -478,12 +511,19 @@ pub fn get_impact(conn: &Connection, key: &str) -> AppResult<FacetImpact> {
         [key],
         |r| r.get(0),
     )?;
+    // V24（§6.5）：数值行数（delete_facet 同事务级联删除，报告必须覆盖）
+    let number_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM asset_facet_numbers WHERE facet_key = ?1",
+        [key],
+        |r| r.get(0),
+    )?;
     Ok(FacetImpact {
         tag_count,
         asset_count,
         ai_suggestion_item_count,
         tag_op_count,
         alias_count,
+        number_count,
     })
 }
 
@@ -764,7 +804,8 @@ pub fn build_prompt_context(
         return Err(AppError::msg("media_kind 只允许 all | image | video"));
     }
     let mut stmt = conn.prepare(&format!(
-        "SELECT key, display_name, description, selection_mode, max_items
+        "SELECT key, display_name, description, selection_mode, max_items,
+                facet_kind, num_min, num_max, num_unit
            FROM tag_facets f
           WHERE {EFF_AI}
             AND (?1 = 'all' OR f.applies_to = 'all' OR f.applies_to = ?1)
@@ -778,9 +819,62 @@ pub fn build_prompt_context(
                 description: r.get(2)?,
                 selection_mode: r.get(3)?,
                 max_items: r.get(4)?,
+                facet_kind: r.get(5)?,
+                num_min: r.get(6)?,
+                num_max: r.get(7)?,
+                num_unit: r.get(8)?,
             })
         })?
         .filter_map(|r| r.ok())
         .collect();
     Ok(out)
+}
+/// V24（Phase 7-7）：分面类型设置（新建数值分面的第二落点 / 编辑数值配置）。
+/// - `number → tag` 直接禁止（§6.6 规则 9：连续值退化成离散标签不可逆）；
+/// - `tag → number` 仅当该分面没有任何标签时允许（新分面直建）；
+///   已有标签必须走 `convert_facet_kind` 转换预览（不静默丢数据）；
+/// - 数值分面上再次调用 = 只调整 num_* 配置。
+pub fn set_facet_kind(
+    conn: &Connection,
+    key: &str,
+    kind: &str,
+    num_min: Option<f64>,
+    num_max: Option<f64>,
+    num_unit: &str,
+    num_decimals: i64,
+    num_step: f64,
+) -> AppResult<TagFacet> {
+    let f = get(conn, key)?;
+    if kind != "tag" && kind != "number" {
+        return Err(AppError::msg("facet_kind 只允许 tag | number"));
+    }
+    if !num_step.is_finite() || num_step <= 0.0 {
+        return Err(AppError::msg("步进必须是正数"));
+    }
+    let now = chrono::Utc::now().timestamp_millis();
+    if f.facet_kind == "number" {
+        if kind != "number" {
+            return Err(AppError::msg("数值分面不能改回标签型（连续值无法无损转成离散标签）"));
+        }
+        conn.execute(
+            "UPDATE tag_facets SET num_min=?1, num_max=?2, num_unit=?3, num_decimals=?4, num_step=?5, updated_at=?6 WHERE key=?7",
+            params![num_min, num_max, num_unit, num_decimals, num_step, now, key],
+        )?;
+    } else if kind == "number" {
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM tags WHERE facet_key = ?1 AND status != 'deprecated'",
+            [key],
+            |r| r.get(0),
+        )?;
+        if n > 0 {
+            return Err(AppError::msg(format!(
+                "分面「{key}」已有 {n} 个标签 —— 请用「转换为数值型」先看转换预览，不能直接改型"
+            )));
+        }
+        conn.execute(
+            "UPDATE tag_facets SET facet_kind='number', num_min=?1, num_max=?2, num_unit=?3, num_decimals=?4, num_step=?5, updated_at=?6 WHERE key=?7",
+            params![num_min, num_max, num_unit, num_decimals, num_step, now, key],
+        )?;
+    }
+    get(conn, key)
 }

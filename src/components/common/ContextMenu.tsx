@@ -5,7 +5,7 @@ import { useEffect, useRef, useState } from "react";
 import clsx from "clsx";
 
 export type MenuEntry =
-  | { label: string; disabled?: boolean; onClick: () => void }
+  | { label: string; disabled?: boolean; title?: string; onClick: () => void }
   | { label: string; children: ({ label: string; onClick: () => void } | { divider: true })[] }
   | { divider: true };
 
@@ -87,6 +87,7 @@ export default function ContextMenu({ x, y, entries, onClose }: ContextMenuProps
           <button
             key={i}
             disabled={entry.disabled}
+            title={entry.title}
             onClick={() => {
               onClose();
               entry.onClick();

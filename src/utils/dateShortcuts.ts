@@ -1,5 +1,6 @@
 /** U-7 ②：日期快捷边界（本地时区，周一为一周起点）。
- *  返回 epoch ms —— 与 QueryBuilder 的 dateToEpoch 单位一致（拍摄/入库/修改时间均按本地零点落库）。
+ *  返回 YYYY-MM-DD 字符串 —— 后端日期条件只收字符串（MetadataFilter.value/min/max，
+ *  拍摄/入库/修改时间编译时按本地零点处理）；AI 路径与手工路径同格式，旧 epoch 数字不再产出。
  *  可注入 now 便于测试断言（默认取当前时间）。 */
 export type DateShortcutKind = "today" | "thisWeek" | "thisMonth" | "thisYear";
 
@@ -12,37 +13,48 @@ export const DATE_SHORTCUT_OPTIONS: { kind: DateShortcutKind; label: string }[] 
 
 const DAY_MS = 86_400_000;
 
-function startOfDayMs(now: Date): number {
-  return new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+function startOfDay(now: Date): Date {
+  return new Date(now.getFullYear(), now.getMonth(), now.getDate());
 }
 
-/** 快捷期起点：今天=本地零点；本周=周一零点；本月=1 号零点；今年=1 月 1 日零点。 */
-export function shortcutStartMs(kind: DateShortcutKind, now: Date = new Date()): number {
-  const day = startOfDayMs(now);
+/** Date → 本地时区 YYYY-MM-DD（不用 toISOString —— 那是 UTC，跨时区会偏移一天）。 */
+export function toIsoDateString(d: Date): string {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
+/** 快捷期起点：今天=当天；本周=周一；本月=1 号；今年=1 月 1 日。返回 YYYY-MM-DD。 */
+export function shortcutStartMs(kind: DateShortcutKind, now: Date = new Date()): string {
+  const day = startOfDay(now);
   switch (kind) {
     case "today":
-      return day;
+      return toIsoDateString(day);
     case "thisWeek": {
       const back = (now.getDay() + 6) % 7; // 周一起点（getDay: 0=周日）
-      return day - back * DAY_MS;
+      return toIsoDateString(new Date(day.getTime() - back * DAY_MS));
     }
     case "thisMonth":
-      return new Date(now.getFullYear(), now.getMonth(), 1).getTime();
+      return toIsoDateString(new Date(now.getFullYear(), now.getMonth(), 1));
     case "thisYear":
-      return new Date(now.getFullYear(), 0, 1).getTime();
+      return toIsoDateString(new Date(now.getFullYear(), 0, 1));
   }
 }
 
-/** 快捷期终点：当天 23:59:59.999（开区间上界，保证 gte/lte 都能含住整日）。 */
-export function shortcutEndMs(kind: DateShortcutKind, now: Date = new Date()): number {
+/** 快捷期终点（当天/周日/月末/年末，含全天）：lte/max 侧写这个日期，
+ *  后端对「不晚于 D」自动含 D 全天，无需把终点推到 23:59。返回 YYYY-MM-DD。 */
+export function shortcutEndMs(kind: DateShortcutKind, now: Date = new Date()): string {
   switch (kind) {
-    case "thisWeek":
-      return shortcutStartMs("thisWeek", now) + 7 * DAY_MS - 1;
+    case "thisWeek": {
+      const start = new Date(`${shortcutStartMs("thisWeek", now)}T00:00:00`);
+      return toIsoDateString(new Date(start.getTime() + 6 * DAY_MS));
+    }
     case "thisMonth":
-      return new Date(now.getFullYear(), now.getMonth() + 1, 1).getTime() - 1;
+      return toIsoDateString(new Date(now.getFullYear(), now.getMonth() + 1, 0));
     case "thisYear":
-      return new Date(now.getFullYear() + 1, 0, 1).getTime() - 1;
+      return toIsoDateString(new Date(now.getFullYear() + 1, 0, 0));
     case "today":
-      return shortcutStartMs("today", now) + DAY_MS - 1;
+      return shortcutStartMs("today", now);
   }
 }

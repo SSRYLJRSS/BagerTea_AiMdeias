@@ -1207,25 +1207,44 @@ fn rebuild_fts_triggers_with_cond(
     facet_cond: &str,
     facet_refresh_col: &str,
 ) -> AppResult<()> {
-    // 聚合子查询模板：与 V8 完全一致的分母 + 分面条件（注入）
-    let tag_terms = format!(
+    // P0-4（铁律 9）：tag_unique_terms=1 后 tag_aliases 冻结（新别名只写 tag_terms），
+    // FTS 词源必须跟着切到 tag_terms —— 否则 gate 开后新增的别名永远进不了 FTS。
+    let gated = crate::db::schema_features::feature_enabled(conn, "tag_unique_terms")?;
+    // 别名半段的词源：gate 关读旧表（V8 语义逐字保留），gate 开读 tag_terms 的非 canonical 行。
+    let alias_source = if gated {
+        r#"      SELECT tt.term AS term, t.sort_order AS ord, t.id AS tid, 1 AS kind
+        FROM asset_tags at JOIN tags t ON t.id = at.tag_id
+        JOIN tag_terms tt ON tt.tag_id = t.id
+         AND tt.is_searchable = 1 AND tt.term_kind != 'canonical'
+       WHERE at.asset_id = {ASSET_REF} AND t.status = 'active' {facet_cond}"#
+    } else {
+        r#"      SELECT ta.alias AS term, t.sort_order AS ord, t.id AS tid, 1 AS kind
+        FROM asset_tags at JOIN tags t ON t.id = at.tag_id
+        JOIN tag_aliases ta ON ta.tag_id = t.id AND ta.is_searchable = 1
+       WHERE at.asset_id = {ASSET_REF} AND t.status = 'active' {facet_cond}"#
+    };
+    // 聚合子查询模板：与 V8 完全一致的分母 + 分面条件（注入）+ 按 gate 选别名词源
+    // 注意：alias_source 是独立的原始字符串，其中的 {facet_cond} 不会被外层 format! 处理，
+    // 组装后再整体 replace 一次（主字面量里的 {facet_cond} 已在 format! 时替换）。
+    let term_words = format!(
         r#"SELECT t.name AS term, t.sort_order AS ord, t.id AS tid, 0 AS kind
         FROM asset_tags at JOIN tags t ON t.id = at.tag_id
        WHERE at.asset_id = {{ASSET_REF}} AND t.status = 'active' {facet_cond}
       UNION ALL
-      SELECT ta.alias AS term, t.sort_order AS ord, t.id AS tid, 1 AS kind
-        FROM asset_tags at JOIN tags t ON t.id = at.tag_id
-        JOIN tag_aliases ta ON ta.tag_id = t.id AND ta.is_searchable = 1
-       WHERE at.asset_id = {{ASSET_REF}} AND t.status = 'active' {facet_cond}
-      ORDER BY ord, tid, kind, term"#
-    );
+{alias_source}
+      ORDER BY ord, tid, kind, term"#,
+        alias_source = alias_source
+    )
+    .replace("{facet_cond}", facet_cond);
     let agg = |asset_ref: &str| -> String {
         format!(
             "SELECT cjk_bigram(COALESCE(group_concat(x.term, ' '), '')) FROM ({}) x",
-            tag_terms.replace("{ASSET_REF}", asset_ref)
+            term_words.replace("{ASSET_REF}", asset_ref)
         )
     };
 
+    // 别名词源的维护触发器按 gate 分两组（旧表一组 / tag_terms 一组）。
+    // 无论哪组都先 DROP 全部相关触发器（幂等重跑 + gate 切换都安全）。
     conn.execute_batch(
         r#"
 DROP TRIGGER IF EXISTS trg_at_ai;
@@ -1234,6 +1253,9 @@ DROP TRIGGER IF EXISTS trg_tags_au;
 DROP TRIGGER IF EXISTS trg_tag_alias_ai;
 DROP TRIGGER IF EXISTS trg_tag_alias_au;
 DROP TRIGGER IF EXISTS trg_tag_alias_ad;
+DROP TRIGGER IF EXISTS trg_terms_ai;
+DROP TRIGGER IF EXISTS trg_terms_au;
+DROP TRIGGER IF EXISTS trg_terms_ad;
 DROP TRIGGER IF EXISTS trg_facet_status_au;
 "#,
     )?;
@@ -1259,9 +1281,27 @@ END;"#,
         agg_fc = agg("fts_content.asset_id"),
     ))?;
 
-    // ③ 别名三触发器
-    conn.execute_batch(&format!(
-        r#"CREATE TRIGGER trg_tag_alias_ai AFTER INSERT ON tag_aliases BEGIN
+    // ③ 别名词源维护触发器：gate 关 → 挂 tag_aliases（冻结前仍由它维护）；
+    //    gate 开 → 挂 tag_terms（新别名/旧词迁移后的唯一事实源，维护时机对齐）。
+    if gated {
+        conn.execute_batch(&format!(
+            r#"CREATE TRIGGER trg_terms_ai AFTER INSERT ON tag_terms BEGIN
+  UPDATE fts_content SET tag_names = ({agg_fc})
+   WHERE asset_id IN (SELECT asset_id FROM asset_tags WHERE tag_id = new.tag_id);
+END;
+CREATE TRIGGER trg_terms_au AFTER UPDATE ON tag_terms BEGIN
+  UPDATE fts_content SET tag_names = ({agg_fc})
+   WHERE asset_id IN (SELECT asset_id FROM asset_tags WHERE tag_id IN (old.tag_id, new.tag_id));
+END;
+CREATE TRIGGER trg_terms_ad AFTER DELETE ON tag_terms BEGIN
+  UPDATE fts_content SET tag_names = ({agg_fc})
+   WHERE asset_id IN (SELECT asset_id FROM asset_tags WHERE tag_id = old.tag_id);
+END;"#,
+            agg_fc = agg("fts_content.asset_id"),
+        ))?;
+    } else {
+        conn.execute_batch(&format!(
+            r#"CREATE TRIGGER trg_tag_alias_ai AFTER INSERT ON tag_aliases BEGIN
   UPDATE fts_content SET tag_names = ({agg_fc})
    WHERE asset_id IN (SELECT asset_id FROM asset_tags WHERE tag_id = new.tag_id);
 END;
@@ -1273,8 +1313,9 @@ CREATE TRIGGER trg_tag_alias_ad AFTER DELETE ON tag_aliases BEGIN
   UPDATE fts_content SET tag_names = ({agg_fc})
    WHERE asset_id IN (SELECT asset_id FROM asset_tags WHERE tag_id = old.tag_id);
 END;"#,
-        agg_fc = agg("fts_content.asset_id"),
-    ))?;
+            agg_fc = agg("fts_content.asset_id"),
+        ))?;
+    }
 
     // ④ 分面条件变化 → 刷新其下标签关联的全部素材（列由调用方指定）
     conn.execute_batch(&format!(
@@ -1577,7 +1618,8 @@ BEGIN SELECT RAISE(ABORT, '标签的 facet_key 指向不存在的分面'); END;
 CREATE TRIGGER IF NOT EXISTS trg_facets_restrict_delete
   BEFORE DELETE ON tag_facets
   WHEN EXISTS (SELECT 1 FROM tags WHERE facet_key = old.key)
-BEGIN SELECT RAISE(ABORT, '该分面下还有标签，请用 delete_tag_facet 命令'); END;
+     OR EXISTS (SELECT 1 FROM asset_facet_numbers WHERE facet_key = old.key)
+BEGIN SELECT RAISE(ABORT, '该分面下还有标签或数值，请用 delete_tag_facet 命令'); END;
 "#,
     )?;
     Ok(())
@@ -1591,6 +1633,19 @@ pub fn apply_v22b_constraints(conn: &Connection) -> AppResult<()> {
     backfill_tag_terms(conn)?;
     create_terms_facet_defenses(conn)?;
     create_facet_fk_guards(conn)?;
+    Ok(())
+}
+
+/// P0-4：gate 开启后重建 FTS 触发器与索引 —— 别名词源从 tag_aliases 切到 tag_terms，
+/// 并全量 rebuild 对齐内容表。调用方必须在 set_feature("tag_unique_terms", true) 之后调用
+/// （rebuild_fts_triggers_with_cond 按 feature 开关决定词源）。幂等可重跑。
+pub fn rebuild_fts_triggers_for_gated_terms(conn: &Connection) -> AppResult<()> {
+    rebuild_fts_triggers_with_cond(
+        conn,
+        "AND EXISTS (SELECT 1 FROM tag_facets f WHERE f.key = t.facet_key AND f.cfg_searchable = 1)",
+        "cfg_searchable",
+    )?;
+    conn.execute_batch("INSERT INTO assets_fts(assets_fts) VALUES('rebuild');")?;
     Ok(())
 }
 
@@ -1717,6 +1772,64 @@ pub fn migrate(conn: &Connection) -> AppResult<()> {
     // V23（C-1）：色板关系表 —— 无条件幂等段（CREATE IF NOT EXISTS），
     // 不推进 user_version（既有版本号不可改；存量库每次启动自愈补齐）。
     migrate_v23(conn)?;
+    // V24（§6）：数值化分面 —— tag_facets num_* 五列 + asset_facet_numbers 载荷表
+    // + ai_suggestion_items 数值两列。无条件幂等段（逐列容错 ALTER + IF NOT EXISTS），
+    // 不推进 user_version（与 V23 同理；存量库每次启动自愈补齐）。
+    migrate_v24(conn)?;
+    Ok(())
+}
+
+/// V24（§6.3）：数值化分面。幂等：
+/// ① tag_facets 追加五列（num_min/num_max/num_unit/num_decimals/num_step）—— 逐列探测再 ALTER；
+/// ② asset_facet_numbers 载荷表（PK (asset_id, facet_key)，覆盖索引）；
+/// ③ ai_suggestion_items 追加 item_kind/num_value 两列。
+/// facet_kind 只做应用层校验，不加 DB CHECK（§10 决策 6：重建表不值得）。
+fn migrate_v24(conn: &Connection) -> AppResult<()> {
+    // ① tag_facets 五列（铁律 2：追加末尾，FACET_COLS 同步）
+    let cols: Vec<String> = {
+        let mut stmt = conn.prepare("PRAGMA table_info(tag_facets)")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(1))?;
+        rows.filter_map(|r| r.ok()).collect()
+    };
+    for (ddl, col) in [
+        ("ALTER TABLE tag_facets ADD COLUMN num_min REAL", "num_min"),
+        ("ALTER TABLE tag_facets ADD COLUMN num_max REAL", "num_max"),
+        ("ALTER TABLE tag_facets ADD COLUMN num_unit TEXT NOT NULL DEFAULT ''", "num_unit"),
+        ("ALTER TABLE tag_facets ADD COLUMN num_decimals INTEGER NOT NULL DEFAULT 0", "num_decimals"),
+        ("ALTER TABLE tag_facets ADD COLUMN num_step REAL NOT NULL DEFAULT 1", "num_step"),
+    ] {
+        if !cols.iter().any(|c| c == col) {
+            conn.execute_batch(ddl)?;
+        }
+    }
+    // ② 数值载荷表（不做通用 EAV：单 REAL 窄表）
+    conn.execute_batch(
+        r#"
+CREATE TABLE IF NOT EXISTS asset_facet_numbers (
+  asset_id        INTEGER NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+  facet_key       TEXT    NOT NULL,
+  value           REAL    NOT NULL,
+  source          TEXT    NOT NULL DEFAULT 'manual',
+  review_state    TEXT    NOT NULL DEFAULT 'ai_unreviewed',
+  source_batch_id INTEGER,
+  created_at      INTEGER NOT NULL,
+  PRIMARY KEY (asset_id, facet_key)
+);
+CREATE INDEX IF NOT EXISTS ix_afn_value ON asset_facet_numbers(facet_key, value, asset_id);
+"#,
+    )?;
+    // ③ 建议项数值两列
+    let item_cols: Vec<String> = {
+        let mut stmt = conn.prepare("PRAGMA table_info(ai_suggestion_items)")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(1))?;
+        rows.filter_map(|r| r.ok()).collect()
+    };
+    if !item_cols.iter().any(|c| c == "item_kind") {
+        conn.execute_batch("ALTER TABLE ai_suggestion_items ADD COLUMN item_kind TEXT NOT NULL DEFAULT 'tag'")?;
+    }
+    if !item_cols.iter().any(|c| c == "num_value") {
+        conn.execute_batch("ALTER TABLE ai_suggestion_items ADD COLUMN num_value REAL")?;
+    }
     Ok(())
 }
 

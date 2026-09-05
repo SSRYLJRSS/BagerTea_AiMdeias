@@ -4,9 +4,9 @@
 //! 兼容现有列表链路）+ plan（含 should 加分，供 U 波次三段式 UI）→ 返回。
 
 use std::sync::Arc;
-use tauri::State;
+use tauri::{Manager, State};
 
-use crate::db::search_plan::{LeafDiagnostic, ShouldDiagnostic};
+use crate::db::search_plan::PlanDiagnostics;
 use crate::db::settings;
 use crate::db::tag_facets;
 use crate::error::{AppError, AppResult};
@@ -142,17 +142,65 @@ pub async fn ai_parse_search_query(
     .map_err(|e| AppError::msg(format!("AI 搜索任务失败: {e}")))?
 }
 
-/// C-2：对当前 SearchPlanV3 做 AST 命中诊断（U-6 数据前提）。
-/// 返回 filter/must_not 叶子的 delta 诊断 + should 命中/总数。
-/// 只读 COUNT（2N+1 次，毫秒级）；无 plan 时返回空。
+/// Phase 2 §4.1：plan 执行 —— 结果列表（分页）。入口 validate → prune → execute（单一编译器）。
+#[tauri::command]
+pub fn list_assets_by_plan(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    plan: Option<crate::db::search_plan::SearchPlanV3>,
+    offset: Option<i64>,
+    limit: Option<i64>,
+) -> AppResult<crate::db::search_plan::PlanAssetPage> {
+    let conn = lock_db(&state.db)?;
+    let Some(plan) = plan else {
+        return Ok(crate::db::search_plan::PlanAssetPage {
+            items: Vec::new(),
+            total: 0,
+            has_more: false,
+            warnings: Vec::new(),
+        });
+    };
+    let page =
+        crate::db::search_plan::run_plan_page(&conn, &plan, offset.unwrap_or(0), limit)?;
+    for a in &page.items {
+        let _ = app
+            .asset_protocol_scope()
+            .allow_file(std::path::Path::new(&a.file_path));
+    }
+    Ok(page)
+}
+
+/// Phase 2 §4.1（B2/B8）：plan 全选 ID —— PlanIdsResult 一路到底，不降级成裸数组。
+#[tauri::command]
+pub fn list_asset_ids_by_plan(
+    state: State<'_, AppState>,
+    plan: Option<crate::db::search_plan::SearchPlanV3>,
+) -> AppResult<crate::db::search_plan::PlanIdsResult> {
+    let conn = lock_db(&state.db)?;
+    let Some(plan) = plan else {
+        return Ok(crate::db::search_plan::PlanIdsResult {
+            ids: Vec::new(),
+            total: 0,
+            truncated: false,
+            warnings: Vec::new(),
+        });
+    };
+    crate::db::search_plan::run_plan_ids(&conn, &plan)
+}
+
+/// C-2/§4.5：对当前 SearchPlanV3 做 AST 命中诊断（U-6 数据前提）。
+/// 入口 validate → prune，返回剔除后的叶子/should 诊断 + 与列表命令同一批 warnings。
+/// 叶子带 zone、加分项带 index（§3.7 不变式 9）；加分命中数为结果集内交集（B3）。
+/// 只读 COUNT（毫秒级）；无 plan 时返回空。
 #[tauri::command]
 pub fn diagnose_search_plan_cmd(
     state: State<'_, AppState>,
     plan: Option<crate::db::search_plan::SearchPlanV3>,
-) -> AppResult<(Vec<LeafDiagnostic>, Vec<ShouldDiagnostic>)> {
+    plan_revision: i64,
+) -> AppResult<PlanDiagnostics> {
     let conn = lock_db(&state.db)?;
     let Some(plan) = plan else {
-        return Ok((Vec::new(), Vec::new()));
+        return Ok(PlanDiagnostics::default());
     };
-    crate::db::search_plan::diagnose_search_plan(&conn, &plan)
+    crate::db::search_plan::diagnose_search_plan(&conn, &plan, plan_revision)
 }

@@ -35,6 +35,13 @@ export interface TagFacet {
   appliesTo: "all" | "image" | "video";
   createdAt: number;
   updatedAt: number;
+  /** V24（Phase 7）：tag | number —— 数值分面配置（facetKind='number' 时生效） */
+  facetKind?: "tag" | "number";
+  numMin?: number | null;
+  numMax?: number | null;
+  numUnit?: string;
+  numDecimals?: number;
+  numStep?: number;
 }
 
 /** W2-4：分面影响范围（与后端 FacetImpact 对齐；aiConfigCount 已随 V20 合表删除）。
@@ -45,6 +52,8 @@ export interface TagFacetImpact {
   aiSuggestionItemCount: number;
   tagOpCount: number;
   aliasCount: number;
+  /** V24：删除影响预览的数值行数 */
+  numberCount?: number;
 }
 
 /** 打标工作台分面：V20 合表后 tag_facets 单一事实源（inputMode 分组取代 enabledForAi）。 */

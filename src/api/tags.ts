@@ -220,3 +220,78 @@ export function scanDuplicateTags(): Promise<DuplicateGroup[]> {
   return invoke<DuplicateGroup[]>("scan_duplicate_tags");
 }
 
+
+// ═══════════════ V24（Phase 7）：数值分面 ═══════════════
+
+/** 数值分面配置载荷（新建数值分面第二落点 / 编辑数值配置共用） */
+export interface FacetNumberConfig {
+  numMin?: number | null;
+  numMax?: number | null;
+  numUnit?: string;
+  numDecimals?: number;
+  numStep?: number;
+}
+
+/** 分面类型设置（number→tag 禁止；已有标签的 tag→number 须走 convertFacetKind） */
+export function setFacetKind(
+  key: string,
+  kind: "tag" | "number",
+  config?: FacetNumberConfig,
+): Promise<TagFacet> {
+  return invoke<TagFacet>("set_facet_kind", {
+    key,
+    kind,
+    numMin: config?.numMin ?? null,
+    numMax: config?.numMax ?? null,
+    numUnit: config?.numUnit ?? "",
+    numDecimals: config?.numDecimals ?? 0,
+    numStep: config?.numStep ?? 1,
+  });
+}
+
+/** 手工赋值（source=manual，同源扇出 RAW/非RAW 兄弟） */
+export function setFacetNumber(assetIds: number[], facetKey: string, value: number): Promise<void> {
+  return invoke<void>("set_facet_number", { assetIds, facetKey, value });
+}
+
+/** 手工清值（扇出对称删除） */
+export function clearFacetNumber(assetIds: number[], facetKey: string): Promise<void> {
+  return invoke<void>("clear_facet_number", { assetIds, facetKey });
+}
+
+export interface FacetNumber {
+  assetId: number;
+  facetKey: string;
+  value: number;
+  source: string;
+  reviewState: string;
+  sourceBatchId: number | null;
+  createdAt: number;
+}
+
+/** 读单素材某分面的数值（ViewerTagBar / 打标台回显） */
+export function getFacetNumber(assetId: number, facetKey: string): Promise<FacetNumber | null> {
+  return invoke<FacetNumber | null>("get_facet_number", { assetId, facetKey });
+}
+
+/** 批量读多素材某分面的数值 */
+export function getFacetNumbers(assetIds: number[], facetKey: string): Promise<FacetNumber[]> {
+  return invoke<FacetNumber[]>("get_facet_numbers", { assetIds, facetKey });
+}
+
+/** tag → number 转换报告（dryRun 只出预览，一行不写） */
+export interface ConversionReport {
+  facetKey: string;
+  parsed: { tagId: number; name: string; value: number }[];
+  ambiguous: { tagId: number; name: string; reason: string }[];
+  unparseable: { tagId: number; name: string; assetCount: number }[];
+  conflicts: { assetId: number; candidates: [number, number, string][] }[];
+  hierarchyLoss: number;
+  aliasLoss: number;
+  pendingRejected: number;
+}
+
+/** tag → number 转换：dryRun=true 预览；false 执行（冲突/歧义未清空时后端拒绝） */
+export function convertFacetKind(key: string, dryRun: boolean): Promise<ConversionReport> {
+  return invoke<ConversionReport>("convert_facet_kind", { key, dryRun });
+}

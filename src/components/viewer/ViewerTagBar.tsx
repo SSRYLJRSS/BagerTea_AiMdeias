@@ -5,11 +5,12 @@
  *  正文为「分面组两栏」grid：每个分面的名称与标签处于同一 grid item，左侧 76px 名称列。
  *  「添加标签」是标题栏右侧独立图标按钮（Plus），不在正文内，避免 button 嵌套 button。
  *  仅承载展示 + 删除；添加仍走容器注入（避免在查看器内再造一个完整打标工作台）。 */
-import { memo, useMemo, useState } from "react";
+import { memo, useEffect, useMemo, useState } from "react";
 import { Plus } from "lucide-react";
 import TagChip from "@/components/library/TagChip";
 import { useTagStore, buildWorkbenchFacets } from "@/stores/tagStore";
 import type { Tag } from "@/types/tag";
+import { getFacetNumber } from "@/api/tags";
 
 interface ViewerTagBarProps {
   assetId: number;
@@ -20,7 +21,7 @@ interface ViewerTagBarProps {
   onAddTag: () => void;
 }
 
-export default memo(function ViewerTagBar({ tags, contentDescription, onRemoveTag, onAddTag }: ViewerTagBarProps) {
+export default memo(function ViewerTagBar({ assetId, tags, contentDescription, onRemoveTag, onAddTag }: ViewerTagBarProps) {
   const [collapsed, setCollapsed] = useState(false);
   // 分面唯一事实源 = tag_facets（tagStore.facets），aiFacetConfigs 只覆盖显隐/显示名
   const tagFacets = useTagStore((s) => s.facets);
@@ -44,6 +45,28 @@ export default memo(function ViewerTagBar({ tags, contentDescription, onRemoveTa
     if (other.length) out.push({ key: "other", name: "其他", items: other });
     return out;
   }, [tags, facets]);
+
+  // V24（Phase 7-8）：数值分面值展示 —— 该素材的全部数值分面值（手工/AI 确认后落库的）
+  const numberFacets = useMemo(() => tagFacets.filter((f) => f.facetKind === "number"), [tagFacets]);
+  const [numbers, setNumbers] = useState<{ key: string; name: string; value: number; unit: string }[]>([]);
+  useEffect(() => {
+    let alive = true;
+    void (async () => {
+      const out: { key: string; name: string; value: number; unit: string }[] = [];
+      for (const f of numberFacets) {
+        try {
+          const n = await getFacetNumber(assetId, f.key);
+          if (n && alive) out.push({ key: f.key, name: f.displayName, value: n.value, unit: f.numUnit ?? "" });
+        } catch {
+          /* 数值读取失败静默（不阻塞标签展示） */
+        }
+      }
+      if (alive) setNumbers(out);
+    })();
+    return () => {
+      alive = false;
+    };
+  }, [assetId, numberFacets]);
 
   // FB5-05（§7.6.1）：描述正文（trim 后为空则不渲染行）
   const description = (contentDescription ?? "").trim();
@@ -93,7 +116,20 @@ export default memo(function ViewerTagBar({ tags, contentDescription, onRemoveTa
               <span className="text-xs leading-5 text-[var(--color-text)]">{description}</span>
             </div>
           )}
-          {groups.length === 0 && !hasDescription ? (
+          {numbers.length > 0 && (
+            <div className="col-span-2 grid min-w-0 grid-cols-[76px_minmax(0,1fr)] items-start gap-2">
+              <span className="min-w-0 truncate text-[11px] text-[var(--color-text-secondary)]">数值</span>
+              <div className="flex min-w-0 flex-wrap gap-1" data-testid="viewer-facet-numbers">
+                {numbers.map((n) => (
+                  <span key={n.key} className="inline-flex h-6 items-center rounded-full bg-[var(--color-surface)] px-2 text-xs tabular-nums text-[var(--color-text)]">
+                    {n.value}
+                    {n.unit}
+                  </span>
+                ))}
+              </div>
+            </div>
+          )}
+          {groups.length === 0 && !hasDescription && numbers.length === 0 ? (
             <div className="col-span-2 flex h-full items-center text-xs text-[var(--color-text-tertiary)]">
               未打标
             </div>

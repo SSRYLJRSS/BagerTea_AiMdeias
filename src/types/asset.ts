@@ -91,7 +91,7 @@ export interface AssetFilter {
   metadataFilters?: MetadataFilter[];
   search?: string;
   /** 排序字段（R-21）：createdAt（默认）| takenAt | modifiedAt | name | size | resolution */
-  sortBy?: "created_at" | "taken_at" | "modified_at" | "name" | "size" | "resolution";
+  sortBy?: "created_at" | "taken_at" | "modified_at" | "name" | "size" | "resolution" | "rating";
   /** desc（默认）| asc */
   sortDir?: "desc" | "asc";
   /** true = 查回收站（R-22） */
@@ -168,12 +168,37 @@ export interface MetadataFilter {
   /** between 操作符使用 */
   min?: MetadataValue;
   max?: MetadataValue;
+  /** Phase 4（§4-3）：file_size 的展示单位（KB/MB/GB）—— 提升进条件，between 两侧共用且换源不丢。
+   *  后端只消费字节数值，本字段仅在协议里透传，Rust 侧 serde 忽略未知字段。 */
+  unit?: "KB" | "MB" | "GB";
 }
 
 export interface MetadataFacetItem {
   value: string;
   label: string;
   count: number;
+}
+
+/** Phase 4（§5.3）：数值字段的 NumericDomain 单一事实源（get_numeric_domains 命令下发）。
+ *  unit = 控件类型标签（raw|bytes|millis|pixels|degrees|percent|stars|custom）；
+ *  unitLabel = 单位展示文本（f/、mm、B、px、°、%…，null = 无单位）；
+ *  presets = (label, value) 快捷项（16:9、ISO 800、f/2.8…）。 */
+export interface NumericDomain {
+  key: MetadataFilterKey | `facet:${string}`;
+  /** V24：数值分面的显示名（人数）；内置 key 由前端字段表提供，此列缺省 */
+  label?: string;
+  unit: "raw" | "bytes" | "millis" | "pixels" | "degrees" | "percent" | "stars" | "custom";
+  unitLabel?: string | null;
+  min?: number | null;
+  max?: number | null;
+  step: number;
+  decimals: number;
+  presets: [string, number][];
+  /** dominant_hue：允许 min > max（跨 0° 区间） */
+  circular: boolean;
+  /** R2-2 量纲提示阈值（低于该值提示可能写错单位） */
+  suspiciousBelow?: number | null;
+  allowedOps: MetadataOp[];
 }
 
 export interface MetadataFacet {
@@ -188,6 +213,8 @@ export interface AssetPage {
   items: Asset[];
   total: number;
   hasMore: boolean;
+  /** R2-1：后端编译层剔除/降级 warning（String）；plan 路径用 SearchWarning[]（见 PlanAssetPage） */
+  warnings?: string[];
 }
 
 /** 分面标签条件（ResolvedSearchQuery 内，tagIds 为后端解析结果） */
@@ -209,7 +236,7 @@ export interface ResolvedSearchQuery {
   facetFilters: ResolvedFacetFilter[];
   excludeTagIds: number[];
   metadataFilters: MetadataFilter[];
-  sortBy: "created_at" | "taken_at" | "modified_at" | "name" | "size" | "resolution";
+  sortBy: "created_at" | "taken_at" | "modified_at" | "name" | "size" | "resolution" | "rating";
   sortDir: "desc" | "asc";
 }
 

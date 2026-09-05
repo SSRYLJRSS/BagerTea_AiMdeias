@@ -259,6 +259,7 @@ pub fn run() {
             // 一句话描述列表（标签设置页展示）
             commands::list_content_descriptions,
             commands::list_metadata_facets,
+            commands::get_numeric_domains,
             commands::get_asset,
             commands::delete_assets,
             commands::trash_restore,
@@ -296,6 +297,9 @@ pub fn run() {
             commands::ai_parse_search_query,
             // C-2：AST 命中诊断（U-6 界面数据前提）
             commands::diagnose_search_plan_cmd,
+            // Phase 2 §4.1：plan 列表分页 + 全选 ID（B2 同源）
+            commands::list_assets_by_plan,
+            commands::list_asset_ids_by_plan,
             // 入库
             commands::import_files,
             commands::inspect_import,
@@ -316,6 +320,13 @@ pub fn run() {
             commands::get_tag_facet_impact,
             commands::list_tags_by_facet,
             commands::list_tag_governance,
+            // V24（Phase 7-3/7-6）：数值分面 —— 手工赋值/清值/读值 + tag→number 转换
+            commands::set_facet_number,
+            commands::clear_facet_number,
+            commands::get_facet_number,
+            commands::get_facet_numbers,
+            commands::convert_facet_kind,
+            commands::set_facet_kind,
             commands::scan_duplicate_tags,
             commands::search_tag_candidates,
             commands::create_canonical_tag,

@@ -14,15 +14,18 @@ import Button from "@/components/common/Button";
 import Modal from "@/components/common/Modal";
 import TagManageDialog from "@/components/dialogs/TagManageDialog";
 import {
+  convertFacetKind,
   createTagFacet,
   deactivateTagFacet,
   deleteTagFacet,
   getTagFacetImpact,
+  setFacetKind,
   listAllTagFacets,
   listContentDescriptions,
   reorderTagFacets,
   restoreTagFacet,
   updateTagFacet,
+  type ConversionReport,
   type FacetDeleteReport,
   type ContentDescription,
 } from "@/api/tags";
@@ -45,7 +48,20 @@ function slugify(s: string): string {
     .slice(0, 64);
 }
 
+/** P1-1：中文（或纯符号）名称 slugify 出空串时给一个合法随机兜底 key。
+ *  后端 key 约束：小写 snake_case 2–64 位，仅字母/数字/下划线，字母开头。 */
+function genFacetFallbackKey(): string {
+  const rand = Math.random().toString(36).slice(2, 8) || "1a2b3c";
+  return `facet_${rand}`;
+}
+
 function ruleSummary(f: TagFacet): string {
+  // V24（Phase 7-7）：数值分面摘要 —— 类型优先于选数规则
+  if (f.facetKind === "number") {
+    const range = f.numMin != null || f.numMax != null ? ` ${f.numMin ?? "-∞"}–${f.numMax ?? "∞"}` : "";
+    const unit = f.numUnit ? ` · 单位 ${f.numUnit}` : "";
+    return `数值型 ·${range}${unit}`;
+  }
   const mode = f.selectionMode === "single" ? "单选" : f.maxItems ? `可多选 ≤${f.maxItems}` : "可多选不限";
   const applies = APP_TO_OPTIONS.find((o) => o.value === f.appliesTo)?.label ?? "全部";
   return f.appliesTo === "all" ? mode : `${mode} · ${applies}`;
@@ -434,6 +450,7 @@ export default function FacetManagePanel({ draft, onPatchAi }: {
               <li>解除 {deleteImpact.assetCount} 个素材的关联</li>
               <li>清除 {deleteImpact.aiSuggestionItemCount} 条 AI 候选记录、{deleteImpact.tagOpCount} 条操作流水</li>
               {deleteImpact.aliasCount > 0 && <li>删除 {deleteImpact.aliasCount} 条别名</li>}
+              {(deleteImpact.numberCount ?? 0) > 0 && <li>删除 {deleteImpact.numberCount} 条数值（级联，不可恢复）</li>}
             </ul>
           )}
           <p className="text-xs text-[var(--color-text-secondary)]">建议改用「停用」：历史标签与查询保留，随时可恢复。</p>
@@ -476,6 +493,12 @@ function EditFacetDialog({ facet, onClose, onSaved, onError }: {
   const [appliesTo, setAppliesTo] = useState<"all" | "image" | "video">("all");
   const [saving, setSaving] = useState(false);
   const [showAdvanced, setShowAdvanced] = useState(false);
+  // V24（Phase 7-7）：数值分面配置编辑 + tag→number 转换预览入口
+  const [numMin, setNumMin] = useState("");
+  const [numMax, setNumMax] = useState("");
+  const [numUnit, setNumUnit] = useState("");
+  const [numStep, setNumStep] = useState("1");
+  const [convertOpen, setConvertOpen] = useState(false);
 
   useEffect(() => {
     if (facet) {
@@ -486,6 +509,11 @@ function EditFacetDialog({ facet, onClose, onSaved, onError }: {
       setMaxItems(facet.maxItems ? String(facet.maxItems) : "");
       setAppliesTo(facet.appliesTo);
       setShowAdvanced(false);
+      setNumMin(facet.numMin != null ? String(facet.numMin) : "");
+      setNumMax(facet.numMax != null ? String(facet.numMax) : "");
+      setNumUnit(facet.numUnit ?? "");
+      setNumStep(facet.numStep ? String(facet.numStep) : "1");
+      setConvertOpen(false);
     }
   }, [facet]);
 
@@ -502,6 +530,20 @@ function EditFacetDialog({ facet, onClose, onSaved, onError }: {
         maxItems: selectionMode === "single" ? 1 : maxItems ? Number(maxItems) || null : null,
         appliesTo,
       });
+      // V24：数值分面 —— 同步数值配置（number→tag 已被后端禁止，这里只回写配置）
+      if (facet.facetKind === "number") {
+        if (numMin !== "" && numMax !== "" && Number(numMin) > Number(numMax)) {
+          onError("数值下限不能大于上限");
+          return;
+        }
+        await setFacetKind(facet.key, "number", {
+          numMin: numMin === "" ? null : Number(numMin),
+          numMax: numMax === "" ? null : Number(numMax),
+          numUnit: numUnit.trim(),
+          numDecimals: facet.numDecimals ?? 0,
+          numStep: Number(numStep) > 0 ? Number(numStep) : 1,
+        });
+      }
       onSaved(`已保存「${displayName.trim()}」`);
       onClose();
     } catch (e) {
@@ -547,15 +589,37 @@ function EditFacetDialog({ facet, onClose, onSaved, onError }: {
             <label className="flex items-center gap-1.5"><input type="radio" checked={inputMode === "ai_and_manual"} onChange={() => setInputMode("ai_and_manual")} />AI 自动打标（也可手工填写）</label>
             <label className="flex items-center gap-1.5"><input type="radio" checked={inputMode === "manual_only"} onChange={() => setInputMode("manual_only")} />只手工填写</label>
           </fieldset>
-          <fieldset className="flex flex-col gap-1 text-xs">
-            <legend className="mb-0.5">可选几个</legend>
-            <label className="flex items-center gap-1.5"><input type="radio" checked={selectionMode === "single"} onChange={() => setSelectionMode("single")} />只能选 1 个</label>
-            <label className="flex items-center gap-1.5">
-              <input type="radio" checked={selectionMode === "multi"} onChange={() => setSelectionMode("multi")} />可多选，上限
-              <input className="ui-control w-16 px-1 py-0.5" type="number" min={1} disabled={selectionMode === "single"} value={maxItems} onChange={(e) => setMaxItems(e.target.value)} placeholder="不限" aria-label="多选上限" />
-              （留空 = 不限）
-            </label>
-          </fieldset>
+          {facet.facetKind === "number" ? (
+            // V24：数值分面 —— 规则区替换为数值配置（不可改回标签型，§6.6 规则 9）
+            <fieldset className="flex flex-col gap-1 text-xs">
+              <legend className="mb-0.5">数值配置 · 数值型不可改回标签型</legend>
+              <div className="flex flex-wrap items-center gap-2">
+                <label className="flex items-center gap-1">下限
+                  <input className="ui-control w-16 px-1 py-0.5" type="number" value={numMin} onChange={(e) => setNumMin(e.target.value)} placeholder="不限" aria-label="数值下限" />
+                </label>
+                <label className="flex items-center gap-1">上限
+                  <input className="ui-control w-16 px-1 py-0.5" type="number" value={numMax} onChange={(e) => setNumMax(e.target.value)} placeholder="不限" aria-label="数值上限" />
+                </label>
+                <label className="flex items-center gap-1">单位
+                  <input className="ui-control w-14 px-1 py-0.5" value={numUnit} onChange={(e) => setNumUnit(e.target.value)} aria-label="数值单位" />
+                </label>
+                <label className="flex items-center gap-1">步进
+                  <input className="ui-control w-14 px-1 py-0.5" type="number" step="any" min="0" value={numStep} onChange={(e) => setNumStep(e.target.value)} aria-label="数值步进" />
+                </label>
+              </div>
+              <span className="text-[10px] text-[var(--color-text-tertiary)]">范围会同时约束 AI 输出与手工输入；已确认的数值不受影响</span>
+            </fieldset>
+          ) : (
+            <fieldset className="flex flex-col gap-1 text-xs">
+              <legend className="mb-0.5">可选几个</legend>
+              <label className="flex items-center gap-1.5"><input type="radio" checked={selectionMode === "single"} onChange={() => setSelectionMode("single")} />只能选 1 个</label>
+              <label className="flex items-center gap-1.5">
+                <input type="radio" checked={selectionMode === "multi"} onChange={() => setSelectionMode("multi")} />可多选，上限
+                <input className="ui-control w-16 px-1 py-0.5" type="number" min={1} disabled={selectionMode === "single"} value={maxItems} onChange={(e) => setMaxItems(e.target.value)} placeholder="不限" aria-label="多选上限" />
+                （留空 = 不限）
+              </label>
+            </fieldset>
+          )}
           <div>
             <button type="button" onClick={() => setShowAdvanced((v) => !v)} className="text-[11px] text-[var(--color-text-secondary)] hover:text-[var(--color-text)]">
               ▸ 高级{showAdvanced ? "（收起）" : ""}
@@ -571,16 +635,132 @@ function EditFacetDialog({ facet, onClose, onSaved, onError }: {
                 <label className="flex items-center gap-2 text-xs text-[var(--color-text-tertiary)]">
                   英文标识（只读）：<code>{facet.key}</code>
                 </label>
+                {/* V24（Phase 7-7）：tag → number 转换（先 dry-run 预览，不自动裁决） */}
+                <div className="flex flex-col gap-1">
+                  <button
+                    type="button"
+                    className="self-start rounded border border-[var(--color-border)] px-2 py-1 text-[11px] text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-hover)]"
+                    onClick={() => setConvertOpen(true)}
+                  >
+                    转换为数值型…
+                  </button>
+                  <span className="text-[10px] text-[var(--color-text-tertiary)]">
+                    按标签名解析出数值（如「5人」→ 5）；不可逆，先看预览报告
+                  </span>
+                </div>
               </div>
             )}
           </div>
+          <ConvertPreviewDialog facetKey={facet.key} open={convertOpen} onClose={() => setConvertOpen(false)} onDone={(msg) => { onSaved(msg); onClose(); }} onError={onError} />
         </div>
       )}
     </Modal>
   );
 }
 
-/** W4-3 新建弹窗：2 个必填（名称 + 这类标签是什么）；key 自动生成，CJK 空串时明确提示 */
+/** V24（Phase 7-7）：tag → number 转换预览对话框 —— dry-run 报告全部展示；
+ *  冲突/歧义未清零时后端拒绝执行（不自动裁决，铁律 5），执行按钮只在这两类为空时可用。 */
+function ConvertPreviewDialog({ facetKey, open, onClose, onDone, onError }: {
+  facetKey: string;
+  open: boolean;
+  onClose: () => void;
+  onDone: (msg: string) => void;
+  onError: (msg: string) => void;
+}) {
+  const [report, setReport] = useState<ConversionReport | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [executing, setExecuting] = useState(false);
+
+  useEffect(() => {
+    if (!open) {
+      setReport(null);
+      return;
+    }
+    let alive = true;
+    setLoading(true);
+    convertFacetKind(facetKey, true)
+      .then((r) => { if (alive) setReport(r); })
+      .catch((e) => { if (alive) onError(e instanceof Error ? e.message : String(e)); onClose(); })
+      .finally(() => { if (alive) setLoading(false); });
+    return () => { alive = false; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, facetKey]);
+
+  const execute = async () => {
+    setExecuting(true);
+    try {
+      await convertFacetKind(facetKey, false);
+      onDone("已转换为数值型");
+    } catch (e) {
+      onError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setExecuting(false);
+    }
+  };
+
+  const blocked = (report?.conflicts.length ?? 0) > 0 || (report?.ambiguous.length ?? 0) > 0;
+
+  return (
+    <Modal
+      open={open}
+      title="转换为数值型 · 预览报告"
+      onClose={onClose}
+      footer={
+        <>
+          <Button onClick={onClose}>取消</Button>
+          <Button variant="primary" disabled={loading || executing || blocked} onClick={() => void execute()}>
+            {executing ? "转换中…" : blocked ? "存在冲突/歧义，先处理" : "确认转换"}
+          </Button>
+        </>
+      }
+    >
+      {loading || !report ? (
+        <p className="text-xs text-[var(--color-text-tertiary)]">解析标签名中…</p>
+      ) : (
+        <div className="flex max-h-96 flex-col gap-2 overflow-y-auto text-xs">
+          <p className="text-[var(--color-text-secondary)]">
+            可解析 {report.parsed.length} 条 · 歧义 {report.ambiguous.length} 条 · 不可解析 {report.unparseable.length} 条 · 冲突 {report.conflicts.length} 处
+          </p>
+          {report.parsed.length > 0 && (
+            <div>
+              <p className="font-medium">将写入的数值</p>
+              <ul className="ml-4 list-disc">{report.parsed.map((p) => <li key={p.tagId}>「{p.name}」→ {p.value}</li>)}</ul>
+            </div>
+          )}
+          {report.ambiguous.length > 0 && (
+            <div className="text-[var(--color-status-warning,--color-text)]">
+              <p className="font-medium">歧义（不自动取值 —— 请逐条改名后重试，或手工填值）</p>
+              <ul className="ml-4 list-disc">{report.ambiguous.map((a) => <li key={a.tagId}>「{a.name}」：{a.reason}</li>)}</ul>
+            </div>
+          )}
+          {report.unparseable.length > 0 && (
+            <div>
+              <p className="font-medium">不可解析（这些标签会丢失，原标签置为弃用）</p>
+              <ul className="ml-4 list-disc">{report.unparseable.map((u) => <li key={u.tagId}>「{u.name}」（{u.assetCount} 张素材）</li>)}</ul>
+            </div>
+          )}
+          {report.conflicts.length > 0 && (
+            <div className="text-[var(--color-danger)]">
+              <p className="font-medium">同素材多个数值冲突（系统不代选，需先在标签侧合并/改名）</p>
+              <ul className="ml-4 list-disc">
+                {report.conflicts.slice(0, 20).map((c) => (
+                  <li key={c.assetId}>素材 #{c.assetId}：{c.candidates.map(([, v, rs]) => `${v}（${rs}）`).join(" / ")}</li>
+                ))}
+              </ul>
+            </div>
+          )}
+          <p className="text-[10px] text-[var(--color-text-tertiary)]">
+            层级丢失 {report.hierarchyLoss} 条 · 别名丢弃 {report.aliasLoss} 条 · pending 建议将拒绝 {report.pendingRejected} 条。转换在单事务内执行，原标签置为弃用（不物理删）。
+          </p>
+        </div>
+      )}
+    </Modal>
+  );
+}
+
+/** W4-3 新建弹窗：2 个必填（名称 + 这类标签是什么）；key 自动生成。
+ *  P1-1：纯中文名 slugify 出空串不再硬报错 —— 自动补一个合法随机标识（facet_xxx），
+ *  用户仍可改；只有显式清空了自己输入过的标识才报错。 */
 function CreateFacetDialog({ group, onClose, onCreated }: {
   group: "ai" | "manual" | null;
   onClose: () => void;
@@ -589,9 +769,17 @@ function CreateFacetDialog({ group, onClose, onCreated }: {
   const [displayName, setDisplayName] = useState("");
   const [key, setKey] = useState("");
   const [keyTouched, setKeyTouched] = useState(false);
+  // 每次打开弹窗生成一次兜底 key，避免输入中文名时每敲一字都变
+  const [fallbackKey, setFallbackKey] = useState(() => genFacetFallbackKey());
   const [description, setDescription] = useState("");
   const [saving, setSaving] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  // V24（Phase 7-7）：类型第一项 —— 标签 / 数值；数值带值域配置（§6.7：类型在创建时定）
+  const [facetKind, setFacetKindSel] = useState<"tag" | "number">("tag");
+  const [numMin, setNumMin] = useState("");
+  const [numMax, setNumMax] = useState("");
+  const [numUnit, setNumUnit] = useState("");
+  const [numStep, setNumStep] = useState("1");
 
   useEffect(() => {
     if (group != null) {
@@ -600,17 +788,29 @@ function CreateFacetDialog({ group, onClose, onCreated }: {
       setKeyTouched(false);
       setDescription("");
       setErr(null);
+      setFallbackKey(genFacetFallbackKey());
+      setFacetKindSel("tag");
+      setNumMin("");
+      setNumMax("");
+      setNumUnit("");
+      setNumStep("1");
     }
   }, [group]);
 
-  const effectiveKey = keyTouched ? key : slugify(displayName);
-  const keyEmpty = effectiveKey.trim() === "";
+  // 用户没碰英文标识时：名称能 slugify 就用 slugify 结果，空（纯中文/符号）用随机兜底
+  const effectiveKey = keyTouched ? key : slugify(displayName) || fallbackKey;
+  // 只有「显式输入过又被清空」才拦（自动生成路径永远非空，不再硬报错）
+  const keyEmpty = keyTouched && effectiveKey.trim() === "";
+  const autoGenerated = !keyTouched;
 
   const submit = async () => {
     setErr(null);
     if (!displayName.trim()) return setErr("请填写分类名称");
     if (!description.trim()) return setErr("请填写「这类标签是什么」（它会成为给 AI 的提示词）");
-    if (keyEmpty) return setErr("请填写英文标识（中文名无法自动生成）");
+    if (keyEmpty) return setErr("英文标识不能为空");
+    if (facetKind === "number" && numMin !== "" && numMax !== "" && Number(numMin) > Number(numMax)) {
+      return setErr("数值下限不能大于上限");
+    }
     setSaving(true);
     try {
       await createTagFacet({
@@ -621,6 +821,16 @@ function CreateFacetDialog({ group, onClose, onCreated }: {
         maxItems: null,
         appliesTo: "all",
       });
+      // V24：数值分面第二落点 —— 新分面无标签，直接改型 + 配置（已有标签须走转换）
+      if (facetKind === "number") {
+        await setFacetKind(effectiveKey, "number", {
+          numMin: numMin === "" ? null : Number(numMin),
+          numMax: numMax === "" ? null : Number(numMax),
+          numUnit: numUnit.trim(),
+          numDecimals: 0,
+          numStep: Number(numStep) > 0 ? Number(numStep) : 1,
+        });
+      }
       // 新建默认 ai_and_manual；「只手工填写」组的按钮需要再改一次 input_mode
       if (group === "manual") {
         await updateTagFacet({
@@ -654,24 +864,55 @@ function CreateFacetDialog({ group, onClose, onCreated }: {
       }
     >
       <div className="flex flex-col gap-3">
+        {/* V24（Phase 7-7）：类型第一项（Cloudinary/Notion 惯例：类型在创建时定） */}
+        <fieldset className="flex flex-col gap-1 text-xs">
+          <legend className="mb-0.5">类型</legend>
+          <label className="flex items-center gap-1.5"><input type="radio" checked={facetKind === "tag"} onChange={() => setFacetKindSel("tag")} />标签（从词表选词）</label>
+          <label className="flex items-center gap-1.5">
+            <input type="radio" checked={facetKind === "number"} onChange={() => setFacetKindSel("number")} />数值（AI / 手工填一个数，如人数）
+          </label>
+          {facetKind === "number" && (
+            <div className="mt-1 flex flex-wrap items-center gap-2 rounded-md border border-[var(--color-border)] bg-[var(--color-surface)] p-2">
+              <label className="flex items-center gap-1 text-xs">下限
+                <input className="ui-control w-16 px-1 py-0.5" type="number" value={numMin} onChange={(e) => setNumMin(e.target.value)} placeholder="不限" aria-label="数值下限" />
+              </label>
+              <label className="flex items-center gap-1 text-xs">上限
+                <input className="ui-control w-16 px-1 py-0.5" type="number" value={numMax} onChange={(e) => setNumMax(e.target.value)} placeholder="不限" aria-label="数值上限" />
+              </label>
+              <label className="flex items-center gap-1 text-xs">单位
+                <input className="ui-control w-14 px-1 py-0.5" value={numUnit} onChange={(e) => setNumUnit(e.target.value)} placeholder="人" aria-label="数值单位" />
+              </label>
+              <label className="flex items-center gap-1 text-xs">步进
+                <input className="ui-control w-14 px-1 py-0.5" type="number" step="any" min="0" value={numStep} onChange={(e) => setNumStep(e.target.value)} aria-label="数值步进" />
+              </label>
+              <span className="text-[10px] text-[var(--color-text-tertiary)]">范围会同时约束 AI 输出与手工输入</span>
+            </div>
+          )}
+        </fieldset>
         <label className="flex flex-col gap-1 text-xs">
           分类名称（必填）
-          <input className="ui-control px-2 py-1.5 text-sm" placeholder="如「人物服装颜色」" value={displayName} onChange={(e) => setDisplayName(e.target.value)} aria-label="分类名称" />
+          <input className="ui-control px-2 py-1.5 text-sm" placeholder={facetKind === "number" ? "如「人数」" : "如「人物服装颜色」"} value={displayName} onChange={(e) => setDisplayName(e.target.value)} aria-label="分类名称" />
         </label>
         <label className="flex flex-col gap-1 text-xs">
-          这类标签是什么（必填）
-          <textarea className="ui-control min-h-20 px-2 py-1.5 text-sm" placeholder="如「人物服装的主色调」（这段话会原样给 AI 看）" value={description} onChange={(e) => setDescription(e.target.value)} aria-label="这类标签是什么" />
+          {facetKind === "number" ? "这个数值是什么（必填）" : "这类标签是什么（必填）"}
+          <textarea className="ui-control min-h-20 px-2 py-1.5 text-sm" placeholder={facetKind === "number" ? "如「画面中的人数」（这段话会原样给 AI 看）" : "如「人物服装的主色调」（这段话会原样给 AI 看）"} value={description} onChange={(e) => setDescription(e.target.value)} aria-label="这类标签是什么" />
         </label>
         <label className="flex flex-col gap-1 text-xs">
           英文标识
           <input
             className="ui-control px-2 py-1.5 text-sm"
-            placeholder={keyEmpty ? "请输入英文标识，如 clothing_color" : effectiveKey}
+            placeholder={keyEmpty ? "请输入英文标识，如 clothing_color" : ""}
             value={effectiveKey}
             onChange={(e) => { setKey(slugify(e.target.value)); setKeyTouched(true); }}
             aria-label="英文标识"
           />
-          <span className="text-[10px] text-[var(--color-text-tertiary)]">⚠ 创建后不可修改，只能删除</span>
+          {autoGenerated ? (
+            <span className="text-[10px] text-[var(--color-text-tertiary)]">
+              {slugify(displayName) ? "自动从名称生成，可修改" : "中文名无法转英文，已自动生成随机标识，可修改"} · 创建后不可修改
+            </span>
+          ) : (
+            <span className="text-[10px] text-[var(--color-text-tertiary)]">⚠ 创建后不可修改，只能删除</span>
+          )}
         </label>
         {err && <p className="text-xs text-[var(--color-danger)]">{err}</p>}
       </div>

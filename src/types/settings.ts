@@ -35,6 +35,13 @@ export interface AiSettings {
   systemPromptSearch: string;
   /** 一键安装的下载源偏好（"auto" = 测速选最快；旧数据缺省视为 auto） */
   ollamaSourceId: string;
+  // ── A4 置信度策略（与 Rust AiSettings 逐字对应；缺省 = 指导书默认）──
+  /** 精确命中词表 canonical/synonym → 自动接收（写 asset_tags，review_state='ai_unreviewed'） */
+  autoAcceptExactTerms: boolean;
+  /** AI 直接向词表添加新标签（显式开关，默认关 —— 新词走「新词待确认」逐个采纳） */
+  autoAdoptNewTerms: boolean;
+  /** AI 建议最低置信度阈值：confidence < 此值不入库（连 pending 都不进）；默认 0.30 */
+  confidenceMinSuggest: number;
 }
 
 /** 标签分类（PRD 5.5，已弃用）：旧 name/机器协议，仅作迁移输入 */

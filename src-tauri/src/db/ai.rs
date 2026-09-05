@@ -28,8 +28,172 @@ pub struct TagProposal {
 pub struct AnalysisResult {
     pub description: String,
     pub proposals: Vec<TagProposal>,
+    /// V24（§6.3④）：数值分面提议（平行字段，不改 CategorizedTags 形状）
+    #[serde(default)]
+    pub numbers: Vec<NumberProposal>,
     #[serde(default)]
     pub warnings: Vec<String>,
+}
+
+/// V24（§6.3④）：数值提议 —— AI 对数值分面的单条建议。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct NumberProposal {
+    /// 已过 resolve_facet_key 归一的分面 key
+    pub facet_key: String,
+    /// 模型原始输出（"5" / "5人" / "大约5"）
+    pub raw_text: String,
+    /// 解析并按 num_min/num_max 校验后的值
+    pub value: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f32>,
+}
+
+/// V24（§6.5）：数值解析三态 —— 不变量 11：有歧义绝不静默取首个数字。
+#[derive(Debug, Clone, PartialEq)]
+pub enum NumberParse {
+    /// 无歧义单值 → 可落建议
+    Value(f64),
+    /// 有歧义 → 进 pending / 转换预览「待确认」桶
+    Ambiguous { reason: String },
+    /// 完全没有数字
+    None,
+}
+
+/// 约数限定词表（§6.5「数值解析的严格规则」）
+const APPROX_WORDS: &[&str] = &["约", "大约", "左右", "上下", "approximately", "approx"];
+/// 比较式限定词表
+const COMPARISON_WORDS: &[&str] = &["不少于", "不多于", "不超过", "超过", "以上", "以下", "至少", "最多", "大于", "小于", "多于", "少于"];
+
+/// 提取文本中的全部数字 token（支持整数/小数/负号）。
+fn extract_number_tokens(text: &str) -> Vec<f64> {
+    let mut out = Vec::new();
+    let lower = text.to_lowercase();
+    let bytes: Vec<char> = lower.chars().collect();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c.is_ascii_digit() || (c == '-' && i + 1 < bytes.len() && bytes[i + 1].is_ascii_digit()) {
+            let start = i;
+            let mut seen_dot = false;
+            let mut j = i + 1;
+            while j < bytes.len() {
+                let d = bytes[j];
+                if d.is_ascii_digit() {
+                    j += 1;
+                } else if d == '.' && !seen_dot && j + 1 < bytes.len() && bytes[j + 1].is_ascii_digit() {
+                    seen_dot = true;
+                    j += 1;
+                } else {
+                    break;
+                }
+            }
+            let s: String = bytes[start..j].iter().collect();
+            if let Ok(v) = s.parse::<f64>() {
+                out.push(v);
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// V24（§6.5）：数值解析严格规则 —— 同一函数同时服务 AI 落建议与 tag→number 转换预览。
+///
+/// | 输入 | 结果 |
+/// |---|---|
+/// | `"5"` `"5.0"` `"05"` | `Value(5.0)`（归一一致） |
+/// | `"5人"` `"5 人"` `"人数5"` | `Value(5.0)`（恰好一个数字 token + 纯标签性文字） |
+/// | `"-3"` | `Value(-3.0)`（负数合法；越界由 num_min/max 判） |
+/// | `"5~6"` `"5-6"` `"5 到 6"` | `Ambiguous("范围")` |
+/// | `"约5"` `"大约 5"` `"5左右"` | `Ambiguous("约数")` |
+/// | `"不少于5"` `"超过5"` | `Ambiguous("比较式")` |
+/// | `"3或4"` `"3、4"` | `Ambiguous("多值")` |
+/// | `"很多"` | `None` |
+pub fn parse_number_proposal(raw: &str) -> NumberParse {
+    let s = raw.trim();
+    if s.is_empty() {
+        return NumberParse::None;
+    }
+    let lower = s.to_lowercase();
+    // ① 比较式（先判，避免「以上」等词被当普通文字）
+    if COMPARISON_WORDS.iter().any(|w| lower.contains(w)) {
+        return NumberParse::Ambiguous { reason: "比较式".into() };
+    }
+    // ② 约数
+    if APPROX_WORDS.iter().any(|w| lower.contains(w)) {
+        return NumberParse::Ambiguous { reason: "约数".into() };
+    }
+    // ③ 范围：数字间夹着范围符号/范围词（「5~6」「5-6」「5 到 6」「5至6」「5—6」「5~ 6」）
+    let tokens = extract_number_tokens(s);
+    if tokens.len() >= 2 {
+        // 两个以上数字 token 一定多值；两个则看中间是否范围词
+        let range_words = ["~", "～", "—", "–", "到", "至", "-"];
+        let between: String = {
+            // 取第一个数字末尾到第二个数字开头之间的片段
+            let chars: Vec<char> = s.chars().collect();
+            let mut first_end = 0usize;
+            let mut idx = 0usize;
+            let mut found = 0usize;
+            while idx < chars.len() {
+                let c = chars[idx];
+                if c.is_ascii_digit() && found == 0 {
+                    let mut j = idx;
+                    while j < chars.len() && (chars[j].is_ascii_digit() || chars[j] == '.') {
+                        j += 1;
+                    }
+                    first_end = j;
+                    found += 1;
+                    idx = j;
+                    continue;
+                }
+                if c.is_ascii_digit() && found >= 1 {
+                    let mut seg = String::new();
+                    for ch in &chars[first_end..idx] {
+                        seg.push(*ch);
+                    }
+                    if range_words.iter().any(|w| seg.trim().contains(w)) {
+                        return NumberParse::Ambiguous { reason: "范围".into() };
+                    }
+                    break;
+                }
+                idx += 1;
+            }
+            String::new()
+        };
+        let _ = between;
+        return NumberParse::Ambiguous { reason: "多值".into() };
+    }
+    // ④ 单数字 + 剩余文字必须是纯标签性文字（字母数字中文，不含其他数字 —— 已由 tokens.len()==1 保证）
+    if tokens.len() == 1 {
+        // 剩余文字允许：中文/字母/空格/单位（数字已剥离）；只要不含范围/歧义符号即可
+        return NumberParse::Value(tokens[0]);
+    }
+    NumberParse::None
+}
+
+/// V24：按分面配置校验值域（越界 → Ambiguous「超出范围」，绝不裁到边界）。
+pub fn validate_number_in_range(value: f64, num_min: Option<f64>, num_max: Option<f64>) -> NumberParse {
+    if !value.is_finite() {
+        return NumberParse::Ambiguous { reason: "超出范围".into() };
+    }
+    if let Some(lo) = num_min {
+        if value < lo {
+            return NumberParse::Ambiguous {
+                reason: format!("超出范围 {}–{}", num_min.map(|v| v.to_string()).unwrap_or_else(|| "−∞".into()), num_max.map(|v| v.to_string()).unwrap_or_else(|| "+∞".into())),
+            };
+        }
+    }
+    if let Some(hi) = num_max {
+        if value > hi {
+            return NumberParse::Ambiguous {
+                reason: format!("超出范围 {}–{}", num_min.map(|v| v.to_string()).unwrap_or_else(|| "−∞".into()), num_max.map(|v| v.to_string()).unwrap_or_else(|| "+∞".into())),
+            };
+        }
+    }
+    NumberParse::Value(value)
 }
 
 /// A1：AnalysisResult → 传统 CategorizedTags（描述 + 标签树）。
@@ -240,6 +404,8 @@ pub fn create_batch_with_retag(
     //（ai_reviewed/manual 永不触碰，铁律 10 由 asset_tags::retag_clear_unreviewed 守卫）
     if retag == RetagMode::ReplaceAiOnly {
         asset_tags::retag_clear_unreviewed(&tx, &effective_ids)?;
+        // V24（§6.4）：数值同步重跑 —— manual / ai_reviewed 数值行保留
+        crate::db::facet_numbers::retag_clear_unreviewed_numbers(&tx, &effective_ids)?;
     }
     tx.commit()?;
     let mut batch = get_batch(conn, batch_id)?;
@@ -556,6 +722,20 @@ pub fn set_suggestion_result_policy(
     Ok(())
 }
 
+/// A4 + V24：数值提议落库（§6.4）—— 建议项写入后追加 item_kind='number' 的条目。
+/// 解析（含歧义进 pending）与越界校验收口在 facet_numbers::record_number_proposals。
+pub fn record_number_proposals_for_suggestion(
+    conn: &Connection,
+    id: i64,
+    numbers: &[NumberProposal],
+) -> AppResult<Vec<String>> {
+    let pairs: Vec<(String, String)> = numbers
+        .iter()
+        .map(|n| (n.facet_key.clone(), n.raw_text.clone()))
+        .collect();
+    crate::db::facet_numbers::record_number_proposals(conn, id, &pairs)
+}
+
 /// A2：逐字写模型原始返回 + AnalysisResult 序列化（溯源；analysis_schema_version 恒 1，
 /// 旧行/旧版本默认 1，schema_version_allows_old_data 守护兼容）。
 pub fn set_suggestion_provenance(
@@ -616,6 +796,12 @@ pub struct AiSuggestionItem {
     pub decision: String,
     pub decision_reason: Option<String>,
     pub created_at: i64,
+    /// V24（§6.3③）：tag | number（数值建议项）
+    #[serde(default)]
+    pub item_kind: String,
+    /// V24：item_kind='number' 时为确认值；歧义项为 NULL（需人工填数）
+    #[serde(default)]
+    pub num_value: Option<f64>,
 }
 
 fn suggestion_from_row(r: &rusqlite::Row) -> rusqlite::Result<AiSuggestion> {
@@ -661,7 +847,7 @@ pub fn list_suggestion_items(
 ) -> AppResult<Vec<AiSuggestionItem>> {
     let mut stmt = conn.prepare(
         "SELECT id, suggestion_id, facet_key, raw_name, normalized_name, tag_id,
-                confidence, decision, decision_reason, created_at
+                confidence, decision, decision_reason, created_at, item_kind, num_value
            FROM ai_suggestion_items
           WHERE suggestion_id = ?1 ORDER BY id",
     )?;
@@ -678,6 +864,8 @@ pub fn list_suggestion_items(
                 decision: r.get(7)?,
                 decision_reason: r.get(8)?,
                 created_at: r.get(9)?,
+                item_kind: r.get(10)?,
+                num_value: r.get(11)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -689,7 +877,7 @@ pub fn list_suggestion_items(
 pub fn list_new_word_candidates(conn: &Connection) -> AppResult<Vec<AiSuggestionItem>> {
     let mut stmt = conn.prepare(
         "SELECT id, suggestion_id, facet_key, raw_name, normalized_name, tag_id,
-                confidence, decision, decision_reason, created_at
+                confidence, decision, decision_reason, created_at, item_kind, num_value
            FROM ai_suggestion_items
           WHERE decision = 'pending' AND tag_id IS NULL
           ORDER BY created_at DESC, id",
@@ -707,6 +895,8 @@ pub fn list_new_word_candidates(conn: &Connection) -> AppResult<Vec<AiSuggestion
                 decision: r.get(7)?,
                 decision_reason: r.get(8)?,
                 created_at: r.get(9)?,
+                item_kind: r.get(10)?,
+                num_value: r.get(11)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -736,6 +926,35 @@ pub fn decide_suggestion_item(
 ) -> AppResult<()> {
     if !matches!(decision, "accepted" | "modified" | "rejected") {
         return Err(crate::error::AppError::msg("无效的候选决策"));
+    }
+    // V24（§6.4）：数值建议项分流 —— accepted 写 asset_facet_numbers（confirm_number_item
+    // 内含不变量 10 守卫）；rejected 仅置决策。modified 对数值无意义（用户在打标台就地改值）。
+    {
+        let kind: String = conn.query_row(
+            "SELECT item_kind FROM ai_suggestion_items WHERE id = ?1",
+            [item_id],
+            |r| r.get(0),
+        )?;
+        if kind == "number" {
+            return match decision {
+                "accepted" => {
+                    if let Some(warn) = crate::db::facet_numbers::confirm_number_item(conn, item_id)? {
+                        tracing::info!("数值建议确认跳过：{warn}");
+                    }
+                    Ok(())
+                }
+                "rejected" => {
+                    conn.execute(
+                        "UPDATE ai_suggestion_items SET decision='rejected', decision_reason=COALESCE(?2, '用户拒绝') WHERE id=?1",
+                        rusqlite::params![item_id, reason],
+                    )?;
+                    Ok(())
+                }
+                _ => Err(crate::error::AppError::msg(
+                    "数值建议不支持「修改」——请手工赋值或拒绝",
+                )),
+            };
+        }
     }
     let tx = conn.unchecked_transaction()?;
     let (facet_key, current_tag_id, raw_name): (String, Option<i64>, String) = tx.query_row(
@@ -897,6 +1116,15 @@ fn confirm_suggestion_inner(
         if item.decision != "pending" {
             continue;
         }
+        // V24（§6.4 确认分流）：数值项不走标签配对 —— 写 asset_facet_numbers
+        //（不变量 10 守卫在 confirm_number_item：manual/ai_reviewed 跳过并记 warning）。
+        // 歧义项（num_value=NULL）确认会报「需人工填数」→ 保持 pending，不阻塞整条建议。
+        if item.item_kind == "number" {
+            if let Err(e) = crate::db::facet_numbers::confirm_number_item(conn, item.id) {
+                tracing::info!("数值建议保持待确认：{e}");
+            }
+            continue;
+        }
         if let Some((_, _, tag_id)) = final_pairs.iter().find(|(facet, normalized, _)| {
             facet == &item.facet_key && normalized == &item.normalized_name
         }) {
@@ -1041,4 +1269,121 @@ pub fn confirm_all_pending(conn: &Connection, batch_id: i64) -> AppResult<()> {
     }
     tx.commit()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod number_tests {
+    use super::*;
+
+    // ═══════════ Phase 6 · §6.5 数值解析严格规则（8 条） ═══════════
+
+    #[test]
+    fn number_parse_accepts_unambiguous_single_value() {
+        assert_eq!(parse_number_proposal("5"), NumberParse::Value(5.0));
+        assert_eq!(parse_number_proposal("5人"), NumberParse::Value(5.0));
+        assert_eq!(parse_number_proposal("5 人"), NumberParse::Value(5.0));
+        assert_eq!(parse_number_proposal("人数5"), NumberParse::Value(5.0));
+        assert_eq!(parse_number_proposal(" -3 "), NumberParse::Value(-3.0));
+    }
+
+    #[test]
+    fn number_parse_rejects_range_forms() {
+        for s in ["5~6", "5-6", "5 到 6", "5至6", "5～6", "5—6"] {
+            assert_eq!(
+                parse_number_proposal(s),
+                NumberParse::Ambiguous { reason: "范围".into() },
+                "范围「{s}」不得静默取首个数字"
+            );
+        }
+    }
+
+    #[test]
+    fn number_parse_rejects_approximation_words() {
+        for s in ["约5", "大约 5", "5左右", "5上下", "approximately 5"] {
+            assert_eq!(
+                parse_number_proposal(s),
+                NumberParse::Ambiguous { reason: "约数".into() },
+                "约数「{s}」必须进 pending"
+            );
+        }
+    }
+
+    #[test]
+    fn number_parse_rejects_comparison_words() {
+        for s in ["不少于5", "不多于5", "超过5", "5以上", "5以下", "至少5", "最多5", "大于5", "小于5"] {
+            assert_eq!(
+                parse_number_proposal(s),
+                NumberParse::Ambiguous { reason: "比较式".into() },
+                "比较式「{s}」必须进 pending"
+            );
+        }
+    }
+
+    #[test]
+    fn number_parse_rejects_multiple_numbers() {
+        for s in ["3或4", "3、4", "3 个或 4 个"] {
+            assert_eq!(
+                parse_number_proposal(s),
+                NumberParse::Ambiguous { reason: "多值".into() },
+                "多值「{s}」不得自动裁决"
+            );
+        }
+    }
+
+    #[test]
+    fn number_parse_rejects_nan_inf_and_out_of_range() {
+        // NaN / Infinity 在解析层就进不了 Value（无数字 token 或非有限值）
+        assert_eq!(parse_number_proposal("NaN"), NumberParse::None);
+        assert_eq!(parse_number_proposal("很多"), NumberParse::None);
+        assert_eq!(parse_number_proposal("一群人"), NumberParse::None);
+        // 非有限值与越界由 validate_number_in_range 拒绝（绝不裁到边界）
+        assert_eq!(
+            validate_number_in_range(f64::NAN, Some(0.0), Some(50.0)),
+            NumberParse::Ambiguous { reason: "超出范围".into() }
+        );
+        assert_eq!(
+            validate_number_in_range(f64::INFINITY, Some(0.0), Some(50.0)),
+            NumberParse::Ambiguous { reason: "超出范围".into() }
+        );
+        assert_eq!(
+            validate_number_in_range(51.0, Some(0.0), Some(50.0)),
+            NumberParse::Ambiguous { reason: "超出范围 0–50".into() }
+        );
+        assert_eq!(
+            validate_number_in_range(-1.0, Some(0.0), Some(50.0)),
+            NumberParse::Ambiguous { reason: "超出范围 0–50".into() }
+        );
+        assert_eq!(validate_number_in_range(50.0, Some(0.0), Some(50.0)), NumberParse::Value(50.0));
+    }
+
+    #[test]
+    fn ai_ambiguous_number_goes_to_pending_not_value() {
+        // 三态处置表：AI 落建议路径 Value→落值；Ambiguous→num_value=NULL + decision_reason；None→丢弃。
+        // 本测试锁解析函数的处置输入：模糊输出不能产出 Value（调用方据此写 pending）。
+        let ambiguous_inputs = ["5~6", "约5", "不少于5", "3或4"];
+        for s in ambiguous_inputs {
+            assert!(
+                !matches!(parse_number_proposal(s), NumberParse::Value(_)),
+                "「{s}」绝不能解析为可落库的值"
+            );
+        }
+    }
+
+    #[test]
+    fn five_and_five_point_zero_normalize_equal() {
+        // "5" / "5.0" / "05" / "5人" 归一为同一个值（PK 上唯一）
+        let a = parse_number_proposal("5");
+        let b = parse_number_proposal("5.0");
+        let c = parse_number_proposal("05");
+        let d = parse_number_proposal("5人");
+        match (a, b, c, d) {
+            (NumberParse::Value(x), NumberParse::Value(y), NumberParse::Value(z), NumberParse::Value(w)) => {
+                assert_eq!(x, 5.0);
+                assert_eq!(y, 5.0);
+                assert_eq!(z, 5.0);
+                assert_eq!(w, 5.0);
+            }
+            other => panic!("四者都应解析为 Value(5.0)：{other:?}"),
+        }
+    }
 }

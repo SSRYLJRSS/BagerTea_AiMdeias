@@ -367,6 +367,8 @@ pub fn apply_tag_constraints(state: State<AppState>) -> AppResult<()> {
         ] {
             crate::db::schema_features::set_feature(&conn, feature, true, None)?;
         }
+        // P0-4：gate 已开 → FTS 别名词源切到 tag_terms（set_feature 之后重建才读到开关）
+        crate::db::migrations::rebuild_fts_triggers_for_gated_terms(&conn)?;
     }
     state.refresh_schema_features();
     Ok(())
@@ -380,4 +382,94 @@ pub fn check_terms_facet_consistency(
     let conn = lock_db(&state)?;
     let report = crate::db::tags::detect_tag_conflicts(&conn)?;
     Ok(report.facet_mismatches)
+}
+
+// ═══════════════ V24（Phase 7-3/7-6）：数值分面命令 ═══════════════
+
+/// 手工赋值（§6.4）：source='manual'，review_state='manual'，同源扇出到 kinship 兄弟。
+#[tauri::command]
+pub fn set_facet_number(
+    state: State<AppState>,
+    asset_ids: Vec<i64>,
+    facet_key: String,
+    value: f64,
+) -> AppResult<()> {
+    let conn = lock_db(&state)?;
+    crate::db::facet_numbers::set_facet_number(&conn, &asset_ids, &facet_key, value)
+}
+
+/// 手工清值（同源扇出对称删除）。
+#[tauri::command]
+pub fn clear_facet_number(
+    state: State<AppState>,
+    asset_ids: Vec<i64>,
+    facet_key: String,
+) -> AppResult<()> {
+    let conn = lock_db(&state)?;
+    crate::db::facet_numbers::clear_facet_number(&conn, &asset_ids, &facet_key)
+}
+
+/// 读单素材某分面的数值（ViewerTagBar / 打标台回显）。
+#[tauri::command]
+pub fn get_facet_number(
+    state: State<AppState>,
+    asset_id: i64,
+    facet_key: String,
+) -> AppResult<Option<crate::db::facet_numbers::FacetNumber>> {
+    let conn = lock_db(&state)?;
+    crate::db::facet_numbers::get_number(&conn, asset_id, &facet_key)
+}
+
+/// 批量读多素材某分面的数值（网格/打标台列表一次拉取）。
+#[tauri::command]
+pub fn get_facet_numbers(
+    state: State<AppState>,
+    asset_ids: Vec<i64>,
+    facet_key: String,
+) -> AppResult<Vec<crate::db::facet_numbers::FacetNumber>> {
+    let conn = lock_db(&state)?;
+    let mut out = Vec::new();
+    for aid in asset_ids {
+        if let Some(n) = crate::db::facet_numbers::get_number(&conn, aid, &facet_key)? {
+            out.push(n);
+        }
+    }
+    Ok(out)
+}
+
+/// tag → number 转换：dry_run=true 只出预览报告（一行不写）；false 执行（单事务，
+/// 冲突/歧义未清空时拒绝执行 —— 不自动裁决，铁律 5）。
+#[tauri::command]
+pub fn convert_facet_kind(
+    state: State<AppState>,
+    key: String,
+    dry_run: bool,
+) -> AppResult<crate::db::facet_numbers::ConversionReport> {
+    let conn = lock_db(&state)?;
+    crate::db::facet_numbers::convert_facet_kind_execute(&conn, &key, dry_run)
+}
+
+/// V24（Phase 7-7）：分面类型设置（number→tag 禁止；已有标签的 tag→number 须走转换预览）。
+#[tauri::command]
+pub fn set_facet_kind(
+    state: State<AppState>,
+    key: String,
+    kind: String,
+    num_min: Option<f64>,
+    num_max: Option<f64>,
+    num_unit: Option<String>,
+    num_decimals: Option<i64>,
+    num_step: Option<f64>,
+) -> AppResult<crate::db::tag_facets::TagFacet> {
+    let conn = lock_db(&state)?;
+    crate::db::tag_facets::set_facet_kind(
+        &conn,
+        &key,
+        &kind,
+        num_min,
+        num_max,
+        num_unit.as_deref().unwrap_or(""),
+        num_decimals.unwrap_or(0),
+        num_step.unwrap_or(1.0),
+    )
 }

@@ -23,6 +23,9 @@ function mkSettings(): Settings {
       ollamaSourceId: "auto",
       systemPromptTagging: "",
       systemPromptSearch: "",
+      autoAcceptExactTerms: true,
+      autoAdoptNewTerms: false,
+      confidenceMinSuggest: 0.3,
     },
     theme: "system",
     thumbnailCacheMb: 2048,
@@ -65,7 +68,7 @@ vi.mock("@/api/thumbnail", () => ({
 }));
 vi.mock("@/api/settings", () => ({
   getSettings: vi.fn().mockResolvedValue({
-    ai: { profiles: [], activeProfile: "", videoTagging: false, batchLimit: 500, systemPromptTagging: "", systemPromptSearch: "", ollamaSourceId: "auto" },
+    ai: { profiles: [], activeProfile: "", videoTagging: false, batchLimit: 500, systemPromptTagging: "", systemPromptSearch: "", ollamaSourceId: "auto", autoAcceptExactTerms: true, autoAdoptNewTerms: false, confidenceMinSuggest: 0.3 },
     theme: "system",
     thumbnailCacheMb: 2048,
     tagCategories: [],

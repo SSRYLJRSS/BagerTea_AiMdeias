@@ -706,6 +706,24 @@ pub fn list(conn: &Connection, filter: &AssetFilter) -> AppResult<AssetPage> {
     })
 }
 
+/// Phase 2：按 id 列表取素材并保持传入顺序 + 回填标签（plan 执行分页用，
+/// plan 的排序由 SQL 决定，这里不再 ORDER BY —— 只按 ids 原序重排）。
+pub(crate) fn by_ids_ordered(conn: &Connection, ids: &[i64]) -> AppResult<Vec<Asset>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let sql = format!("SELECT {COLUMNS} FROM assets a WHERE a.id IN ({placeholders})");
+    let mut stmt = conn.prepare(&sql)?;
+    let mut items: Vec<Asset> = stmt
+        .query_map(rusqlite::params_from_iter(ids.iter()), from_row)?
+        .collect::<Result<Vec<_>, _>>()?;
+    let pos: std::collections::HashMap<i64, usize> = ids.iter().enumerate().map(|(i, &id)| (id, i)).collect();
+    items.sort_by_key(|a| pos.get(&a.id).copied().unwrap_or(usize::MAX));
+    fill_tags(conn, &mut items)?;
+    Ok(items)
+}
+
 fn metadata_items(
     conn: &Connection,
     value_expr: &str,

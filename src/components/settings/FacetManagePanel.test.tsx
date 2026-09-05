@@ -4,7 +4,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { render, screen, waitFor, fireEvent } from "@testing-library/react";
 import FacetManagePanel from "@/components/settings/FacetManagePanel";
-import { listAllTagFacets, createTagFacet, updateTagFacet, deleteTagFacet, getTagFacetImpact, restoreTagFacet } from "@/api/tags";
+import { listAllTagFacets, createTagFacet, updateTagFacet, deleteTagFacet, getTagFacetImpact, restoreTagFacet, setFacetKind, convertFacetKind, type ConversionReport } from "@/api/tags";
 import type { TagFacet } from "@/types/tag";
 import type { Settings } from "@/types/settings";
 
@@ -18,6 +18,8 @@ vi.mock("@/api/tags", () => ({
   restoreTagFacet: vi.fn().mockResolvedValue(undefined),
   getTagFacetImpact: vi.fn().mockResolvedValue({ tagCount: 2, assetCount: 3, aiSuggestionItemCount: 0, tagOpCount: 0 }),
   listContentDescriptions: vi.fn().mockResolvedValue([]),
+  setFacetKind: vi.fn().mockResolvedValue(undefined),
+  convertFacetKind: vi.fn().mockResolvedValue(undefined),
 }));
 
 /** 页面草稿（提示词编辑进 draft，由「保存设置」统一落库） */
@@ -32,6 +34,9 @@ const mkDraft = (over: Partial<Settings["ai"]> = {}): Settings => ({
     systemPromptTagging: "",
     systemPromptSearch: "",
     ollamaSourceId: "auto",
+    autoAcceptExactTerms: true,
+    autoAdoptNewTerms: false,
+    confidenceMinSuggest: 0.3,
     ...over,
   },
   theme: "system",
@@ -118,23 +123,42 @@ describe("W4 facetManagePanel_two_groups", () => {
     );
   });
 
-  it("新建弹窗：2 个必填；CJK 名称自动 key 为空时提示输入英文标识", async () => {
+  it("新建弹窗：2 个必填；纯中文名 slugify 空串时自动生成合法随机标识并创建成功（不再硬报错）", async () => {
     vi.mocked(listAllTagFacets).mockResolvedValue([facet()]);
     vi.mocked(createTagFacet).mockResolvedValue(facet());
     renderPanel();
     await waitFor(() => expect(screen.getByText("衣服颜色")).toBeInTheDocument());
     fireEvent.click(screen.getAllByRole("button", { name: "+ 新增分类" })[0]);
-    // 中文名（slugify 产出空）+ 描述都填 → 报错要求英文标识
+    // 中文名（slugify 产出空）+ 描述都填 → 不报错，直接创建成功（key 用自动兜底 facet_xxx）
     fireEvent.change(screen.getByLabelText("分类名称"), { target: { value: "人物服装颜色" } });
     fireEvent.change(screen.getByLabelText("这类标签是什么"), { target: { value: "人物服装的主色调" } });
     fireEvent.click(screen.getByRole("button", { name: "创建" }));
-    expect(await screen.findByText(/请填写英文标识/)).toBeInTheDocument();
-    // 补英文标识 → 创建成功
-    fireEvent.change(screen.getByLabelText("英文标识"), { target: { value: "clothing_color" } });
-    fireEvent.click(screen.getByRole("button", { name: "创建" }));
     await waitFor(() =>
-      expect(createTagFacet).toHaveBeenCalledWith(expect.objectContaining({ key: "clothing_color", displayName: "人物服装颜色" })),
+      expect(createTagFacet).toHaveBeenCalledWith(
+        expect.objectContaining({
+          displayName: "人物服装颜色",
+          key: expect.stringMatching(/^facet_[a-z0-9]+$/),
+        }),
+      ),
     );
+    expect(screen.queryByText(/请填写英文标识/)).not.toBeInTheDocument();
+  });
+
+  it("新建弹窗：用户可改自动 key；显式清空自己输入的标识才报错", async () => {
+    vi.mocked(listAllTagFacets).mockResolvedValue([facet()]);
+    vi.mocked(createTagFacet).mockResolvedValue(facet());
+    renderPanel();
+    await waitFor(() => expect(screen.getByText("衣服颜色")).toBeInTheDocument());
+    fireEvent.click(screen.getAllByRole("button", { name: "+ 新增分类" })[0]);
+    fireEvent.change(screen.getByLabelText("分类名称"), { target: { value: "人物服装颜色" } });
+    fireEvent.change(screen.getByLabelText("这类标签是什么"), { target: { value: "人物服装的主色调" } });
+    // 覆盖自动 key
+    fireEvent.change(screen.getByLabelText("英文标识"), { target: { value: "clothing_color" } });
+    // 又清空 → 明确报错
+    fireEvent.change(screen.getByLabelText("英文标识"), { target: { value: "" } });
+    fireEvent.click(screen.getByRole("button", { name: "创建" }));
+    expect(await screen.findByText(/英文标识不能为空/)).toBeInTheDocument();
+    expect(createTagFacet).not.toHaveBeenCalled();
   });
 
   it("删除确认：显示精确影响数字；输入分类名后才能确认删除", async () => {
@@ -195,5 +219,77 @@ describe("W4 facetManagePanel_two_groups", () => {
     expect(onPatchAi).toHaveBeenCalledWith({ systemPromptTagging: "你是素材打标助手" });
     fireEvent.change(search, { target: { value: "你是搜索助手" } });
     expect(onPatchAi).toHaveBeenCalledWith({ systemPromptSearch: "你是搜索助手" });
+  });
+});
+
+// ═══════════════ V24（Phase 7-7）：数值分面类型驱动表单 + 转换预览 ═══════════════
+
+describe("V24 facetManagePanel_number_facet_form", () => {
+  it("新建弹窗类型第一项：选「数值」→ 值域配置出现；创建后调用 setFacetKind 写类型与配置", async () => {
+    vi.mocked(listAllTagFacets).mockResolvedValue([facet()]);
+    vi.mocked(createTagFacet).mockResolvedValue(facet());
+    vi.mocked(setFacetKind).mockResolvedValue(facet());
+    renderPanel();
+    await waitFor(() => expect(screen.getByText("衣服颜色")).toBeInTheDocument());
+    fireEvent.click(screen.getAllByRole("button", { name: "+ 新增分类" })[0]);
+    expect(await screen.findByText("类型")).toBeTruthy();
+
+    // 选「数值」→ 值域配置出现
+    const numberRadio = screen.getByLabelText(/数值（AI \/ 手工填一个数/);
+    fireEvent.click(numberRadio);
+    expect(screen.getByLabelText("数值下限")).toBeTruthy();
+    fireEvent.change(screen.getByLabelText("数值下限"), { target: { value: "0" } });
+    fireEvent.change(screen.getByLabelText("数值上限"), { target: { value: "50" } });
+    fireEvent.change(screen.getByLabelText("数值单位"), { target: { value: "人" } });
+    fireEvent.change(screen.getByLabelText("分类名称"), { target: { value: "人数" } });
+    fireEvent.change(screen.getByLabelText("这类标签是什么"), { target: { value: "画面中的人数" } });
+
+    fireEvent.click(screen.getByRole("button", { name: "创建" }));
+    await waitFor(() => expect(setFacetKind).toHaveBeenCalled());
+    expect(setFacetKind).toHaveBeenCalledWith(
+      expect.stringMatching(/^facet_[a-z0-9]+$/),
+      "number",
+      expect.objectContaining({ numMin: 0, numMax: 50, numUnit: "人" }),
+    );
+  });
+
+  it("编辑数值分面：显示数值配置区（不可改回标签）；保存同步 setFacetKind", async () => {
+    const numberFacet = facet({ key: "people_count", displayName: "人数", facetKind: "number", numMin: 0, numMax: 50, numUnit: "人", numStep: 1 });
+    vi.mocked(listAllTagFacets).mockResolvedValue([numberFacet]);
+    vi.mocked(setFacetKind).mockResolvedValue(numberFacet);
+    renderPanel();
+    await screen.findByText("人数");
+    fireEvent.click(screen.getAllByRole("button", { name: "编辑" })[0]);
+    expect(await screen.findByText(/数值型不可改回标签型/)).toBeTruthy();
+    fireEvent.change(screen.getByLabelText("数值上限"), { target: { value: "99" } });
+    fireEvent.click(screen.getByRole("button", { name: "保存" }));
+    await waitFor(() => expect(setFacetKind).toHaveBeenCalledWith("people_count", "number", expect.objectContaining({ numMax: 99, numUnit: "人" })));
+  });
+
+  it("转换为数值型：先 dry-run 预览分桶；存在冲突/歧义时执行按钮禁用（不自动裁决）", async () => {
+    const report: ConversionReport = {
+      facetKey: "clothing_color",
+      parsed: [{ tagId: 1, name: "5", value: 5 }],
+      ambiguous: [{ tagId: 2, name: "约5", reason: "约数" }],
+      unparseable: [{ tagId: 3, name: "很多", assetCount: 2 }],
+      conflicts: [{ assetId: 9, candidates: [[1, 5, "manual"], [2, 6, "ai_unreviewed"]] }],
+      hierarchyLoss: 0,
+      aliasLoss: 1,
+      pendingRejected: 0,
+    };
+    const numberFacet = facet({ key: "people_count", displayName: "人数", facetKind: "number" });
+    vi.mocked(listAllTagFacets).mockResolvedValue([facet(), numberFacet]);
+    vi.mocked(convertFacetKind).mockResolvedValue(report);
+    renderPanel();
+    await screen.findByText("衣服颜色");
+    fireEvent.click(screen.getAllByRole("button", { name: "编辑" })[0]);
+    fireEvent.click(await screen.findByRole("button", { name: /高级/ }));
+    fireEvent.click(await screen.findByText("转换为数值型…"));
+    expect(await screen.findByText("转换为数值型 · 预览报告")).toBeTruthy();
+    await waitFor(() => expect(convertFacetKind).toHaveBeenCalledWith("clothing_color", true));
+    expect(await screen.findByText(/冲突 1 处/)).toBeTruthy();
+    const execBtn = screen.getByRole("button", { name: "存在冲突/歧义，先处理" }) as HTMLButtonElement;
+    expect(execBtn.disabled).toBe(true);
+    expect(convertFacetKind).toHaveBeenCalledTimes(1); // 只 dry-run，未执行
   });
 });

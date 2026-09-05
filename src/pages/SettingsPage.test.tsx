@@ -10,7 +10,7 @@ import { render, screen, waitFor, fireEvent } from "@testing-library/react";
 import { StrictMode as ReactStrictMode } from "react";
 import SettingsPage from "@/pages/SettingsPage";
 import { useSettingsStore } from "@/stores/settingsStore";
-import { getSettings, resetAppData } from "@/api/settings";
+import { getSettings, resetAppData, saveSettings } from "@/api/settings";
 import { rescanAssetMetadata } from "@/api/assets";
 import type { Settings } from "@/types/settings";
 import type { TagFacet } from "@/types/tag";
@@ -19,6 +19,7 @@ import type { TagFacet } from "@/types/tag";
 const assetMocks = vi.hoisted(() => ({
   rescanAssetMetadata: vi.fn(),
   rescanAssetPalette: vi.fn(),
+  rescanPaletteColors: vi.fn().mockResolvedValue(0),
   cancelMediaRefill: vi.fn(),
   getPaletteStatus: vi.fn(),
 }));
@@ -96,6 +97,7 @@ vi.mock("@/api/assets", () => ({
   rescanAssetPalette: assetMocks.rescanAssetPalette,
   rescanAssetPhash: vi.fn().mockResolvedValue({ total: 0, success: 0, failed: 0, skipped: 0 }),
   rescanImageDimensions: vi.fn().mockResolvedValue({ total: 0, success: 0, failed: 0, skipped: 0 }),
+  rescanPaletteColors: assetMocks.rescanPaletteColors,
   cancelMediaRefill: assetMocks.cancelMediaRefill,
   getPaletteStatus: assetMocks.getPaletteStatus,
 }));
@@ -132,6 +134,9 @@ function mkSettings(over: Partial<Settings> = {}): Settings {
       ollamaSourceId: "auto",
       systemPromptTagging: "",
       systemPromptSearch: "",
+      autoAcceptExactTerms: true,
+      autoAdoptNewTerms: false,
+      confidenceMinSuggest: 0.3,
     },
     theme: "system",
     thumbnailCacheMb: 2048,
@@ -305,6 +310,45 @@ describe("SettingsPage §6.1 信息架构", () => {
     await waitFor(() => expect(screen.getByRole("tab", { name: "本机服务" })).toBeInTheDocument());
     fireEvent.click(screen.getByRole("tab", { name: "本机服务" }));
     await waitFor(() => expect(screen.getByText(/仅在本机处理/)).toBeInTheDocument());
+  });
+});
+
+// ── A4：AI 置信度策略三项随保存设置保留（save_settings 整份覆写不得刷回默认）──
+describe("SettingsPage A4 置信度策略", () => {
+  async function openTagging() {
+    useSettingsStore.setState({ settings: mkSettings(), loaded: true, loading: false, loadError: null, saving: false });
+    render(<SettingsPage />);
+    await waitFor(() => expect(screen.getByText("保存设置")).toBeInTheDocument());
+    fireEvent.click(screen.getByText("AI 设置"));
+    fireEvent.click(screen.getAllByText("自动打标")[0]);
+    await waitFor(() => expect(screen.getByText("自动接收精确命中")).toBeInTheDocument());
+  }
+
+  it("三个 A4 控件渲染且初始值来自草稿（与后端默认一致：开 / 关 / 0.30）", async () => {
+    await openTagging();
+    const acceptSwitch = fieldSwitch("自动接收精确命中");
+    const adoptSwitch = fieldSwitch("AI 自动新建标签");
+    expect(acceptSwitch).toHaveAttribute("aria-checked", "true");
+    expect(adoptSwitch).toHaveAttribute("aria-checked", "false");
+    const conf = screen.getByLabelText("建议最低置信度") as HTMLInputElement;
+    expect(conf.value).toBe("0.3");
+  });
+
+  it("修改三项后保存：saveSettings 收到的设置里三项策略被保留（不再被整份覆写刷回默认）", async () => {
+    await openTagging();
+    fireEvent.click(fieldSwitch("自动接收精确命中")); // 开 → 关
+    fireEvent.click(fieldSwitch("AI 自动新建标签")); // 关 → 开
+    fireEvent.change(screen.getByLabelText("建议最低置信度"), { target: { value: "0.5" } });
+
+    fireEvent.click(screen.getByRole("button", { name: "保存设置" }));
+    await waitFor(() => expect(saveSettings).toHaveBeenCalledTimes(1));
+    const payload = vi.mocked(saveSettings).mock.calls[0][0] as Settings;
+    expect(payload.ai.autoAcceptExactTerms).toBe(false);
+    expect(payload.ai.autoAdoptNewTerms).toBe(true);
+    expect(payload.ai.confidenceMinSuggest).toBe(0.5);
+    // 其余设置不受影响（仍是完整设置对象）
+    expect(payload.ai.batchLimit).toBe(500);
+    expect(payload.theme).toBe("system");
   });
 });
 
@@ -544,6 +588,30 @@ describe("数据与缓存 · 重置数据", () => {
     await waitFor(() => expect(screen.getAllByText(/请等它结束或取消后再重置/).length).toBeGreaterThan(0));
     expect(libraryMocks.refresh).not.toHaveBeenCalled();
   });
+
+  it("reset_clears_super_search_persist：重置成功后同步清除 localStorage 里的超级搜索条件", async () => {
+    vi.mocked(resetAppData).mockResolvedValue({
+      assetsDeleted: 259,
+      tagsDeleted: 40,
+      aiTasksDeleted: 3,
+      connectionsDeleted: 0,
+      preferencesReset: false,
+      cacheFilesDeleted: 512,
+    });
+    // 预置陈旧条件（旧 epoch 日期格式的 expr 会让 hydrate 报错 —— 这正是要清掉的场景）
+    localStorage.setItem("super-search-conditions", JSON.stringify({ expr: { op: "leaf", cond: { type: "metadata", filter: { key: "taken_at", op: "gte", value: 1722508800000 } } } }));
+    expect(localStorage.getItem("super-search-conditions")).not.toBeNull();
+
+    useSettingsStore.setState({ settings: mkSettings(), loaded: true, loading: false, loadError: null });
+    await openData();
+    fireEvent.click(screen.getAllByText("标签与分类").at(-1)!);
+    fireEvent.click(screen.getByRole("button", { name: "重置所选数据" }));
+    fireEvent.click(screen.getByRole("button", { name: "确认重置" }));
+    await waitFor(() => expect(resetAppData).toHaveBeenCalledTimes(1));
+
+    // 重置成功后键被移除（否则改完日期 P0 后这条陈旧条件仍会 hydrate 报错）
+    await waitFor(() => expect(localStorage.getItem("super-search-conditions")).toBeNull());
+  });
 });
 
 // W3：旧「aiFacetConfigs 草稿」路径已删（V20 合表后分面 AI 语义在 tag_facets.input_mode，
@@ -607,6 +675,18 @@ describe("数据与缓存路由（W5c 备份恢复 + W5d phash 行）", () => {
       expect(screen.getByText("数据库备份与恢复")).toBeTruthy();
     });
     expect(screen.getByText("感知哈希回填")).toBeTruthy();
+  });
+
+  it("色板关系表重建按钮调用 rescanPaletteColors（色板索引表空时点一次补齐）", async () => {
+    useSettingsStore.setState({ settings: mkSettings(), loaded: true, loading: false, saving: false });
+    render(<SettingsPage />);
+    fireEvent.click(screen.getByText("数据与缓存"));
+    await waitFor(() => expect(screen.getByText("色板关系表重建")).toBeInTheDocument());
+
+    assetMocks.rescanPaletteColors.mockResolvedValue(410);
+    fireEvent.click(screen.getByRole("button", { name: "重建前三色索引" }));
+    await waitFor(() => expect(assetMocks.rescanPaletteColors).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(screen.getByText(/色板关系表已重建：写入 410 条/)).toBeInTheDocument());
   });
 });
 

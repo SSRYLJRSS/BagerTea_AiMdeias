@@ -1,8 +1,8 @@
-/** FilterChips（FB5-05 §9.6.1）：expr 为唯一条件源——
- *  - chips 递归遍历 expr：AND 显示「同时满足」，OR 根按组「任一组 N」，NOT 叶「排除：…」；
- *  - 删除 chip 走 store.removeExprAtPath（只摘除该节点），不走 setQuery；
+/** FilterChips（FB5-05 §9.6.1 + §3.7/§3.10）：三区共用一个 chip 行。
+ *  - 必须区（plan.filter / expr 派生）组标签「必须」；删除走 removeAtZonePath("filter", path)；
+ *  - 排除区（plan.mustNot）组标签「排除」；优先区（plan.should）组标签「优先」；
  *  - 排序 chip 独立 setSort；清除全部走 clearConditions；
- *  - 无 expr 时（纯手动链路）退回扁平 query 渲染。 */
+ *  - 无 plan（纯手动链路）退回扁平 query 渲染。 */
 import { describe, expect, it } from "vitest";
 import { fireEvent, render, screen } from "@testing-library/react";
 import FilterChips from "@/components/supersearch/FilterChips";
@@ -20,10 +20,10 @@ const searchLeaf = (value: string, scope: "all" | "content" | "fileName" = "all"
 });
 
 function setExprState(expr: QueryExpr | undefined, resolvedTags: { facetKey: string; text: string; tagId: number; path?: string }[] = []) {
+  // §3.7：走真实 store action（setExpr → plan.filter），保证 plan/expr 一致（换源后 expr 是派生视图）
+  useSuperSearchStore.getState().setExpr(expr);
   useSuperSearchStore.setState({
-    expr,
     resolvedTags: resolvedTags.map((t) => ({ ...t, path: t.path ?? "" })),
-    query: useSuperSearchStore.getState().query,
     aiExplanation: null,
     warnings: [],
   });
@@ -43,7 +43,7 @@ describe("FilterChips（FB5-05 §9.6.1 expr 驱动）", () => {
     expect(screen.getByText("色彩：红色")).toBeInTheDocument();
   });
 
-  it("OR 根按组显示「任一组 1 / 任一组 2」", () => {
+  it("OR 根按组显示，组标签统一「必须」（§3.10）", () => {
     setExprState({
       op: "or",
       children: [
@@ -57,8 +57,8 @@ describe("FilterChips（FB5-05 §9.6.1 expr 驱动）", () => {
       { facetKey: "scene", text: "建筑", tagId: 4 },
     ]);
     render(<FilterChips />);
-    expect(screen.getAllByText("任一组 1").length).toBeGreaterThanOrEqual(1);
-    expect(screen.getAllByText("任一组 2").length).toBeGreaterThanOrEqual(1);
+    // 三区统一标签：全部叶子都是「必须」组
+    expect(screen.getAllByText("必须").length).toBeGreaterThanOrEqual(4);
     expect(screen.getAllByText(/夜间|树|白天|建筑/).length).toBeGreaterThanOrEqual(4);
   });
 
@@ -76,7 +76,7 @@ describe("FilterChips（FB5-05 §9.6.1 expr 驱动）", () => {
     expect(screen.getByText("内容：银杏树")).toBeInTheDocument();
   });
 
-  it("删除 chip 只摘除该 expr 节点（removeExprAtPath），保留其余条件", () => {
+  it("删除 chip 走 removeAtZonePath（filter 区）只摘除该节点，保留其余条件", () => {
     setExprState(
       { op: "and", children: [tagLeaf("subject", [1]), tagLeaf("color", [2])] },
       [
@@ -141,10 +141,10 @@ describe("FilterChips（FB5-05 §9.6.1 expr 驱动）", () => {
 });
 
 describe("U-5 加分 chips", () => {
-  it("plan.should 渲染为「加分」组 chip，删除按索引调用 removePlanShould", () => {
+  it("plan.should 渲染为「优先」组 chip，删除按索引调用 removePlanShould（§3.10）", () => {
     const expr = searchLeaf("海边");
+    useSuperSearchStore.getState().setExpr(expr);
     useSuperSearchStore.setState({
-      expr,
       resolvedTags: [{ facetKey: "subject", text: "女孩", tagId: 2, path: "" }],
       plan: {
         planSchemaVersion: 3, normalizationVersion: 1, compilerVersion: 1,
@@ -156,8 +156,8 @@ describe("U-5 加分 chips", () => {
       },
     });
     render(<FilterChips />);
-    // chip 组标签「加分」+ 可读文案
-    expect(screen.getByText("加分")).toBeInTheDocument();
+    // chip 组标签「优先」+ 可读文案
+    expect(screen.getByText("优先")).toBeInTheDocument();
     const chip = screen.getByText("标签：女孩");
     expect(chip).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "取消 标签：女孩" }));

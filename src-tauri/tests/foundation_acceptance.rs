@@ -6,7 +6,7 @@
 //!   C 波次 → 组 7；全部绿 + 四关全绿 → foundation-verified。
 
 use bagertea_ai_media_v2_lib::db::{
-    ai, init_memory, asset_tags, assets, migrations, query_expr, schema_features, tag_facets, tags,
+    ai, facet_numbers, init_memory, asset_tags, assets, migrations, query_expr, schema_features, tag_facets, tags,
 };
 use bagertea_ai_media_v2_lib::error::AppResult;
 
@@ -43,81 +43,62 @@ fn db_schema_make_terms(
 
 // ═══════════════ 组 1：分面停用/恢复/删除/重建（F1 F4） ═══════════════
 
+/// 把 EFF_* 常量丢给 SQLite 真跑：对每个组合，先写一行真实分面再分别算两侧。
+fn sql_eff(conn: &rusqlite::Connection, key: &str, cond: &str) -> bool {
+    let n: i64 = conn
+        .query_row(
+            &format!("SELECT COUNT(*) FROM tag_facets f WHERE f.key = ?1 AND {cond}"),
+            [key],
+            |r| r.get(0),
+        )
+        .unwrap();
+    n > 0
+}
+
 /// F1-b：effective() 与 SQL 常量同规则 —— status 3 值 × cfg 四列 16 组合 = 48 组合。
-/// 这条测试的价值不是「验证现在对」，而是下次有人改规则时会失败。
+/// 这条测试的价值不是「验证现在对」，而是下次有人改规则时会失败：两侧任一改动都会撞红。
+/// 0-7：真调 TagFacet::effective()，且把 EFF_* 真丢给 SQLite —— 删掉/改错任何一侧都必红。
 #[test]
 fn effective_value_sql_matches_rust() {
+    let c = mem();
+    tag_facets::create(&c, "eff", "有效值", "", "multi", None, "all").unwrap();
     let statuses = ["active", "inactive", "deprecated"];
     for status in statuses {
         for vis in [false, true] {
             for manual in [false, true] {
                 for ai in [false, true] {
                     for search in [false, true] {
-                        let f = TagFacetFixture {
-                            status,
-                            cfg_visible_in_navigation: vis,
-                            cfg_manual_assignable: manual,
-                            cfg_ai_assignable: ai,
-                            cfg_searchable: search,
-                        };
-                        let eff = f.rust_effective();
-                        // SQL 侧语义：
-                        //  visible/manual/ai 都要 alive(status='active')；
-                        //  searchable 不看 status（F4 语义变更）
-                        let alive = status == "active";
+                        // 写真实分面行（组合由 status × cfg 四列决定）
+                        c.execute(
+                            "UPDATE tag_facets SET status=?1, cfg_visible_in_navigation=?2,
+                                    cfg_manual_assignable=?3, cfg_ai_assignable=?4, cfg_searchable=?5
+                              WHERE key='eff'",
+                            rusqlite::params![status, vis as i64, manual as i64, ai as i64, search as i64],
+                        )
+                        .unwrap();
+                        // Rust 侧：从库里读回来再调 effective()（被测代码必须在场）
+                        let facet = tag_facets::get(&c, "eff").unwrap();
+                        let eff = facet.effective();
+                        // SQL 侧：把 EFF_* 常量真丢给 SQLite 算同一行
+                        let s_visible = sql_eff(&c, "eff", tag_facets::EFF_VISIBLE);
+                        let s_manual = sql_eff(&c, "eff", tag_facets::EFF_MANUAL);
+                        let s_ai = sql_eff(&c, "eff", tag_facets::EFF_AI);
+                        let s_search = sql_eff(&c, "eff", tag_facets::EFF_SEARCH);
+                        let tag = format!("status={status} vis={vis} manual={manual} ai={ai} search={search}");
+                        assert_eq!(eff.visible, s_visible, "visible 不符：{tag}");
+                        assert_eq!(eff.manual, s_manual, "manual 不符：{tag}");
+                        assert_eq!(eff.ai, s_ai, "ai 不符：{tag}");
+                        assert_eq!(eff.searchable, s_search, "searchable 不符：{tag}");
+                        // input_mode 只读派生看的是配置（停用不丢配置）—— 与原始 cfg 对齐，不看 status
+                        let derived = facet.derived_input_mode();
                         assert_eq!(
-                            eff.visible,
-                            alive && vis,
-                            "status={status} vis={vis} 时 visible 应一致"
+                            derived == "ai_and_manual",
+                            ai,
+                            "input_mode 派生应与 cfg_ai_assignable 对齐：{tag}"
                         );
-                        assert_eq!(
-                            eff.manual,
-                            alive && manual,
-                            "status={status} manual={manual} 时 manual 应一致"
-                        );
-                        assert_eq!(
-                            eff.ai,
-                            alive && ai,
-                            "status={status} ai={ai} 时 ai 应一致"
-                        );
-                        assert_eq!(
-                            eff.searchable,
-                            search,
-                            "status={status} search={search} 时 searchable 应只看 cfg（不看 status）"
-                        );
-                        // input_mode 只读派生
-                        let derived = if ai { "ai_and_manual" } else { "manual_only" };
-                        assert_eq!(f.rust_derived_input_mode(), derived);
                     }
                 }
             }
-        }
-    }
-}
-
-struct TagFacetFixture {
-    status: &'static str,
-    cfg_visible_in_navigation: bool,
-    cfg_manual_assignable: bool,
-    cfg_ai_assignable: bool,
-    cfg_searchable: bool,
-}
-
-impl TagFacetFixture {
-    fn rust_effective(&self) -> tag_facets::FacetEffective {
-        let alive = self.status == "active";
-        tag_facets::FacetEffective {
-            visible: alive && self.cfg_visible_in_navigation,
-            manual: alive && self.cfg_manual_assignable,
-            ai: alive && self.cfg_ai_assignable,
-            searchable: self.cfg_searchable,
-        }
-    }
-    fn rust_derived_input_mode(&self) -> &'static str {
-        if self.cfg_ai_assignable {
-            "ai_and_manual"
-        } else {
-            "manual_only"
         }
     }
 }
@@ -609,10 +590,12 @@ fn find_by_term_is_deterministic() {
 // ═══════════════ 组 1（F4）：可见性三常量 —— 消费点一致性矩阵 ═══════════════
 
 /// F5/F2 辅助：完整启用 tag_unique_terms（与命令层 apply_tag_constraints 同语义：
-/// 先建约束/灌 canonical，再登记 feature 标志）。
+/// 先建约束/灌 canonical，再登记 feature 标志，最后重建 FTS 触发器与索引 ——
+/// P0-4：gate 开启后 FTS 别名词源切到 tag_terms，不重建则新别名进不了 FTS）。
 fn enable_terms(conn: &rusqlite::Connection) {
     migrations::apply_v22b_constraints(conn).unwrap();
     schema_features::set_feature(conn, "tag_unique_terms", true, None).unwrap();
+    migrations::rebuild_fts_triggers_for_gated_terms(conn).unwrap();
 }
 
 /// F4 辅助：插入一张图片素材，返回 id。
@@ -1299,6 +1282,7 @@ fn analysis_result_roundtrips() {
             ai::TagProposal { facet_key: "scene".into(), raw_name: "海边".into(), confidence: Some(0.9) },
             ai::TagProposal { facet_key: "scene".into(), raw_name: "日落".into(), confidence: None },
         ],
+        numbers: vec![],
         warnings: vec!["未知分面已归入 custom".into()],
     };
     let json = serde_json::to_string(&ar).unwrap();
@@ -1364,6 +1348,7 @@ fn raw_response_stored_verbatim() {
     let analysis_json = serde_json::to_string(&ai::AnalysisResult {
         description: ma.description.clone(),
         proposals: ma.proposals.clone(),
+        numbers: ma.numbers.clone(),
         warnings: ma.warnings.clone(),
     })
     .unwrap();
@@ -1403,7 +1388,8 @@ fn request_config_hash_is_stable() {
         description: "画面场景".into(),
         selection_mode: "multi".into(),
         max_items: Some(3),
-    }];
+            ..Default::default()
+        }];
     let top = vec![("scene".to_string(), "海边/森林/室内".to_string())];
     let h = |sys: &str, model: &str, max_tokens: i64| {
         stable_config_hash(&build_batch_request_config(
@@ -1432,7 +1418,8 @@ fn request_config_json_contains_all_inputs() {
         description: "画面的地理或场景".into(),
         selection_mode: "multi".into(),
         max_items: Some(3),
-    }];
+            ..Default::default()
+        }];
     let top = vec![("scene".to_string(), "海边/森林/室内".to_string())];
     let cfg = build_batch_request_config(
         "你是图片打标助手（用户覆盖版）",
@@ -1979,7 +1966,7 @@ fn term_query_expands_in_tag_leaf() {
 fn e2e_grass_required_sky_preferred_night_excluded() {
     use bagertea_ai_media_v2_lib::db::query_expr::{LeafCond, QueryExpr};
     use bagertea_ai_media_v2_lib::db::search_plan::{
-        run_search_plan, Ranking, RetrieverPlan, SearchPlanV3, ShouldClause,
+        run_search_plan, Ranking, SearchPlanV3, ShouldClause,
     };
     use bagertea_ai_media_v2_lib::db::tags::TermMatch;
     let c = mem();
@@ -2018,11 +2005,10 @@ fn e2e_grass_required_sky_preferred_night_excluded() {
             },
             weight: 1.0,
             label: "蓝天（加分项）".into(),
+            evidence: None,
         }],
         minimum_should_match: 0,
-        ranking: Ranking::Relevance {
-            retrievers: RetrieverPlan::default(),
-        },
+        ranking: Ranking::Relevance,
         ..Default::default()
     };
     let out = run_search_plan(&c, &plan, None, 0).unwrap();
@@ -2290,4 +2276,50 @@ fn palette_top3_ratio_min_filters() {
     let page = assets::list(&c, &filter).unwrap();
     let ids: Vec<i64> = page.items.iter().map(|x| x.id).collect();
     assert_eq!(ids, vec![hi], "红占比 ≥50% 应只有 hi：{ids:?}");
+}
+
+// ═══════════════ P0-4：gate 开启后 FTS/aliases() 同 gate 读 tag_terms ═══════════════
+
+/// P0-4：tag_unique_terms=1 后 add_alias 只写 tag_terms（tag_aliases 冻结），
+/// FTS 触发器词源必须切到 tag_terms —— 否则新别名永远搜不到。
+/// 用 3 字 CJK 走 FTS 短语路径（≤2 字走 LIKE，不属于本测试的 FTS 范围）。
+#[test]
+fn alias_reaches_fts_after_gate_enabled() {
+    let c = mem();
+    enable_terms(&c);
+    let t = tags::create_in_facet(&c, "茶", None, Some("subject")).unwrap();
+    // gate 开：add_alias 写 tag_terms（trg_terms_ai 触发刷新）
+    tags::add_alias(&c, t.id, "茶饮料", None, "synonym").unwrap();
+    let aid = f4_insert_asset(&c, "d:/tea.jpg");
+    asset_tags::assign(&c, &[aid], &[t.id], "manual").unwrap();
+
+    // 修复前：FTS 词源仍读 tag_aliases，别名进不了 FTS → 此处必 miss
+    let hits = bagertea_ai_media_v2_lib::db::search::search_asset_ids_all(&c, "茶饮料").unwrap();
+    assert_eq!(hits, vec![aid], "gate 开启后新增别名应能经 FTS 命中：{hits:?}");
+    // canonical 路径不受影响（回源仍是 tags.name）
+    let canon = bagertea_ai_media_v2_lib::db::search::search_asset_ids_all(&c, "茶").unwrap();
+    assert_eq!(canon, vec![aid]);
+}
+
+/// P0-4：Tag.aliases 与 tag_unique_terms 同 gate —— 关时读 tag_aliases，开时读 tag_terms，
+/// 否则 gate 开启后 aliases() 恒空（hydrate_metadata 喂给前端 chips/树形视图）。
+#[test]
+fn tag_aliases_field_reads_terms_when_gated() {
+    // gate 关（旧路径）：add_alias 写 tag_aliases，aliases() 照旧读它
+    let c = mem();
+    let t = tags::create_in_facet(&c, "海", None, Some("scene")).unwrap();
+    tags::add_alias(&c, t.id, "海边", None, "synonym").unwrap();
+    let off = tags::aliases(&c, t.id).unwrap();
+    assert!(off.iter().any(|a| a == "海边"), "gate 关应读 tag_aliases：{off:?}");
+
+    // gate 开：add_alias 只写 tag_terms → aliases() 必须同 gate 读 tag_terms
+    let c2 = mem();
+    enable_terms(&c2);
+    let t2 = tags::create_in_facet(&c2, "海", None, Some("scene")).unwrap();
+    tags::add_alias(&c2, t2.id, "海边", None, "synonym").unwrap();
+    let on = tags::aliases(&c2, t2.id).unwrap();
+    assert!(
+        on.iter().any(|a| a == "海边"),
+        "gate 开后 aliases() 应读 tag_terms，实际：{on:?}"
+    );
 }

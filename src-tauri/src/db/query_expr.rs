@@ -91,6 +91,18 @@ pub enum LeafCond {
     /// W2-7：分面没有标签（「场景 没有标签」—— 精准补漏筛选）
     #[serde(rename_all = "camelCase")]
     FacetMissing { facet_key: String },
+    /// V24（§7-2）：数值分面条件 —— 对 asset_facet_numbers 的 EXISTS 编译（照
+    /// compile_palette_meta 对卫星表的形状）。正向谓词，允许进 must_not（§4.1b 极性白名单）。
+    #[serde(rename_all = "camelCase")]
+    FacetNumber {
+        facet_key: String,
+        /// eq | gte | lte | gt | lt | between
+        op: String,
+        value: f64,
+        /// between 的上界（其余 op 忽略）
+        #[serde(default)]
+        max_value: Option<f64>,
+    },
 }
 
 fn default_true() -> bool {
@@ -183,6 +195,31 @@ fn validate_leaf(cond: &LeafCond) -> AppResult<()> {
                 return Err(AppError::msg("分面 key 不能为空"));
             }
             Ok(())
+        }
+        LeafCond::FacetNumber {
+            facet_key,
+            op,
+            value,
+            max_value,
+        } => {
+            if facet_key.trim().is_empty() {
+                return Err(AppError::msg("分面 key 不能为空"));
+            }
+            if !matches!(op.as_str(), "eq" | "gt" | "gte" | "lt" | "lte" | "between") {
+                return Err(AppError::msg(format!("非法数值分面 op：{op}")));
+            }
+            if !value.is_finite() {
+                return Err(AppError::msg("数值分面的值必须是有限数"));
+            }
+            if op == "between" {
+                match max_value {
+                    Some(m) if m.is_finite() && *value <= *m => Ok(()),
+                    Some(_) => Err(AppError::msg("介于 的上界必须是有限数且不小于下界")),
+                    None => Err(AppError::msg("介于 需要上下界两个值")),
+                }
+            } else {
+                Ok(())
+            }
         }
     }
 }
@@ -329,7 +366,24 @@ pub fn compile_leaf_with(
                 }
                 if ids.is_empty() {
                     // 词查明确但一个都没命中 → 条件不可满足（0 结果），
-                    // 区别于「空 tag_ids = 无约束恒真」——搜索框零结果由此给出
+                    // 区别于「空 tag_ids = 无约束恒真」——搜索框零结果由此给出。
+                    // S5 5-4（不变量 11）：**不改写条件**，只给「试试相近的词」建议——
+                    // 用户点了才改（前端零结果建议）。cap=5 与 fuzzy 上限一致。
+                    let (fuzzy_hits, _) = super::tags::expand_term_query(
+                        conn,
+                        facet_key,
+                        &normalized,
+                        TermMatch::Fuzzy,
+                        super::tags::FUZZY_EXPAND_CAP,
+                    )?;
+                    if !fuzzy_hits.is_empty() {
+                        let names: Vec<&str> =
+                            fuzzy_hits.iter().map(|h| h.matched_term.as_str()).collect();
+                        warnings.push(format!(
+                            "词查「{raw}」没有命中。试试相近的词：{}",
+                            names.join("、")
+                        ));
+                    }
                     return Ok(("1=0".to_string(), Vec::new()));
                 }
             } else if ids.is_empty() {
@@ -376,6 +430,58 @@ pub fn compile_leaf_with(
                 ));
             }
             Ok((sql.trim_start_matches(" AND ").to_string(), params))
+        }
+        LeafCond::FacetNumber {
+            facet_key,
+            op,
+            value,
+            max_value,
+        } => {
+            // §7-2：分面必须存在且 facet_kind='number'，否则剔除（§4.2，与 FacetHasAny 同策略：
+            // 分面删除/改型后已保存的搜索不应被卡死）。prune_invalid 探测 1=1 折叠自动接链。
+            let kind: Option<String> = conn
+                .query_row(
+                    "SELECT facet_kind FROM tag_facets WHERE key = ?1",
+                    [facet_key],
+                    |r| r.get(0),
+                )
+                .optional()
+                .unwrap_or(None);
+            if kind.as_deref() != Some("number") {
+                tracing::warn!("数值分面 {facet_key} 不存在或不是数值型，剔除该条件（查询继续）");
+                warnings.push(format!(
+                    "数值分面「{facet_key}」不存在或不是数值型，已忽略该条件。"
+                ));
+                return Ok(("1=1".to_string(), Vec::new()));
+            }
+            let mut params: Vec<Value> = vec![Value::Text(facet_key.clone())];
+            let mut sql = format!(
+                "EXISTS (SELECT 1 FROM asset_facet_numbers afn WHERE afn.asset_id = a.id AND afn.facet_key = ?1"
+            );
+            match op.as_str() {
+                "eq" => {
+                    params.push((*value).into());
+                    sql.push_str(" AND ABS(afn.value - ?2) < 1e-9");
+                }
+                "gt" | "gte" => {
+                    params.push((*value).into());
+                    let cmp = if op == "gt" { ">" } else { ">=" };
+                    sql.push_str(&format!(" AND afn.value {cmp} ?2"));
+                }
+                "lt" | "lte" => {
+                    params.push((*value).into());
+                    let cmp = if op == "lt" { "<" } else { "<=" };
+                    sql.push_str(&format!(" AND afn.value {cmp} ?2"));
+                }
+                "between" => {
+                    params.push((*value).into());
+                    params.push((max_value.unwrap_or(*value)).into());
+                    sql.push_str(" AND afn.value >= ?2 AND afn.value <= ?3");
+                }
+                _ => unreachable!("validate_leaf 已拒绝非法 op"),
+            }
+            sql.push(')');
+            Ok((sql, params))
         }
         LeafCond::Metadata { filter } => {
             // R2-2：量纲人话（expr 路径与扁平路径同规则；不阻断执行）
@@ -815,5 +921,63 @@ mod tests {
             QueryExpr::And { children } => assert!(children.len() >= 4),
             _ => panic!("应组装为 AND"),
         }
+    }
+
+    /// S5 5-5：词查零命中 → 条件保持原样（1=0 由原 leaf 产生，不改写 termQuery），
+    /// 且 warning 给出「试试相近的词」可点建议（Fuzzy 扩展词列表）。不变量 11：
+    /// 系统可以建议，但不能悄悄改用户的语义。
+    #[test]
+    fn zero_result_suggests_fuzzy_without_rewriting() {
+        use crate::db::migrations;
+        use crate::db::schema_features;
+        use crate::db::tags;
+        let c = init_memory().unwrap();
+        migrations::apply_v22b_constraints(&c).unwrap();
+        schema_features::set_feature(&c, "tag_unique_terms", true, None).unwrap();
+        let t = tags::create_in_facet(&c, "森林", None, Some("scene")).unwrap();
+        assert!(t.id > 0);
+
+        // 错别字「森材」：Alias 精确零命中
+        let leaf = LeafCond::Tag {
+            facet_key: "scene".into(),
+            tag_ids: vec![],
+            mode: Some("any".into()),
+            include_descendants: true,
+            term_query: Some("森材".into()),
+            term_match: tags::TermMatch::Alias,
+        };
+        let mut warnings = Vec::new();
+        let (sql, _) = compile_leaf_with(&c, &leaf, &mut warnings).unwrap();
+        assert_eq!(sql, "1=0", "零命中 → 不可满足（搜索框零结果归因于此）");
+        // 条件本身未被改写
+        match &leaf {
+            LeafCond::Tag { term_query, term_match, .. } => {
+                assert_eq!(term_query.as_deref(), Some("森材"), "termQuery 不得被改写");
+                assert_eq!(*term_match, tags::TermMatch::Alias, "termMatch 不得被改写");
+            }
+            _ => unreachable!(),
+        }
+        // 有可点建议：相近词命中「森林」
+        assert!(
+            warnings.iter().any(|w| w.contains("试试相近的词") && w.contains("森林")),
+            "零命中应建议相近词「森林」: {warnings:?}"
+        );
+
+        // 对照：完全无相近词时不给建议（避免空建议文案）
+        let leaf2 = LeafCond::Tag {
+            facet_key: "scene".into(),
+            tag_ids: vec![],
+            mode: Some("any".into()),
+            include_descendants: true,
+            term_query: Some("不存在的词".into()),
+            term_match: tags::TermMatch::Alias,
+        };
+        let mut w2 = Vec::new();
+        let (sql2, _) = compile_leaf_with(&c, &leaf2, &mut w2).unwrap();
+        assert_eq!(sql2, "1=0");
+        assert!(
+            !w2.iter().any(|w| w.contains("试试相近的词")),
+            "无相近词时不得出现空建议: {w2:?}"
+        );
     }
 }

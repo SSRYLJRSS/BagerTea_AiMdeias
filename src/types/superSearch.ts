@@ -1,6 +1,6 @@
 /** 超级搜索 AI 协议（FB5-05 §9 + S1/S3）：SearchIntent V3（required + preferred）
  *  + 后端 QueryExpr（必须部分）事实源 + SearchPlanV3（含 should 加分，供三段式 UI）。 */
-import type { MetadataFilter, ResolvedSearchQuery } from "./asset";
+import type { Asset, MetadataFilter, ResolvedSearchQuery } from "./asset";
 import type { LeafCond, QueryExpr } from "./queryExpr";
 
 /** 原子概念：模型输出的规范名词/短语（组内 AND、组间 OR） */
@@ -61,12 +61,15 @@ export interface ShouldClause {
   /** 0.5 | 1.0 | 2.0（UI 只给三档） */
   weight: number;
   label: string;
+  /** §4.8：AI 证据原文回显（「最好是户外」）；手工添加的条件为空 */
+  evidence?: string | null;
 }
 
-/** S2：排序方式 */
+/** S2：排序方式。线上形状与后端 serde 一致（tag="type"）。
+ *  B10：Relevance 无载荷 —— plan.retrievers 是唯一来源。 */
 export type Ranking =
   | { type: "field"; key: string; dir: string }
-  | { type: "relevance"; retrievers?: RetrieverPlan };
+  | { type: "relevance" };
 
 /** S2/S4：多路召回计划 */
 export interface RetrieverPlan {
@@ -108,9 +111,22 @@ export interface ResolvedTag {
   path: string;
 }
 
-/** C-2/U-6：AST 命中诊断 —— 单个叶子条件的 4 指标（后端 diagnose_search_plan_cmd 返回） */
+/** B7/B8：执行/解析 warning 双通道 —— source="plan" 为执行剔除（带区名）；
+ *  source="ai" 为 AI 解析层。两条通道互不清空。 */
+export type PlanWarningSource = "ai" | "plan";
+export interface SearchWarning {
+  source: PlanWarningSource;
+  zone?: "filter" | "mustNot" | "should";
+  message: string;
+}
+
+/** C-2/U-6/§4.5：AST 命中诊断 —— 单个叶子条件的 4 指标（后端 diagnose_search_plan_cmd 返回）。
+ *  zone 标识叶子所在区（仅凭 path 无法区分两区同下标，§3.7 不变式 9）。 */
 export interface LeafDiagnostic {
+  zone: "filter" | "mustNot";
   path: number[];
+  /** §3.7 不变式 9：发起诊断时的 plan 代次 —— 返回时代次过期则整批丢弃 */
+  planRevision: number;
   label: string;
   /** ① 该条件单独执行的命中数 */
   selfCount: number;
@@ -122,16 +138,41 @@ export interface LeafDiagnostic {
   delta: number;
 }
 
-/** C-2/U-6：should（加分项）诊断 —— 命中该加分项的素材数 / 结果总数 */
+/** C-2/U-6/§4.5：should（加分项）诊断 —— 命中该加分项的素材数 / 结果总数。
+ *  hitCount = 当前结果集 ∩ 该加分项（B3）；index 对应 plan.should 下标。 */
 export interface ShouldDiagnostic {
+  index: number;
+  /** §3.7 不变式 9：发起诊断时的 plan 代次（过期整批丢弃） */
+  planRevision: number;
   label: string;
   hitCount: number;
   totalCount: number;
 }
 
-export interface SearchDiagnostics {
+/** §4.5：诊断命令返回值 —— warnings 与列表命令同一批 */
+export interface PlanDiagnostics {
   leaves: LeafDiagnostic[];
   should: ShouldDiagnostic[];
+  warnings: SearchWarning[];
+}
+
+/** B2/B8：plan 全选 ID 一路到底的返回类型（store 不得降级成 number[]） */
+export interface PlanIdsResult {
+  ids: number[];
+  total: number;
+  truncated: boolean;
+  warnings: SearchWarning[];
+}
+
+/** §4.6/2-16：store.fetchAllIds 的返回类型 —— 与 PlanIdsResult 同一个类型，不降级。 */
+export type FetchAllIdsResult = PlanIdsResult;
+
+/** §4.1：plan 执行分页结果（与 AssetPage 同形；warnings 升级为 SearchWarning[]） */
+export interface PlanAssetPage {
+  items: Asset[];
+  total: number;
+  hasMore: boolean;
+  warnings: SearchWarning[];
 }
 
 /** FB5-05（§9.5）+ S1/S3：AI 解析结果。expr 为必须部分唯一执行事实源；

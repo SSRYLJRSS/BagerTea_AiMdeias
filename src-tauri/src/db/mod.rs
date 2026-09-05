@@ -7,6 +7,7 @@ pub mod assets;
 pub mod backup;
 pub mod dedup;
 pub mod export;
+pub mod facet_numbers;
 pub mod migrations;
 pub mod palette_bucket;
 pub mod query_expr;

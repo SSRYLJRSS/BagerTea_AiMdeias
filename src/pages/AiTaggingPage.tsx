@@ -9,7 +9,7 @@ import LegacyProfileModelField from "@/components/common/LegacyProfileModelField
 import AiTaggingProgress, { assetFileLabel } from "@/components/ai/AiTaggingProgress";
 import Filmstrip from "@/components/ai/Filmstrip";
 import Workbench from "@/components/ai/Workbench";
-import { aiApplyTags, onAiProgress } from "@/api/ai";
+import { aiApplyTags, aiDecideSuggestionItem, aiListSuggestionItems, onAiProgress } from "@/api/ai";
 import { recentTagOps, undoTagBatch } from "@/api/tags";
 import { useTauriEvent } from "@/hooks/hooks";
 import { useAiStore } from "@/stores/aiStore";
@@ -19,6 +19,7 @@ import { useTagStore, buildWorkbenchFacets, normalizeTagKeys } from "@/stores/ta
 import { computeAiStats, estimateRequests } from "@/utils/aiStats";
 import { pickReviewDescription } from "@/utils/reviewDescription";
 import type { AiSuggestion, AiTaggingUiState, CategorizedTags } from "@/types/ai";
+import type { WorkbenchNumberItem } from "@/components/ai/Workbench";
 import type { TagOp } from "@/types/asset";
 
 export default function AiTaggingPage() {
@@ -232,6 +233,60 @@ export default function AiTaggingPage() {
 
   // 当前张编辑中的标签（切张即重置：已确认张展示 confirmed，其余展示 suggested）
   const [draftTags, setDraftTags] = useState<CategorizedTags>({});
+  // V24（Phase 7-4）：当前建议的数值建议项（itemKind='number'）—— 确认/拒绝后重拉
+  const [numberItems, setNumberItems] = useState<WorkbenchNumberItem[]>([]);
+  const currentSuggestionId = currentSuggestion?.id;
+  useEffect(() => {
+    let alive = true;
+    if (currentSuggestionId == null) {
+      setNumberItems([]);
+      return;
+    }
+    void aiListSuggestionItems(currentSuggestionId)
+      .then((items) => {
+        if (!alive) return;
+        const nums = items.filter((i) => i.itemKind === "number");
+        setNumberItems(
+          nums.map((n) => ({
+            id: n.id,
+            facetKey: n.facetKey,
+            displayName: tagFacets.find((f) => f.key === n.facetKey)?.displayName ?? n.facetKey,
+            numValue: n.numValue ?? null,
+            decision: n.decision,
+            decisionReason: n.decisionReason,
+          })),
+        );
+      })
+      .catch(() => {
+        if (alive) setNumberItems([]);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [currentSuggestionId, tagFacets]);
+  const decideNumberItem = useCallback(
+    async (itemId: number, decision: "accepted" | "rejected") => {
+      await aiDecideSuggestionItem(itemId, decision);
+      if (currentSuggestionId == null) return;
+      try {
+        const items = await aiListSuggestionItems(currentSuggestionId);
+        const nums = items.filter((i) => i.itemKind === "number");
+        setNumberItems(
+          nums.map((n) => ({
+            id: n.id,
+            facetKey: n.facetKey,
+            displayName: tagFacets.find((f) => f.key === n.facetKey)?.displayName ?? n.facetKey,
+            numValue: n.numValue ?? null,
+            decision: n.decision,
+            decisionReason: n.decisionReason,
+          })),
+        );
+      } catch {
+        /* 刷新失败静默：下次切换建议时重拉 */
+      }
+    },
+    [currentSuggestionId, tagFacets],
+ );
   useEffect(() => {
     if (!currentSuggestion) return;
     const src =
@@ -672,6 +727,8 @@ export default function AiTaggingPage() {
               onTagsChange={setDraftTags}
               description={draftDescription}
               onDescriptionChange={setDraftDescription}
+              numberItems={numberItems}
+              onDecideNumberItem={decideNumberItem}
               index={idx}
               total={suggestions.length}
               filmstrip={

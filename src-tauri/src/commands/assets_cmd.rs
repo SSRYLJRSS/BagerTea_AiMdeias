@@ -5,6 +5,7 @@ use tauri::{Manager, State};
 
 use crate::db::assets::{self, Asset, AssetFilter, AssetPage, MetadataFacet};
 use crate::db::dedup::{self, DupGroup};
+use crate::db::search_query;
 use crate::db::settings;
 use crate::error::{AppError, AppResult};
 use crate::services::thumbnail::ThumbnailService;
@@ -89,6 +90,14 @@ pub fn list_metadata_facets(state: State<AppState>) -> AppResult<Vec<MetadataFac
     let conn = lock_db(&state)?;
     let library_root = settings::get_settings(&conn)?.library_root;
     assets::list_metadata_facets(&conn, Some(&library_root))
+}
+
+/// Phase 4（§5.3）+ V24（Phase 7-8）：数值字段的 NumericDomain 单一事实源
+///（含预设/单位/边界/量纲阈值/运算符）+ 数值分面动态段（key = "facet:<facet_key>"）。
+#[tauri::command]
+pub fn get_numeric_domains(state: State<AppState>) -> AppResult<Vec<search_query::NumericDomain>> {
+    let conn = state.db.lock().map_err(|_| crate::error::AppError::msg("数据库锁中毒"))?;
+    Ok(search_query::numeric_domains_with_facets(&conn))
 }
 
 #[tauri::command]

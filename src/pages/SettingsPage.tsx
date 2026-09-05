@@ -16,6 +16,7 @@ import {
   rescanAssetPalette,
   rescanAssetPhash,
   rescanImageDimensions,
+  rescanPaletteColors,
   cancelMediaRefill,
   getPaletteStatus,
   type RefillProgress,
@@ -191,6 +192,24 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
       phashUnsub.current?.();
       phashUnsub.current = null;
       setPhashProgress(null);
+    }
+  };
+
+  // ── R1-2：色板关系表重建（rescan_palette_colors：从 palette_json 重灌 asset_palette_colors，
+  //  不解码图片毫秒级；表空时「前三色包含红」等筛选恒 0 结果，导入素材后点一次）──
+  const [paletteColorsRunning, setPaletteColorsRunning] = useState(false);
+  const [paletteColorsResult, setPaletteColorsResult] = useState<string | null>(null);
+  const onRescanPaletteColors = async () => {
+    if (paletteColorsRunning || paletteRunning || refilling) return;
+    setPaletteColorsRunning(true);
+    setPaletteColorsResult(null);
+    try {
+      const n = await rescanPaletteColors();
+      setPaletteColorsResult(`色板关系表已重建：写入 ${n} 条（表已满时重复执行返回 0，属正常）`);
+    } catch (e) {
+      setPaletteColorsResult(e instanceof Error ? e.message : String(e));
+    } finally {
+      setPaletteColorsRunning(false);
     }
   };
 
@@ -926,6 +945,21 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
               {paletteResult && (
                 <p className="px-4 py-2 text-xs text-[var(--color-text-secondary)]">{paletteResult}</p>
               )}
+              {/* R1-2：色板关系表重建（从 palette_json 重灌 asset_palette_colors，不解码图片）
+                  —— 「前三色包含红」类筛选的表源；老库/重置后为空时点一次即可补齐 */}
+              <Field
+                label="色板关系表重建"
+                hint="从每张素材已算好的 palette_json 重建「前三色包含」筛选用的索引表（asset_palette_colors）。不解码图片、不调 AI，毫秒级且幂等。素材的色板数据改动（如回算）后如有遗漏，再点一次即可对齐"
+              >
+                <div className="flex items-center gap-2">
+                  <Button disabled={paletteColorsRunning || paletteRunning || refilling} onClick={() => void onRescanPaletteColors()}>
+                    {paletteColorsRunning ? "重建中…" : "重建前三色索引"}
+                  </Button>
+                </div>
+              </Field>
+              {paletteColorsResult && (
+                <p className="px-4 py-2 text-xs text-[var(--color-text-secondary)]">{paletteColorsResult}</p>
+              )}
               {/* W5d（§W5d）：感知哈希回填（相似图去重的前提；新导入的图片已自动计算，这里只补存量） */}
               <Field
                 label="感知哈希回填"
@@ -1188,6 +1222,57 @@ function AiPurposePanel({
         <Field label="每批处理数量" hint="当前为本地模型：固定每轮 15 张，此设置不生效（切换回在线服务后可调）">
           <span className="text-xs text-[var(--color-text-secondary)]">本地固定 15 张/轮</span>
         </Field>
+      )}
+      {/* A4 置信度策略：与后端 AiSettings 逐字段对应；必须随整份设置一起保存，
+          否则 save_settings 整份覆写会把这三项刷回默认（后端读得到、前端丢得掉）。 */}
+      {!isSuperSearch && (
+        <>
+          <Field
+            label="自动接收精确命中"
+            hint="AI 输出与词表中的规范名或别名完全一致时，直接写入素材标签（ai_unreviewed），不再逐条确认。关闭后精确命中也会进「新词待确认」供你逐个勾选"
+          >
+            <span className="flex items-center gap-2">
+              <Toggle checked={draft.ai.autoAcceptExactTerms} onChange={(v) => patchAi({ autoAcceptExactTerms: v })} />
+              <span className="w-16 text-xs whitespace-nowrap text-[var(--color-text-secondary)]">
+                {draft.ai.autoAcceptExactTerms ? "已开启" : "已关闭"}
+              </span>
+            </span>
+          </Field>
+          <Field
+            label="AI 自动新建标签"
+            hint="⚠ 风险选项（默认关闭）：开启后，AI 在词表中找不到合适标签时会直接创建新标签并写入素材，词表会被 AI 输出持续扩充，可能产生大量一次性标签。保持关闭时，新词只会进入「新词待确认」由你逐个采纳"
+          >
+            <span className="flex items-center gap-2">
+              <Toggle checked={draft.ai.autoAdoptNewTerms} onChange={(v) => patchAi({ autoAdoptNewTerms: v })} />
+              <span className="w-16 text-xs whitespace-nowrap text-[var(--color-text-secondary)]">
+                {draft.ai.autoAdoptNewTerms ? "已开启" : "已关闭"}
+              </span>
+            </span>
+          </Field>
+          <Field
+            label="建议最低置信度"
+            hint="AI 建议的置信度低于此阈值时直接丢弃（不进建议列表也不打标）。0.30 = 30%，与指导书默认一致；0.00 = 不设下限，所有建议都保留"
+          >
+            <div className="flex items-center gap-2">
+              <input
+                type="number"
+                min={0}
+                max={1}
+                step={0.05}
+                value={draft.ai.confidenceMinSuggest}
+                onChange={(e) => {
+                  const v = Number(e.target.value);
+                  patchAi({ confidenceMinSuggest: Number.isFinite(v) ? Math.max(0, Math.min(1, v)) : 0.3 });
+                }}
+                aria-label="建议最低置信度"
+                className="ui-control w-24 px-2 py-1.5 text-sm"
+              />
+              <span className="w-12 text-xs text-[var(--color-text-secondary)]">
+                {Math.round((draft.ai.confidenceMinSuggest ?? 0.3) * 100)}%
+              </span>
+            </div>
+          </Field>
+        </>
       )}
     </Group>
   );
@@ -1455,6 +1540,13 @@ function ResetDataPanel({
       notify(msg);
       setSel(RESET_NONE);
       setConfirming(false);
+      // P0-0：重置只清库记录与派生缓存，localStorage 不在库里清不掉 ——
+      // 陈旧条件里可能是旧 epoch 日期格式，不清会让日期 P0 修完后仍 hydrate 报错。
+      try {
+        localStorage.removeItem("super-search-conditions");
+      } catch {
+        /* localStorage 不可用时静默跳过（非阻断步骤） */
+      }
       await onDataReset(done);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);

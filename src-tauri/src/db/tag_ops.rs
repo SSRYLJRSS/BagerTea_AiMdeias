@@ -105,7 +105,14 @@ pub fn undo_batch(conn: &Connection, batch_id: i64) -> AppResult<u64> {
             .collect::<Result<Vec<_>, _>>()?;
         rows
     };
-    if ops.is_empty() {
+    // V24：数值-only 批次（无 tag_ops 流水但确认过数值建议）也必须可撤销
+    let numbers_present: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM asset_facet_numbers
+          WHERE source_batch_id = ?1 AND source != 'manual' AND review_state = 'ai_unreviewed'",
+        [batch_id],
+        |r| r.get(0),
+    )?;
+    if ops.is_empty() && numbers_present == 0 {
         return Ok(0);
     }
     let tx = conn.unchecked_transaction()?;
@@ -137,6 +144,10 @@ pub fn undo_batch(conn: &Connection, batch_id: i64) -> AppResult<u64> {
         }
     }
     // D-4：撤销成功后置 undone（不再显示可点击撤销；不影响历史 confirmed 计数语义）
+    // V24（§6.4）：数值批次撤销 —— 与 asset_tags 的 D-3 守卫逐字对齐
+    //（source_batch_id 匹配 + source != 'manual' + review_state='ai_unreviewed'）。
+    let numbers_removed = crate::db::facet_numbers::undo_batch_numbers(&tx, batch_id)?;
+    let applied = applied + numbers_removed as u64;
     tx.execute(
         "UPDATE ai_batches SET status = 'undone' WHERE id = ?1",
         [batch_id],

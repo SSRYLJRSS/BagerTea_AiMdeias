@@ -1,11 +1,13 @@
-/** 超级搜索条件芯片（FB5-05 §9.6.1）：expr 为唯一条件源。
- *  - chips 递归遍历 expr：AND 组显示「同时满足」，OR 根按组显示「任一组 N」，NOT 叶显示「排除：…」；
- *  - 每个 chip 保存稳定 expr path，删除只摘除该节点后 normalize（禁止走 setQuery 清空整棵 AI 树）；
- *  - 排序 chip 独立（setSort）；「清除全部」调用 clearConditions 同时清 expr 与兼容扁平筛选；
- *  - 无 expr 时（纯手动条件链路）退回扁平 query 渲染，仍可逐项删除。 */
+/** 超级搜索条件芯片（FB5-05 §9.6.1 + §3.7）：三区共用一个 chip 行。
+ *  - 必须区（plan.filter，expr 为派生视图）→ 组标签「必须」，删除走 removeAtZonePath("filter", path)；
+ *  - 排除区（plan.mustNot）→ 组标签「排除」，删除走 removeAtZonePath("mustNot", path)（§3.10 统一标签）；
+ *  - 优先区（plan.should）→ 组标签「优先」，按 index 单条移除；
+ *  - 排序 chip 独立（setSort）；「清除全部」调用 clearConditions 同时清 plan 与兼容扁平筛选；
+ *  - 无 plan（纯手动条件旧链路）退回扁平 query 渲染，仍可逐项删除。 */
 import { useShallow } from "zustand/react/shallow";
 import { useSuperSearchStore } from "@/stores/superSearchStore";
 import { useTagStore } from "@/stores/tagStore";
+import { useNumericDomainStore } from "@/stores/numericDomainStore";
 import type { MetadataFilter } from "@/types/asset";
 import type { LeafCond } from "@/types/queryExpr";
 import {
@@ -68,17 +70,26 @@ function bonusLabel(cond: LeafCond, tagName: Map<number, string>): string {
       return `排除：${names(cond.tagIds) || cond.facetKey}`;
     case "metadata":
       return metaLabel(cond.filter);
+    case "facetNumber": {
+      // V24（Phase 7-8）：数值分面 chip —— 显示名从 NumericDomain 反查（无则退 key）
+      const d = useNumericDomainStore.getState().domains.find((x) => x.key === `facet:${cond.facetKey}`);
+      const label = d?.label ?? cond.facetKey;
+      const opText: Record<string, string> = { eq: "=", gt: ">", gte: "≥", lt: "<", lte: "≤" };
+      return cond.op === "between"
+        ? `${label} ${cond.value}~${cond.maxValue ?? ""}`
+        : `${label} ${opText[cond.op] ?? cond.op} ${cond.value}`;
+    }
   }
 }
 
 export default function FilterChips() {
-  const { query, expr, plan, resolvedTags, removeExprAtPath, removePlanShould, setQuery, setSort, clearConditions } = useSuperSearchStore(
+  const { query, expr, plan, resolvedTags, removeAtZonePath, removePlanShould, setQuery, setSort, clearConditions } = useSuperSearchStore(
     useShallow((s) => ({
       query: s.query,
       expr: s.expr,
       plan: s.plan,
       resolvedTags: s.resolvedTags,
-      removeExprAtPath: s.removeExprAtPath,
+      removeAtZonePath: s.removeAtZonePath,
       removePlanShould: s.removePlanShould,
       setQuery: s.setQuery,
       setSort: s.setSort,
@@ -90,10 +101,10 @@ export default function FilterChips() {
   const chips: Chip[] = [];
 
   if (expr) {
-    // §9.6.1：expr 是唯一条件源（AI 树 / 构建器树）；组标签由 flatten 提供（同时满足/任一组 N/排除）
+    // §3.10：必须区组标签统一「必须」；删除带 zone（§3.7 不变式 6）
     const models: ExprChipModel[] = flattenExprForDisplay(expr, resolvedTags);
     for (const m of models) {
-      chips.push({ key: m.key, label: m.label, group: m.group, onRemove: () => removeExprAtPath(m.path) });
+      chips.push({ key: `filter:${m.key}`, label: m.label, group: "必须", onRemove: () => removeAtZonePath("filter", m.path) });
     }
   } else {
     // 纯手动条件链路（无 expr）：扁平 query 渲染，仍逐项删除
@@ -144,14 +155,22 @@ export default function FilterChips() {
     }
   }
 
-  // U-5：加分项（should）作为独立「加分」组 chips（按索引单条移除）
+  // 排除区（plan.mustNot）：§3.10 组标签统一「排除」；删除带 zone（§3.7 不变式 6）
+  if (plan?.mustNot) {
+    const models: ExprChipModel[] = flattenExprForDisplay(plan.mustNot, resolvedTags);
+    for (const m of models) {
+      chips.push({ key: `exclude:${m.key}`, label: m.label, group: "排除", onRemove: () => removeAtZonePath("mustNot", m.path) });
+    }
+  }
+
+  // U-5/§3.10：加分项（should）作为独立「优先」组 chips（按索引单条移除）
   if (plan && plan.should.length > 0) {
     const tagName = new Map(resolvedTags.map((rt) => [rt.tagId, rt.text]));
     plan.should.forEach((sc, i) => {
       chips.push({
         key: `bonus:${i}:${JSON.stringify(sc.cond)}:${sc.weight}`,
         label: bonusLabel(sc.cond, tagName),
-        group: "加分",
+        group: "优先",
         onRemove: () => removePlanShould(i),
       });
     });

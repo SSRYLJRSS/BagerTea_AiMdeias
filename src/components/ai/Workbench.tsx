@@ -33,6 +33,19 @@ interface WorkbenchProps {
   onConfirm: () => Promise<void>;
   onReject: () => Promise<void>;
   onRestore: () => Promise<void>;
+  /** V24（Phase 7-4）：数值建议项（itemKind='number'）—— 采纳写 asset_facet_numbers；
+   *  歧义项（numValue=null）提示人工确认，系统绝不自动取值（不变量 11） */
+  numberItems?: WorkbenchNumberItem[];
+  onDecideNumberItem?: (itemId: number, decision: "accepted" | "rejected") => Promise<void>;
+}
+
+export interface WorkbenchNumberItem {
+  id: number;
+  facetKey: string;
+  displayName: string;
+  numValue: number | null;
+  decision: string;
+  decisionReason: string | null;
 }
 
 function exifLine(a: Asset | null): string {
@@ -63,6 +76,8 @@ export default function Workbench({
   onConfirm,
   onReject,
   onRestore,
+  numberItems,
+  onDecideNumberItem,
 }: WorkbenchProps) {
   const [stage, setStage] = useState<ImgStage>("hd");
   const [imgUrl, setImgUrl] = useState<string | null>(null);
@@ -292,6 +307,36 @@ export default function Workbench({
           <h3 className="ui-section-title">标签</h3>
           <span className="text-[11px] text-[var(--color-text-tertiary)]">共 {totalTags} 个</span>
         </div>
+        {/* V24（Phase 7-4）：数值建议 —— 确认建议时自动落库；歧义项保持待确认 */}
+        {numberItems && numberItems.length > 0 && (
+          <div className="mb-2 border-b border-[var(--color-border)]/70 pb-2">
+            <span className="text-xs font-medium text-[var(--color-text-secondary)]">数值建议</span>
+            <div className="mt-1 flex flex-col gap-1">
+              {numberItems.map((n) => (
+                <div key={n.id} className="flex min-h-6 flex-wrap items-center gap-2 text-xs" data-testid="workbench-number-item">
+                  <span className="font-medium text-[var(--color-text)]">{n.displayName}</span>
+                  {n.numValue != null ? (
+                    <>
+                      <span className="rounded bg-[var(--color-surface)] px-1.5 py-0.5 tabular-nums">{n.numValue}</span>
+                      {n.decision === "pending" && !readOnly && onDecideNumberItem ? (
+                        <>
+                          <button type="button" aria-label={`采纳数值建议 ${n.displayName}`} onClick={() => void onDecideNumberItem(n.id, "accepted")} className="text-[var(--color-status)] hover:underline">采纳</button>
+                          <button type="button" aria-label={`拒绝数值建议 ${n.displayName}`} onClick={() => void onDecideNumberItem(n.id, "rejected")} className="text-[var(--color-text-tertiary)] hover:underline">拒绝</button>
+                        </>
+                      ) : (
+                        <span className="text-[10px] text-[var(--color-text-tertiary)]">{n.decision === "accepted" ? "已采纳" : n.decision === "rejected" ? "已拒绝" : ""}</span>
+                      )}
+                    </>
+                  ) : (
+                    <span className="text-[10px] text-[var(--color-text-tertiary)]">
+                      需人工确认：{n.decisionReason ?? "表达有歧义"}（数值不自动取值；可在看片台手工赋值）
+                    </span>
+                  )}
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
         {/* FB5-05（§7.6）：一句话描述。单行 input、maxLength 20、字符计数用 JS 字符迭代；
             位于标签分面滚动区顶部（分面滚动时描述保持在编辑区顶部）。 */}
         <div className="mb-2 flex min-h-8 items-center gap-3 border-b border-[var(--color-border)]/70 pb-2">

@@ -6,6 +6,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { listAssetIds } from "@/api/assets";
 import AssetGrid from "@/components/library/AssetGrid";
+import GridToolbar from "@/components/library/GridToolbar";
 import { useLibraryStore } from "@/stores/libraryStore";
 import { useSelectionStore } from "@/stores/selectionStore";
 import { useSettingsStore, DEFAULT_APPEARANCE } from "@/stores/settingsStore";
@@ -322,6 +323,9 @@ describe("AssetGrid FB2-01 档位缩放（Alt/Ctrl+滚轮）", () => {
         ollamaSourceId: "auto",
         systemPromptTagging: "",
         systemPromptSearch: "",
+        autoAcceptExactTerms: true,
+        autoAdoptNewTerms: false,
+        confidenceMinSuggest: 0.3,
       },
       theme: "system",
       thumbnailCacheMb: 2048,
@@ -359,5 +363,76 @@ describe("AssetGrid FB2-01 档位缩放（Alt/Ctrl+滚轮）", () => {
     fireEvent.wheel(scrollEl, { deltaY: -100 }); // 无 Alt/Ctrl
     expect(useSettingsStore.getState().previewAppearance).toBeNull();
     // 无修饰键 + Alt 关，行为不变
+  });
+});
+// ═══════════════ §4.6 全选截断安全策略（B2/B8 + Phase 2-16） ═══════════════
+
+describe("AssetGrid §4.6 截断安全", () => {
+  it("truncated_ids_block_delete_and_invert：触顶 100000 → 反选/删除菜单项禁用（不可逆 + 集合不完整）", async () => {
+    // fetchAllIds 返回触顶的 100000 个 id，total=100010（截断前匹配总数）
+    const ids = Array.from({ length: 100_000 }, (_, i) => i + 1);
+    vi.mocked(listAssetIds).mockResolvedValue(ids);
+    const assets = [mkAsset(1), mkAsset(2)];
+    useLibraryStore.setState({ items: assets, viewItems: assets, total: 100_010 });
+    useSelectionStore.setState({ selected: new Set(), anchorIndex: null, truncated: false, selectionTotal: 0 });
+    renderGrid();
+
+    // Ctrl+A 全选 → setAll 记录 truncated + total（粘性）
+    fireEvent.keyDown(window, { key: "a", ctrlKey: true });
+    await waitFor(() => expect(useSelectionStore.getState().truncated).toBe(true));
+    await waitFor(() => expect(useSelectionStore.getState().selectionTotal).toBe(100_010));
+
+    // 右键打开菜单：反选 / 删除 必须禁用（guardTruncated 的导出/打标走二次确认，不在本条断言）
+    fireEvent.contextMenu(cardByName("a1.jpg"));
+    const invertBtn = screen.getByText("反选").closest("button") as HTMLButtonElement;
+    expect(invertBtn.disabled).toBe(true);
+    expect(invertBtn.title).toContain("100000");
+    const deleteBtn = screen.getByText("删除").closest("button") as HTMLButtonElement;
+    expect(deleteBtn.disabled).toBe(true);
+    expect(deleteBtn.title).toContain("收窄条件");
+  });
+
+  it("truncated_ids_require_confirm_for_export：截断时导出走二次确认（window.confirm 拒绝则不执行）", async () => {
+    const ids = Array.from({ length: 100_000 }, (_, i) => i + 1);
+    vi.mocked(listAssetIds).mockResolvedValue(ids);
+    const onExport = vi.fn();
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(false);
+    const assets = [mkAsset(1), mkAsset(2)];
+    useLibraryStore.setState({ items: assets, viewItems: assets, total: 100_010 });
+    useSelectionStore.setState({ selected: new Set(), anchorIndex: null, truncated: false, selectionTotal: 0 });
+    render(
+      <AssetGrid
+        onPreview={vi.fn()}
+        onAiTag={vi.fn()}
+        onAssignTags={vi.fn()}
+        onExport={onExport}
+        onMove={vi.fn()}
+        onDelete={vi.fn()}
+      />,
+    );
+    fireEvent.keyDown(window, { key: "a", ctrlKey: true });
+    await waitFor(() => expect(useSelectionStore.getState().truncated).toBe(true));
+
+    fireEvent.contextMenu(cardByName("a1.jpg"));
+    fireEvent.click(screen.getByText("导出"));
+    await waitFor(() => expect(confirmSpy).toHaveBeenCalled());
+    expect(confirmSpy.mock.calls[0][0]).toContain("100010");
+    expect(onExport).not.toHaveBeenCalled(); // 拒绝确认 → 不执行
+  });
+
+  it("selection_bar_shows_partial_count：选择栏恒显示「已选 N / total」，不是只显示 N", async () => {
+    // 选择栏文案在 GridToolbar（LibraryPage 渲染），此处直接挂载它验证显示逻辑
+    const ids = Array.from({ length: 100_000 }, (_, i) => i + 1);
+    vi.mocked(listAssetIds).mockResolvedValue(ids);
+    useSelectionStore.setState({
+      selected: new Set(ids),
+      anchorIndex: null,
+      truncated: true,
+      selectionTotal: 100_010,
+    });
+    render(
+      <GridToolbar onAiTag={vi.fn()} onAssignTags={vi.fn()} onExport={vi.fn()} onMove={vi.fn()} onDelete={vi.fn()} onPurge={vi.fn()} />,
+    );
+    expect(screen.getByText(/已选中 100000 \/ 100010 项/)).toBeTruthy();
   });
 });

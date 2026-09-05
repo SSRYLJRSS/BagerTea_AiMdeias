@@ -20,13 +20,15 @@ import { ASPECT_RATIO } from "@/utils/cellFit";
 import { thumbSizeForCell } from "@/utils/thumbSize";
 import { HEIGHT_PX, type PaletteSegment } from "@/components/library/ColorStrip";
 import type { Asset } from "@/types/asset";
+import type { FetchAllIdsResult } from "@/types/superSearch";
 
 export interface AssetGridViewProps extends LibraryGridActions {
   items: Asset[];
   total: number;
   loading: boolean;
   loadMore: () => void;
-  fetchAllIds: () => Promise<number[]>;
+  /** §4.6（B2/B8）：全选 ID 一路到底 —— FetchAllIdsResult（= PlanIdsResult，不降级成 number[]） */
+  fetchAllIds: () => Promise<FetchAllIdsResult>;
   onPreview: (asset: Asset) => void;
   /** §12（FB-06）：外部主滚动容器。缺省时内部自建可滚容器（普通库页）；
    *  提供时虚拟滚动使用外部容器，内部不再 overflow 自身。 */
@@ -78,15 +80,42 @@ export default function AssetGridView({
   onClearFilter,
   zeroingActions,
 }: AssetGridViewProps) {
-  const { selected, toggle, rangeTo, clear, setAll, invert } = useSelectionStore(
+  const { selected, truncated, selectionTotal, toggle, rangeTo, clear, setAll, invert } = useSelectionStore(
     useShallow((s) => ({
       selected: s.selected,
+      truncated: s.truncated,
+      selectionTotal: s.selectionTotal,
       toggle: s.toggle,
       rangeTo: s.rangeTo,
       clear: s.clear,
       setAll: s.setAll,
       invert: s.invert,
     })),
+  );
+
+  // §4.6 截断策略：全选 → 记录 truncated/total；反选 → 触顶直接禁止（「不在前十万里」≠「不匹配」）
+  const selectAll = useCallback(() => {
+    void fetchAllIds().then((r) => setAll(r.ids, { truncated: r.truncated, total: r.total }));
+  }, [fetchAllIds, setAll]);
+  const invertAll = useCallback(() => {
+    void fetchAllIds().then((r) => {
+      if (r.truncated) {
+        window.alert("当前结果超过 100000 张，反选在截断集合上没有定义，请先收窄条件。");
+        return;
+      }
+      invert(r.ids, { truncated: false, total: r.total });
+    });
+  }, [fetchAllIds, invert]);
+  // §4.6：可逆性差的批量操作在截断集合上二次确认；删除/反选直接禁用（见菜单）
+  const guardTruncated = useCallback(
+    (action: () => void, noun: string) => () => {
+      if (truncated) {
+        const ok = window.confirm(`将${noun}已选中的 ${selected.size} 张（共 ${selectionTotal} 张匹配）。继续？`);
+        if (!ok) return;
+      }
+      action();
+    },
+    [truncated, selectionTotal, selected.size],
   );
   const { ref, width } = useElementSize<HTMLDivElement>();
 
@@ -314,10 +343,10 @@ export default function AssetGridView({
       if (!(e.ctrlKey || e.metaKey)) return;
       if (e.key === "a" || e.key === "A") {
         e.preventDefault();
-        void fetchAllIds().then(setAll);
+        selectAll();
       } else if (e.key === "i" || e.key === "I") {
         e.preventDefault();
-        void fetchAllIds().then(invert);
+        invertAll();
       } else if (e.key === "=" || e.key === "+") {
         e.preventDefault();
         stepCell(1);
@@ -328,7 +357,7 @@ export default function AssetGridView({
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [fetchAllIds, setAll, invert, menu, stepCell, applyRating, toggleFavorite, selected]);
+  }, [selectAll, invertAll, menu, stepCell, applyRating, toggleFavorite, selected]);
 
   const handleContextMenu = useCallback(
     (asset: Asset, _index: number, e: React.MouseEvent) => {
@@ -384,22 +413,29 @@ export default function AssetGridView({
   const hasActiveFilter = hasActiveFilterProp ?? storeHasFilter;
 
   const menuEntries = useMemo((): MenuEntry[] => {
+    // §4.6：反选在截断集合上禁止（结果没有定义）；全选允许但记 truncated
     const common: MenuEntry[] = [
-      { label: "全选", onClick: () => void fetchAllIds().then(setAll) },
-      { label: "反选", onClick: () => void fetchAllIds().then(invert) },
+      { label: "全选", onClick: selectAll },
+      { label: "反选", disabled: truncated, title: truncated ? "当前结果超过 100000 张，反选在截断集合上没有定义" : undefined, onClick: invertAll },
     ];
     if (selected.size === 0) return common;
     return [
       {
         label: "打标",
         children: [
-          { label: "AI", onClick: onAiTag },
-          { label: "手动", onClick: onAssignTags },
+          { label: "AI", onClick: guardTruncated(onAiTag, "送 AI 批量打标") },
+          { label: "手动", onClick: guardTruncated(onAssignTags, "批量打标") },
         ],
       },
-      { label: "导出", onClick: onExport },
-      { label: "移动到…", onClick: onMove },
-      { label: "删除", onClick: onDelete },
+      { label: "导出", onClick: guardTruncated(onExport, "导出") },
+      { label: "移动到…", onClick: guardTruncated(onMove, "移动") },
+      // §4.6：删除（移入回收站）在截断集合上禁止 —— 不可逆 + 集合不完整 = 最坏组合
+      {
+        label: "删除",
+        disabled: truncated,
+        title: truncated ? "当前结果超过 100000 张，请先收窄条件再删除" : undefined,
+        onClick: onDelete,
+      },
       { divider: true },
       // W5b（§W5b）：右键收藏 + 评级子菜单（对选中集批量生效）
       { label: "收藏", onClick: () => toggleFavorite(Array.from(selected)) },
@@ -428,7 +464,7 @@ export default function AssetGridView({
       ...common,
       { label: "取消选择", onClick: clear },
     ];
-  }, [selected.size, fetchAllIds, setAll, invert, onAiTag, onAssignTags, onExport, onMove, onDelete, copyPaths, revealFirst, openFirstExternal, clear, toggleFavorite, applyRating]);
+  }, [selected.size, truncated, selectAll, invertAll, guardTruncated, onAiTag, onAssignTags, onExport, onMove, onDelete, copyPaths, revealFirst, openFirstExternal, clear, toggleFavorite, applyRating]);
 
   if (items.length === 0) {
     return (

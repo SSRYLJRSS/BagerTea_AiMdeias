@@ -175,7 +175,8 @@ fn categories() -> Vec<FacetPromptContext> {
         description: "场景".into(),
         selection_mode: "single".into(),
         max_items: Some(3),
-    }]
+            ..Default::default()
+        }]
 }
 
 fn progress_sink() -> (

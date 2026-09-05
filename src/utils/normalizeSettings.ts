@@ -28,6 +28,8 @@ export const BATCH_LIMIT_MIN = 10;
 export const BATCH_LIMIT_MAX = 50;
 export const DEFAULT_CACHE_MB = 2048;
 export const DEFAULT_TRASH_RETENTION_DAYS = 30;
+// ── A4 置信度策略默认（与 Rust db/settings.rs 的 default_* 逐字对应）──
+export const DEFAULT_CONF_MIN_SUGGEST = 0.3;
 
 function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
@@ -81,6 +83,14 @@ function normalizeAi(raw: unknown): AiSettings {
     videoFrameCount: clampInt(r.videoFrameCount, 2, 8, 3),
     systemPromptTagging: asStr(r.systemPromptTagging, ""),
     systemPromptSearch: asStr(r.systemPromptSearch, ""),
+    // A4 置信度策略：默认与指导书一致（精确命中自动接收开 / 自动建词关 / 阈值 0.30）——
+    // 必须保留这三项，否则 save_settings 整份 JSON 覆写会把后端已落库的策略刷回默认。
+    autoAcceptExactTerms: asBool(r.autoAcceptExactTerms, true),
+    autoAdoptNewTerms: asBool(r.autoAdoptNewTerms, false),
+    confidenceMinSuggest: (() => {
+      const n = asNum(r.confidenceMinSuggest, DEFAULT_CONF_MIN_SUGGEST);
+      return Number.isFinite(n) && n >= 0 && n <= 1 ? n : DEFAULT_CONF_MIN_SUGGEST;
+    })(),
   };
 }
 

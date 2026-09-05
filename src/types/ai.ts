@@ -49,6 +49,10 @@ export interface AiSuggestionItem {
   decision: "pending" | "accepted" | "modified" | "rejected";
   decisionReason: string | null;
   createdAt: number;
+  /** V24（Phase 7-4）：tag | number —— 数值建议项 */
+  itemKind?: "tag" | "number";
+  /** itemKind='number' 时为确认值；歧义项为 null（需人工填数） */
+  numValue?: number | null;
 }
 
 /** FB6 需求一：AI 打标页内进度 UI 状态（由 aiStore 数据派生；进度事件只经页面内唯一

@@ -72,6 +72,11 @@ pub fn build_batch_request_config(
                 "selectionMode": f.selection_mode,
                 "maxItems": f.max_items,
                 "appliesTo": "all",
+                // V24（§6.4）：数值分面配置随批次溯源
+                "facetKind": f.facet_kind,
+                "numMin": f.num_min,
+                "numMax": f.num_max,
+                "numUnit": f.num_unit,
             })
         })
         .collect();
@@ -117,6 +122,8 @@ pub struct MediaAnalysis {
     /// A1：typed 提议（facet_key/raw_name/confidence）——与 tags 对齐（同序、同裁剪）。
     /// 纯字符串回退时 confidence=None。
     pub proposals: Vec<ai::TagProposal>,
+    /// V24（§6.3④）：数值分面提议（平行字段；当前解析层暂不产出，链路预留）
+    pub numbers: Vec<ai::NumberProposal>,
     /// A2：解析层告警（未知分面 key 等），随 AnalysisResult 的 analysis_json 一并落库溯源。
     pub warnings: Vec<String>,
     /// A2：该次请求的模型原始返回（逐字存储，不做任何清洗/剥围栏）
@@ -150,14 +157,23 @@ fn build_system_prompt() -> String {
     // W5a（a9）+ A1：置信度强类型协议 —— 标签可带置信度，写成 {"t":"标签","c":0.9}
     // （c 为 0 到 1 的数字；纯字符串仍是合法回退）。A1 起解析层强类型处理，不再吞标签。
     sys.push_str("- 标签可带置信度：写成 {\"t\":\"标签\",\"c\":0.9}（c 为 0 到 1 的数字；纯字符串也接受）。\n");
+    // V24（§6.4）：数值分面输出协议 —— numbers 对象，值为原文（字符串或数字都接受）。
+    // 歧义表达（范围/约数）如实输出，由解析层判定（绝不取首个数字）。
+    sys.push_str("- 数值分类输出到 \"numbers\" 对象：{\"numbers\": {\"分面key\": \"原文\"}}；");
+    sys.push_str("原文如实写（如 \"5\" 或 \"5人\"），画不出数字的分面不要出现在 numbers 里。\n");
     sys
 }
 
 /// W5a（a2/a3/a5）：user 段 —— 每分面拼 description + 规则 + Top-N 候选词 + 真实 few-shot。
 /// top_tags 来自 W2-9 top_tags_per_facet（按使用次数降序，高频词优先 → 标签收敛）。
 pub fn build_user_prompt(facets: &[FacetPromptContext], top_tags: &[(String, String)]) -> String {
+    // V24（§6.4）：数值分面独立成段 —— 不发词表（无候选词可给），发「输出一个数字 + 值域 + 单位」
+    let number_facets: Vec<&FacetPromptContext> =
+        facets.iter().filter(|f| f.facet_kind == "number").collect();
+    let tag_facets: Vec<&FacetPromptContext> =
+        facets.iter().filter(|f| f.facet_kind != "number").collect();
     let mut user = String::from("请为这张图片打标。可用的分类（key 为英文标识）：\n");
-    for c in facets {
+    for c in tag_facets {
         let rule = if c.selection_mode == "single" {
             "单选，最多 1 个".to_string()
         } else {
@@ -176,6 +192,33 @@ pub fn build_user_prompt(facets: &[FacetPromptContext], top_tags: &[(String, Str
                 format!("：{}", c.description)
             },
         ));
+    }
+    if !number_facets.is_empty() {
+        user.push_str("\n数值分类（输出到 numbers 对象，不进 tags）：\n");
+        for c in &number_facets {
+            let range = match (c.num_min, c.num_max) {
+                (Some(lo), Some(hi)) => format!("{lo}–{hi} 的"),
+                (Some(lo), None) => format!("不小于 {lo} 的"),
+                (None, Some(hi)) => format!("不大于 {hi} 的"),
+                (None, None) => String::new(),
+            };
+            let unit = if c.num_unit.trim().is_empty() {
+                String::new()
+            } else {
+                format!("，单位：{}", c.num_unit)
+            };
+            user.push_str(&format!(
+                "- {}（key: {}）：输出一个{}数字{unit}；画面中数不出来就不输出该 key，不要猜{}\n",
+                c.display_name,
+                c.key,
+                range,
+                if c.description.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!("（{}）", c.description)
+                },
+            ));
+        }
     }
     if !top_tags.is_empty() {
         user.push_str("\n已有标签候选词（含义相同就用已有的词，不要造近义词）：\n");
@@ -589,7 +632,62 @@ pub fn parse_media_analysis(
             (String::new(), trimmed.to_string())
         };
     let description = normalize_content_description(&raw_desc);
-    let (mut tags, warnings) = parse_categorized_checked_ex(&tags_content, valid_keys, manual_keys);
+    let (mut tags, mut warnings) = parse_categorized_checked_ex(&tags_content, valid_keys, manual_keys);
+    // V24（§6.4）：数值分面解析 —— 从 numbers 对象收集 NumberProposal（原文原样保留，
+    // 歧义判定与越界校验统一在落库层 parse_number_proposal / validate_number_in_range）。
+    let (mut numbers, mut num_warnings): (Vec<ai::NumberProposal>, Vec<String>) = (Vec::new(), Vec::new());
+    let kind_of = |key: &str| -> Option<&str> {
+        facets
+            .iter()
+            .find(|f| f.key == key)
+            .map(|f| f.facet_kind.as_str())
+    };
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_candidate) {
+        if let Some(nums) = v.get("numbers").and_then(|n| n.as_object()) {
+            for (key, val) in nums {
+                let raw = match val {
+                    serde_json::Value::String(s) => s.trim().to_string(),
+                    serde_json::Value::Number(n) => n.to_string(),
+                    _ => continue,
+                };
+                if raw.is_empty() {
+                    continue;
+                }
+                match kind_of(key) {
+                    Some("number") => numbers.push(ai::NumberProposal {
+                        facet_key: key.clone(),
+                        raw_text: raw,
+                        value: 0.0,
+                        confidence: None,
+                    }),
+                    _ => num_warnings.push(format!("数值提议的分面「{key}」不存在或不是数值型。")),
+                }
+            }
+        }
+    }
+    // 模型把数值误写进 tags（如 tags.people_count=["5"]）→ 摘出来转成 NumberProposal
+    let number_keys: Vec<String> = facets
+        .iter()
+        .filter(|f| f.facet_kind == "number")
+        .map(|f| f.key.clone())
+        .collect();
+    for key in &number_keys {
+        if let Some(vals) = tags.remove(key) {
+            for val in vals {
+                let raw = val.trim().to_string();
+                if !raw.is_empty() {
+                    numbers.push(ai::NumberProposal {
+                        facet_key: key.clone(),
+                        raw_text: raw,
+                        value: 0.0,
+                        confidence: None,
+                    });
+                }
+            }
+            num_warnings.push(format!("数值分面「{key}」的输出误写在 tags 里，已转入数值提议。"));
+        }
+    }
+    warnings.extend(num_warnings);
     // W5a（a8）：按 selection_mode / max_items 强制裁剪（替换无差别 take(5)）。
     // single 恒 1 个；multi 裁到 max_items（None = 不限）；超量记 warning。
     {
@@ -633,6 +731,7 @@ pub fn parse_media_analysis(
         description,
         tags,
         proposals,
+        numbers,
         warnings,
         // A2 溯源字段由调用方（request_analysis 的 enrich）补写，纯解析层置空
         raw_response: String::new(),
@@ -779,6 +878,7 @@ fn request_analysis(
             serde_json::to_string(&ai::AnalysisResult {
                 description: a.description.clone(),
                 proposals: a.proposals.clone(),
+                numbers: a.numbers.clone(),
                 warnings: a.warnings.clone(),
             })
             .unwrap_or_default(),
@@ -1490,6 +1590,7 @@ fn analyze_video_frames(
         description,
         tags: merged,
         proposals: Vec::new(),
+        numbers: Vec::new(),
         warnings: Vec::new(),
         // 视频合并路径：单帧溯源已被逐帧 enrich 捕获，合并结果不再重复存储
         raw_response: String::new(),
@@ -1672,6 +1773,12 @@ pub fn run_cloud_batch<F: Fn(AiProgress)>(
                             &a.description,
                             &policy,
                         )?;
+                        // V24（§6.4）：数值提议落库（歧义进 pending 待人工填数；越界/无数字丢弃 + warning）
+                        let number_warnings =
+                            ai::record_number_proposals_for_suggestion(&conn, s.id, &a.numbers)?;
+                        for w in number_warnings {
+                            tracing::info!("asset {} 数值提议: {w}", s.asset_id);
+                        }
                         // A2：逐字存模型原始返回 + AnalysisResult 序列化（analysis_schema_version 恒 1）
                         ai::set_suggestion_provenance(
                             &conn,
@@ -1742,6 +1849,7 @@ mod tests {
         apply_keep_alive, extract_anthropic_text, parse_categorized, parse_model_ids,
         KEEP_ALIVE_IDLE,
     };
+    use crate::db::tag_facets::FacetPromptContext;
 
     #[test]
     fn categorized_clean_object() {
@@ -2100,6 +2208,65 @@ mod tests {
         let a = super::parse_media_analysis(r#"{"subject":["树"]}"#, &valid, &[], &[]).unwrap();
         assert_eq!(a.description, "");
         assert_eq!(a.tags.get("subject").unwrap(), &vec!["树".to_string()]);
+    }
+
+    /// V24（§6.4）：numbers 对象 → NumberProposal（原文原样）；数值分面 key 不得留在 tags。
+    #[test]
+    fn parse_media_analysis_extracts_numbers_object() {
+        let valid = ["subject", "people_count"];
+        let facets = vec![FacetPromptContext {
+            key: "people_count".into(),
+            display_name: "人数".into(),
+            description: String::new(),
+            selection_mode: "single".into(),
+            max_items: None,
+            facet_kind: "number".into(),
+            num_min: Some(0.0),
+            num_max: Some(50.0),
+            num_unit: "人".into(),
+        }];
+        let a = super::parse_media_analysis(
+            r#"{"description":"树下五人合影","tags":{"subject":["树"]},"numbers":{"people_count":"5人"}}"#,
+            &valid,
+            &facets,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(a.numbers.len(), 1, "numbers 提议应收集 1 条：{:?}", a.numbers);
+        assert_eq!(a.numbers[0].facet_key, "people_count");
+        assert_eq!(a.numbers[0].raw_text, "5人");
+        assert!(a.tags.get("people_count").is_none(), "数值分面不得留在 tags");
+    }
+
+    /// V24：模型把数值误写进 tags（tags.people_count=["5"]）→ 摘出转成数值提议 + warning。
+    #[test]
+    fn parse_media_analysis_number_in_tags_is_moved_to_numbers() {
+        let valid = ["people_count"];
+        let facets = vec![FacetPromptContext {
+            key: "people_count".into(),
+            display_name: "人数".into(),
+            description: String::new(),
+            selection_mode: "single".into(),
+            max_items: None,
+            facet_kind: "number".into(),
+            num_min: None,
+            num_max: None,
+            num_unit: String::new(),
+        }];
+        let a = super::parse_media_analysis(
+            r#"{"description":"五人合影","tags":{"people_count":["5"]}}"#,
+            &valid,
+            &facets,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(a.numbers.len(), 1);
+        assert_eq!(a.numbers[0].raw_text, "5");
+        assert!(
+            a.warnings.iter().any(|w| w.contains("误写")),
+            "应有「误写已转」warning：{:?}",
+            a.warnings
+        );
     }
 
     #[test]
