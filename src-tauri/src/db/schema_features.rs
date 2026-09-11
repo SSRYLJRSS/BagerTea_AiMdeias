@@ -105,12 +105,24 @@ pub fn verify_schema_features(conn: &Connection) -> AppResult<Vec<String>> {
     let cycle_ok = object_exists(conn, "trigger", "trg_tags_no_cycle")?
         && object_exists(conn, "trigger", "trg_tags_max_depth_au")?
         && object_exists(conn, "trigger", "trg_tags_max_depth_ai")?;
-    sync_feature(conn, "tag_cycle_guard", cycle_ok, "cycle_guard_missing", &mut diffs)?;
+    sync_feature(
+        conn,
+        "tag_cycle_guard",
+        cycle_ok,
+        "cycle_guard_missing",
+        &mut diffs,
+    )?;
 
     // tag_unique_terms：ux_terms 唯一索引 + tag_terms 表
-    let terms_ok = object_exists(conn, "table", "tag_terms")?
-        && object_exists(conn, "index", "ux_terms")?;
-    sync_feature(conn, "tag_unique_terms", terms_ok, "terms_index_missing", &mut diffs)?;
+    let terms_ok =
+        object_exists(conn, "table", "tag_terms")? && object_exists(conn, "index", "ux_terms")?;
+    sync_feature(
+        conn,
+        "tag_unique_terms",
+        terms_ok,
+        "terms_index_missing",
+        &mut diffs,
+    )?;
 
     // tag_facet_fk：两个触发器
     let fk_ok = object_exists(conn, "trigger", "trg_tags_facet_fk_ai")?
@@ -119,7 +131,13 @@ pub fn verify_schema_features(conn: &Connection) -> AppResult<Vec<String>> {
 
     // tag_facet_restrict_delete：删除拦截触发器
     let restrict_ok = object_exists(conn, "trigger", "trg_facets_restrict_delete")?;
-    sync_feature(conn, "tag_facet_restrict_delete", restrict_ok, "restrict_delete_missing", &mut diffs)?;
+    sync_feature(
+        conn,
+        "tag_facet_restrict_delete",
+        restrict_ok,
+        "restrict_delete_missing",
+        &mut diffs,
+    )?;
 
     Ok(diffs)
 }

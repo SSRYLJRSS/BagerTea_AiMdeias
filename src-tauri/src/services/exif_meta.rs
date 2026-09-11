@@ -92,8 +92,9 @@ fn gps_coordinate(ex: &Exif, coord: Tag, ref_tag: Tag, limit: f64) -> Option<f64
     };
     let v = gps_dms_to_decimal(&dms)?;
     let sign = match text(ex, ref_tag).as_deref() {
-        Some(r) if r.trim().to_ascii_uppercase().starts_with('S')
-            || r.trim().to_ascii_uppercase().starts_with('W') =>
+        Some(r)
+            if r.trim().to_ascii_uppercase().starts_with('S')
+                || r.trim().to_ascii_uppercase().starts_with('W') =>
         {
             -1.0
         }
@@ -257,7 +258,10 @@ mod tests {
         let colon = parse_exif_datetime("2026:07:27 15:01:04");
         let dash = parse_exif_datetime("2026-07-27 15:01:04");
         assert!(colon.is_some(), "冒号格式应可解析（实测数据字节层是冒号）");
-        assert!(dash.is_some(), "短横线格式应可解析（kamadak display_value 输出）");
+        assert!(
+            dash.is_some(),
+            "短横线格式应可解析（kamadak display_value 输出）"
+        );
         assert_eq!(colon, dash, "同一时刻两种写法应得到相同时间戳");
     }
 

@@ -445,22 +445,8 @@ pub fn rescan_assets_dimensions(
         }
         let path = std::path::PathBuf::from(&asset.file_path);
         // 锁外探测：先 image_dimensions，RAW 失败走 rawler
-        let dims = image::image_dimensions(&path)
-            .ok()
-            .map(|(w, h)| (w as i64, h as i64))
-            .or_else(|| {
-                let ext = path
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .unwrap_or("")
-                    .to_ascii_lowercase();
-                if crate::utils::mime::is_raw_ext(&ext) {
-                    crate::services::raw_decode::probe_dimensions(&path)
-                        .map(|(w, h)| (w as i64, h as i64))
-                } else {
-                    None
-                }
-            });
+        let dims =
+            crate::services::imaging::probe_dimensions(&path).map(|(w, h)| (w as i64, h as i64));
         let Some((w, h)) = dims else {
             summary.failed += 1;
             emit_progress(&mut on_progress, i + 1, &summary, id);
@@ -625,6 +611,135 @@ pub fn rescan_assets_palette(
         });
     }
     Ok(summary)
+}
+
+/// W5d（§W5d）：感知哈希存量回填（骨架照抄 palette 回算：读行短锁、解码锁外、进度 + 取消）。
+/// 差异点（计划书明确要求）：写库走批量事务，**每 500 条提交一次** —— 解码在锁外，
+/// 只在批量落库瞬间短锁，绝不把解码时长压进 DB 锁。
+pub fn rescan_assets_phash(
+    db: &Arc<Mutex<Connection>>,
+    asset_ids: &[i64],
+    cancel: &AtomicBool,
+    mut on_progress: impl FnMut(&RefillProgress),
+) -> AppResult<RefillSummary> {
+    const BATCH: usize = 500;
+    let lock = || {
+        db.lock()
+            .map_err(|_| crate::error::AppError::msg("数据库锁中毒"))
+    };
+    let mut summary = RefillSummary {
+        total: asset_ids.len() as i64,
+        ..Default::default()
+    };
+    // 累积待写 (id, phash)，攒满 BATCH 一次性短锁落库（见 flush_phash_batch）
+    let mut pending: Vec<(i64, u64)> = Vec::new();
+
+    for (i, &id) in asset_ids.iter().enumerate() {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        let asset = {
+            let conn = lock()?;
+            assets::get(&conn, id).ok()
+        };
+        let Some(asset) = asset else {
+            summary.skipped += 1;
+            continue;
+        };
+        if !asset.mime_type.starts_with("image/") {
+            summary.skipped += 1;
+            continue;
+        }
+        // 取材：placeholder（入库即生成，已解码像素的最小载体）→ hd → 原图
+        let src = asset
+            .placeholder_path
+            .as_deref()
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                asset
+                    .hd_thumbnail_path
+                    .as_deref()
+                    .map(std::path::PathBuf::from)
+            })
+            .or_else(|| Some(std::path::PathBuf::from(&asset.file_path)));
+        let Some(src) = src.filter(|p| p.exists()) else {
+            summary.skipped += 1;
+            on_progress(&RefillProgress {
+                done: (i + 1) as i64,
+                total: summary.total,
+                success: summary.success,
+                failed: summary.failed,
+                skipped: summary.skipped,
+                current_id: id,
+            });
+            continue;
+        };
+        // 锁外解码（decode_thumb 内部已取全局并发闸，这里不再 acquire —— FX-08）
+        let decoded = crate::services::imaging::decode_thumb(&src, 128);
+        let Some(phash) = decoded.map(|img| crate::services::perceptual::dhash(&img)) else {
+            summary.failed += 1;
+            on_progress(&RefillProgress {
+                done: (i + 1) as i64,
+                total: summary.total,
+                success: summary.success,
+                failed: summary.failed,
+                skipped: summary.skipped,
+                current_id: id,
+            });
+            continue;
+        };
+        if phash == 0 {
+            // 全纯色/无差分图：0 是 set_phash 的哨兵，跳过（不是错误）
+            summary.skipped += 1;
+            continue;
+        }
+        summary.success += 1;
+        pending.push((id, phash));
+        if pending.len() >= BATCH {
+            flush_phash_batch(db, &mut summary, &mut pending)?;
+        }
+        on_progress(&RefillProgress {
+            done: (i + 1) as i64,
+            total: summary.total,
+            success: summary.success,
+            failed: summary.failed,
+            skipped: summary.skipped,
+            current_id: id,
+        });
+    }
+    flush_phash_batch(db, &mut summary, &mut pending)?;
+    Ok(summary)
+}
+
+/// 批量落库一批 phash：单事务写入 → commit（失败整体回滚）→ 计数归位。
+/// decode 阶段已把整批计进 success，这里把写库失败的条目扣回 success 转记 failed；
+/// updated_ids 只收真实写库成功的 id（与 palette 命令语义一致，绝不虚报）。
+fn flush_phash_batch(
+    db: &Arc<Mutex<Connection>>,
+    summary: &mut RefillSummary,
+    pending: &mut Vec<(i64, u64)>,
+) -> AppResult<()> {
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let conn = db
+        .lock()
+        .map_err(|_| crate::error::AppError::msg("数据库锁中毒"))?;
+    let tx = conn.unchecked_transaction()?;
+    let mut ok_ids: Vec<i64> = Vec::new();
+    for &(id, phash) in pending.iter() {
+        if assets::set_phash(&tx, id, phash).is_ok() {
+            ok_ids.push(id);
+        }
+    }
+    tx.commit()?;
+    let n = pending.len();
+    let written = ok_ids.len();
+    summary.success -= (n - written) as i64;
+    summary.failed += (n - written) as i64;
+    summary.updated_ids.extend(ok_ids);
+    pending.clear();
+    Ok(())
 }
 
 #[cfg(test)]
@@ -812,7 +927,11 @@ mod tests {
         assert_eq!(a.latitude, Some(30.25));
         assert_eq!(a.longitude, Some(120.16));
         let v = assets::get(&c, vid).unwrap();
-        assert_eq!(v.taken_at, Some(1_710_484_200_000), "视频 taken_at 应被补上");
+        assert_eq!(
+            v.taken_at,
+            Some(1_710_484_200_000),
+            "视频 taken_at 应被补上"
+        );
         let d = assets::get(&c, vid_done).unwrap();
         assert_eq!(d.latitude, Some(1.0), "已有值不得被覆盖");
         assert_eq!(d.taken_at, Some(123), "已有 taken_at 不得被覆盖");
@@ -863,8 +982,10 @@ mod tests {
         };
         {
             let c = db.lock().unwrap();
-            let mut u = assets::MediaProbeUpdate::default();
-            u.media_metadata_json = Some(json.to_string());
+            let u = assets::MediaProbeUpdate {
+                media_metadata_json: Some(json.to_string()),
+                ..Default::default()
+            };
             assets::update_media_metadata(&c, id, &u).unwrap();
         }
         let a = assets::get(&db.lock().unwrap(), id).unwrap();
@@ -883,7 +1004,7 @@ mod tests {
         // 左黑右白的渐变图（dHash 应产出非 0 值）
         let png = dir.join("grad.png");
         let mut im = RgbImage::new(64, 32);
-        for (x, _y, p) in im.enumerate_pixels_mut() {
+        for (_x, _y, p) in im.enumerate_pixels_mut() {
             // 左白右黑：差分边界处 255>0 → dHash 置位（全黑/全白/左黑右白差分恒 false → hash 0 会被哨兵跳过）
             *p = Rgb([255, 255, 255]);
         }
@@ -916,128 +1037,4 @@ mod tests {
         assert!(a.phash.is_some_and(|p| p > 0), "渐变图应有非 0 phash");
         let _ = std::fs::remove_dir_all(&dir);
     }
-}
-
-
-
-/// W5d（§W5d）：感知哈希存量回填（骨架照抄 palette 回算：读行短锁、解码锁外、进度 + 取消）。
-/// 差异点（计划书明确要求）：写库走批量事务，**每 500 条提交一次** —— 解码在锁外，
-/// 只在批量落库瞬间短锁，绝不把解码时长压进 DB 锁。
-pub fn rescan_assets_phash(
-    db: &Arc<Mutex<Connection>>,
-    asset_ids: &[i64],
-    cancel: &AtomicBool,
-    mut on_progress: impl FnMut(&RefillProgress),
-) -> AppResult<RefillSummary> {
-    const BATCH: usize = 500;
-    let lock = || {
-        db.lock()
-            .map_err(|_| crate::error::AppError::msg("数据库锁中毒"))
-    };
-    let mut summary = RefillSummary {
-        total: asset_ids.len() as i64,
-        ..Default::default()
-    };
-    // 累积待写 (id, phash)，攒满 BATCH 一次性短锁落库（见 flush_phash_batch）
-    let mut pending: Vec<(i64, u64)> = Vec::new();
-
-    for (i, &id) in asset_ids.iter().enumerate() {
-        if cancel.load(Ordering::Relaxed) {
-            break;
-        }
-        let asset = {
-            let conn = lock()?;
-            assets::get(&conn, id).ok()
-        };
-        let Some(asset) = asset else {
-            summary.skipped += 1;
-            continue;
-        };
-        if !asset.mime_type.starts_with("image/") {
-            summary.skipped += 1;
-            continue;
-        }
-        // 取材：placeholder（入库即生成，已解码像素的最小载体）→ hd → 原图
-        let src = asset
-            .placeholder_path
-            .as_deref()
-            .map(std::path::PathBuf::from)
-            .or_else(|| asset.hd_thumbnail_path.as_deref().map(std::path::PathBuf::from))
-            .or_else(|| Some(std::path::PathBuf::from(&asset.file_path)));
-        let Some(src) = src.filter(|p| p.exists()) else {
-            summary.skipped += 1;
-            on_progress(&RefillProgress {
-                done: (i + 1) as i64,
-                total: summary.total,
-                success: summary.success,
-                failed: summary.failed,
-                skipped: summary.skipped,
-                current_id: id,
-            });
-            continue;
-        };
-        // 锁外解码（decode_thumb 内部已取全局并发闸，这里不再 acquire —— FX-08）
-        let decoded = crate::services::imaging::decode_thumb(&src, 128);
-        let Some(phash) = decoded.map(|img| crate::services::perceptual::dhash(&img)) else {
-            summary.failed += 1;
-            on_progress(&RefillProgress {
-                done: (i + 1) as i64,
-                total: summary.total,
-                success: summary.success,
-                failed: summary.failed,
-                skipped: summary.skipped,
-                current_id: id,
-            });
-            continue;
-        };
-        if phash == 0 {
-            // 全纯色/无差分图：0 是 set_phash 的哨兵，跳过（不是错误）
-            summary.skipped += 1;
-            continue;
-        }
-        summary.success += 1;
-        pending.push((id, phash));
-        if pending.len() >= BATCH {
-            flush_phash_batch(db, &mut summary, &mut pending)?;
-        }
-        on_progress(&RefillProgress {
-            done: (i + 1) as i64,
-            total: summary.total,
-            success: summary.success,
-            failed: summary.failed,
-            skipped: summary.skipped,
-            current_id: id,
-        });
-    }
-    flush_phash_batch(db, &mut summary, &mut pending)?;
-    Ok(summary)
-}
-
-/// 批量落库一批 phash：单事务写入 → commit（失败整体回滚）→ 计数归位。
-/// decode 阶段已把整批计进 success，这里把写库失败的条目扣回 success 转记 failed；
-/// updated_ids 只收真实写库成功的 id（与 palette 命令语义一致，绝不虚报）。
-fn flush_phash_batch(
-    db: &Arc<Mutex<Connection>>,
-    summary: &mut RefillSummary,
-    pending: &mut Vec<(i64, u64)>,
-) -> AppResult<()> {
-    if pending.is_empty() {
-        return Ok(());
-    }
-    let conn = db.lock().map_err(|_| crate::error::AppError::msg("数据库锁中毒"))?;
-    let tx = conn.unchecked_transaction()?;
-    let mut ok_ids: Vec<i64> = Vec::new();
-    for &(id, phash) in pending.iter() {
-        if assets::set_phash(&tx, id, phash).is_ok() {
-            ok_ids.push(id);
-        }
-    }
-    tx.commit()?;
-    let n = pending.len();
-    let written = ok_ids.len();
-    summary.success -= (n - written) as i64;
-    summary.failed += (n - written) as i64;
-    summary.updated_ids.extend(ok_ids);
-    pending.clear();
-    Ok(())
 }

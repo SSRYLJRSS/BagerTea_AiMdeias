@@ -6,22 +6,17 @@ import { useShallow } from "zustand/react/shallow";
 import { flattenVisible, useTagStore } from "@/stores/tagStore";
 import { useLibraryStore } from "@/stores/libraryStore";
 import { useAiStore } from "@/stores/aiStore";
-import type { TagNode } from "@/types/tag";
 
 interface TagTreeProps {
   onManage?: () => void;
 }
 
 export default function TagTree({ onManage }: TagTreeProps) {
-  const { tree, facets, expanded, refresh, toggleExpand, expandAll, collapseAll } = useTagStore(
+  const { tree, facets, refresh } = useTagStore(
     useShallow((s) => ({
       tree: s.tree,
       facets: s.facets,
-      expanded: s.expanded,
       refresh: s.refresh,
-      toggleExpand: s.toggleExpand,
-      expandAll: s.expandAll,
-      collapseAll: s.collapseAll,
     })),
   );
   const { filter, setFilter } = useLibraryStore(useShallow((s) => ({ filter: s.filter, setFilter: s.setFilter })));
@@ -47,26 +42,36 @@ export default function TagTree({ onManage }: TagTreeProps) {
     if (tree.length === 0) void refresh();
   }, [tree.length, refresh]);
 
-  // FB6 需求四：全局展开控制。allExpanded 必须覆盖树中所有可展开节点（递归），空树时按钮隐藏。
-  const expandableIds = useMemo(() => {
-    const ids: number[] = [];
-    const walk = (nodes: TagNode[]) => {
-      for (const n of nodes) {
-        if (n.children.length > 0) {
-          ids.push(n.tag.id);
-          walk(n.children);
-        }
-      }
-    };
-    walk(tree);
-    return ids;
-  }, [tree]);
-  const allExpanded = expandableIds.length > 0 && expandableIds.every((id) => expanded.has(id));
-
-  const groups = (facets.length > 0
-    ? facets.map((facet) => ({ facet, rows: flattenVisible(tree.filter((n) => n.tag.facetKey === facet.key), expanded) }))
-    : [{ facet: null, rows: flattenVisible(tree, expanded) }])
-    .filter(({ rows }) => rows.length > 0);
+  // 分面分组与文件属性保持相同的折叠模型：分组标题负责展开/收起，组内仍保留标签树层级。
+  const [collapsedFacets, setCollapsedFacets] = useState<ReadonlySet<string>>(new Set());
+  const [expandedNodes, setExpandedNodes] = useState<ReadonlySet<number>>(new Set());
+  const groups = useMemo(
+    () => (facets.length > 0
+      ? facets.map((facet) => ({ facet, roots: tree.filter((n) => n.tag.facetKey === facet.key) }))
+      : [{ facet: null, roots: tree }])
+      .filter(({ roots }) => roots.length > 0),
+    [facets, tree],
+  );
+  const allCollapsed = groups.length > 0 && groups.every(({ facet }) => collapsedFacets.has(facet?.key ?? "legacy"));
+  const toggleFacet = (key: string) => {
+    setCollapsedFacets((current) => {
+      const next = new Set(current);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  };
+  const toggleAllFacets = () => {
+    setCollapsedFacets(allCollapsed ? new Set() : new Set(groups.map(({ facet }) => facet?.key ?? "legacy")));
+  };
+  const toggleNode = (id: number) => {
+    setExpandedNodes((current) => {
+      const next = new Set(current);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
   const currentFilters = filter.facetFilters ?? [];
   const excludedIds = filter.excludeTagIds ?? [];
   const [menu, setMenu] = useState<{ tagId: number; x: number; y: number } | null>(null);
@@ -94,18 +99,18 @@ export default function TagTree({ onManage }: TagTreeProps) {
 
   return (
     <div className="flex flex-col py-1 text-sm">
-      {/* FB6 需求四：统一标题行——左标题、右展开控制（有可展开节点才显示按钮） */}
+      {/* 与文件属性统一：标题行控制全部分组，下面每个分面标题可独立折叠。 */}
       <div className="flex min-h-8 items-center justify-between px-2">
         <h4 className="text-[11px] font-semibold text-[var(--color-text)]">智能标签</h4>
-        {expandableIds.length > 0 && (
+        {groups.length > 0 && (
           <button
             type="button"
-            onClick={allExpanded ? collapseAll : expandAll}
-            aria-label={allExpanded ? "全部收起" : "全部展开"}
-            title={allExpanded ? "收起所有标签的子标签" : "展开所有标签的子标签"}
+            onClick={toggleAllFacets}
+            aria-label={allCollapsed ? "全部展开" : "全部收起"}
+            title={allCollapsed ? "展开所有智能标签分组" : "收起所有智能标签分组"}
             className="px-1.5 py-1 text-[10px] text-[var(--color-text-secondary)] transition-colors hover:text-[var(--color-text)]"
           >
-            {allExpanded ? "全部收起" : "全部展开"}
+            {allCollapsed ? "全部展开" : "全部收起"}
           </button>
         )}
       </div>
@@ -130,23 +135,36 @@ export default function TagTree({ onManage }: TagTreeProps) {
         )}
       </div>
 
-      {groups.map(({ facet, rows }) => (
-        <div key={facet?.key ?? "legacy"}>
-          {facet && (
-            <div className="px-2 pt-3 pb-1 text-[10px] font-semibold tracking-wide text-[var(--color-text-tertiary)]">
-              {facet.displayName}
-            </div>
-          )}
-          {rows.map(({ node, depth }) => {
+      {groups.map(({ facet, roots }) => {
+        const facetKey = facet?.key ?? "legacy";
+        const collapsed = collapsedFacets.has(facetKey);
+        const rows = flattenVisible(roots, expandedNodes);
+        return (
+        <section key={facetKey} className="pt-2">
+          <button
+            type="button"
+            onClick={() => toggleFacet(facetKey)}
+            className="flex w-full items-center justify-between px-2 pb-1 text-left"
+            aria-label={facet?.displayName ?? "标签"}
+            aria-expanded={!collapsed}
+          >
+            <span className="block text-[11px] font-semibold text-[var(--color-text)]">
+              {facet?.displayName ?? "标签"}
+            </span>
+            <span className="ml-2 text-xs text-[var(--color-text-tertiary)]">
+              {collapsed ? "▸" : "▾"}
+            </span>
+          </button>
+          {!collapsed && rows.map(({ node, depth }) => {
         const hasChildren = node.children.length > 0;
-        const isOpen = expanded.has(node.tag.id);
+        const isOpen = expandedNodes.has(node.tag.id);
         const active = currentFilters.some((f) => f.tagIds.includes(node.tag.id)) && !filter.untaggedOnly;
         const excluded = excludedIds.includes(node.tag.id);
         return (
           <div key={node.tag.id} className="flex items-center" style={{ paddingLeft: depth * 14 }}>
             <button
               aria-label={isOpen ? "折叠" : "展开"}
-              onClick={() => hasChildren && toggleExpand(node.tag.id)}
+              onClick={() => hasChildren && toggleNode(node.tag.id)}
               className={clsx(
                 "w-4 shrink-0 text-[10px] text-[var(--color-text-secondary)]",
                 !hasChildren && "invisible",
@@ -186,8 +204,9 @@ export default function TagTree({ onManage }: TagTreeProps) {
           </div>
         );
           })}
-        </div>
-      ))}
+        </section>
+        );
+      })}
 
       {tree.length === 0 && (
         <p className="px-3 py-2 text-xs text-[var(--color-text-secondary)]">暂无标签</p>

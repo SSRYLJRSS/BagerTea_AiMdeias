@@ -1,12 +1,13 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import SuperSearchPage from "@/pages/SuperSearchPage";
 import { useSuperSearchStore } from "@/stores/superSearchStore";
 import { useSelectionStore } from "@/stores/selectionStore";
 import { useSettingsStore, DEFAULT_APPEARANCE } from "@/stores/settingsStore";
 import type { Asset } from "@/types/asset";
+import { useLibraryStore } from "@/stores/libraryStore";
 
-// 让 rAF 同步执行：滚动方向 hook 依赖它（jsdom 无真实 rAF 时钟）
+// 让 rAF 同步执行：滚动方向 hook 依赖它（jsdom 无真实 rAF 时钟）。
 vi.spyOn(global, "requestAnimationFrame").mockImplementation((cb) => {
   cb(0);
   return 0;
@@ -42,7 +43,15 @@ vi.mock("@/api/thumbnail", () => ({
 vi.mock("@/api/tags", () => ({
   listTags: vi.fn().mockResolvedValue([]),
   listTagFacets: vi.fn().mockResolvedValue([]),
+  removeTags: vi.fn().mockResolvedValue(undefined),
 }));
+
+vi.mock("@/api/video", () => ({
+  ensureVideoProxy: vi.fn(),
+  cancelVideoProxy: vi.fn().mockResolvedValue(undefined),
+  toProxyFileUrl: (p: string) => `asset://proxy/${p}`,
+}));
+vi.mock("@tauri-apps/api/core", () => ({ convertFileSrc: (p: string) => `asset://${p}` }));
 
 class MockResizeObserver {
   cb: ResizeObserverCallback;
@@ -328,5 +337,89 @@ describe("S5 5-4 零结果相近词建议", () => {
     }
     // 第二个建议也在（丛林），可继续点
     expect(screen.getByRole("button", { name: /试试「丛林」/ })).toBeInTheDocument();
+  });
+});
+
+describe("超级搜索 → 详情查看器（联动显示 bug 回归）", () => {
+  beforeEach(() => {
+    // 素材库列表故意放另一批素材（5 项），用于证明查看器不会错用素材库全量列表
+    useLibraryStore.setState({
+      items: [mkAsset(201), mkAsset(202), mkAsset(203), mkAsset(204), mkAsset(205)],
+      total: 5,
+      viewerOpen: false,
+    });
+  });
+
+  async function renderWithResults() {
+    const superItems = [mkAsset(101), mkAsset(102)];
+    const { listSuperAssets } = await import("@/api/superSearch");
+    vi.mocked(listSuperAssets).mockResolvedValue({ items: superItems, total: 2, hasMore: false });
+    useSuperSearchStore.setState({ items: superItems, total: 2, loading: false });
+    render(<SuperSearchPage />);
+    await waitFor(() => expect(screen.getAllByAltText("a101.jpg").length).toBeGreaterThan(0));
+    return superItems;
+  }
+
+  it("双击结果卡片：查看器整页替换超搜页、viewerOpen 同步、过片只走搜索结果集（非素材库 5 项）", async () => {
+    await renderWithResults();
+    expect(screen.getByRole("searchbox")).toBeInTheDocument();
+
+    const card = screen.getAllByAltText("a101.jpg")[0].closest('[role="button"]') as HTMLElement;
+    fireEvent.doubleClick(card);
+
+    // 互斥挂载：搜索头部卸载、Viewer 出现（旧实现把 Viewer 挤在 flex 列底部，主图塌陷）
+    await waitFor(() => expect(screen.getByRole("button", { name: "返回素材库" })).toBeInTheDocument());
+    expect(screen.queryByRole("searchbox")).not.toBeInTheDocument();
+    // viewerOpen 同步（App 据此隐藏全局 BottomBar，避免双底栏）
+    expect(useLibraryStore.getState().viewerOpen).toBe(true);
+    // 位置计数 = 搜索结果集 2 项，而不是素材库全量 5 项（旧实现错显 x/5 的联动错位）
+    expect(screen.getByText("1 / 2")).toBeInTheDocument();
+    expect(screen.queryByText(/\/ 5/)).not.toBeInTheDocument();
+    // 胶片条只含搜索结果，不混入素材库列表
+    expect(screen.getByRole("button", { name: "第 1 张：a101.jpg" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "第 2 张：a102.jpg" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /a20\d\.jpg/ })).not.toBeInTheDocument();
+
+    // 下一张在搜索结果集内推进；到末尾再点也被钳住，不会跳进素材库列表
+    fireEvent.click(screen.getByRole("button", { name: "下一张" }));
+    expect(screen.getByText("2 / 2")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "下一张" }));
+    expect(screen.getByText("2 / 2")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /a20\d\.jpg/ })).not.toBeInTheDocument();
+  });
+
+  it("关闭查看器：回到超搜页且 viewerOpen 复位（全局 BottomBar 恢复）", async () => {
+    await renderWithResults();
+    const card = screen.getAllByAltText("a101.jpg")[0].closest('[role="button"]') as HTMLElement;
+    fireEvent.doubleClick(card);
+    await waitFor(() => expect(screen.getByRole("button", { name: "关闭查看器" })).toBeInTheDocument());
+    expect(useLibraryStore.getState().viewerOpen).toBe(true);
+
+    fireEvent.click(screen.getByRole("button", { name: "关闭查看器" }));
+    await waitFor(() => expect(screen.getByRole("searchbox")).toBeInTheDocument());
+    expect(useLibraryStore.getState().viewerOpen).toBe(false);
+  });
+});
+
+describe("FB5-03 条件面板唯一披露按钮（位于面板最底部，不再有第二个向上箭头）", () => {
+  it("展开态：全页只有一个收起按钮，且位于三区条件（条件公式）之后；点它即收起，再点展开", () => {
+    render(<SuperSearchPage />);
+    const panel = document.getElementById("super-search-filters") as HTMLElement;
+    expect(panel.style.gridTemplateRows).toBe("1fr");
+    // 全页只有一个「收起详细条件」按钮（旧实现顶部、底部各一个）
+    expect(screen.getAllByRole("button", { name: "收起详细条件" })).toHaveLength(1);
+    expect(screen.queryByRole("button", { name: "收起详细条件（底部）" })).not.toBeInTheDocument();
+    const toggle = screen.getByRole("button", { name: "收起详细条件" });
+    // 按钮位于 QueryBuilder（条件公式 region）之后 —— 即面板最底部
+    const builder = screen.getByRole("region", { name: "条件公式" });
+    expect(toggle.compareDocumentPosition(builder) & Node.DOCUMENT_POSITION_PRECEDING).toBeTruthy();
+
+    fireEvent.click(toggle);
+    expect(panel.style.gridTemplateRows).toBe("0fr");
+    expect(panel.getAttribute("aria-hidden")).toBe("true");
+    // 收起后同一个按钮变成「展开详细条件」（面板 0fr 后它贴到摘要行下方）
+    expect(screen.getByRole("button", { name: "展开详细条件" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "展开详细条件" }));
+    expect(panel.style.gridTemplateRows).toBe("1fr");
   });
 });

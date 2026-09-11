@@ -154,7 +154,12 @@ fn facet_from_row(r: &rusqlite::Row) -> rusqlite::Result<TagFacet> {
         created_at: r.get(9)?,
         updated_at: r.get(10)?,
         // input_mode 已由 DB 列降级为只读派生：按 cfg_ai_assignable 计算
-        input_mode: if cfg_ai { "ai_and_manual" } else { "manual_only" }.to_string(),
+        input_mode: if cfg_ai {
+            "ai_and_manual"
+        } else {
+            "manual_only"
+        }
+        .to_string(),
         cfg_visible_in_navigation: r.get::<_, i64>(11)? != 0,
         cfg_manual_assignable: r.get::<_, i64>(12)? != 0,
         cfg_ai_assignable: cfg_ai,
@@ -183,8 +188,20 @@ const SYSTEM_FACETS: &[(&str, &str, &str, i64, i64)] = &[
     ("composition", "构图/视角", "景别、视角和构图关系", 4, 60),
     ("lighting", "光线/时间", "光线方向、质感和时间氛围", 3, 70),
     ("people", "人物属性", "人物数量、年龄段和可观察动作", 4, 80),
-    ("technical", "可用性/技术特征", "透明背景、可裁切等非文件格式属性", 4, 90),
-    ("custom", "自定义", "用户自定义且暂未归入固定分面的标签", 0, 100),
+    (
+        "technical",
+        "可用性/技术特征",
+        "透明背景、可裁切等非文件格式属性",
+        4,
+        90,
+    ),
+    (
+        "custom",
+        "自定义",
+        "用户自定义且暂未归入固定分面的标签",
+        0,
+        100,
+    ),
 ];
 
 /// 幂等补种系统分面（INSERT OR IGNORE：已存在行不动，包括用户改过的 display_name 与停用态）。
@@ -304,24 +321,6 @@ pub fn create(
     get(conn, &key)
 }
 
-fn normalize_selection_mode(
-    selection_mode: &str,
-    max_items: Option<i64>,
-) -> AppResult<(String, Option<i64>)> {
-    if selection_mode != "single" && selection_mode != "multi" {
-        return Err(AppError::msg("selection_mode 只允许 single | multi"));
-    }
-    let max_items = match selection_mode {
-        "single" => Some(1),
-        _ => match max_items {
-            Some(n) if n >= 1 => Some(n),
-            Some(_) => return Err(AppError::msg("多选分面的 max_items 必须为正整数或为空")),
-            None => None,
-        },
-    };
-    Ok((selection_mode.to_string(), max_items))
-}
-
 /// 重新排序（传入完整的有序 key 列表）。
 pub fn reorder(conn: &Connection, ordered_keys: &[String]) -> AppResult<()> {
     // 只更新传入的 key；未传入的不动（幂等）。按索引递增 sort_order。
@@ -344,6 +343,8 @@ pub fn reorder(conn: &Connection, ordered_keys: &[String]) -> AppResult<()> {
 /// 部分字段非法时全部不生效（单一保存通道语义）。
 /// F1-b：input_mode 降级为只读派生 —— 此处按入参换算写 `cfg_ai_assignable`，
 /// 同时回写 input_mode 列保持 DB 内一致（回滚/历史查询可读）。
+// 8 参数为分面编辑字段的内聚集合，收进结构体需同步改全部调用点，收益低，集中豁免。
+#[allow(clippy::too_many_arguments)]
 pub fn update_facet(
     conn: &Connection,
     key: &str,
@@ -359,7 +360,9 @@ pub fn update_facet(
         return Err(AppError::msg("显示名不能为空"));
     }
     if input_mode != "ai_and_manual" && input_mode != "manual_only" {
-        return Err(AppError::msg("input_mode 只允许 ai_and_manual | manual_only"));
+        return Err(AppError::msg(
+            "input_mode 只允许 ai_and_manual | manual_only",
+        ));
     }
     let cfg_ai: i64 = if input_mode == "ai_and_manual" { 1 } else { 0 };
     if selection_mode != "single" && selection_mode != "multi" {
@@ -385,8 +388,16 @@ pub fn update_facet(
             input_mode = CASE WHEN ?4 = 1 THEN 'ai_and_manual' ELSE 'manual_only' END,
             selection_mode = ?5, max_items = ?6, applies_to = ?7, updated_at = ?8
           WHERE key = ?1",
-        rusqlite::params![key, display_name, description.trim(), cfg_ai,
-                selection_mode, max_items, applies_to, now],
+        rusqlite::params![
+            key,
+            display_name,
+            description.trim(),
+            cfg_ai,
+            selection_mode,
+            max_items,
+            applies_to,
+            now
+        ],
     )?;
     if n == 0 {
         return Err(AppError::msg("分面不存在"));
@@ -527,6 +538,159 @@ pub fn get_impact(conn: &Connection, key: &str) -> AppResult<FacetImpact> {
     })
 }
 
+/// W2-10：AI 返回分类 key 的唯一路由入口。三条分支：
+/// ① DB 里存在该 key → 原样返回（自建分面走这条）
+/// ② 中文旧名表命中且该 key 在 DB → 返回映射结果
+/// ③ 都不中 → custom + warning（绝不静默丢进 custom：必须留痕）
+///
+/// 返回 (facet_key, 旧名映射到的 key)。第二个返回值仅用于日志区分来源。
+pub fn resolve_facet_key(conn: &Connection, raw: &str) -> AppResult<(String, String)> {
+    let raw = raw.trim();
+    let exists = |key: &str| -> bool {
+        conn.query_row("SELECT 1 FROM tag_facets WHERE key = ?1", [key], |_| Ok(()))
+            .is_ok()
+    };
+    // ① DB 直存
+    if exists(raw) {
+        return Ok((raw.to_string(), raw.to_string()));
+    }
+    // ② 旧名表映射
+    let mapped = key_for_legacy_name(raw);
+    if mapped != raw && exists(mapped) {
+        return Ok((mapped.to_string(), mapped.to_string()));
+    }
+    // ③ 兜底 custom（含警告：manual_only/停用分面落这里说明 AI 输出了不参与 AI 的分类）
+    if mapped != raw || raw != "custom" {
+        tracing::warn!(
+            "AI 返回未知分面 key「{raw}」，路由到 custom（该分类不存在或不参与 AI 打标）"
+        );
+    }
+    Ok(("custom".to_string(), "custom".to_string()))
+}
+
+/// 兼容旧 AI 分类显示名（纯函数：只查中文旧名表，**不再作为路由入口**——
+/// W2-10 起分面 key 路由必须走 resolve_facet_key，它会查 DB 让自建分面生效）。
+/// 仅保留给：解析历史 CategorizedTags JSON 的中文 key（老数据确实存着中文分类名）。
+pub fn key_for_legacy_name(name: &str) -> &'static str {
+    match name.trim() {
+        "subject" => "subject",
+        "scene" => "scene",
+        "purpose" => "purpose",
+        "style" => "style",
+        "color" => "color",
+        "composition" => "composition",
+        "lighting" => "lighting",
+        "people" => "people",
+        "technical" => "technical",
+        "custom" => "custom",
+        "主体" | "主体/对象" | "物体" => "subject",
+        "场景" | "场景/地点" => "scene",
+        "用途" | "用途/项目类型" => "purpose",
+        "风格" | "风格/氛围" | "色彩风格" | "氛围情绪" => "style",
+        "色彩" | "色调" => "color",
+        "构图" | "构图视角" | "构图/视角" => "composition",
+        "光线" | "时间" | "光线/时间" | "光线/时间氛围" => "lighting",
+        "人物" | "人物属性" | "人物/主体属性" => "people",
+        "技术" | "可用性/技术特征" => "technical",
+        _ => "custom",
+    }
+}
+
+/// W2-1：tag_facets 是唯一事实源 —— 直接从 DB 读，只取参与 AI 的分面。
+/// V20 合表后 settings.aiFacetConfigs 的语义已全部搬进 tag_facets，不再传参。
+/// 一次消灭③诊断的四类 bug：两个保存通道、两个显示名、孤儿条目、缺条目静默不参与 AI。
+///
+/// F4：筛选条件改用 EFF_AI（cfg_ai_assignable 事实源，取代旧 input_mode 列判断），
+/// 并按 `applies_to` 消费 media_kind —— 视频专属分面不再污染图片批次提示词：
+/// - `media_kind = "all"`：返回全部参与 AI 的分面（超级搜索词典需要跨类型全量）；
+/// - `media_kind = "image" | "video"`：只取 `applies_to IN ('all', media_kind)`。
+pub fn build_prompt_context(
+    conn: &Connection,
+    media_kind: &str,
+) -> AppResult<Vec<FacetPromptContext>> {
+    if !matches!(media_kind, "all" | "image" | "video") {
+        return Err(AppError::msg("media_kind 只允许 all | image | video"));
+    }
+    let mut stmt = conn.prepare(&format!(
+        "SELECT key, display_name, description, selection_mode, max_items,
+                facet_kind, num_min, num_max, num_unit
+           FROM tag_facets f
+          WHERE {EFF_AI}
+            AND (?1 = 'all' OR f.applies_to = 'all' OR f.applies_to = ?1)
+          ORDER BY f.sort_order"
+    ))?;
+    let out = stmt
+        .query_map(params![media_kind], |r| {
+            Ok(FacetPromptContext {
+                key: r.get(0)?,
+                display_name: r.get(1)?,
+                description: r.get(2)?,
+                selection_mode: r.get(3)?,
+                max_items: r.get(4)?,
+                facet_kind: r.get(5)?,
+                num_min: r.get(6)?,
+                num_max: r.get(7)?,
+                num_unit: r.get(8)?,
+            })
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(out)
+}
+/// V24（Phase 7-7）：分面类型设置（新建数值分面的第二落点 / 编辑数值配置）。
+/// - `number → tag` 直接禁止（§6.6 规则 9：连续值退化成离散标签不可逆）；
+/// - `tag → number` 仅当该分面没有任何标签时允许（新分面直建）；
+///   已有标签必须走 `convert_facet_kind` 转换预览（不静默丢数据）；
+/// - 数值分面上再次调用 = 只调整 num_* 配置。
+// 8 参数为分面类型/数值配置的内聚集合，收进结构体需同步改全部调用点，收益低，集中豁免。
+#[allow(clippy::too_many_arguments)]
+pub fn set_facet_kind(
+    conn: &Connection,
+    key: &str,
+    kind: &str,
+    num_min: Option<f64>,
+    num_max: Option<f64>,
+    num_unit: &str,
+    num_decimals: i64,
+    num_step: f64,
+) -> AppResult<TagFacet> {
+    let f = get(conn, key)?;
+    if kind != "tag" && kind != "number" {
+        return Err(AppError::msg("facet_kind 只允许 tag | number"));
+    }
+    if !num_step.is_finite() || num_step <= 0.0 {
+        return Err(AppError::msg("步进必须是正数"));
+    }
+    let now = chrono::Utc::now().timestamp_millis();
+    if f.facet_kind == "number" {
+        if kind != "number" {
+            return Err(AppError::msg(
+                "数值分面不能改回标签型（连续值无法无损转成离散标签）",
+            ));
+        }
+        conn.execute(
+            "UPDATE tag_facets SET num_min=?1, num_max=?2, num_unit=?3, num_decimals=?4, num_step=?5, updated_at=?6 WHERE key=?7",
+            params![num_min, num_max, num_unit, num_decimals, num_step, now, key],
+        )?;
+    } else if kind == "number" {
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM tags WHERE facet_key = ?1 AND status != 'deprecated'",
+            [key],
+            |r| r.get(0),
+        )?;
+        if n > 0 {
+            return Err(AppError::msg(format!(
+                "分面「{key}」已有 {n} 个标签 —— 请用「转换为数值型」先看转换预览，不能直接改型"
+            )));
+        }
+        conn.execute(
+            "UPDATE tag_facets SET facet_kind='number', num_min=?1, num_max=?2, num_unit=?3, num_decimals=?4, num_step=?5, updated_at=?6 WHERE key=?7",
+            params![num_min, num_max, num_unit, num_decimals, num_step, now, key],
+        )?;
+    }
+    get(conn, key)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -545,7 +709,11 @@ mod tests {
         seed_system_facets(&c).unwrap();
         assert_eq!(list_all(&c).unwrap().len(), n);
         // 已存在的行（含用户改名）不被覆盖
-        c.execute("UPDATE tag_facets SET display_name='我改过的名字' WHERE key='subject'", []).unwrap();
+        c.execute(
+            "UPDATE tag_facets SET display_name='我改过的名字' WHERE key='subject'",
+            [],
+        )
+        .unwrap();
         seed_system_facets(&c).unwrap();
         assert_eq!(get(&c, "subject").unwrap().display_name, "我改过的名字");
     }
@@ -557,17 +725,23 @@ mod tests {
         c.execute("DELETE FROM tag_facets", []).unwrap();
         assert!(list(&c).unwrap().is_empty());
         seed_system_facets_if_empty(&c).unwrap();
-        let keys: Vec<String> = list(&c)
-            .unwrap()
-            .into_iter()
-            .map(|f| f.key)
-            .collect();
+        let keys: Vec<String> = list(&c).unwrap().into_iter().map(|f| f.key).collect();
         assert!(keys.contains(&"subject".to_string()));
-        assert!(!keys.contains(&"color".to_string()), "color 应补种为 inactive，不出现在 active 列表");
+        assert!(
+            !keys.contains(&"color".to_string()),
+            "color 应补种为 inactive，不出现在 active 列表"
+        );
         assert_eq!(get(&c, "color").unwrap().status, "inactive");
         // 非空表不触发（用户自建分面不被打扰）
         seed_system_facets_if_empty(&c).unwrap();
-        assert_eq!(list_all(&c).unwrap().iter().filter(|f| !f.is_system).count(), 0);
+        assert_eq!(
+            list_all(&c)
+                .unwrap()
+                .iter()
+                .filter(|f| !f.is_system)
+                .count(),
+            0
+        );
     }
 
     #[test]
@@ -597,9 +771,16 @@ mod tests {
         assert_eq!(mode, "ai_and_manual", "新建用户分面默认参与 AI");
         // JSON 侧不得残留（旧语义的 seed_ai_config 已被 V20 取代）
         let raw: String = c
-            .query_row("SELECT value FROM settings WHERE key='app_settings'", [], |r| r.get(0))
+            .query_row(
+                "SELECT value FROM settings WHERE key='app_settings'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap_or_default();
-        assert!(!raw.contains("my_facet"), "ai_facet_configs 已死，不得再写入");
+        assert!(
+            !raw.contains("my_facet"),
+            "ai_facet_configs 已死，不得再写入"
+        );
     }
 
     #[test]
@@ -685,7 +866,16 @@ mod tests {
     #[test]
     fn impact_counts_aliases_in_facet() {
         let c = conn();
-        let f = create(&c, "impact_alias_facet", "影响别名", "", "multi", None, "all").unwrap();
+        let f = create(
+            &c,
+            "impact_alias_facet",
+            "影响别名",
+            "",
+            "multi",
+            None,
+            "all",
+        )
+        .unwrap();
         let tag_id: i64 = c
             .query_row(
                 "INSERT INTO tags (name, normalized_name, canonical_name, facet_key, is_system, status, sort_order)
@@ -711,12 +901,37 @@ mod tests {
     fn list_all_includes_input_mode_for_ui_grouping() {
         let c = conn();
         // 自建一个分面并改成 manual_only（create 默认 ai_and_manual）
-        create(&c, "w7_manual", "手工专属", "仅手工填写", "multi", None, "all").unwrap();
-        update_facet(&c, "w7_manual", "手工专属", "仅手工填写", "manual_only", "multi", None, "all").unwrap();
+        create(
+            &c,
+            "w7_manual",
+            "手工专属",
+            "仅手工填写",
+            "multi",
+            None,
+            "all",
+        )
+        .unwrap();
+        update_facet(
+            &c,
+            "w7_manual",
+            "手工专属",
+            "仅手工填写",
+            "manual_only",
+            "multi",
+            None,
+            "all",
+        )
+        .unwrap();
         let facets = list_all(&c).unwrap();
-        let manual = facets.iter().find(|f| f.key == "w7_manual").expect("自建分面应列出");
+        let manual = facets
+            .iter()
+            .find(|f| f.key == "w7_manual")
+            .expect("自建分面应列出");
         assert_eq!(manual.input_mode, "manual_only");
-        let scene = facets.iter().find(|f| f.key == "scene").expect("系统分面应列出");
+        let scene = facets
+            .iter()
+            .find(|f| f.key == "scene")
+            .expect("系统分面应列出");
         assert_eq!(scene.input_mode, "ai_and_manual");
         // 序列化给前端必须 camelCase inputMode（FacetManagePanel/Workbench 分组依据）
         let json = serde_json::to_value(&facets).unwrap();
@@ -726,155 +941,4 @@ mod tests {
             "序列化 JSON 必须含 inputMode（camelCase）"
         );
     }
-}
-
-/// W2-10：AI 返回分类 key 的唯一路由入口。三条分支：
-/// ① DB 里存在该 key → 原样返回（自建分面走这条）
-/// ② 中文旧名表命中且该 key 在 DB → 返回映射结果
-/// ③ 都不中 → custom + warning（绝不静默丢进 custom：必须留痕）
-///
-/// 返回 (facet_key, 旧名映射到的 key)。第二个返回值仅用于日志区分来源。
-pub fn resolve_facet_key(conn: &Connection, raw: &str) -> AppResult<(String, String)> {
-    let raw = raw.trim();
-    let exists = |key: &str| -> bool {
-        conn.query_row(
-            "SELECT 1 FROM tag_facets WHERE key = ?1",
-            [key],
-            |_| Ok(()),
-        )
-        .is_ok()
-    };
-    // ① DB 直存
-    if exists(raw) {
-        return Ok((raw.to_string(), raw.to_string()));
-    }
-    // ② 旧名表映射
-    let mapped = key_for_legacy_name(raw);
-    if mapped != raw && exists(mapped) {
-        return Ok((mapped.to_string(), mapped.to_string()));
-    }
-    // ③ 兜底 custom（含警告：manual_only/停用分面落这里说明 AI 输出了不参与 AI 的分类）
-    if mapped != raw || raw != "custom" {
-        tracing::warn!("AI 返回未知分面 key「{raw}」，路由到 custom（该分类不存在或不参与 AI 打标）");
-    }
-    Ok(("custom".to_string(), "custom".to_string()))
-}
-
-/// 兼容旧 AI 分类显示名（纯函数：只查中文旧名表，**不再作为路由入口**——
-/// W2-10 起分面 key 路由必须走 resolve_facet_key，它会查 DB 让自建分面生效）。
-/// 仅保留给：解析历史 CategorizedTags JSON 的中文 key（老数据确实存着中文分类名）。
-pub fn key_for_legacy_name(name: &str) -> &'static str {
-    match name.trim() {
-        "subject" => "subject",
-        "scene" => "scene",
-        "purpose" => "purpose",
-        "style" => "style",
-        "color" => "color",
-        "composition" => "composition",
-        "lighting" => "lighting",
-        "people" => "people",
-        "technical" => "technical",
-        "custom" => "custom",
-        "主体" | "主体/对象" | "物体" => "subject",
-        "场景" | "场景/地点" => "scene",
-        "用途" | "用途/项目类型" => "purpose",
-        "风格" | "风格/氛围" | "色彩风格" | "氛围情绪" => "style",
-        "色彩" | "色调" => "color",
-        "构图" | "构图视角" | "构图/视角" => "composition",
-        "光线" | "时间" | "光线/时间" | "光线/时间氛围" => "lighting",
-        "人物" | "人物属性" | "人物/主体属性" => "people",
-        "技术" | "可用性/技术特征" => "technical",
-        _ => "custom",
-    }
-}
-
-/// W2-1：tag_facets 是唯一事实源 —— 直接从 DB 读，只取参与 AI 的分面。
-/// V20 合表后 settings.aiFacetConfigs 的语义已全部搬进 tag_facets，不再传参。
-/// 一次消灭③诊断的四类 bug：两个保存通道、两个显示名、孤儿条目、缺条目静默不参与 AI。
-///
-/// F4：筛选条件改用 EFF_AI（cfg_ai_assignable 事实源，取代旧 input_mode 列判断），
-/// 并按 `applies_to` 消费 media_kind —— 视频专属分面不再污染图片批次提示词：
-/// - `media_kind = "all"`：返回全部参与 AI 的分面（超级搜索词典需要跨类型全量）；
-/// - `media_kind = "image" | "video"`：只取 `applies_to IN ('all', media_kind)`。
-pub fn build_prompt_context(
-    conn: &Connection,
-    media_kind: &str,
-) -> AppResult<Vec<FacetPromptContext>> {
-    if !matches!(media_kind, "all" | "image" | "video") {
-        return Err(AppError::msg("media_kind 只允许 all | image | video"));
-    }
-    let mut stmt = conn.prepare(&format!(
-        "SELECT key, display_name, description, selection_mode, max_items,
-                facet_kind, num_min, num_max, num_unit
-           FROM tag_facets f
-          WHERE {EFF_AI}
-            AND (?1 = 'all' OR f.applies_to = 'all' OR f.applies_to = ?1)
-          ORDER BY f.sort_order"
-    ))?;
-    let out = stmt
-        .query_map(params![media_kind], |r| {
-            Ok(FacetPromptContext {
-                key: r.get(0)?,
-                display_name: r.get(1)?,
-                description: r.get(2)?,
-                selection_mode: r.get(3)?,
-                max_items: r.get(4)?,
-                facet_kind: r.get(5)?,
-                num_min: r.get(6)?,
-                num_max: r.get(7)?,
-                num_unit: r.get(8)?,
-            })
-        })?
-        .filter_map(|r| r.ok())
-        .collect();
-    Ok(out)
-}
-/// V24（Phase 7-7）：分面类型设置（新建数值分面的第二落点 / 编辑数值配置）。
-/// - `number → tag` 直接禁止（§6.6 规则 9：连续值退化成离散标签不可逆）；
-/// - `tag → number` 仅当该分面没有任何标签时允许（新分面直建）；
-///   已有标签必须走 `convert_facet_kind` 转换预览（不静默丢数据）；
-/// - 数值分面上再次调用 = 只调整 num_* 配置。
-pub fn set_facet_kind(
-    conn: &Connection,
-    key: &str,
-    kind: &str,
-    num_min: Option<f64>,
-    num_max: Option<f64>,
-    num_unit: &str,
-    num_decimals: i64,
-    num_step: f64,
-) -> AppResult<TagFacet> {
-    let f = get(conn, key)?;
-    if kind != "tag" && kind != "number" {
-        return Err(AppError::msg("facet_kind 只允许 tag | number"));
-    }
-    if !num_step.is_finite() || num_step <= 0.0 {
-        return Err(AppError::msg("步进必须是正数"));
-    }
-    let now = chrono::Utc::now().timestamp_millis();
-    if f.facet_kind == "number" {
-        if kind != "number" {
-            return Err(AppError::msg("数值分面不能改回标签型（连续值无法无损转成离散标签）"));
-        }
-        conn.execute(
-            "UPDATE tag_facets SET num_min=?1, num_max=?2, num_unit=?3, num_decimals=?4, num_step=?5, updated_at=?6 WHERE key=?7",
-            params![num_min, num_max, num_unit, num_decimals, num_step, now, key],
-        )?;
-    } else if kind == "number" {
-        let n: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM tags WHERE facet_key = ?1 AND status != 'deprecated'",
-            [key],
-            |r| r.get(0),
-        )?;
-        if n > 0 {
-            return Err(AppError::msg(format!(
-                "分面「{key}」已有 {n} 个标签 —— 请用「转换为数值型」先看转换预览，不能直接改型"
-            )));
-        }
-        conn.execute(
-            "UPDATE tag_facets SET facet_kind='number', num_min=?1, num_max=?2, num_unit=?3, num_decimals=?4, num_step=?5, updated_at=?6 WHERE key=?7",
-            params![num_min, num_max, num_unit, num_decimals, num_step, now, key],
-        )?;
-    }
-    get(conn, key)
 }

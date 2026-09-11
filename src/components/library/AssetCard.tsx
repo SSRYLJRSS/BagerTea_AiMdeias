@@ -25,8 +25,6 @@ interface AssetCardProps {
   onContextMenu: (asset: Asset, index: number, e: React.MouseEvent) => void;
   /** FB2-08（§14.9）：点击主色段以同色系搜索；不传则色条主色段不可点 */
   onSearchDominant?: (segment: PaletteSegment) => void;
-  /** W5b（§W5b）：悬浮星标切换收藏；不传则不渲染星标按钮 */
-  onToggleFavorite?: (asset: Asset) => void;
 }
 
 function formatDuration(ms: number): string {
@@ -51,7 +49,7 @@ function formatBadge(ext: string): string | null {
   return null;
 }
 
-export default memo(function AssetCard({ asset, index, selected, thumbSize, onSelect, onPreview, onContextMenu, onSearchDominant, onToggleFavorite }: AssetCardProps) {
+export default memo(function AssetCard({ asset, index, selected, thumbSize, onSelect, onPreview, onContextMenu, onSearchDominant }: AssetCardProps) {
   const { grid, hoverPreview, colorStrip } = useAppearance();
   const isScrolling = useContext(GridScrollingContext);
   const handleClick = useCallback(
@@ -67,8 +65,7 @@ export default memo(function AssetCard({ asset, index, selected, thumbSize, onSe
   // B-4：视频类型统一按 MIME 判断（导入时长读取失败时 durationMs 为 null 也能识别为视频）
   const isVideo = isVideoAsset(asset);
   const badge = formatBadge(asset.fileExt);
-  // W5b：收藏与评级派生值（favorite 0/1；rating 0–5）
-  const favorited = asset.favorite === 1;
+  // W5b：评级派生值（rating 0–5）
   const ratingStars = asset.rating && asset.rating > 0 ? "★".repeat(Math.min(asset.rating, 5)) : "";
 
   // FB2-02：容器比例 + 内容填充（smart 需 contentAspect）
@@ -152,25 +149,6 @@ export default memo(function AssetCard({ asset, index, selected, thumbSize, onSe
           <span className="absolute right-1 top-1 rounded bg-black/60 px-1 text-[10px] leading-4 text-white">
             {badge}
           </span>
-        )}
-
-        {/* W5b（§W5b）：悬浮星标切换收藏（hover 出现；已收藏常显金色） */}
-        {onToggleFavorite && (
-          <button
-            type="button"
-            aria-label={favorited ? "取消收藏" : "收藏"}
-            title={favorited ? "取消收藏" : "收藏"}
-            onClick={(e) => {
-              e.stopPropagation();
-              onToggleFavorite(asset);
-            }}
-            className={clsx(
-              "absolute right-1 top-1 z-10 flex h-5 w-5 items-center justify-center rounded-full bg-black/50 text-[11px] leading-none transition-opacity hover:bg-black/70",
-              favorited ? "text-[#f5c542] opacity-100" : "text-white opacity-0 group-hover:opacity-100",
-            )}
-          >
-            {favorited ? "★" : "☆"}
-          </button>
         )}
 
         {/* W5b（§W5b）：评级角标（仅 1–5 星显示；0 = 无评级） */}

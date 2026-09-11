@@ -80,6 +80,14 @@ export function mergeQueryExpr(a?: QueryExpr, b?: QueryExpr): QueryExpr | undefi
   return children.length === 1 ? children[0] : { op: "and", children };
 }
 
+/** 跨区移动：把节点追加为目标区根组的一项，按目标根组当前连接词参与
+ *  （根组 op 一致直接 append，否则包一层 op 组；调用方 normalizeExpr 拍平同 op 嵌套）。 */
+export function appendToExpr(root: QueryExpr | undefined, node: QueryExpr, op: "and" | "or"): QueryExpr {
+  if (!root) return node;
+  if (root.op === op) return { op, children: [...root.children, node] };
+  return { op, children: [root, node] };
+}
+
 function leaf(cond: LeafCond): QueryExpr {
   return { op: "leaf", cond };
 }
@@ -229,7 +237,12 @@ function walk(
       break;
     }
     case "or": {
-      expr.children.forEach((c, i) => walk(c, [...path, i], `任一组 ${i + 1}`, out, nameById));
+      // 多层嵌套时组标签补层级序号（顶层「任一组 1」；嵌套「任一组 2.1」= 第 2 项内第 1 组）
+      expr.children.forEach((c, i) => {
+        const childPath = [...path, i];
+        const label = path.length > 0 ? `任一组 ${childPath.map((v) => v + 1).join(".")}` : `任一组 ${i + 1}`;
+        walk(c, childPath, label, out, nameById);
+      });
       break;
     }
     case "not": {

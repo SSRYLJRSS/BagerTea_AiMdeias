@@ -8,7 +8,7 @@ import { dominantFiltersFor } from "@/utils/dominantFilter";
 import type { Asset } from "@/types/asset";
 
 export type { LibraryGridActions };
-export interface LibraryActions extends LibraryGridActions {}
+export type LibraryActions = LibraryGridActions;
 
 interface AssetGridProps extends LibraryActions {
   onPreview: (asset: Asset) => void;

@@ -13,13 +13,14 @@ import type { Asset, ResolvedSearchQuery, MetadataFilter } from "@/types/asset";
 import type { QueryExpr, TermMatch } from "@/types/queryExpr";
 import type { AiApplyMode, ResolvedTag, SearchPlanV3, SearchWarning, ShouldClause, FetchAllIdsResult } from "@/types/superSearch";
 import {
+  appendToExpr,
   mergeQueryExpr,
   normalizeExpr,
   removeExprAtPath,
   serializeExpr,
   syncQueryFromExpr,
 } from "@/utils/queryExprUtils";
-import { appendPlanMerge, fieldRanking, mergeMustNotExpr, resolvedQueryToPlan } from "@/utils/planUtils";
+import { appendPlanMerge, fieldRanking, migratePlanV3 as migratePlanWithNormalization, normalizeSearchPlan, resolvedQueryToPlan } from "@/utils/planUtils";
 import type { ExprPath } from "@/utils/queryExprUtils";
 
 const PAGE_SIZE = 200;
@@ -70,10 +71,6 @@ function queryEqual(a: ResolvedSearchQuery, b: ResolvedSearchQuery): boolean {
   return JSON.stringify(a) === JSON.stringify(b);
 }
 
-/** §3.7 不变式 4：minimumShouldMatch 随 should 长度自动收敛 */
-function clampMin(min: number, shouldLen: number): number {
-  return Math.max(0, Math.min(shouldLen, Math.floor(min)));
-}
 
 /** 从当前状态起一个最小 plan（手动条件首次加分 / 纯 mustNot 时的依托） */
 function minimalPlanFrom(cur: { expr?: QueryExpr; query: ResolvedSearchQuery }): SearchPlanV3 {
@@ -223,6 +220,8 @@ export interface SuperSearchState {
   clearConditions: () => void;
   refresh: () => Promise<void>;
   loadMore: () => Promise<void>;
+  /** 查看器内删标签/信息栏编辑后的本地回写（语义同 libraryStore.patchLocal，不触发整页刷新） */
+  patchLocal: (ids: number[], patch: Partial<Asset>) => void;
   /** B2/B8/§4.6：plan 全选 ID 一路到底 —— FetchAllIdsResult（= PlanIdsResult，不降级成 number[]） */
   fetchAllIds: () => Promise<FetchAllIdsResult>;
   clearQuery: () => void;
@@ -232,20 +231,7 @@ export interface SuperSearchState {
  *  planSchemaVersion / normalizationVersion > 当前（用户降级应用）→ null（丢弃 + 提示）；
  *  ≤ 当前视为可迁移。当前 schema v3 无历史结构差异，恒等返回；未来结构变更在此加分支。 */
 export function migratePlanV3(plan: SearchPlanV3): SearchPlanV3 | null {
-  const CURRENT_PLAN_SCHEMA = 3;
-  const CURRENT_NORMALIZATION = 1;
-  if (
-    plan.planSchemaVersion > CURRENT_PLAN_SCHEMA ||
-    (plan.normalizationVersion ?? 1) > CURRENT_NORMALIZATION
-  ) {
-    return null;
-  }
-  return {
-    ...plan,
-    planSchemaVersion: CURRENT_PLAN_SCHEMA,
-    normalizationVersion: CURRENT_NORMALIZATION,
-    compilerVersion: 1,
-  };
+  return migratePlanWithNormalization(plan);
 }
 
 // W5f-f6：搜索条件持久化（localStorage）—— §3.7 不变式 5：只存 plan + sortBy/sortDir，
@@ -290,7 +276,7 @@ export const useSuperSearchStore = create<SuperSearchState>()(
     // 不变式 1：手工改条件不清 AI 的优先项（should 原样保留）。
     const rebuilt = resolvedQueryToPlan(next);
     const plan = curPlan && curPlan.should.length > 0
-      ? { ...rebuilt, should: curPlan.should, minimumShouldMatch: clampMin(curPlan.minimumShouldMatch, curPlan.should.length) }
+      ? normalizeSearchPlan({ ...rebuilt, should: curPlan.should, minimumShouldMatch: 0 })
       : rebuilt;
     const resolvedTags = filterResolvedTagsByPlan(get().resolvedTags, plan);
     set({ query: next, plan, expr: plan.filter ?? undefined, planRevision: get().planRevision + 1, warnings: [], aiExplanation: null, aiError: null, aiLoading: false, resolvedTags });
@@ -306,7 +292,7 @@ export const useSuperSearchStore = create<SuperSearchState>()(
     // §3.7 不变式 1：只动 plan.filter；should/mustNot/ranking 原样保留
     const curPlan = cur.plan;
     const base: SearchPlanV3 = curPlan ?? minimalPlanFrom(cur);
-    const plan = maybeNullPlan({ ...base, filter: expr ?? null });
+    const plan = maybeNullPlan(normalizeSearchPlan({ ...base, filter: expr ?? null }));
     const query = syncQueryFromExpr(cur.query, expr);
     const resolvedTags = filterResolvedTagsByPlan(cur.resolvedTags, plan);
     set({ query, expr: expr ?? undefined, plan, planRevision: cur.planRevision + 1, warnings: [], aiExplanation: null, aiError: null, aiLoading: false, resolvedTags });
@@ -322,7 +308,7 @@ export const useSuperSearchStore = create<SuperSearchState>()(
     invalidatePendingRequests();
     // 无 plan 时从当前 filter 起一个最小 plan（纯排除条件也可独立成 plan）
     const base: SearchPlanV3 = curPlan ?? minimalPlanFrom(cur);
-    const plan = maybeNullPlan({ ...base, mustNot: expr ?? null });
+    const plan = maybeNullPlan(normalizeSearchPlan({ ...base, mustNot: expr ?? null }));
     const resolvedTags = filterResolvedTagsByPlan(cur.resolvedTags, plan);
     set({ plan, expr: plan?.filter ?? undefined, planRevision: cur.planRevision + 1, resolvedTags });
     useSelectionStore.getState().clear();
@@ -365,14 +351,14 @@ export const useSuperSearchStore = create<SuperSearchState>()(
       const result = await aiParseSearchQuery(text);
       if (aiSeq !== requestSeq) return;
       // §3.7：AI 返回的 expr 摄入时即丢弃（改用 plan 的 filter/mustNot 区，避免排除双算）
-      const aiPlan = result.plan ?? planFromParseResult(result.expr, result.sortBy, result.sortDir);
+     const aiPlan = normalizeSearchPlan(result.plan ?? planFromParseResult(result.expr, result.sortBy, result.sortDir));
       let nextExpr: QueryExpr | undefined;
       let nextPlan: SearchPlanV3 | null;
       let nextQuery: ResolvedSearchQuery;
       let nextResolvedTags: ResolvedTag[];
       let aiWarnings: string[] = result.warnings;
       if (mode === "replace") {
-        nextPlan = aiPlan;
+       nextPlan = normalizeSearchPlan(aiPlan);
         nextExpr = aiPlan.filter ?? undefined;
         // query 只同步 sortBy/sortDir，不从复杂 plan 反推扁平条件（§9.6）
         nextQuery = { ...defaultQuery(), sortBy: result.sortBy, sortDir: result.sortDir };
@@ -381,7 +367,7 @@ export const useSuperSearchStore = create<SuperSearchState>()(
         // §4.8：append 按表逐字段合并 plan（filter AND / mustNot OR / should 拼接 / ranking+retrievers 保留用户）
         const basePlan = get().plan ?? resolvedQueryToPlan(cur);
         const merged = appendPlanMerge(basePlan, aiPlan);
-        nextPlan = merged.plan;
+         nextPlan = normalizeSearchPlan(merged.plan);
         nextExpr = merged.plan.filter ?? undefined;
         nextQuery = cur; // append 不改用户排序（§4.8）
         nextResolvedTags = mergeResolvedTags(get().resolvedTags, result.resolvedTags);
@@ -475,18 +461,21 @@ export const useSuperSearchStore = create<SuperSearchState>()(
       if (from === "filter") filter = srcRemoved ?? null;
       else mustNot = srcRemoved ?? null;
     }
-    // 目标区并入：filter 按 AND（保留内部 OR），mustNot 按 OR（任一命中即排除），
+    // 目标区并入：移动项 append 到目标区根组，按目标根组当前连接词参与
+    // （filter 根为 OR 时并进 OR、mustNot 根为 AND 时并进 AND，不再写死拼接）；
     // should 拼接（默认一般偏好 1.0；加分项上限 12 由 setPlanShould 语义裁剪）
     if (to === "filter") {
-      filter = normalizeExpr(mergeQueryExpr(filter ?? undefined, node) as QueryExpr) ?? null;
+      const op = filter && filter.op === "or" ? "or" : "and";
+      filter = normalizeExpr(appendToExpr(filter ?? undefined, node, op)) ?? null;
     } else if (to === "mustNot") {
-      mustNot = normalizeExpr(mergeMustNotExpr(mustNot, node) as QueryExpr) ?? null;
+      const op = mustNot && mustNot.op === "and" ? "and" : "or";
+      mustNot = normalizeExpr(appendToExpr(mustNot ?? undefined, node, op)) ?? null;
     } else {
       if (node.op !== "leaf") return; // 加分项只接受叶子（组仍留在原区）
       should = [...should, { cond: node.cond, weight: 1, label: "", evidence: null }].slice(0, 12);
       min = should.length ? min : 0;
     }
-    const nextPlan = maybeNullPlan({ ...plan, filter, mustNot, should, minimumShouldMatch: min });
+     const nextPlan = maybeNullPlan(normalizeSearchPlan({ ...plan, filter, mustNot, should, minimumShouldMatch: min }));
     const resolvedTags = filterResolvedTagsByPlan(cur.resolvedTags, nextPlan);
     set({ plan: nextPlan, expr: nextPlan?.filter ?? undefined, planRevision: cur.planRevision + 1, resolvedTags });
     useSelectionStore.getState().clear();
@@ -503,13 +492,13 @@ export const useSuperSearchStore = create<SuperSearchState>()(
     else get().setPlanMustNot(undefined);
   },
 
-  setPlanShould: (should, minimumShouldMatch) => {
+  setPlanShould: (should, _minimumShouldMatch) => {
     const cur = get();
     if (!cur.plan && should.length === 0) return; // 没有 plan 也没有加分项：无事可做
-    const clamped = clampMin(minimumShouldMatch, should.length);
+  const clamped = 0;
     // U-5：手动条件首次加分时，从当前 expr/query 起一个最小 plan（filter 单源镜像）
     const plan: SearchPlanV3 = cur.plan ?? minimalPlanFrom(cur);
-    const next = maybeNullPlan({ ...plan, should: should.slice(0, 12), minimumShouldMatch: clamped });
+     const next = maybeNullPlan(normalizeSearchPlan({ ...plan, should, minimumShouldMatch: clamped }));
     set({ plan: next, planRevision: cur.planRevision + 1 });
   },
 
@@ -584,6 +573,11 @@ export const useSuperSearchStore = create<SuperSearchState>()(
     return result;
   },
 
+  patchLocal: (ids, patch) => {
+    const hit = new Set(ids);
+    set((s) => ({ items: s.items.map((a) => (hit.has(a.id) ? { ...a, ...patch } : a)) }));
+  },
+
   clearQuery: () => {
     const def = defaultQuery();
     void get().replaceQuery(def, undefined);
@@ -593,6 +587,17 @@ export const useSuperSearchStore = create<SuperSearchState>()(
   name: "super-search-conditions",
   // §3.7 不变式 5：持久化只存 plan + query.sortBy/sortDir（expr 是 plan.filter 的派生视图，不再存）
   version: 2,
+  // merge：persisted 的残缺 query（v2 只存 sortBy/sortDir）必须在合并时就归一到完整
+  // defaultQuery —— 否则 query.search 等字段为 undefined，首次渲染即崩
+  //（SuperSearchPage 的 query.search.trim()；onRehydrateStorage 补全来不及在首帧前生效）。
+  merge: (persisted, current) => {
+    const p = persisted as { plan?: SearchPlanV3 | null; query?: Partial<ResolvedSearchQuery> } | null;
+    return {
+      ...current,
+      plan: p?.plan ? migratePlanV3(p.plan) : null,
+      query: { ...defaultQuery(), ...(p?.query ?? {}) },
+    } as typeof current;
+  },
   partialize: (state) => ({
     plan: state.plan,
     query: { sortBy: state.query.sortBy, sortDir: state.query.sortDir },

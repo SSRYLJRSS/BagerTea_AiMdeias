@@ -238,9 +238,7 @@ pub fn ai_list_suggestion_items(
 
 /// F6-d：全库「新词待确认」列表（pending 且词表里没有的候选）。
 #[tauri::command]
-pub fn ai_list_new_word_candidates(
-    state: State<AppState>,
-) -> AppResult<Vec<AiSuggestionItem>> {
+pub fn ai_list_new_word_candidates(state: State<AppState>) -> AppResult<Vec<AiSuggestionItem>> {
     let conn = lock_db(&state)?;
     ai::list_new_word_candidates(&conn)
 }

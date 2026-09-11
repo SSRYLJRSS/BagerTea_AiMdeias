@@ -27,10 +27,8 @@ pub(crate) const AI_ASSIGNABLE_TAG: &str =
 
 /// F4：分面生命周期是否有效（存在且 active，不看 cfg_*）。详情页据此对
 /// 「分面已停用/已删除」的标签打「已停用/孤儿」角标（get_asset_tags 不过滤恒显示）。
-pub(crate) const FACET_EFFECTIVE: &str =
-    "EXISTS (SELECT 1 FROM tag_facets f \
+pub(crate) const FACET_EFFECTIVE: &str = "EXISTS (SELECT 1 FROM tag_facets f \
       WHERE f.key = COALESCE(t.facet_key,'custom') AND f.status = 'active')";
-
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -81,6 +79,29 @@ pub fn normalize_name(name: &str) -> String {
         .collect::<Vec<_>>()
         .join(" ")
         .to_lowercase()
+}
+
+/// 读取活动标签的所属分面，用于命令层校验父标签关系。
+pub fn active_facet_key(conn: &Connection, id: i64) -> AppResult<Option<String>> {
+    Ok(conn
+        .query_row(
+            "SELECT facet_key FROM tags WHERE id = ?1 AND status = 'active'",
+            [id],
+            |row| row.get(0),
+        )
+        .optional()?)
+}
+
+/// 判断标签是否为系统标签。
+pub fn is_system(conn: &Connection, id: i64) -> AppResult<bool> {
+    Ok(conn
+        .query_row(
+            "SELECT is_system != 0 FROM tags WHERE id = ?1",
+            [id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .unwrap_or(false))
 }
 
 /// 子孙 id 集合（含自身）—— 递归 CTE
@@ -361,9 +382,11 @@ pub fn update(
         if let Some(pid) = parent_id {
             // ① 改 parent 校验同分面（V22a 触发器同规则兜底——双层防护，应用层给清晰报错）
             if let Some(new_parent) = pid {
-                let cur_facet: Option<String> =
-                    c.query_row("SELECT facet_key FROM tags WHERE id = ?1", [id], |r| r.get(0))
-                        .optional()?;
+                let cur_facet: Option<String> = c
+                    .query_row("SELECT facet_key FROM tags WHERE id = ?1", [id], |r| {
+                        r.get(0)
+                    })
+                    .optional()?;
                 let par_facet: Option<String> = c
                     .query_row(
                         "SELECT facet_key FROM tags WHERE id = ?1",
@@ -492,11 +515,10 @@ pub fn add_alias(
     //       应用层把 UNIQUE 错误翻译成人话；
     //   =0：只写 tag_aliases（tag_terms 不读不写），维持原行为。
     if crate::db::schema_features::feature_enabled(conn, "tag_unique_terms").unwrap_or(false) {
-        let facet: String = conn.query_row(
-            "SELECT facet_key FROM tags WHERE id = ?1",
-            [tag_id],
-            |r| r.get(0),
-        )?;
+        let facet: String =
+            conn.query_row("SELECT facet_key FROM tags WHERE id = ?1", [tag_id], |r| {
+                r.get(0)
+            })?;
         let result = conn.execute(
             "INSERT INTO tag_terms
              (tag_id, facet_key, normalized_term, term, locale, term_kind, is_searchable, created_at)
@@ -690,7 +712,8 @@ pub fn top_tags_per_facet(conn: &Connection, n: usize) -> AppResult<Vec<(String,
         // 贪心凑词直到分面配额；超长首词也保留（每分面至少 1 个词）
         let mut line = String::new();
         for w in &words {
-            let cost = line.chars().count() + if line.is_empty() { 0 } else { 1 } + w.chars().count();
+            let cost =
+                line.chars().count() + if line.is_empty() { 0 } else { 1 } + w.chars().count();
             if cost > per_facet_cap && !line.is_empty() {
                 break;
             }
@@ -806,7 +829,9 @@ pub fn merge_preserve_alias(conn: &Connection, src_id: i64, dst_id: i64) -> AppR
         crate::db::schema_features::feature_enabled(conn, "tag_unique_terms").unwrap_or(false);
     transactional(conn, |c| {
         let src_name: String =
-            c.query_row("SELECT name FROM tags WHERE id = ?1", [src_id], |r| r.get(0))?;
+            c.query_row("SELECT name FROM tags WHERE id = ?1", [src_id], |r| {
+                r.get(0)
+            })?;
         // ① src 独有素材 → 挂到 dst（INSERT 触发 FTS 更新）
         c.execute(
             "INSERT INTO asset_tags
@@ -888,10 +913,16 @@ pub fn merge_preserve_alias(conn: &Connection, src_id: i64, dst_id: i64) -> AppR
                 "UPDATE tags SET name = ?1, canonical_name = ?1, normalized_name = ?2 WHERE id = ?3",
                 rusqlite::params![renamed, normalize_name(&renamed), src_id],
             )?;
-            c.execute("UPDATE tags SET status = 'deprecated' WHERE id = ?1", [src_id])?;
+            c.execute(
+                "UPDATE tags SET status = 'deprecated' WHERE id = ?1",
+                [src_id],
+            )?;
         } else {
             // 旧表路径：④ src 置 deprecated（物理删除语义由 merge() 兼容包装负责）
-            c.execute("UPDATE tags SET status = 'deprecated' WHERE id = ?1", [src_id])?;
+            c.execute(
+                "UPDATE tags SET status = 'deprecated' WHERE id = ?1",
+                [src_id],
+            )?;
             add_alias(c, dst_id, &src_name, None, "old_name")?;
         }
         Ok(())
@@ -1142,7 +1173,11 @@ pub fn detect_tag_conflicts(conn: &Connection) -> AppResult<TagConflictReport> {
                 });
             }
             if members.len() > 1 {
-                out.push(TermConflictGroup { facet_key: facet, term, entries: members });
+                out.push(TermConflictGroup {
+                    facet_key: facet,
+                    term,
+                    entries: members,
+                });
             }
         }
         out
@@ -1157,7 +1192,11 @@ pub fn detect_tag_conflicts(conn: &Connection) -> AppResult<TagConflictReport> {
               ORDER BY t.facet_key, t.name",
         )?;
         let rows = stmt.query_map([], |r| {
-            Ok(OrphanTag { id: r.get(0)?, name: r.get(1)?, facet_key: r.get(2)? })
+            Ok(OrphanTag {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                facet_key: r.get(2)?,
+            })
         })?;
         rows.filter_map(|r| r.ok()).collect()
     };
@@ -1198,16 +1237,25 @@ pub fn detect_tag_conflicts(conn: &Connection) -> AppResult<TagConflictReport> {
             let mut is_cycle = false;
             for _ in 0..12 {
                 let parent: Option<Option<i64>> = conn
-                    .query_row("SELECT parent_id FROM tags WHERE id=?1", [cur], |r| r.get(0))
+                    .query_row("SELECT parent_id FROM tags WHERE id=?1", [cur], |r| {
+                        r.get(0)
+                    })
                     .ok();
                 match parent {
-                    Some(Some(p)) if p == id => { is_cycle = true; break; }
+                    Some(Some(p)) if p == id => {
+                        is_cycle = true;
+                        break;
+                    }
                     Some(Some(p)) => cur = p,
                     _ => break,
                 }
             }
             if is_cycle {
-                out.push(CycleEdge { id, name, parent_id: pid });
+                out.push(CycleEdge {
+                    id,
+                    name,
+                    parent_id: pid,
+                });
             }
         }
         out
@@ -1356,7 +1404,10 @@ pub fn find_by_term(
                 _ => FUZZY_EXPAND_CAP,
             };
             let (h, w) = expand_term_query(conn, facet_key, normalized, mode, cap)?;
-            return Ok(TermLookup { hits: h, warnings: w });
+            return Ok(TermLookup {
+                hits: h,
+                warnings: w,
+            });
         }
         // Exact / Alias：精确单点（唯一索引保证最多一行）
         let kind_filter = match mode {
@@ -1383,11 +1434,7 @@ pub fn find_by_term(
                 .unwrap_or_else(|_| "active".into());
             if term_kind != "canonical" {
                 let canonical: Option<String> = conn
-                    .query_row(
-                        "SELECT name FROM tags WHERE id=?1",
-                        [tag_id],
-                        |r| r.get(0),
-                    )
+                    .query_row("SELECT name FROM tags WHERE id=?1", [tag_id], |r| r.get(0))
                     .ok();
                 warnings.push(
                     canonical
@@ -1624,7 +1671,11 @@ pub fn expand_term_query(
         }
         TermMatch::Fuzzy => {
             let len = normalized.chars().count() as i64;
-            let first = normalized.chars().next().map(String::from).unwrap_or_default();
+            let first = normalized
+                .chars()
+                .next()
+                .map(String::from)
+                .unwrap_or_default();
             // ① 首字符相同 或 长度差 ≤ 1 → SQL 缩候选（首字符走前缀可索引扫描）
             vals.push(first.clone().into());
             vals.push((len - 1).max(0).into());
@@ -1659,7 +1710,8 @@ pub fn expand_term_query(
     }
     // ② Fuzzy 第二阶段：编辑距离 ≤ 1（char），按距离升序、同距按名字长度升序
     let ordered: Vec<(i64, String, String, String)> = if mode == TermMatch::Fuzzy {
-        let mut scored: Vec<(usize, usize, (i64, String, String, String))> = loaded
+        type ScoredTerm = (usize, usize, (i64, String, String, String));
+        let mut scored: Vec<ScoredTerm> = loaded
             .into_iter()
             .filter_map(|row| {
                 let d = char_levenshtein(normalized, &row.2);
@@ -1754,8 +1806,8 @@ pub fn find_similar_tag(
         }
         let len_diff = (cnorm.chars().count() as isize - normalized.chars().count() as isize).abs();
         // ② 子串（长度差 ≤ 2）
-        let substring = len_diff <= 2
-            && (cnorm.contains(normalized) || normalized.contains(cnorm.as_str()));
+        let substring =
+            len_diff <= 2 && (cnorm.contains(normalized) || normalized.contains(cnorm.as_str()));
         // ③ 编辑距离 ≤ 1
         let spell = char_levenshtein(&cnorm, normalized) <= 1;
         if substring {
@@ -1809,12 +1861,11 @@ pub fn scan_duplicate_tags(conn: &Connection) -> AppResult<Vec<DuplicateGroup>> 
           ORDER BY t.facet_key, t.id",
     )?;
     let all: Vec<(i64, String, String, i64)> = stmt
-        .query_map([], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
-        })?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
         .filter_map(|r| r.ok())
         .collect();
-    let mut by_facet: std::collections::BTreeMap<String, Vec<(i64, String, i64)>> = Default::default();
+    let mut by_facet: std::collections::BTreeMap<String, Vec<(i64, String, i64)>> =
+        Default::default();
     for (id, name, facet, uses) in all {
         by_facet.entry(facet).or_default().push((id, name, uses));
     }
@@ -1835,8 +1886,7 @@ pub fn scan_duplicate_tags(conn: &Connection) -> AppResult<Vec<DuplicateGroup>> 
                 if na.is_empty() || nb.is_empty() || na == nb {
                     continue;
                 }
-                let len_diff =
-                    (na.chars().count() as isize - nb.chars().count() as isize).abs();
+                let len_diff = (na.chars().count() as isize - nb.chars().count() as isize).abs();
                 let similar = (len_diff <= 2
                     && (na.contains(nb.as_str()) || nb.contains(na.as_str())))
                     || char_levenshtein(&na, &nb) <= 2;
@@ -1906,15 +1956,6 @@ mod tests {
         schema_features::set_feature(&c, "tag_unique_terms", true, None).unwrap();
         c
     }
-    fn seed_term(c: &Connection, tag_id: i64, facet: &str, term: &str) {
-        c.execute(
-            "INSERT INTO tag_terms (tag_id, facet_key, normalized_term, term, locale, term_kind, is_searchable, created_at)
-             VALUES (?1, ?2, ?3, ?3, '', 'canonical', 1, 1)",
-            rusqlite::params![tag_id, facet, term],
-        )
-        .unwrap();
-    }
-
     /// S5：Prefix 必须走索引 —— EXPLAIN QUERY PLAN 含 SEARCH 且不含 SCAN。
     /// 防止有人把范围查询改回 `LIKE 'x%'`（实测 5 万行 → SCAN）。
     #[test]
@@ -1927,10 +1968,7 @@ mod tests {
             .prepare(&format!("EXPLAIN QUERY PLAN {}", term_prefix_sql("scene")))
             .unwrap();
         let plan: String = stmt
-            .query_row(
-                rusqlite::params!["scene", "海", "鸿"],
-                |r| r.get(3),
-            )
+            .query_row(rusqlite::params!["scene", "海", "鸿"], |r| r.get(3))
             .unwrap();
         assert!(plan.contains("SEARCH"), "前缀范围查询必须走索引：{plan}");
         assert!(!plan.contains("SCAN"), "不得退化全表扫：{plan}");
@@ -1967,12 +2005,15 @@ mod tests {
                 .unwrap()
                 .filter_map(|r| r.ok())
                 .collect();
-            let rust_hits: Vec<&String> = all.iter().filter(|t| t.starts_with(&normalized)).collect();
+            let rust_hits: Vec<&String> =
+                all.iter().filter(|t| t.starts_with(&normalized)).collect();
             assert_eq!(
                 hits.len(),
                 rust_hits.len(),
                 "SQL 与 Rust 前缀命中数不一致：prefix={prefix} sql={:?} rust={:?}",
-                hits.iter().map(|h| h.matched_term.as_str()).collect::<Vec<_>>(),
+                hits.iter()
+                    .map(|h| h.matched_term.as_str())
+                    .collect::<Vec<_>>(),
                 rust_hits
             );
             // 区间不变式：SQL 每个命中都满足 Rust 的 starts_with

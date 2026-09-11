@@ -58,8 +58,7 @@ pub async fn ai_parse_search_query(
             let facets = tag_facets::build_prompt_context(&conn, "all")?;
             let dict = super_search_ai::collect_tag_dictionary(&conn, &facets)?;
             // C-3：实时库能力摘要（缓存 60s，只告知不改写）；失败时静默给空串不阻塞搜索
-            let capabilities =
-                super_search_ai::library_capabilities(&conn).unwrap_or_default();
+            let capabilities = super_search_ai::library_capabilities(&conn).unwrap_or_default();
             (s.ai, facets, dict, capabilities)
         };
         // 3. 锁外网络请求 + V3 解析（V3→V2→关键词 三层降级；配置错误仍真报错）。
@@ -73,8 +72,7 @@ pub async fn ai_parse_search_query(
         let (expr, resolved_tags, plan, resolve_warnings) = {
             let conn = lock_db(&db)?;
             let v2_view = super_search_ai::v3_to_v2_view(&intent);
-            let (expr, resolved_tags, ew) =
-                super_search_ai::build_expr_from_v2(&conn, &v2_view)?;
+            let (expr, resolved_tags, ew) = super_search_ai::build_expr_from_v2(&conn, &v2_view)?;
             let (plan, pr, pw) = super_search_ai::build_plan_from_v3(&conn, &intent)?;
             let mut all_resolved = resolved_tags.clone();
             for r in pr {
@@ -98,8 +96,7 @@ pub async fn ai_parse_search_query(
                     let (fe, fr, fw, fp) = {
                         let conn = lock_db(&db)?;
                         let v2 = super_search_ai::v3_to_v2_view(&fallback);
-                        let (expr, r, w) =
-                            super_search_ai::build_expr_from_v2(&conn, &v2)?;
+                        let (expr, r, w) = super_search_ai::build_expr_from_v2(&conn, &v2)?;
                         let (p, _, _) = super_search_ai::build_plan_from_v3(&conn, &fallback)?;
                         (expr, r, w, p)
                     };
@@ -160,8 +157,7 @@ pub fn list_assets_by_plan(
             warnings: Vec::new(),
         });
     };
-    let page =
-        crate::db::search_plan::run_plan_page(&conn, &plan, offset.unwrap_or(0), limit)?;
+    let page = crate::db::search_plan::run_plan_page(&conn, &plan, offset.unwrap_or(0), limit)?;
     for a in &page.items {
         let _ = app
             .asset_protocol_scope()

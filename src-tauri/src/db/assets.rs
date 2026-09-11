@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 pub use super::search_query::MetadataFilter;
 use super::search_query::{self};
 use super::sql_utils::offset_placeholders;
-use super::{search, tags::FACET_EFFECTIVE, tags::Tag};
+use super::{search, tags::Tag, tags::FACET_EFFECTIVE};
 use crate::error::{AppError, AppResult};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -106,7 +106,7 @@ pub struct PaletteSegmentDto {
 /// 全部复用同一解析语义，禁止各写一份：
 /// - `NULL` / 空字符串 / 全空白 / `[]` / 损坏 JSON / 合法但空数组 -> `None`
 /// - 合法且非空数组 -> `Some(Vec<PaletteSegmentDto>)`
-/// 避免「页面说已完成，但实际渲染为空」的语义分叉。
+///   避免「页面说已完成，但实际渲染为空」的语义分叉。
 pub(crate) fn parse_palette_json(raw: Option<String>) -> Option<Vec<PaletteSegmentDto>> {
     let raw = raw?;
     if raw.trim().is_empty() {
@@ -138,11 +138,12 @@ pub fn rescan_palette_colors(conn: &Connection) -> AppResult<i64> {
     let tx = conn.unchecked_transaction()?;
     tx.execute("DELETE FROM asset_palette_colors", [])?;
     let rows: Vec<(i64, Option<String>)> = {
-        let mut stmt = tx.prepare(
-            "SELECT id, palette_json FROM assets WHERE deleted_at IS NULL",
-        )?;
+        let mut stmt =
+            tx.prepare("SELECT id, palette_json FROM assets WHERE deleted_at IS NULL")?;
         let r = stmt
-            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?)))?
+            .query_map([], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?))
+            })?
             .filter_map(|r| r.ok())
             .collect();
         r
@@ -153,10 +154,11 @@ pub fn rescan_palette_colors(conn: &Connection) -> AppResult<i64> {
          VALUES (?1, ?2, ?3, ?4)",
     )?;
     for (id, raw) in rows {
-        let Some(segments) = parse_palette_json(raw) else { continue };
+        let Some(segments) = parse_palette_json(raw) else {
+            continue;
+        };
         for (rank, seg) in segments.into_iter().enumerate() {
-            let (bucket, _name) =
-                crate::db::palette_bucket::bucket_of_rgb(seg.r, seg.g, seg.b);
+            let (bucket, _name) = crate::db::palette_bucket::bucket_of_rgb(seg.r, seg.g, seg.b);
             stmt.execute(rusqlite::params![id, rank as i64, bucket, seg.ratio as f64])?;
             written += 1;
         }
@@ -718,7 +720,8 @@ pub(crate) fn by_ids_ordered(conn: &Connection, ids: &[i64]) -> AppResult<Vec<As
     let mut items: Vec<Asset> = stmt
         .query_map(rusqlite::params_from_iter(ids.iter()), from_row)?
         .collect::<Result<Vec<_>, _>>()?;
-    let pos: std::collections::HashMap<i64, usize> = ids.iter().enumerate().map(|(i, &id)| (id, i)).collect();
+    let pos: std::collections::HashMap<i64, usize> =
+        ids.iter().enumerate().map(|(i, &id)| (id, i)).collect();
     items.sort_by_key(|a| pos.get(&a.id).copied().unwrap_or(usize::MAX));
     fill_tags(conn, &mut items)?;
     Ok(items)
@@ -860,18 +863,6 @@ pub fn list_metadata_facets(
                 "CAST(a.rating AS TEXT)",
                 "CASE a.rating WHEN 1 THEN '★' WHEN 2 THEN '★★' WHEN 3 THEN '★★★' WHEN 4 THEN '★★★★' ELSE '★★★★★' END",
                 "a.rating > 0",
-            )?,
-        },
-        // W2-8：收藏分面（favorite 仿 has_location 的 CASE 编译，值域 yes/no）
-        MetadataFacet {
-            key: "favorite".into(),
-            display_name: "收藏".into(),
-            description: "你收藏的素材".into(),
-            items: metadata_items(
-                conn,
-                "CASE WHEN a.favorite = 1 THEN 'yes' ELSE 'no' END",
-                "CASE WHEN a.favorite = 1 THEN '已收藏' ELSE '未收藏' END",
-                "a.favorite = 1",
             )?,
         },
         MetadataFacet {
@@ -1042,6 +1033,7 @@ pub fn get(conn: &Connection, id: i64) -> AppResult<Asset> {
     Ok(asset)
 }
 
+// 8 参数为素材入库字段的内聚集合，收进结构体需同步改全部调用点，收益低，集中豁免。
 #[allow(clippy::too_many_arguments)]
 pub fn insert(
     conn: &Connection,
@@ -1250,19 +1242,6 @@ pub fn list_geo_taken_all_ids(conn: &Connection) -> AppResult<Vec<i64>> {
 
 /// 回填 GPS 定位与拍摄时间（仅补空，不覆盖已有值；老素材无定位保持 NULL）。
 /// 注意 COALESCE 参数顺序：已有列值在前，新值在后 —— COALESCE(旧, 新) 才是「只补空」。
-/// W2-8：批量收藏/取消收藏（favorite 0/1）。返回受影响行数。
-pub fn set_favorite(conn: &Connection, ids: &[i64], favorite: bool) -> AppResult<u64> {
-    if ids.is_empty() {
-        return Ok(0);
-    }
-    let list = ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
-    let n = conn.execute(
-        &format!("UPDATE assets SET favorite = ?1 WHERE id IN ({list})"),
-        rusqlite::params![if favorite { 1 } else { 0 }],
-    )?;
-    Ok(n as u64)
-}
-
 /// W2-8：批量评级（0–5；0 = 清除评级）。
 pub fn set_rating(conn: &Connection, ids: &[i64], rating: i64) -> AppResult<u64> {
     if ids.is_empty() {
@@ -1308,7 +1287,12 @@ pub fn list_ids_needing_dimensions(conn: &Connection) -> AppResult<Vec<i64>> {
 }
 
 /// W1-4：写回宽高（只补空，不覆盖已有值）。
-pub fn set_dimensions(conn: &Connection, id: i64, width: Option<i64>, height: Option<i64>) -> AppResult<()> {
+pub fn set_dimensions(
+    conn: &Connection,
+    id: i64,
+    width: Option<i64>,
+    height: Option<i64>,
+) -> AppResult<()> {
     conn.execute(
         "UPDATE assets SET width = COALESCE(width, ?1),
             height = COALESCE(height, ?2)
@@ -1524,6 +1508,14 @@ pub fn list_all_ids(conn: &Connection) -> AppResult<Vec<i64>> {
     Ok(rows.filter_map(|r| r.ok()).collect())
 }
 
+/// 列出全部未删除图片，用于图片尺寸回填的 all 范围。
+pub fn list_image_ids(conn: &Connection) -> AppResult<Vec<i64>> {
+    let mut stmt = conn
+        .prepare("SELECT id FROM assets WHERE deleted_at IS NULL AND mime_type LIKE 'image/%'")?;
+    let rows = stmt.query_map([], |row| row.get(0))?;
+    Ok(rows.filter_map(|row| row.ok()).collect())
+}
+
 pub fn set_hd_thumbnail_path(conn: &Connection, id: i64, path: &str) -> AppResult<()> {
     conn.execute(
         "UPDATE assets SET hd_thumbnail_path = ?1 WHERE id = ?2",
@@ -1558,13 +1550,32 @@ pub fn clear_all_hd_thumbnail_paths(conn: &Connection) -> AppResult<()> {
     Ok(())
 }
 
+/// 列出非空的一句话描述（标签与分类设置页展示用；描述走 FTS 模糊搜索，不参与分面精确筛选）。
+pub fn list_content_descriptions(
+    conn: &Connection,
+    limit: i64,
+) -> AppResult<Vec<(i64, String, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, file_name, content_description FROM assets
+          WHERE deleted_at IS NULL AND content_description IS NOT NULL AND content_description != ''
+          ORDER BY id LIMIT ?1",
+    )?;
+    let rows = stmt.query_map([limit], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+        ))
+    })?;
+    Ok(rows.filter_map(|r| r.ok()).collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn mem() -> Connection {
-        let c = crate::db::init_memory().unwrap();
-        c
+        crate::db::init_memory().unwrap()
     }
 
     fn ins(c: &Connection, path: &str, mime: &str) -> i64 {
@@ -1790,11 +1801,21 @@ mod tests {
         let vid_full = ins(&c, "/v2.mp4", "video/mp4");
         set_geo_taken(&c, img_geo, Some(30.25), Some(120.16), None).unwrap();
         set_geo_taken(&c, vid_no_taken, Some(30.25), Some(120.16), None).unwrap();
-        set_geo_taken(&c, vid_full, Some(30.25), Some(120.16), Some(1_710_484_200_000)).unwrap();
+        set_geo_taken(
+            &c,
+            vid_full,
+            Some(30.25),
+            Some(120.16),
+            Some(1_710_484_200_000),
+        )
+        .unwrap();
 
         let ids = list_ids_needing_geo_taken(&c).unwrap();
         assert!(ids.contains(&img_no_geo), "图片缺定位应入选");
-        assert!(ids.contains(&img_geo), "图片有定位但缺 taken_at 应入选（R0-2）");
+        assert!(
+            ids.contains(&img_geo),
+            "图片有定位但缺 taken_at 应入选（R0-2）"
+        );
         assert!(ids.contains(&vid_no_taken), "视频缺 taken_at 应入选");
         assert!(!ids.contains(&vid_full), "视频定位+时间齐全不入选");
     }
@@ -1806,10 +1827,20 @@ mod tests {
         let img_no_taken = ins(&c, "/i3.jpg", "image/jpeg");
         let img_full = ins(&c, "/i4.jpg", "image/jpeg");
         set_geo_taken(&c, img_no_taken, Some(30.25), Some(120.16), None).unwrap();
-        set_geo_taken(&c, img_full, Some(30.25), Some(120.16), Some(1_710_484_200_000)).unwrap();
+        set_geo_taken(
+            &c,
+            img_full,
+            Some(30.25),
+            Some(120.16),
+            Some(1_710_484_200_000),
+        )
+        .unwrap();
 
         let ids = list_ids_needing_geo_taken(&c).unwrap();
-        assert!(ids.contains(&img_no_taken), "图片有定位但缺 taken_at 应入选（R0-2）");
+        assert!(
+            ids.contains(&img_no_taken),
+            "图片有定位但缺 taken_at 应入选（R0-2）"
+        );
         assert!(!ids.contains(&img_full), "图片定位+时间齐全不入选");
     }
 
@@ -1842,7 +1873,10 @@ mod tests {
         set_geo_taken(&c, red_a, Some(30.25), Some(120.16), None).unwrap();
 
         let facets = list_metadata_facets(&c, None).unwrap();
-        let hue = facets.iter().find(|f| f.key == "hue").expect("应有色调分面");
+        let hue = facets
+            .iter()
+            .find(|f| f.key == "hue")
+            .expect("应有色调分面");
         let get_count = |v: &str| {
             hue.items
                 .iter()
@@ -1892,17 +1926,4 @@ mod tests {
         assert_eq!(b.user_rotation, 0);
         assert_eq!(b.phash, None);
     }
-}
-
-/// 列出非空的一句话描述（标签与分类设置页展示用；描述走 FTS 模糊搜索，不参与分面精确筛选）。
-pub fn list_content_descriptions(conn: &Connection, limit: i64) -> AppResult<Vec<(i64, String, String)>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, file_name, content_description FROM assets
-          WHERE deleted_at IS NULL AND content_description IS NOT NULL AND content_description != ''
-          ORDER BY id LIMIT ?1",
-    )?;
-    let rows = stmt.query_map([limit], |r| {
-        Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
-    })?;
-    Ok(rows.filter_map(|r| r.ok()).collect())
 }

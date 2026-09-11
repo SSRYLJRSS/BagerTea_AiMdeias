@@ -1,6 +1,7 @@
 /** queryExprUtils（FB5-05 §9.5.6/§9.6.1）：normalize / removeExprAtPath / flattenExprForDisplay。 */
 import { describe, expect, it } from "vitest";
 import {
+  appendToExpr,
   flattenExprForDisplay,
   normalizeExpr,
   removeExprAtPath,
@@ -59,6 +60,26 @@ describe("removeExprAtPath（§9.6.1）", () => {
   });
   it("删除 NOT 整棵清空", () => {
     expect(removeExprAtPath({ op: "not", child: tagLeaf("lighting", [1]) }, [0])).toBeUndefined();
+  });
+});
+
+describe("appendToExpr（2026-09-06 跨区移动）", () => {
+  it("空根 → 直接返回节点", () => {
+    expect(appendToExpr(undefined, searchLeaf("海边"), "or")).toEqual(searchLeaf("海边"));
+  });
+  it("根组 op 一致 → 直接 append 为根组的一项（按目标根组连接词参与）", () => {
+    const root: QueryExpr = { op: "or", children: [searchLeaf("海边"), searchLeaf("日落")] };
+    expect(appendToExpr(root, searchLeaf("夜景"), "or")).toEqual({
+      op: "or",
+      children: [searchLeaf("海边"), searchLeaf("日落"), searchLeaf("夜景")],
+    });
+  });
+  it("根组 op 不一致 → 包一层 op 组（normalize 再拍平同 op）", () => {
+    const root: QueryExpr = searchLeaf("海边");
+    expect(appendToExpr(root, searchLeaf("日落"), "and")).toEqual({
+      op: "and",
+      children: [searchLeaf("海边"), searchLeaf("日落")],
+    });
   });
 });
 

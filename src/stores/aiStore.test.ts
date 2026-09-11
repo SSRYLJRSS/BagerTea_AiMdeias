@@ -225,6 +225,25 @@ describe("aiStore 打标状态机", () => {
     expect(useAiStore.getState().suggestions.map((s) => s.id)).toEqual([201]);
   });
 
+  it("同批次竞态回归：较早回载的旧快照晚到时不得覆盖新结果", async () => {
+    useAiStore.setState({ currentBatchId: 1 });
+    let resolveOld!: (v: AiSuggestion[]) => void;
+    vi.mocked(aiListSuggestions).mockImplementationOnce(
+      () => new Promise((res) => (resolveOld = res)),
+    );
+    const oldReload = useAiStore.getState().openBatch(1);
+
+    vi.mocked(aiListSuggestions).mockResolvedValueOnce([
+      mkSuggestion(102, { suggestedTags: { scene: ["公园"] } }),
+    ]);
+    await useAiStore.getState().openBatch(1);
+    expect(useAiStore.getState().suggestions.map((s) => s.id)).toEqual([102]);
+
+    resolveOld([mkSuggestion(101, { suggestedTags: {} })]);
+    await oldReload;
+    expect(useAiStore.getState().suggestions.map((s) => s.id)).toEqual([102]);
+  });
+
   it("阶段5 §8.1：所选素材完整进入逻辑批次，不做静默截断", async () => {
     useSettingsStore.setState({ settings: mkSettings({ batchLimit: 2 }) });
     useAiStore.setState({ pendingAssetIds: [1, 2, 3, 4, 5], pendingMode: "auto" });

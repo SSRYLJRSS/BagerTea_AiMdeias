@@ -3,7 +3,7 @@
 //!  - 用途绑定：super_search / tagging 各自指向一个 connection_id，可同可异；
 //!  - 协议 protocol ∈ openai_chat | anthropic_messages（apiMode 迁移见 §6.4）。
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::error::{AppError, AppResult};
 
@@ -134,6 +134,8 @@ pub fn apply_usage_binding(
 }
 
 /// 写入/覆盖连接档案（upsert）。api_key_ref 由调用方决定（成功写凭据后置为 id）。
+// 8 参数为档案字段的内聚集合，收进结构体需同步改全部调用点，收益低，集中豁免。
+#[allow(clippy::too_many_arguments)]
 pub fn upsert(
     conn: &Connection,
     id: &str,
@@ -177,6 +179,32 @@ pub fn bind_usage(conn: &Connection, usage: &str, connection_id: &str) -> AppRes
         params![usage, connection_id, now],
     )?;
     Ok(())
+}
+
+/// 清除某个用途绑定。
+pub fn unbind_usage(conn: &Connection, usage: &str) -> AppResult<()> {
+    if !matches!(usage, "super_search" | "tagging") {
+        return Err(AppError::msg("非法用途（super_search|tagging）"));
+    }
+    conn.execute(
+        "DELETE FROM ai_usage_bindings WHERE usage = ?1",
+        params![usage],
+    )?;
+    Ok(())
+}
+
+/// 读取某个用途当前绑定的连接 id（未绑定返回 None）。
+pub fn binding_id(conn: &Connection, usage: &str) -> AppResult<Option<String>> {
+    if !matches!(usage, "super_search" | "tagging") {
+        return Err(AppError::msg("非法用途（super_search|tagging）"));
+    }
+    Ok(conn
+        .query_row(
+            "SELECT connection_id FROM ai_usage_bindings WHERE usage = ?1",
+            params![usage],
+            |row| row.get(0),
+        )
+        .optional()?)
 }
 
 /// 删除连接档案（同时清除用途绑定）。

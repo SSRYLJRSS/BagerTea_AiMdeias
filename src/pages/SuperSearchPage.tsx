@@ -22,6 +22,7 @@ import { useScrollDirection } from "@/hooks/useScrollDirection";
 import { useSuperSearchStore } from "@/stores/superSearchStore";
 import { useSelectionStore } from "@/stores/selectionStore";
 import { useAiStore } from "@/stores/aiStore";
+import { useLibraryStore } from "@/stores/libraryStore";
 import { diagnoseSearchPlan } from "@/api/superSearch";
 import type { Asset } from "@/types/asset";
 import type { SearchPlanV3 } from "@/types/superSearch";
@@ -32,7 +33,7 @@ import { dominantFiltersFor } from "@/utils/dominantFilter";
 type DialogKey = "delete" | "export" | "tags" | null;
 
 export default function SuperSearchPage() {
-  const { refresh, error, total, loading, items, loadMore, fetchAllIds, applyAiSearch, query, setQuery, expr, plan, planRevision, executionWarnings, resolvedTags, clearConditions, removeAtZonePath, applyTermSuggestion } = useSuperSearchStore(
+  const { refresh, error, total, loading, items, loadMore, fetchAllIds, patchLocal, applyAiSearch, query, setQuery, expr, plan, planRevision, executionWarnings, resolvedTags, clearConditions, removeAtZonePath, applyTermSuggestion } = useSuperSearchStore(
     useShallow((s) => ({
       refresh: s.refresh,
       error: s.error,
@@ -41,6 +42,7 @@ export default function SuperSearchPage() {
       items: s.items,
       loadMore: s.loadMore,
       fetchAllIds: s.fetchAllIds,
+      patchLocal: s.patchLocal,
       applyAiSearch: s.applyAiSearch,
       query: s.query,
       setQuery: s.setQuery,
@@ -58,6 +60,20 @@ export default function SuperSearchPage() {
   const [dialog, setDialog] = useState<DialogKey>(null);
   const [exportMode, setExportMode] = useState<"copy" | "move">("copy");
   const [preview, setPreview] = useState<Asset | null>(null);
+
+  // §7.2/§7.3（与素材库页一致）：打开/关闭 Viewer 同步全局 viewerOpen（App 据此隐藏 BottomBar）。
+  // 超搜此前只 setPreview、不同步 viewerOpen，且把 ViewerPage 内联在 flex 列末尾——
+  // 头部+结果网格仍占着布局，Viewer 被挤到窗口底部、主图舞台塌陷（详情显示 bug 根因）。
+  const openViewer = (asset: Asset) => {
+    setPreview(asset);
+    useLibraryStore.getState().setViewerOpen(true);
+  };
+  const closeViewer = () => {
+    setPreview(null);
+    useLibraryStore.getState().setViewerOpen(false);
+  };
+  // 兜底：查看器打开期间经标题栏齿轮等跨页离开时，复位全局 viewerOpen，避免 BottomBar 被永久隐藏
+  useEffect(() => () => useLibraryStore.getState().setViewerOpen(false), []);
   // U-7③：空结果时列出「把结果砍到 0」的归零条件（C-2 诊断），可单条移除。
   // §3.7 不变式 9：归零条件带 zone + planRevision（两区同下标不混淆；代次过期不渲染删除按钮）
   const [zeroing, setZeroing] = useState<{ zone: "filter" | "mustNot"; path: number[]; label: string }[]>([]);
@@ -199,6 +215,22 @@ export default function SuperSearchPage() {
     }, 60);
   };
 
+  // §7.2 互斥（同素材库页）：Viewer 打开时整体替换超搜页（搜索头部/结果网格/弹窗全部卸载），
+  // 让 ViewerPage 独占整页高度；关闭后由 store 恢复筛选/滚动/选中上下文。
+  // 过片数据集显式传「当前搜索结果集」，避免胶片条/上下张错用素材库全量列表。
+  if (preview) {
+    return (
+      <ViewerPage
+        asset={preview}
+        onClose={closeViewer}
+        listItems={items}
+        listTotal={total}
+        onListLoadMore={loadMore}
+        patchListItem={patchLocal}
+      />
+    );
+  }
+
   return (
     <div className="relative flex h-full flex-col">
       {/* FB6 需求五：顶栏已移除（无返回按钮、无重复标题）。结果计数保留在下方摘要行。 */}
@@ -290,26 +322,6 @@ export default function SuperSearchPage() {
           </div>
         </div>
 
-        {/* FB5-03（§3.5）：中央 Chevron 披露行 —— 摘要区与详细条件面板之间，固定 24px。
-            左右一条细分隔线表达「展开下方」，按钮只显示 Chevron 图标（无文字），
-            aria-expanded/aria-controls 与 grid-template-rows 折叠逻辑保持不变。 */}
-        <div className="mx-auto max-w-5xl px-4">
-          <div className="relative flex h-6 items-center justify-center">
-            <div className="absolute inset-x-0 top-1/2 h-px -translate-y-1/2 bg-[var(--color-border)]" aria-hidden="true" />
-            <button
-              type="button"
-              onClick={() => setChrome(chrome === "expanded" ? "collapsed" : "expanded")}
-              aria-expanded={chrome === "expanded"}
-              aria-controls="super-search-filters"
-              aria-label={chrome === "expanded" ? "收起详细条件" : "展开详细条件"}
-              title={chrome === "expanded" ? "收起详细条件" : "展开详细条件"}
-              className="relative z-10 flex size-6 items-center justify-center rounded-full bg-[var(--color-bg)] text-[var(--color-text-secondary)] transition-colors hover:text-[var(--color-text)] focus-visible:ring-1 focus-visible:ring-[var(--color-status)]"
-            >
-              {chrome === "expanded" ? <ChevronUp size={14} strokeWidth={1.75} aria-hidden="true" /> : <ChevronDown size={14} strokeWidth={1.75} aria-hidden="true" />}
-            </button>
-          </div>
-        </div>
-
         {/* 详细条件面板：始终在 DOM，用 grid-template-rows 0fr↔1fr 折叠（§3.5 禁动画 height） */}
         <div
           id="super-search-filters"
@@ -326,6 +338,25 @@ export default function SuperSearchPage() {
             </div>
           </div>
         </div>
+
+        {/* 唯一的 Chevron 披露行（放在面板下方）：展开时位于三区条件最底部，一键收起看图片；
+            收起后面板 0fr 不占位，它自然贴到摘要行下方，作为「展开详细条件」入口。 */}
+        <div className="mx-auto max-w-5xl px-4">
+          <div className="relative flex h-6 items-center justify-center">
+            <div className="absolute inset-x-0 top-1/2 h-px -translate-y-1/2 bg-[var(--color-border)]" aria-hidden="true" />
+            <button
+              type="button"
+              onClick={() => setChrome(chrome === "expanded" ? "collapsed" : "expanded")}
+              aria-expanded={chrome === "expanded"}
+              aria-controls="super-search-filters"
+              aria-label={chrome === "expanded" ? "收起详细条件" : "展开详细条件"}
+              title={chrome === "expanded" ? "收起详细条件" : "展开详细条件"}
+              className="relative z-10 flex size-6 items-center justify-center rounded-full bg-[var(--color-bg)] text-[var(--color-text-secondary)] transition-colors hover:text-[var(--color-text)] focus-visible:ring-1 focus-visible:ring-[var(--color-status)]"
+            >
+              {chrome === "expanded" ? <ChevronUp size={14} strokeWidth={1.75} aria-hidden="true" /> : <ChevronDown size={14} strokeWidth={1.75} aria-hidden="true" />}
+            </button>
+          </div>
+        </div>
       </div>
 
       {/* 滚动容器：只装虚拟化网格（FB2-06 唯一滚动上下文） */}
@@ -336,12 +367,13 @@ export default function SuperSearchPage() {
           loading={loading}
           loadMore={loadMore}
           fetchAllIds={fetchAllIds}
-          onPreview={setPreview}
+          onPreview={openViewer}
           onSearchDominant={onSearchDominant}
           scrollElementRef={scrollRef}
           scrollRestoreKey="superSearch"
           hasActiveFilter={hasActiveFilter}
           onClearFilter={clearConditions}
+          patchListItem={patchLocal}
           zeroingActions={zeroing.map((z) => ({ key: `${z.zone}:${z.path.join(".")}`, label: z.label, onRemove: () => removeAtZonePath(z.zone, z.path) }))}
           {...actions}
         />
@@ -356,7 +388,6 @@ export default function SuperSearchPage() {
       <DeleteDialog open={dialog === "delete"} onClose={() => setDialog(null)} />
       <ExportDialog open={dialog === "export" && selected.size > 0} initialMode={exportMode} onClose={() => setDialog(null)} />
       <TagAssignDialog open={dialog === "tags"} onClose={() => setDialog(null)} />
-      {preview && <ViewerPage asset={preview} onClose={() => setPreview(null)} />}
     </div>
   );
 }

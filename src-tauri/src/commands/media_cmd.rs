@@ -64,7 +64,7 @@ pub async fn rescan_asset_metadata(
     if scope != "all" && scope != "missing" && scope != "ids" {
         return Err(AppError::msg("scope 只允许 all | missing | ids"));
     }
-    if scope == "ids" && ids.as_ref().map_or(true, |v| v.is_empty()) {
+    if scope == "ids" && ids.as_ref().is_none_or(|v| v.is_empty()) {
         return Err(AppError::msg("未选择任何素材"));
     }
     let db = Arc::clone(&state.db);
@@ -112,7 +112,7 @@ pub async fn rescan_asset_palette(
     if scope != "all" && scope != "missing" && scope != "ids" {
         return Err(AppError::msg("scope 只允许 all | missing | ids"));
     }
-    if scope == "ids" && ids.as_ref().map_or(true, |v| v.is_empty()) {
+    if scope == "ids" && ids.as_ref().is_none_or(|v| v.is_empty()) {
         return Err(AppError::msg("未选择任何素材"));
     }
     let db = Arc::clone(&state.db);
@@ -148,10 +148,7 @@ pub async fn rescan_asset_palette(
 /// C-1：从 palette_json 全量重建 asset_palette_colors（不解码图片，毫秒级；幂等）。
 /// 照抄 rescan_asset_palette 的具名后台线程骨架（本命令轻量，无进度事件仍走 spawn_blocking）。
 #[tauri::command]
-pub async fn rescan_palette_colors(
-    app: AppHandle,
-    state: State<'_, AppState>,
-) -> AppResult<i64> {
+pub async fn rescan_palette_colors(app: AppHandle, state: State<'_, AppState>) -> AppResult<i64> {
     let db = Arc::clone(&state.db);
     tauri::async_runtime::spawn_blocking(move || -> AppResult<i64> {
         let conn = db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
@@ -177,7 +174,7 @@ pub async fn rescan_asset_geo_taken(
     if scope != "all" && scope != "missing" && scope != "ids" {
         return Err(AppError::msg("scope 只允许 all | missing | ids"));
     }
-    if scope == "ids" && ids.as_ref().map_or(true, |v| v.is_empty()) {
+    if scope == "ids" && ids.as_ref().is_none_or(|v| v.is_empty()) {
         return Err(AppError::msg("未选择任何素材"));
     }
     let db = Arc::clone(&state.db);
@@ -222,7 +219,7 @@ pub async fn rescan_image_dimensions(
     if scope != "all" && scope != "missing" && scope != "ids" {
         return Err(AppError::msg("scope 只允许 all | missing | ids"));
     }
-    if scope == "ids" && ids.as_ref().map_or(true, |v| v.is_empty()) {
+    if scope == "ids" && ids.as_ref().is_none_or(|v| v.is_empty()) {
         return Err(AppError::msg("未选择任何素材"));
     }
     let db = Arc::clone(&state.db);
@@ -237,17 +234,7 @@ pub async fn rescan_image_dimensions(
             match scope.as_str() {
                 "ids" => ids.unwrap_or_default(),
                 "missing" => assets::list_ids_needing_dimensions(&conn)?,
-                _ => {
-                    // all：全部未软删的图片
-                    let mut stmt = conn
-                        .prepare(
-                            "SELECT id FROM assets
-                              WHERE deleted_at IS NULL AND mime_type LIKE 'image/%'",
-                        )
-                        .map_err(crate::error::AppError::from)?;
-                    let rows = stmt.query_map([], |r| r.get(0))?;
-                    rows.filter_map(|r| r.ok()).collect()
-                }
+                _ => assets::list_image_ids(&conn)?,
             }
         };
         let summary = media_refill::rescan_assets_dimensions(&db, &resolved, &cancel, |p| {
@@ -286,7 +273,7 @@ pub async fn rescan_asset_phash(
     if scope != "all" && scope != "missing" && scope != "ids" {
         return Err(AppError::msg("scope 只允许 all | missing | ids"));
     }
-    if scope == "ids" && ids.as_ref().map_or(true, |v| v.is_empty()) {
+    if scope == "ids" && ids.as_ref().is_none_or(|v| v.is_empty()) {
         return Err(AppError::msg("未选择任何素材"));
     }
     let db = Arc::clone(&state.db);

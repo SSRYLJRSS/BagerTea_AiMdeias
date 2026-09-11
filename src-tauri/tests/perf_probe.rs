@@ -1,7 +1,6 @@
 //! 性能探针：用老板真实文件测图像引擎各路径耗时
 //! 运行：cargo test --test perf_probe -- --ignored --nocapture
 
-use std::path::Path;
 use std::time::Instant;
 
 use bagertea_ai_media_v2_lib::services::imaging;
@@ -269,7 +268,16 @@ fn probe_deep_pagination() {
     {
         let tx = conn.unchecked_transaction().unwrap();
         for i in 0..30_000 {
-            assets::insert(&tx, &format!("d:/p/{i:05}.jpg"), &format!("{i:05}.jpg"), "jpg", 1024, "image/jpeg", 1700000000000 + i * 1000).unwrap();
+            assets::insert(
+                &tx,
+                &format!("d:/p/{i:05}.jpg"),
+                &format!("{i:05}.jpg"),
+                "jpg",
+                1024,
+                "image/jpeg",
+                1700000000000 + i * 1000,
+            )
+            .unwrap();
             if i % 5000 == 0 {
                 println!("插入 {i}…");
             }
@@ -288,7 +296,12 @@ fn probe_deep_pagination() {
         f.offset = depth;
         let t = std::time::Instant::now();
         let page = assets::list(&conn, &f).unwrap();
-        println!("深翻页 offset={depth}: {:?} → {} 条 / total {}", t.elapsed(), page.items.len(), page.total);
+        println!(
+            "深翻页 offset={depth}: {:?} → {} 条 / total {}",
+            t.elapsed(),
+            page.items.len(),
+            page.total
+        );
     }
 }
 
@@ -306,8 +319,21 @@ fn probe_phash_scan_30k() {
             seed ^= seed << 13;
             seed ^= seed >> 7;
             seed ^= seed << 17;
-            let phash = if i % 500 == 0 { 0xABCD_0000_0000_0000 | (seed & 0xFF) } else { seed };
-            assets::insert(&tx, &format!("d:/p/{i:05}.jpg"), &format!("{i:05}.jpg"), "jpg", 1024, "image/jpeg", 1700000000000).unwrap();
+            let phash = if i % 500 == 0 {
+                0xABCD_0000_0000_0000 | (seed & 0xFF)
+            } else {
+                seed
+            };
+            assets::insert(
+                &tx,
+                &format!("d:/p/{i:05}.jpg"),
+                &format!("{i:05}.jpg"),
+                "jpg",
+                1024,
+                "image/jpeg",
+                1700000000000,
+            )
+            .unwrap();
             assets::set_phash(&tx, i as i64 + 1, phash).unwrap();
         }
         tx.commit().unwrap();
@@ -315,7 +341,11 @@ fn probe_phash_scan_30k() {
     println!("插入 3 万行 + phash: {:?}", t.elapsed());
     let t = std::time::Instant::now();
     let groups = dedup::scan_similar_groups(&conn, 8, false, &[]).unwrap();
-    println!("scan_similar_groups(3万行, 阈值8): {:?} → {} 组", t.elapsed(), groups.len());
+    println!(
+        "scan_similar_groups(3万行, 阈值8): {:?} → {} 组",
+        t.elapsed(),
+        groups.len()
+    );
 }
 
 /// RAW 宽高回填：真机 205 张 RW2 的量级感知（文件不存在则跳过）
@@ -347,7 +377,11 @@ fn probe_raw_dimension_walk() {
             let _ = (w, h);
         }
     }
-    println!("probe_dimensions 全部完成: {:?}（成功 {ok}/{}）", t.elapsed(), raws.len());
+    println!(
+        "probe_dimensions 全部完成: {:?}（成功 {ok}/{}）",
+        t.elapsed(),
+        raws.len()
+    );
 }
 
 /// 提示词 token 量级：W5a 后 system + user 实际字符数（近似 token ≈ 字符数，中文 1 字 ≈ 1 token）
@@ -357,32 +391,54 @@ fn probe_prompt_size() {
     let conn = db::init_memory().unwrap();
     let facets = tag_facets::build_prompt_context(&conn, "all").unwrap();
     // 用中等分面数模拟真实场景（含用户自建分面时）
-    let facets = if facets.len() >= 8 { facets } else {
+    let facets = if facets.len() >= 8 {
+        facets
+    } else {
         for i in 0..(8 - facets.len()) {
-            tag_facets::create(&conn, &format!("user_facet_{i}"), &format!("用户分面{i}"), "测试描述", "multi", Some(5), "all").unwrap();
+            tag_facets::create(
+                &conn,
+                &format!("user_facet_{i}"),
+                &format!("用户分面{i}"),
+                "测试描述",
+                "multi",
+                Some(5),
+                "all",
+            )
+            .unwrap();
         }
         tag_facets::build_prompt_context(&conn, "all").unwrap()
     };
     let system = bagertea_ai_media_v2_lib::services::super_search_ai::build_system_prompt(&facets);
     // user 段在 request_intent 内联拼接，这里复刻（含分面说明段；词典与查询句按真实量级估算）
-    let mut user = String::from("标签词典（规范名 | aliases: 可搜索别名）
+    let mut user = String::from(
+        "标签词典（规范名 | aliases: 可搜索别名）
 - 示例标签 1
 - 示例标签 2
 
 分面说明
-");
+",
+    );
     for f in &facets {
         user.push_str(&format!(
             "- {}(key={}) selection={} max={}: {}
 ",
-            f.display_name, f.key, f.selection_mode, f.max_items.unwrap_or(3), f.description
+            f.display_name,
+            f.key,
+            f.selection_mode,
+            f.max_items.unwrap_or(3),
+            f.description
         ));
     }
-    user.push_str("
+    user.push_str(
+        "
 用户查询：<query>海边日落 2025</query>
-请输出解析结果。");
+请输出解析结果。",
+    );
     println!("分面数: {}", facets.len());
     println!("system 字符数: {}（≈token 量级）", system.chars().count());
     println!("user 字符数: {}（≈token 量级）", user.chars().count());
-    println!("合计: {} 字符", system.chars().count() + user.chars().count());
+    println!(
+        "合计: {} 字符",
+        system.chars().count() + user.chars().count()
+    );
 }

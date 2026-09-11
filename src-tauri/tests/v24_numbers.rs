@@ -1,7 +1,9 @@
 //! V24 数值分面（Phase 6 协议测试，§6.3–6.6）—— 生命周期 / 链路 / 转换。
 //! 运行：cargo test --test v24_numbers
 
-use bagertea_ai_media_v2_lib::db::{ai, asset_tags, assets, facet_numbers, init_memory, tag_facets, tags};
+use bagertea_ai_media_v2_lib::db::{
+    ai, asset_tags, assets, facet_numbers, init_memory, tag_facets, tags,
+};
 
 fn mem() -> rusqlite::Connection {
     init_memory().expect("内存库初始化失败")
@@ -42,10 +44,14 @@ fn facet_deactivate_preserves_numbers() {
     let aid = f4_insert_asset(&c, "d:/num1.jpg");
     facet_numbers::set_facet_number(&c, &[aid], "people_count", 5.0).unwrap();
     tag_facets::deactivate(&c, "people_count").unwrap();
-    let row = facet_numbers::get_number(&c, aid, "people_count").unwrap().expect("停用后数值必须保留");
+    let row = facet_numbers::get_number(&c, aid, "people_count")
+        .unwrap()
+        .expect("停用后数值必须保留");
     assert_eq!(row.value, 5.0);
     tag_facets::restore(&c, "people_count").unwrap();
-    let row2 = facet_numbers::get_number(&c, aid, "people_count").unwrap().unwrap();
+    let row2 = facet_numbers::get_number(&c, aid, "people_count")
+        .unwrap()
+        .unwrap();
     assert_eq!(row2.value, 5.0);
 }
 
@@ -59,7 +65,11 @@ fn facet_delete_cascades_numbers() {
     let report = tag_facets::delete_facet(&c, "people_count").unwrap();
     assert_eq!(report.tags_deleted, 0);
     let left: i64 = c
-        .query_row("SELECT COUNT(*) FROM asset_facet_numbers WHERE facet_key='people_count'", [], |r| r.get(0))
+        .query_row(
+            "SELECT COUNT(*) FROM asset_facet_numbers WHERE facet_key='people_count'",
+            [],
+            |r| r.get(0),
+        )
         .unwrap();
     assert_eq!(left, 0, "删除分面不得遗留孤儿数值");
 }
@@ -72,7 +82,11 @@ fn facet_impact_reports_number_count() {
     let aid = f4_insert_asset(&c, "d:/num3.jpg");
     facet_numbers::set_facet_number(&c, &[aid], "people_count", 3.0).unwrap();
     let n: i64 = c
-        .query_row("SELECT COUNT(*) FROM asset_facet_numbers WHERE facet_key='people_count'", [], |r| r.get(0))
+        .query_row(
+            "SELECT COUNT(*) FROM asset_facet_numbers WHERE facet_key='people_count'",
+            [],
+            |r| r.get(0),
+        )
         .unwrap();
     assert_eq!(n, 1, "影响预览应统计到 1 条数值行");
 }
@@ -100,7 +114,11 @@ fn recreate_same_key_has_no_stale_numbers() {
     tag_facets::delete_facet(&c, "people_count").unwrap();
     number_facet_setup(&c);
     let n: i64 = c
-        .query_row("SELECT COUNT(*) FROM asset_facet_numbers WHERE facet_key='people_count'", [], |r| r.get(0))
+        .query_row(
+            "SELECT COUNT(*) FROM asset_facet_numbers WHERE facet_key='people_count'",
+            [],
+            |r| r.get(0),
+        )
         .unwrap();
     assert_eq!(n, 0, "重建分面不得残留旧数值");
 }
@@ -115,17 +133,45 @@ fn ai_number_never_overwrites_manual_or_reviewed() {
     let aid = f4_insert_asset(&c, "d:/num6.jpg");
     facet_numbers::set_facet_number(&c, &[aid], "people_count", 5.0).unwrap();
     // AI 想写 999 → guarded 写入必须跳过
-    let written = facet_numbers::upsert_number_guarded(&c, aid, "people_count", 999.0, "ai_cloud", None).unwrap();
+    let written =
+        facet_numbers::upsert_number_guarded(&c, aid, "people_count", 999.0, "ai_cloud", None)
+            .unwrap();
     assert!(!written, "AI 不得覆盖人工值");
-    assert_eq!(facet_numbers::get_number(&c, aid, "people_count").unwrap().unwrap().value, 5.0);
+    assert_eq!(
+        facet_numbers::get_number(&c, aid, "people_count")
+            .unwrap()
+            .unwrap()
+            .value,
+        5.0
+    );
     // ai_unreviewed → AI 可覆盖：先撤掉 manual 行，写一条 AI 未审核值（重跑语义）
-    c.execute("DELETE FROM asset_facet_numbers WHERE asset_id=?1", [aid]).unwrap();
-    facet_numbers::upsert_number_guarded(&c, aid, "people_count", 6.0, "ai_cloud", Some(1)).unwrap();
-    assert_eq!(facet_numbers::get_number(&c, aid, "people_count").unwrap().unwrap().value, 6.0);
-    c.execute("UPDATE asset_facet_numbers SET review_state='ai_reviewed' WHERE asset_id=?1", [aid]).unwrap();
-    let written2 = facet_numbers::upsert_number_guarded(&c, aid, "people_count", 7.0, "ai_cloud", Some(1)).unwrap();
+    c.execute("DELETE FROM asset_facet_numbers WHERE asset_id=?1", [aid])
+        .unwrap();
+    facet_numbers::upsert_number_guarded(&c, aid, "people_count", 6.0, "ai_cloud", Some(1))
+        .unwrap();
+    assert_eq!(
+        facet_numbers::get_number(&c, aid, "people_count")
+            .unwrap()
+            .unwrap()
+            .value,
+        6.0
+    );
+    c.execute(
+        "UPDATE asset_facet_numbers SET review_state='ai_reviewed' WHERE asset_id=?1",
+        [aid],
+    )
+    .unwrap();
+    let written2 =
+        facet_numbers::upsert_number_guarded(&c, aid, "people_count", 7.0, "ai_cloud", Some(1))
+            .unwrap();
     assert!(!written2, "AI 不得覆盖已审核值");
-    assert_eq!(facet_numbers::get_number(&c, aid, "people_count").unwrap().unwrap().value, 6.0);
+    assert_eq!(
+        facet_numbers::get_number(&c, aid, "people_count")
+            .unwrap()
+            .unwrap()
+            .value,
+        6.0
+    );
 }
 
 /// 核心不变式：撤销批次只删 AI 数值（manual / ai_reviewed 保留）。
@@ -136,14 +182,43 @@ fn undo_batch_deletes_ai_numbers_only() {
     let a = f4_insert_asset(&c, "d:/num7a.jpg");
     let b = f4_insert_asset(&c, "d:/num7b.jpg");
     facet_numbers::set_facet_number(&c, &[a], "people_count", 5.0).unwrap(); // manual
-    facet_numbers::upsert_number(&c, b, "people_count", 9.0, "ai_cloud", "ai_unreviewed", Some(11)).unwrap();
+    facet_numbers::upsert_number(
+        &c,
+        b,
+        "people_count",
+        9.0,
+        "ai_cloud",
+        "ai_unreviewed",
+        Some(11),
+    )
+    .unwrap();
     // a 的 manual 行已删（set 走 manual），再造一条 AI 值验证 undo 范围
-    c.execute("DELETE FROM asset_facet_numbers WHERE asset_id=?1", [a]).unwrap();
-    facet_numbers::upsert_number(&c, a, "people_count", 4.0, "ai_cloud", "ai_unreviewed", Some(11)).unwrap();
+    c.execute("DELETE FROM asset_facet_numbers WHERE asset_id=?1", [a])
+        .unwrap();
+    facet_numbers::upsert_number(
+        &c,
+        a,
+        "people_count",
+        4.0,
+        "ai_cloud",
+        "ai_unreviewed",
+        Some(11),
+    )
+    .unwrap();
     let deleted = facet_numbers::undo_batch_numbers(&c, 11).unwrap();
     assert_eq!(deleted, 2, "只删 AI 未审核的两条");
-    assert!(facet_numbers::get_number(&c, a, "people_count").unwrap().is_none(), "AI 值应随批次撤销删除");
-    assert!(facet_numbers::get_number(&c, b, "people_count").unwrap().is_none(), "B 的 AI 值同样删除");
+    assert!(
+        facet_numbers::get_number(&c, a, "people_count")
+            .unwrap()
+            .is_none(),
+        "AI 值应随批次撤销删除"
+    );
+    assert!(
+        facet_numbers::get_number(&c, b, "people_count")
+            .unwrap()
+            .is_none(),
+        "B 的 AI 值同样删除"
+    );
 }
 
 /// 核心不变式：重跑 ReplaceAiOnly 删未审核 AI 数值，保留 manual。
@@ -154,11 +229,27 @@ fn replace_ai_only_deletes_unreviewed_numbers_keeps_manual() {
     let a = f4_insert_asset(&c, "d:/num8a.jpg");
     let b = f4_insert_asset(&c, "d:/num8b.jpg");
     facet_numbers::set_facet_number(&c, &[a], "people_count", 5.0).unwrap(); // manual 保留
-    facet_numbers::upsert_number(&c, b, "people_count", 9.0, "ai_cloud", "ai_unreviewed", Some(12)).unwrap();
+    facet_numbers::upsert_number(
+        &c,
+        b,
+        "people_count",
+        9.0,
+        "ai_cloud",
+        "ai_unreviewed",
+        Some(12),
+    )
+    .unwrap();
     facet_numbers::retag_clear_unreviewed_numbers(&c, &[a, b]).unwrap();
-    let ra = facet_numbers::get_number(&c, a, "people_count").unwrap().unwrap();
+    let ra = facet_numbers::get_number(&c, a, "people_count")
+        .unwrap()
+        .unwrap();
     assert_eq!(ra.value, 5.0, "manual 保留");
-    assert!(facet_numbers::get_number(&c, b, "people_count").unwrap().is_none(), "未审核 AI 数值被清");
+    assert!(
+        facet_numbers::get_number(&c, b, "people_count")
+            .unwrap()
+            .is_none(),
+        "未审核 AI 数值被清"
+    );
 }
 
 /// AI 数值建议落库：无歧义 → num_value 有值；歧义 → num_value=NULL + reason（不变量 11）。
@@ -168,7 +259,11 @@ fn ai_number_proposal_lands_in_suggestion_items() {
     number_facet_setup(&c);
     let aid = f4_insert_asset(&c, "d:/num9.jpg");
     let batch = ai::create_batch(&c, &[aid], "cloud").unwrap();
-    let sug = ai::list_suggestions(&c, batch.id).unwrap().into_iter().next().unwrap();
+    let sug = ai::list_suggestions(&c, batch.id)
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
     let warns = facet_numbers::record_number_proposals(
         &c,
         sug.id,
@@ -218,11 +313,18 @@ fn convert_reports_per_asset_conflicts() {
     assert_eq!(report.conflicts.len(), 1, "素材 a 的 3/5 冲突应被列出");
     assert_eq!(report.conflicts[0].asset_id, a);
     assert_eq!(report.conflicts[0].candidates.len(), 2);
-    let n: i64 = c.query_row("SELECT COUNT(*) FROM asset_facet_numbers", [], |r| r.get(0)).unwrap();
+    let n: i64 = c
+        .query_row("SELECT COUNT(*) FROM asset_facet_numbers", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(n, 0, "dry_run 绝不写值");
     let err = facet_numbers::convert_facet_kind_execute(&c, "pc", false).unwrap_err();
-    assert!(err.to_string().contains("冲突"), "冲突必须先由用户裁决：{err}");
-    let n2: i64 = c.query_row("SELECT COUNT(*) FROM asset_facet_numbers", [], |r| r.get(0)).unwrap();
+    assert!(
+        err.to_string().contains("冲突"),
+        "冲突必须先由用户裁决：{err}"
+    );
+    let n2: i64 = c
+        .query_row("SELECT COUNT(*) FROM asset_facet_numbers", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(n2, 0);
     let _ = b;
 }
@@ -241,8 +343,14 @@ fn convert_reports_buckets_and_losses() {
     tags::add_alias(&c, ok.id, "五个人", None, "synonym").unwrap();
     let report = facet_numbers::convert_facet_kind_dry_run(&c, "pc2").unwrap();
     assert_eq!(report.parsed.len(), 2, "5 与 5.0人 都进 parsed");
-    assert!(report.ambiguous.iter().any(|x| x.tag_id == amb.id), "「约5」进 ambiguous");
-    assert!(report.unparseable.iter().any(|x| x.tag_id == bad.id), "「很多」进 unparseable");
+    assert!(
+        report.ambiguous.iter().any(|x| x.tag_id == amb.id),
+        "「约5」进 ambiguous"
+    );
+    assert!(
+        report.unparseable.iter().any(|x| x.tag_id == bad.id),
+        "「很多」进 unparseable"
+    );
     assert_eq!(report.hierarchy_loss, 1, "非根标签 1 个（子级）");
     assert_eq!(report.alias_loss, 1, "别名 1 条（五个人）");
 }
@@ -253,7 +361,10 @@ fn convert_number_to_tag_rejected() {
     let c = mem();
     number_facet_setup(&c);
     let err = facet_numbers::convert_facet_kind_execute(&c, "people_count", true).unwrap_err();
-    assert!(err.to_string().contains("已是数值型"), "number→tag 必须禁止：{err}");
+    assert!(
+        err.to_string().contains("已是数值型"),
+        "number→tag 必须禁止：{err}"
+    );
 }
 
 /// 规则 10：dry_run 一行不写；无冲突执行后数值落库、标签 deprecated、关联移除（单事务）。
@@ -268,13 +379,23 @@ fn convert_dry_run_writes_nothing_then_execute_is_atomic() {
     let report = facet_numbers::convert_facet_kind_dry_run(&c, "pc3").unwrap();
     assert!(report.conflicts.is_empty(), "只挂 t1 时无冲突：{report:?}");
     assert!(report.ambiguous.is_empty());
-    let n0: i64 = c.query_row("SELECT COUNT(*) FROM asset_facet_numbers", [], |r| r.get(0)).unwrap();
+    let n0: i64 = c
+        .query_row("SELECT COUNT(*) FROM asset_facet_numbers", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(n0, 0, "dry_run 一行不写");
     facet_numbers::convert_facet_kind_execute(&c, "pc3", false).unwrap();
-    let row = facet_numbers::get_number(&c, a, "pc3").unwrap().expect("转换后素材应有数值 3");
+    let row = facet_numbers::get_number(&c, a, "pc3")
+        .unwrap()
+        .expect("转换后素材应有数值 3");
     assert_eq!(row.value, 3.0);
     assert_eq!(row.source, "manual");
-    let kind: String = c.query_row("SELECT facet_kind FROM tag_facets WHERE key='pc3'", [], |r| r.get(0)).unwrap();
+    let kind: String = c
+        .query_row(
+            "SELECT facet_kind FROM tag_facets WHERE key='pc3'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
     assert_eq!(kind, "number");
     let dep: i64 = c
         .query_row(
@@ -305,10 +426,19 @@ fn confirm_suggestion_writes_number_rows_and_rejects_out_of_range() {
     number_facet_setup(&c);
     let aid = f4_insert_asset(&c, "d:/num10.jpg");
     let batch = ai::create_batch(&c, &[aid], "cloud").unwrap();
-    let sug = ai::list_suggestions(&c, batch.id).unwrap().into_iter().next().unwrap();
+    let sug = ai::list_suggestions(&c, batch.id)
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
 
     // 999 越界：落库层校验拦下（§6.5 —— 不裁到边界，进 pending 待人工填数）
-    let _warns = facet_numbers::record_number_proposals(&c, sug.id, &[("people_count".into(), "999".into())]).unwrap();
+    let _warns = facet_numbers::record_number_proposals(
+        &c,
+        sug.id,
+        &[("people_count".into(), "999".into())],
+    )
+    .unwrap();
     let (cnt, reason): (i64, String) = c
         .query_row(
             "SELECT COUNT(*), COALESCE(MAX(decision_reason),'') FROM ai_suggestion_items WHERE suggestion_id=?1 AND item_kind='number'",
@@ -317,16 +447,22 @@ fn confirm_suggestion_writes_number_rows_and_rejects_out_of_range() {
         )
         .unwrap();
     assert_eq!(cnt, 1, "越界值进 pending（不裁边界）");
-    assert!(reason.contains("超出范围"), "decision_reason 应标明越界：{reason}");
+    assert!(
+        reason.contains("超出范围"),
+        "decision_reason 应标明越界：{reason}"
+    );
     let val: Option<f64> = c
         .query_row("SELECT num_value FROM ai_suggestion_items WHERE suggestion_id=?1 AND item_kind='number'", [sug.id], |r| r.get(0))
         .unwrap();
     assert!(val.is_none(), "越界 item 不得带确定值");
 
     // 合法值 5：落 pending item → 确认建议（分流）→ 写 asset_facet_numbers
-    facet_numbers::record_number_proposals(&c, sug.id, &[("people_count".into(), "5人".into())]).unwrap();
+    facet_numbers::record_number_proposals(&c, sug.id, &[("people_count".into(), "5人".into())])
+        .unwrap();
     ai::confirm_suggestion(&c, sug.id, &ai::CategorizedTags::new()).unwrap();
-    let row = facet_numbers::get_number(&c, aid, "people_count").unwrap().expect("确认后数值必须落库");
+    let row = facet_numbers::get_number(&c, aid, "people_count")
+        .unwrap()
+        .expect("确认后数值必须落库");
     assert_eq!(row.value, 5.0);
     assert_eq!(row.source, "ai_cloud");
     assert_eq!(row.review_state, "ai_unreviewed");

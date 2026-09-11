@@ -47,6 +47,15 @@ export function useScrollDirection(
   const moved = useRef(0);
   const raf = useRef(0);
   const suppressUntil = useRef(0);
+  /**
+   * 自动收起防闪烁护栏（FB2-06 闪烁回路补丁）：
+   * 收起会让头部变矮、滚动视口变高；结果不多时浏览器把 scrollTop 向下钳制并派发一个
+   * scroll 事件，常恰好落回顶部区（y<=minScrollTop），旧逻辑立刻又自动展开，与用户滚动
+   * 互相打架 → 条件区/图片一直闪烁。判据必须是「结构性」的：仅当首个后续事件发生时
+   * 视口确实因本次收起而变高（clientHeight 增大）、且位置被钳回顶部区，才拦截一次；
+   * 用户主动拖回顶部（视口尺寸不变）不拦，避免「回不了顶、展不开」。
+   */
+  const collapseGuard = useRef<{ client: number; y: number } | null>(null);
 
   const onScroll = useCallback(() => {
     const el = nodeRef.current;
@@ -54,8 +63,21 @@ export function useScrollDirection(
     cancelAnimationFrame(raf.current);
     raf.current = requestAnimationFrame(() => {
       const y = el.scrollTop;
-      // FB3-06：顶部区是唯一自动展开条件（下滚收起后，上滑必须回到顶部才展开）
+      // 自动收起后的首个事件：判断是否为「视口变高 → scrollTop 被钳回顶部区」的钳位事件
+      let clampedByCollapse = false;
+      if (collapseGuard.current) {
+        const g = collapseGuard.current;
+        collapseGuard.current = null;
+        const viewportGrew = el.clientHeight > g.client + 1;
+        clampedByCollapse = viewportGrew && y < g.y && y <= minScrollTop.current;
+      }
+      // FB3-06：顶部区是唯一自动展开条件（下滚收起后，上滑必须回到顶部才展开）。
+      // 钳位事件不算数，否则会「收起→钳回顶部→展开」闪烁。
       if (y <= minScrollTop.current) {
+        if (clampedByCollapse) {
+          lastY.current = y;
+          return;
+        }
         lastY.current = y;
         lastDir.current = null;
         moved.current = 0;
@@ -79,6 +101,8 @@ export function useScrollDirection(
       // FB3-06：仅下滚收起；非顶部的上滑保持收起（用户点了「展开」才是展开来源）
       if (dir === "down" && moved.current >= collapseThreshold.current) {
         moved.current = 0;
+        // 记录收起瞬间的视口高度，供下一事件判断是否为视口变高触发的钳位（见 collapseGuard）
+        collapseGuard.current = { client: el.clientHeight, y };
         setState("collapsed");
       }
     });
@@ -91,6 +115,7 @@ export function useScrollDirection(
     lastY.current = 0;
     lastDir.current = null;
     moved.current = 0;
+    collapseGuard.current = null;
     setState("expanded");
     if (el) {
       el.addEventListener("scroll", onScroll, { passive: true });
@@ -108,6 +133,8 @@ export function useScrollDirection(
   const setExpanded = useCallback((next: FilterChromeState) => {
     // 手动设定后短暂忽略滚动方向，避免被立即覆盖（FB2-06 suppressMs）
     suppressUntil.current = Date.now() + suppressMs.current;
+    // 手动设定优先：清掉自动收起遗留的钳位护栏
+    collapseGuard.current = null;
     setState(next);
     moved.current = 0;
     lastDir.current = null;

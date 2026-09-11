@@ -174,8 +174,7 @@ fn raw_probe_dimensions_reads_rw2() {
         image::image_dimensions(sample).is_err(),
         "前提失效：image crate 已支持 RW2？请复核 probe_dimensions 是否还需要"
     );
-    let dims = raw_decode::probe_dimensions(sample)
-        .expect("rawler 应能读出 RW2 宽高");
+    let dims = raw_decode::probe_dimensions(sample).expect("rawler 应能读出 RW2 宽高");
     // S5II 最大 6000x4000（45MP 全画幅），宽高都应为正且在合理范围
     assert!(dims.0 > 1000 && dims.0 <= 12000, "宽度异常: {dims:?}");
     assert!(dims.1 > 1000 && dims.1 <= 12000, "高度异常: {dims:?}");
@@ -189,8 +188,6 @@ fn raw_probe_dimensions_guards() {
     let garbage = dir.join("g.rw2");
     std::fs::write(&garbage, vec![0u8; 4096]).unwrap();
     assert!(raw_decode::probe_dimensions(&garbage).is_none());
-    assert!(
-        raw_decode::probe_dimensions(std::path::Path::new("不存在.rw2")).is_none()
-    );
+    assert!(raw_decode::probe_dimensions(std::path::Path::new("不存在.rw2")).is_none());
     std::fs::remove_dir_all(&dir).ok();
 }

@@ -29,6 +29,7 @@ use common::{HttpResponse, MockServer, RecordedRequest};
 /// - "error decoding response body" / "error reading a body"：响应在传输中被中止
 /// - "io_failures="：服务器侧读请求失败计数（请求到达但连接中断；任何断言消息中
 ///   出现该字段都视为环境噪声——若为正常 0 值则测试不会失败到此处）
+///
 /// 其余错误（5xx、解析失败、业务错误）不属于连接层特征，不会触发重试。
 fn is_conn_err_text(s: &str) -> bool {
     s.contains("error sending request")
@@ -175,8 +176,8 @@ fn categories() -> Vec<FacetPromptContext> {
         description: "场景".into(),
         selection_mode: "single".into(),
         max_items: Some(3),
-            ..Default::default()
-        }]
+        ..Default::default()
+    }]
 }
 
 fn progress_sink() -> (
@@ -676,7 +677,16 @@ conn_retry_test!(resume_after_cancel_skips_generated, {
     let cancel = Arc::new(AtomicBool::new(false));
     let cancel_ref = Arc::clone(&cancel);
     let progress = move |_p: ai_cloud::AiProgress| cancel_ref.store(true, Ordering::Relaxed);
-    ai_cloud::run_cloud_batch(&dbm, batch.id, &cfg, &categories(), &categories(), None, &cancel, progress)?;
+    ai_cloud::run_cloud_batch(
+        &dbm,
+        batch.id,
+        &cfg,
+        &categories(),
+        &categories(),
+        None,
+        &cancel,
+        progress,
+    )?;
     {
         let conn = dbm.lock().unwrap();
         let b = ai::get_batch(&conn, batch.id)?;

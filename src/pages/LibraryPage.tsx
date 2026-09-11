@@ -39,6 +39,8 @@ export default function LibraryPage() {
     setPreview(null);
     useLibraryStore.getState().setViewerOpen(false);
   };
+  // 兜底：查看器打开期间经标题栏齿轮等跨页离开时，复位全局 viewerOpen，避免 BottomBar 被永久隐藏
+  useEffect(() => () => useLibraryStore.getState().setViewerOpen(false), []);
 
   // §7.2 互斥：Viewer 打开时整体替换库页内容（库页工具栏/侧栏/网格全部卸载）
   if (preview) {

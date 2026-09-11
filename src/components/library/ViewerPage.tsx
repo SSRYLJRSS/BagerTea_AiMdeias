@@ -35,15 +35,30 @@ import type { Asset } from "@/types/asset";
 interface ViewerPageProps {
   asset: Asset;
   onClose: () => void;
+  /**
+   * 过片数据集（胶片条 / 上下张 / 位置计数 / 近尾自动加载）。
+   * 缺省绑定素材库列表（libraryStore）；超级搜索必须传「当前搜索结果集」——
+   * 否则查看器会错用素材库全量列表（搜索只命中 6 项、详情却显示 x/118 的联动 bug）。
+   */
+  listItems?: Asset[];
+  listTotal?: number;
+  onListLoadMore?: () => void | Promise<void>;
+  /** 本地补丁（查看器内删标签 / 信息栏刷新回写当前列表）。缺省写素材库 store；超搜传自身 store。 */
+  patchListItem?: (ids: number[], patch: Partial<Asset>) => void;
 }
 
 /** FB5-01（§4.1）：沉浸浏览状态。off=普通查看器；native=Fullscreen API；fallback=应用内覆盖层。 */
 type ImmersiveMode = "off" | "native" | "fallback";
 
-export default function ViewerPage({ asset: initial, onClose }: ViewerPageProps) {
-  const { items, total, loadMore, patchLocal } = useLibraryStore(
+export default function ViewerPage({ asset: initial, onClose, listItems, listTotal, onListLoadMore, patchListItem }: ViewerPageProps) {
+  const library = useLibraryStore(
     useShallow((s) => ({ items: s.items, total: s.total, loadMore: s.loadMore, patchLocal: s.patchLocal })),
   );
+  // 数据集可注入：素材库走默认 libraryStore；超级搜索走 superSearchStore 的结果集
+  const items = listItems ?? library.items;
+  const total = listTotal ?? library.total;
+  const loadMore = onListLoadMore ?? library.loadMore;
+  const patchLocal = patchListItem ?? library.patchLocal;
   const [currentId, setCurrentId] = useState(initial.id);
   const current: Asset = useMemo(
     () => items.find((a) => a.id === currentId) ?? initial,

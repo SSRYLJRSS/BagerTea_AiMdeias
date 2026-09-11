@@ -127,8 +127,7 @@ pub fn scan_similar_groups(
         for i in 0..bucket.len() {
             let (ida, pha) = bucket[i];
             let idxa = id_to_idx[&ida];
-            for j in (i + 1)..bucket.len() {
-                let (idb, phb) = bucket[j];
+            for &(idb, phb) in bucket.iter().skip(i + 1) {
                 if exclude_kinship
                     && kinship_key(&rows_all[id_to_idx[&ida]].1).0
                         == kinship_key(&rows_all[id_to_idx[&idb]].1).0
@@ -149,9 +148,9 @@ pub fn scan_similar_groups(
 
     // 4. 连通块 → ≥2 成员的组
     let mut groups: std::collections::HashMap<usize, Vec<i64>> = std::collections::HashMap::new();
-    for i in 0..n {
+    for (i, row) in rows_all.iter().enumerate().take(n) {
         let root = find(&mut parent, i);
-        groups.entry(root).or_default().push(rows_all[i].0);
+        groups.entry(root).or_default().push(row.0);
     }
     let member_lists: Vec<Vec<i64>> = groups.into_values().filter(|v| v.len() >= 2).collect();
     if member_lists.is_empty() {
@@ -203,9 +202,24 @@ mod tests {
     #[test]
     fn similar_group_merges_near_hashes() {
         let conn = init_memory().unwrap();
-        let a = insert_asset(&conn, "C:/photos/a.jpg", "h1", Some(0xABCD_0000_0000_0001u64 as i64));
-        let b = insert_asset(&conn, "C:/photos/b.jpg", "h2", Some(0xABCD_0000_0000_0003u64 as i64)); // 汉明 1
-        insert_asset(&conn, "C:/photos/c.jpg", "h3", Some(0xFFFF_FFFF_FFFF_FFFFu64 as i64)); // 远
+        let a = insert_asset(
+            &conn,
+            "C:/photos/a.jpg",
+            "h1",
+            Some(0xABCD_0000_0000_0001u64 as i64),
+        );
+        let b = insert_asset(
+            &conn,
+            "C:/photos/b.jpg",
+            "h2",
+            Some(0xABCD_0000_0000_0003u64 as i64),
+        ); // 汉明 1
+        insert_asset(
+            &conn,
+            "C:/photos/c.jpg",
+            "h3",
+            Some(0xFFFF_FFFF_FFFF_FFFFu64 as i64),
+        ); // 远
         let groups = scan_similar_groups(&conn, 8, false, &[]).unwrap();
         assert_eq!(groups.len(), 1, "只有 a/b 接近成组");
         assert_eq!(groups[0].kind, GroupKind::Similar);
@@ -216,8 +230,18 @@ mod tests {
     #[test]
     fn far_hashes_never_group() {
         let conn = init_memory().unwrap();
-        insert_asset(&conn, "C:/photos/a.jpg", "h1", Some(0x0000_0000_0000_FFFFu64 as i64));
-        insert_asset(&conn, "C:/photos/b.jpg", "h2", Some(0xFFFF_FFFF_FFFF_0000u64 as i64));
+        insert_asset(
+            &conn,
+            "C:/photos/a.jpg",
+            "h1",
+            Some(0x0000_0000_0000_FFFFu64 as i64),
+        );
+        insert_asset(
+            &conn,
+            "C:/photos/b.jpg",
+            "h2",
+            Some(0xFFFF_FFFF_FFFF_0000u64 as i64),
+        );
         let groups = scan_similar_groups(&conn, 8, false, &[]).unwrap();
         assert!(groups.is_empty());
     }
@@ -226,8 +250,18 @@ mod tests {
     fn kinship_exclusion_skips_raw_jpeg_pair() {
         let conn = init_memory().unwrap();
         // 同目录 + 同主干名（DSC0001）+ 一 RAW 一 JPG = 同源文件
-        insert_asset(&conn, "C:/photos/DSC0001.RW2", "r", Some(0xABCD_0000_0000_0001u64 as i64));
-        insert_asset(&conn, "C:/photos/DSC0001.JPG", "j", Some(0xABCD_0000_0000_0003u64 as i64));
+        insert_asset(
+            &conn,
+            "C:/photos/DSC0001.RW2",
+            "r",
+            Some(0xABCD_0000_0000_0001u64 as i64),
+        );
+        insert_asset(
+            &conn,
+            "C:/photos/DSC0001.JPG",
+            "j",
+            Some(0xABCD_0000_0000_0003u64 as i64),
+        );
         // 排除同源 → 不成组
         let excluded = scan_similar_groups(&conn, 8, true, &[]).unwrap();
         assert!(excluded.is_empty(), "同源 RAW+JPG 应被排除");
@@ -239,17 +273,44 @@ mod tests {
     #[test]
     fn threshold_zero_disables_similar() {
         let conn = init_memory().unwrap();
-        insert_asset(&conn, "C:/photos/a.jpg", "h1", Some(0xABCD_0000_0000_0001u64 as i64));
-        insert_asset(&conn, "C:/photos/b.jpg", "h2", Some(0xABCD_0000_0000_0003u64 as i64));
-        assert!(scan_similar_groups(&conn, 0, false, &[]).unwrap().is_empty());
+        insert_asset(
+            &conn,
+            "C:/photos/a.jpg",
+            "h1",
+            Some(0xABCD_0000_0000_0001u64 as i64),
+        );
+        insert_asset(
+            &conn,
+            "C:/photos/b.jpg",
+            "h2",
+            Some(0xABCD_0000_0000_0003u64 as i64),
+        );
+        assert!(scan_similar_groups(&conn, 0, false, &[])
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
     fn need_ids_restricts_scope() {
         let conn = init_memory().unwrap();
-        let a = insert_asset(&conn, "C:/photos/a.jpg", "h1", Some(0xABCD_0000_0000_0001u64 as i64));
-        insert_asset(&conn, "C:/photos/b.jpg", "h2", Some(0xABCD_0000_0000_0003u64 as i64));
-        insert_asset(&conn, "C:/photos/c.jpg", "h3", Some(0xFFFF_FFFF_FFFF_FFFFu64 as i64));
+        let a = insert_asset(
+            &conn,
+            "C:/photos/a.jpg",
+            "h1",
+            Some(0xABCD_0000_0000_0001u64 as i64),
+        );
+        insert_asset(
+            &conn,
+            "C:/photos/b.jpg",
+            "h2",
+            Some(0xABCD_0000_0000_0003u64 as i64),
+        );
+        insert_asset(
+            &conn,
+            "C:/photos/c.jpg",
+            "h3",
+            Some(0xFFFF_FFFF_FFFF_FFFFu64 as i64),
+        );
         // 只检测 [a]：与任何其他 id 距离再近都不参与（b/c 不在范围内）→ 空
         let groups = scan_similar_groups(&conn, 8, false, &[a]).unwrap();
         assert!(groups.is_empty());

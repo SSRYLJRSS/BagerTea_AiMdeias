@@ -37,15 +37,16 @@ fn init_logging(data_dir: &std::path::Path) -> Option<tracing_appender::non_bloc
             // 降级：纯 stdout，不阻断启动
             let _ = fmt::Subscriber::builder()
                 .with_ansi(false)
-                .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+                .with_env_filter(
+                    EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+                )
                 .try_init();
             eprintln!("日志文件初始化失败（降级为 stdout）: {e}");
             return None;
         }
     };
     let (file_writer, guard) = non_blocking(file_appender);
-    let env_filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let stdout_layer = fmt::layer().with_ansi(false);
     let file_layer = fmt::layer()
         .with_writer(file_writer)
@@ -263,8 +264,7 @@ pub fn run() {
             commands::get_asset,
             commands::delete_assets,
             commands::trash_restore,
-            // W2-8：收藏/评级/手动旋转（② T17）
-            commands::set_favorite,
+            // W2-8：评级/手动旋转（② T17）
             commands::set_rating,
             commands::set_user_rotation,
             commands::dedup_scan,

@@ -22,9 +22,7 @@ fn kinship_sibling_ids(conn: &Connection, asset_id: i64) -> Vec<i64> {
         Ok(s) => s,
         Err(_) => return Vec::new(),
     };
-    let rows = match stmt.query_map([], |r| {
-        Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
-    }) {
+    let rows = match stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))) {
         Ok(rows) => rows,
         Err(_) => return Vec::new(),
     };

@@ -46,14 +46,5 @@ export type QueryExpr =
   | { op: "not"; child: QueryExpr }
   | { op: "leaf"; cond: LeafCond };
 
-/** 表达式构建器当前编辑状态：扁平行列表（可在界面上嵌套成组）。
- *  rows：展示层用；expr：由 rows 派生、真正发给后端的树。 */
-export interface BuilderRow {
-  id: string;
-  /** and | or | not：与上/外层连接词 */
-  joiner: "and" | "or" | "not";
-  /** 条件行内容；group 表示一个子组 */
-  kind: "leaf" | "group";
-  cond?: LeafCond;
-  children?: BuilderRow[];
-}
+/* 说明：QueryBuilder 的编辑视图已升级为递归「条件组/叶子」模型（组件内 VGroup/VLeaf，
+ * 2026-09-06 改造），与 QueryExpr 双向递归互转；旧的扁平 BuilderRow 接口已删除（P-f 统一模型）。 */

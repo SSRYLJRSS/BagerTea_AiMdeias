@@ -58,7 +58,10 @@ impl AppState {
     /// F1-e：从库刷新 schema_features 缓存（启动 / apply_tag_constraints 后调用）。
     pub fn refresh_schema_features(&self) {
         let snapshot = {
-            let lock = self.db.lock().map_err(|_| crate::error::AppError::msg("数据库锁中毒"));
+            let lock = self
+                .db
+                .lock()
+                .map_err(|_| crate::error::AppError::msg("数据库锁中毒"));
             match lock {
                 Ok(conn) => crate::db::schema_features::list_features(&conn).ok(),
                 Err(_) => None,

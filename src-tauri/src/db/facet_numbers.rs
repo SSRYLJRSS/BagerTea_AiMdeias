@@ -62,13 +62,30 @@ pub fn upsert_number_guarded(
     if matches!(existing.as_deref(), Some("manual") | Some("ai_reviewed")) {
         return Ok(false);
     }
-    let review_state = if source == "manual" { "manual" } else { "ai_unreviewed" };
-    upsert_number(conn, asset_id, facet_key, value, source, review_state, source_batch_id)?;
+    let review_state = if source == "manual" {
+        "manual"
+    } else {
+        "ai_unreviewed"
+    };
+    upsert_number(
+        conn,
+        asset_id,
+        facet_key,
+        value,
+        source,
+        review_state,
+        source_batch_id,
+    )?;
     Ok(true)
 }
 
 /// 手工赋值命令（§6.4）：source='manual'，review_state='manual'，清 source_batch_id。
-pub fn set_facet_number(conn: &Connection, asset_ids: &[i64], facet_key: &str, value: f64) -> AppResult<()> {
+pub fn set_facet_number(
+    conn: &Connection,
+    asset_ids: &[i64],
+    facet_key: &str,
+    value: f64,
+) -> AppResult<()> {
     let facet = tag_facets::get(conn, facet_key)?;
     if facet.facet_kind != "number" {
         return Err(AppError::msg(format!("分面「{facet_key}」不是数值型分面")));
@@ -125,7 +142,11 @@ fn kinship_siblings(conn: &Connection, asset_id: i64) -> AppResult<Vec<i64>> {
 }
 
 /// 读单素材某分面的数值行。
-pub fn get_number(conn: &Connection, asset_id: i64, facet_key: &str) -> AppResult<Option<FacetNumber>> {
+pub fn get_number(
+    conn: &Connection,
+    asset_id: i64,
+    facet_key: &str,
+) -> AppResult<Option<FacetNumber>> {
     let mut stmt = conn.prepare(
         "SELECT asset_id, facet_key, value, source, review_state, source_batch_id, created_at
            FROM asset_facet_numbers WHERE asset_id = ?1 AND facet_key = ?2",
@@ -183,25 +204,27 @@ pub fn record_number_proposals(
         }
         let facet = tag_facets::get(conn, facet_key)?;
         match parse_number_proposal(raw_text) {
-            NumberParse::Value(v) => match validate_number_in_range(v, facet.num_min, facet.num_max) {
-                NumberParse::Value(checked) => {
-                    conn.execute(
+            NumberParse::Value(v) => {
+                match validate_number_in_range(v, facet.num_min, facet.num_max) {
+                    NumberParse::Value(checked) => {
+                        conn.execute(
                         "INSERT INTO ai_suggestion_items
                          (suggestion_id, facet_key, raw_name, normalized_name, tag_id, item_kind, num_value, decision, created_at)
                          VALUES (?1, ?2, ?3, ?3, NULL, 'number', ?4, 'pending', ?5)",
                         rusqlite::params![suggestion_id, facet_key, raw_text, checked, now],
                     )?;
-                }
-                NumberParse::Ambiguous { reason } => {
-                    conn.execute(
+                    }
+                    NumberParse::Ambiguous { reason } => {
+                        conn.execute(
                         "INSERT INTO ai_suggestion_items
                          (suggestion_id, facet_key, raw_name, normalized_name, tag_id, item_kind, num_value, decision, decision_reason, created_at)
                          VALUES (?1, ?2, ?3, ?3, NULL, 'number', NULL, 'pending', ?4, ?5)",
                         rusqlite::params![suggestion_id, facet_key, raw_text, format!("需人工确认：原文「{raw_text}」（{reason}）"), now],
                     )?;
+                    }
+                    NumberParse::None => unreachable!(),
                 }
-                NumberParse::None => unreachable!(),
-            },
+            }
             NumberParse::Ambiguous { reason } => {
                 conn.execute(
                     "INSERT INTO ai_suggestion_items
@@ -221,18 +244,38 @@ pub fn record_number_proposals(
 /// 确认数值建议（§6.4 确认环节）：decision='accepted' → 写 asset_facet_numbers。
 /// 不变量 10：旧行为 manual/ai_reviewed → 跳过并记 warning。
 pub fn confirm_number_item(conn: &Connection, item_id: i64) -> AppResult<Option<String>> {
-    let (suggestion_id, facet_key, _raw_name, num_value, asset_id, batch_id): (i64, String, String, Option<f64>, i64, Option<i64>) = conn.query_row(
+    let (suggestion_id, facet_key, _raw_name, num_value, asset_id, batch_id): (
+        i64,
+        String,
+        String,
+        Option<f64>,
+        i64,
+        Option<i64>,
+    ) = conn.query_row(
         "SELECT i.suggestion_id, i.facet_key, i.raw_name, i.num_value, s.asset_id, s.batch_id
            FROM ai_suggestion_items i
            JOIN ai_suggestions s ON s.id = i.suggestion_id
           WHERE i.id = ?1",
         [item_id],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+        |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+            ))
+        },
     )?;
     let Some(value) = num_value else {
         return Err(AppError::msg("该数值建议无确定值（歧义项），请先人工填数"));
     };
-    let source = if batch_id.is_some() { "ai_cloud" } else { "ai_local" };
+    let source = if batch_id.is_some() {
+        "ai_cloud"
+    } else {
+        "ai_local"
+    };
     let written = upsert_number_guarded(conn, asset_id, &facet_key, value, source, batch_id)?;
     if !written {
         return Ok(Some(format!(
@@ -275,7 +318,10 @@ pub fn retag_clear_unreviewed_numbers(conn: &Connection, asset_ids: &[i64]) -> A
 /// 删除分面：级联删数值（在同一事务内，先删 asset_facet_numbers 再删分面本身）。
 /// 在 tag_facets::delete_facet 的事务里调用。
 pub fn delete_facet_numbers(conn: &Connection, key: &str) -> AppResult<usize> {
-    let n = conn.execute("DELETE FROM asset_facet_numbers WHERE facet_key = ?1", [key])?;
+    let n = conn.execute(
+        "DELETE FROM asset_facet_numbers WHERE facet_key = ?1",
+        [key],
+    )?;
     Ok(n)
 }
 
@@ -378,14 +424,26 @@ pub fn convert_facet_kind_dry_run(conn: &Connection, key: &str) -> AppResult<Con
     for (tag_id, name, asset_count) in rows {
         match parse_number_proposal(&name) {
             NumberParse::Value(v) => {
-                report.parsed.push(ConvertedValue { tag_id, name, value: v });
+                report.parsed.push(ConvertedValue {
+                    tag_id,
+                    name,
+                    value: v,
+                });
                 values.insert(tag_id, v);
             }
             NumberParse::Ambiguous { reason } => {
-                report.ambiguous.push(AmbiguousEntry { tag_id, name, reason });
+                report.ambiguous.push(AmbiguousEntry {
+                    tag_id,
+                    name,
+                    reason,
+                });
             }
             NumberParse::None => {
-                report.unparseable.push(UnparseableEntry { tag_id, name, asset_count });
+                report.unparseable.push(UnparseableEntry {
+                    tag_id,
+                    name,
+                    asset_count,
+                });
             }
         }
     }
@@ -401,7 +459,8 @@ pub fn convert_facet_kind_dry_run(conn: &Connection, key: &str) -> AppResult<Con
         .query_map([key], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
         .filter_map(|r| r.ok())
         .collect();
-    let mut by_asset: std::collections::HashMap<i64, Vec<(i64, f64, String)>> = std::collections::HashMap::new();
+    let mut by_asset: std::collections::HashMap<i64, Vec<(i64, f64, String)>> =
+        std::collections::HashMap::new();
     for (asset_id, tag_id, review_state) in pairs {
         if let Some(v) = values.get(&tag_id) {
             let entry = by_asset.entry(asset_id).or_default();
@@ -410,10 +469,17 @@ pub fn convert_facet_kind_dry_run(conn: &Connection, key: &str) -> AppResult<Con
     }
     for (asset_id, mut candidates) in by_asset {
         // 同值不算冲突（多个标签映射到同一数值合法，规则 1）
-        candidates.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal).then(a.0.cmp(&b.0)));
+        candidates.sort_by(|a, b| {
+            a.1.partial_cmp(&b.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.0.cmp(&b.0))
+        });
         candidates.dedup_by(|a, b| a.1 == b.1);
         if candidates.len() > 1 {
-            report.conflicts.push(ConflictEntry { asset_id, candidates });
+            report.conflicts.push(ConflictEntry {
+                asset_id,
+                candidates,
+            });
         }
     }
     Ok(report)
@@ -426,7 +492,11 @@ pub fn convert_facet_kind_dry_run(conn: &Connection, key: &str) -> AppResult<Con
 /// ④ pending 标签建议置 rejected（规则 8）
 /// ⑤ tag_facets.facet_kind='number'（应用层校验，无 DB CHECK）
 /// number → tag 直接禁止（规则 9）
-pub fn convert_facet_kind_execute(conn: &Connection, key: &str, dry_run: bool) -> AppResult<ConversionReport> {
+pub fn convert_facet_kind_execute(
+    conn: &Connection,
+    key: &str,
+    dry_run: bool,
+) -> AppResult<ConversionReport> {
     let report = convert_facet_kind_dry_run(conn, key)?;
     if dry_run {
         return Ok(report);

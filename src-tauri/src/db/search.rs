@@ -10,7 +10,7 @@
 //! - content：{file_name content_description}
 //! - description：仅 content_description
 //! - fileName：仅 file_name
-//! 列名只能由 SearchScope 枚举映射，绝不能来自模型或用户字符串；LIKE 参数数量按 scope 精确生成。
+//!   列名只能由 SearchScope 枚举映射，绝不能来自模型或用户字符串；LIKE 参数数量按 scope 精确生成。
 //!
 //! 关键约束（架构 v1.3 §1.5，均有实测依据）：
 //! - 短语必须加双引号，否则空格被当 AND，「海边」会误命中「上海…湖边」；

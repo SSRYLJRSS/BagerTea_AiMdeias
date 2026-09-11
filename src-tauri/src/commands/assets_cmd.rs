@@ -96,7 +96,10 @@ pub fn list_metadata_facets(state: State<AppState>) -> AppResult<Vec<MetadataFac
 ///（含预设/单位/边界/量纲阈值/运算符）+ 数值分面动态段（key = "facet:<facet_key>"）。
 #[tauri::command]
 pub fn get_numeric_domains(state: State<AppState>) -> AppResult<Vec<search_query::NumericDomain>> {
-    let conn = state.db.lock().map_err(|_| crate::error::AppError::msg("数据库锁中毒"))?;
+    let conn = state
+        .db
+        .lock()
+        .map_err(|_| crate::error::AppError::msg("数据库锁中毒"))?;
     Ok(search_query::numeric_domains_with_facets(&conn))
 }
 
@@ -198,13 +201,6 @@ pub async fn delete_assets(
 pub fn trash_restore(state: State<AppState>, ids: Vec<i64>) -> AppResult<u64> {
     let conn = lock_db(&state)?;
     assets::restore(&conn, &ids)
-}
-
-/// W2-8（② T17）：批量收藏/取消收藏
-#[tauri::command]
-pub fn set_favorite(state: State<AppState>, ids: Vec<i64>, favorite: bool) -> AppResult<u64> {
-    let conn = lock_db(&state)?;
-    assets::set_favorite(&conn, &ids, favorite)
 }
 
 /// W2-8（② T17）：批量评级（0 = 清除）
@@ -313,7 +309,10 @@ pub struct ContentDescription {
 }
 
 #[tauri::command]
-pub fn list_content_descriptions(state: State<AppState>, limit: Option<i64>) -> AppResult<Vec<ContentDescription>> {
+pub fn list_content_descriptions(
+    state: State<AppState>,
+    limit: Option<i64>,
+) -> AppResult<Vec<ContentDescription>> {
     let conn = lock_db(&state)?;
     let rows = assets::list_content_descriptions(&conn, limit.unwrap_or(200).clamp(1, 500))?;
     Ok(rows

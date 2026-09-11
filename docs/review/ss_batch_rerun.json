@@ -1,0 +1,310 @@
+[
+  {
+    "idx": 15,
+    "query": "视频素材",
+    "ok": true,
+    "status": "partial",
+    "ms": 34503,
+    "counts": {
+      "leaf": 0,
+      "tag": 0,
+      "exclude_tag": 0,
+      "metadata": 0,
+      "search": 0,
+      "asset_type": 0,
+      "untagged": 0,
+      "facet": 0,
+      "and": 0,
+      "or": 0,
+      "not": 0
+    },
+    "should": 0,
+    "min_should": 0,
+    "warnings": [
+      "一组条件为空，已忽略。",
+      "已忽略 1 组无法识别的条件。",
+      "多组条件已合并，加分项分组信息不再精确，已按必须条件执行。"
+    ],
+    "error": null,
+    "expr": null
+  },
+  {
+    "idx": 19,
+    "query": "小于2MB的图片",
+    "ok": true,
+    "status": "full",
+    "ms": 975,
+    "counts": {
+      "leaf": 2,
+      "tag": 0,
+      "exclude_tag": 0,
+      "metadata": 1,
+      "search": 0,
+      "asset_type": 1,
+      "untagged": 0,
+      "facet": 0,
+      "and": 1,
+      "or": 0,
+      "not": 0
+    },
+    "should": 0,
+    "min_should": 0,
+    "warnings": [],
+    "error": null,
+    "expr": {
+      "children": [
+        {
+          "cond": {
+            "type": "assetType",
+            "value": "image"
+          },
+          "op": "leaf"
+        },
+        {
+          "cond": {
+            "key": "file_size",
+            "max": null,
+            "min": null,
+            "op": "lt",
+            "type": "metadata",
+            "value": 2097152,
+            "values": null
+          },
+          "op": "leaf"
+        }
+      ],
+      "op": "and"
+    }
+  },
+  {
+    "idx": 24,
+    "query": "4K分辨率的素材",
+    "ok": true,
+    "status": "partial",
+    "ms": 5815,
+    "counts": {
+      "leaf": 0,
+      "tag": 0,
+      "exclude_tag": 0,
+      "metadata": 0,
+      "search": 0,
+      "asset_type": 0,
+      "untagged": 0,
+      "facet": 0,
+      "and": 0,
+      "or": 0,
+      "not": 0
+    },
+    "should": 0,
+    "min_should": 0,
+    "warnings": [
+      "已忽略无效的元数据条件（width gte）：字段 width 的 gte 需要 value",
+      "一组条件为空，已忽略。",
+      "已忽略 1 组无法识别的条件。",
+      "多组条件已合并，加分项分组信息不再精确，已按必须条件执行。"
+    ],
+    "error": null,
+    "expr": null
+  },
+  {
+    "idx": 25,
+    "query": "横构图的照片",
+    "ok": true,
+    "status": "full",
+    "ms": 7031,
+    "counts": {
+      "leaf": 2,
+      "tag": 0,
+      "exclude_tag": 0,
+      "metadata": 0,
+      "search": 1,
+      "asset_type": 1,
+      "untagged": 0,
+      "facet": 0,
+      "and": 1,
+      "or": 0,
+      "not": 0
+    },
+    "should": 0,
+    "min_should": 0,
+    "warnings": [],
+    "error": null,
+    "expr": {
+      "children": [
+        {
+          "cond": {
+            "type": "assetType",
+            "value": "image"
+          },
+          "op": "leaf"
+        },
+        {
+          "cond": {
+            "scope": "content",
+            "type": "search",
+            "value": "横构图"
+          },
+          "op": "leaf"
+        }
+      ],
+      "op": "and"
+    }
+  },
+  {
+    "idx": 26,
+    "query": "有拍摄定位的照片",
+    "ok": true,
+    "status": "partial",
+    "ms": 79688,
+    "counts": {
+      "leaf": 2,
+      "tag": 0,
+      "exclude_tag": 0,
+      "metadata": 0,
+      "search": 1,
+      "asset_type": 1,
+      "untagged": 0,
+      "facet": 0,
+      "and": 1,
+      "or": 0,
+      "not": 0
+    },
+    "should": 0,
+    "min_should": 0,
+    "warnings": [
+      "已忽略无效的元数据条件（latitude gte）：字段 latitude 的 gte 需要 value",
+      "已忽略无效的元数据条件（longitude gte）：字段 longitude 的 gte 需要 value"
+    ],
+    "error": null,
+    "expr": {
+      "children": [
+        {
+          "cond": {
+            "type": "assetType",
+            "value": "image"
+          },
+          "op": "leaf"
+        },
+        {
+          "cond": {
+            "scope": "content",
+            "type": "search",
+            "value": "拍摄定位"
+          },
+          "op": "leaf"
+        }
+      ],
+      "op": "and"
+    }
+  },
+  {
+    "idx": 27,
+    "query": "偏绿色调的图片",
+    "ok": true,
+    "status": "full",
+    "ms": 51455,
+    "counts": {
+      "leaf": 2,
+      "tag": 0,
+      "exclude_tag": 0,
+      "metadata": 1,
+      "search": 0,
+      "asset_type": 1,
+      "untagged": 0,
+      "facet": 0,
+      "and": 1,
+      "or": 0,
+      "not": 0
+    },
+    "should": 0,
+    "min_should": 0,
+    "warnings": [],
+    "error": null,
+    "expr": {
+      "children": [
+        {
+          "cond": {
+            "type": "assetType",
+            "value": "image"
+          },
+          "op": "leaf"
+        },
+        {
+          "cond": {
+            "key": "dominant_hue",
+            "max": 155,
+            "min": 70,
+            "op": "between",
+            "type": "metadata",
+            "value": null,
+            "values": null
+          },
+          "op": "leaf"
+        }
+      ],
+      "op": "and"
+    }
+  },
+  {
+    "idx": 28,
+    "query": "文件名包含IMG的素材",
+    "ok": true,
+    "status": "full",
+    "ms": 1150,
+    "counts": {
+      "leaf": 1,
+      "tag": 0,
+      "exclude_tag": 0,
+      "metadata": 0,
+      "search": 1,
+      "asset_type": 0,
+      "untagged": 0,
+      "facet": 0,
+      "and": 0,
+      "or": 0,
+      "not": 0
+    },
+    "should": 0,
+    "min_should": 0,
+    "warnings": [],
+    "error": null,
+    "expr": {
+      "cond": {
+        "scope": "fileName",
+        "type": "search",
+        "value": "IMG"
+      },
+      "op": "leaf"
+    }
+  },
+  {
+    "idx": 29,
+    "query": "没有打标签的素材",
+    "ok": true,
+    "status": "partial",
+    "ms": 919,
+    "counts": {
+      "leaf": 0,
+      "tag": 0,
+      "exclude_tag": 0,
+      "metadata": 0,
+      "search": 0,
+      "asset_type": 0,
+      "untagged": 0,
+      "facet": 0,
+      "and": 0,
+      "or": 0,
+      "not": 0
+    },
+    "should": 0,
+    "min_should": 0,
+    "warnings": [
+      "已忽略无效的元数据条件（tags_count eq）：未知元数据字段：tags_count",
+      "一组条件为空，已忽略。",
+      "已忽略 1 组无法识别的条件。",
+      "多组条件已合并，加分项分组信息不再精确，已按必须条件执行。"
+    ],
+    "error": null,
+    "expr": null
+  }
+]

@@ -208,9 +208,11 @@ mod tests {
         assert!(matches!(s.ownership(), Some(ServiceOwnership::External)));
         assert!(!s.ownership().unwrap().is_app_owned());
         // 关键断言：External 存在一个真实子进程也不停止
-        let _dummy = spawn_dummy(30);
+        let mut dummy = spawn_dummy(30);
         assert!(!s.stop_app_owned());
         assert!(matches!(s.ownership(), Some(ServiceOwnership::External)));
+        let _ = dummy.kill();
+        let _ = dummy.wait();
     }
 
     #[test]

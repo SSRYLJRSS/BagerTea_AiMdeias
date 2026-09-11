@@ -18,6 +18,37 @@ export const COMPILER_VERSION = 1;
 /** S1：加分条数上限。 */
 export const MAX_SHOULD_CLAUSES = 12;
 
+const SHOULD_WEIGHTS = [2.0, 1.0, 0.5] as const;
+
+/** 新版优先区契约：权重由稳定的可见位置生成，UI 不编辑权重。 */
+export function weightForShouldPosition(index: number, length: number): number {
+  if (length <= 0) return SHOULD_WEIGHTS[2];
+  const first = Math.ceil(length / 3);
+  const second = Math.ceil((length * 2) / 3);
+  return index < first ? SHOULD_WEIGHTS[0] : index < second ? SHOULD_WEIGHTS[1] : SHOULD_WEIGHTS[2];
+}
+
+/** 按优先区顺序截断并重算三档权重；不修改输入数组或 clause。 */
+export function normalizeShouldByPosition(should: ShouldClause[]): ShouldClause[] {
+  const kept = should.slice(0, MAX_SHOULD_CLAUSES);
+  return kept.map((clause, index) => ({ ...clause, weight: weightForShouldPosition(index, kept.length) }));
+}
+
+/** SearchPlanV3 的单一归一化边界：min 恒为 0，should 顺序是唯一优先级来源。 */
+export function normalizeSearchPlan(plan: SearchPlanV3): SearchPlanV3 {
+  return { ...plan, should: normalizeShouldByPosition(plan.should), minimumShouldMatch: 0 };
+}
+
+/** 不可变的优先区重排。to 是删除 source 后的最终插入下标。 */
+export function reorderShould<T>(items: T[], from: number, to: number): T[] {
+  if (from < 0 || from >= items.length || to < 0 || to > items.length || from === to) return items.slice();
+  const next = items.slice();
+  const [item] = next.splice(from, 1);
+  if (item === undefined) return next;
+  next.splice(Math.min(to, next.length), 0, item);
+  return next;
+}
+
 export function fieldRanking(key: string, dir: string): Ranking {
   return { type: "field", key, dir: dir === "asc" ? "asc" : "desc" };
 }
@@ -139,7 +170,7 @@ export function appendPlanMerge(
   const filter = andMerge(base.filter, incoming.filter);
   // mustNot：OR 合并
   const mustNot = orMerge(base.mustNot, incoming.mustNot);
-  // should：拼接 + 去重 + 超 12 按权重降序保留前 12
+  // should：拼接 + 去重 + 超 12 按当前用户可见顺序保留前 12
   const seen = new Set<string>();
   const merged: ShouldClause[] = [];
   for (const sc of [...base.should, ...incoming.should]) {
@@ -148,22 +179,15 @@ export function appendPlanMerge(
     seen.add(key);
     merged.push(sc);
   }
-  const dropped = merged.length - MAX_SHOULD_CLAUSES;
-  let should = merged;
+  const dropped = Math.max(0, merged.length - MAX_SHOULD_CLAUSES);
+  const should = normalizeShouldByPosition(merged);
   if (dropped > 0) {
-    should = [...merged].sort((x, y) => y.weight - x.weight).slice(0, MAX_SHOULD_CLAUSES);
     warnings.push(
-      warning("plan", `加分项超过 ${MAX_SHOULD_CLAUSES} 条，已保留权重较高的 ${MAX_SHOULD_CLAUSES} 条。`, "should"),
+      warning("plan", `加分项超过 ${MAX_SHOULD_CLAUSES} 条，已按当前优先顺序保留前 ${MAX_SHOULD_CLAUSES} 条。`, "should"),
     );
   }
   // minimumShouldMatch：old.should 非空时保持用户值；最后 clamp(0, len)
-  const rawMin = base.should.length > 0 ? base.minimumShouldMatch : incoming.minimumShouldMatch;
-  const minimumShouldMatch = Math.max(0, Math.min(should.length, Math.floor(rawMin)));
-  if (base.should.length > 0 && minimumShouldMatch !== base.minimumShouldMatch) {
-    warnings.push(
-      warning("plan", `『至少满足 N 项』已收敛为 ${minimumShouldMatch}。`, "should"),
-    );
-  }
+  const minimumShouldMatch = 0;
   // ranking：append 恒保留用户的；AI 建议不同 → 提示
   if (JSON.stringify(base.ranking) !== JSON.stringify(incoming.ranking)) {
     warnings.push(warning("plan", "AI 建议的排序方式未被采纳（追加模式保留当前排序）。"));
@@ -192,10 +216,10 @@ export function migratePlanV3(plan: SearchPlanV3): SearchPlanV3 | null {
   if (plan.planSchemaVersion > PLAN_SCHEMA_VERSION || plan.normalizationVersion > NORMALIZATION_VERSION) {
     return null;
   }
-  return {
+  return normalizeSearchPlan({
     ...plan,
     planSchemaVersion: PLAN_SCHEMA_VERSION,
     normalizationVersion: NORMALIZATION_VERSION,
     compilerVersion: COMPILER_VERSION,
-  };
+  });
 }

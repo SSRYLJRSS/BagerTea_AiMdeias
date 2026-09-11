@@ -57,6 +57,8 @@ export default class PageErrorBoundary extends Component<PageErrorBoundaryProps,
         {isDev && this.state.error && (
           <pre className="max-h-40 max-w-full overflow-auto rounded-md border border-[var(--color-border)] bg-[var(--color-surface)] px-3 py-2 text-left text-[11px] text-[var(--color-text-secondary)]">
             {String(this.state.error)}
+            {"\n"}
+            {this.state.error.stack ?? ""}
           </pre>
         )}
         <div className="flex items-center gap-2">

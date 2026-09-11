@@ -22,11 +22,8 @@ pub fn backup_to(conn: &Connection, target: &Path) -> AppResult<()> {
     if target.exists() {
         return Err(AppError::msg("目标文件已存在，请换一个文件名"));
     }
-    conn.execute(
-        "VACUUM INTO ?1",
-        [target.to_string_lossy().as_ref()],
-    )
-    .map_err(|e| AppError::msg(format!("备份失败：{e}")))?;
+    conn.execute("VACUUM INTO ?1", [target.to_string_lossy().as_ref()])
+        .map_err(|e| AppError::msg(format!("备份失败：{e}")))?;
     Ok(())
 }
 
@@ -37,7 +34,8 @@ pub fn validate_backup(path: &Path) -> AppResult<i64> {
     if !path.is_file() {
         return Err(AppError::msg("备份文件不存在"));
     }
-    let conn = Connection::open(path).map_err(|e| AppError::msg(format!("备份文件无法打开：{e}")))?;
+    let conn =
+        Connection::open(path).map_err(|e| AppError::msg(format!("备份文件无法打开：{e}")))?;
     let status: String = conn
         .query_row("PRAGMA quick_check", [], |r| r.get(0))
         .map_err(|e| AppError::msg(format!("备份完整性检查失败：{e}")))?;
@@ -89,7 +87,9 @@ mod tests {
         assert_eq!(validate_backup(&target).unwrap(), LATEST_VERSION);
         // 快照内容完整：能读回资产行
         let snap = Connection::open(&target).unwrap();
-        let n: i64 = snap.query_row("SELECT count(*) FROM assets", [], |r| r.get(0)).unwrap();
+        let n: i64 = snap
+            .query_row("SELECT count(*) FROM assets", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(n, 1);
     }
 
@@ -118,7 +118,8 @@ mod tests {
         conn.execute("VACUUM INTO ?1", [target.to_string_lossy().as_ref()])
             .unwrap();
         let snap = Connection::open(&target).unwrap();
-        snap.pragma_update(None, "user_version", LATEST_VERSION + 1).unwrap();
+        snap.pragma_update(None, "user_version", LATEST_VERSION + 1)
+            .unwrap();
         drop(snap);
         let err = validate_backup(&target).unwrap_err();
         assert!(err.to_string().contains("更新版本"), "{err}");
@@ -129,8 +130,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("incomplete.db");
         let conn = Connection::open(&target).unwrap();
-        conn.execute_batch("CREATE TABLE assets (id INTEGER PRIMARY KEY); PRAGMA user_version = 21;")
-            .unwrap();
+        conn.execute_batch(
+            "CREATE TABLE assets (id INTEGER PRIMARY KEY); PRAGMA user_version = 21;",
+        )
+        .unwrap();
         drop(conn);
         let err = validate_backup(&target).unwrap_err();
         assert!(err.to_string().contains("关键表"), "{err}");

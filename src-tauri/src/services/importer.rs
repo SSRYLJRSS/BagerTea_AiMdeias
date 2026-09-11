@@ -305,14 +305,18 @@ fn extract_meta(file: &Path, mime_type: &str) -> Option<AssetMeta> {
         ) {
             // W1-4：image crate 不支持 RAW（RW2 等）→ rawler 只读宽高。
             // 205 张 RAW 宽高 NULL 会拖垮分辨率分面/搜索/信息面板。
-            if let Some((w, h)) = crate::services::raw_decode::probe_dimensions(file) {
+            if let Some((w, h)) = crate::services::imaging::probe_dimensions(file) {
                 meta.width = Some(w as i64);
                 meta.height = Some(h as i64);
                 has_any = true;
             }
         }
         let ex = exif_meta::extract(file);
-        if ex.camera.is_some() || ex.taken_at.is_some() || ex.aperture.is_some() || ex.latitude.is_some() {
+        if ex.camera.is_some()
+            || ex.taken_at.is_some()
+            || ex.aperture.is_some()
+            || ex.latitude.is_some()
+        {
             meta.exif = Some(ex);
             has_any = true;
         }

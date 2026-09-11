@@ -585,7 +585,6 @@ CREATE INDEX IF NOT EXISTS idx_assets_width_height ON assets(width, height);
 "#;
 
 /// v10：tagCategories（中文名机器协议）→ ai_facet_configs（稳定 facet_key）已在上方 migrate() 处理。
-
 /// v11：独立 color 分面补齐（指导书 C-3/C-5）。
 /// 老库 V8 已建 tag_facets，但默认 AI 配置曾把「色彩风格」归 style 而缺少独立 color；
 /// 新库由 default_tag_categories 覆盖（含「色彩」→color）。本迁移幂等：
@@ -1134,7 +1133,12 @@ fn migrate_v19(conn: &Connection) -> AppResult<()> {
     add_column_if_missing(conn, "assets", "rating", "INTEGER NOT NULL DEFAULT 0")?;
     // user_rotation：用户手动旋转（0/90/180/270）。
     // 严禁复用 assets.rotation —— 那是 V12 的 ffprobe 媒体元数据语义。
-    add_column_if_missing(conn, "assets", "user_rotation", "INTEGER NOT NULL DEFAULT 0")?;
+    add_column_if_missing(
+        conn,
+        "assets",
+        "user_rotation",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
     add_column_if_missing(conn, "assets", "phash", "INTEGER")?;
     conn.execute_batch(
         r#"
@@ -1156,14 +1160,22 @@ fn migrate_v20(conn: &Connection) -> AppResult<()> {
 
     // ① 加列。SQLite 的 ALTER ADD COLUMN 不能带 CHECK（tag_facets 已有 3 个 CHECK，
     //    只能建表时声明）→ input_mode 靠 Rust 层 validate 兜底。
-    add_column_if_missing(conn, "tag_facets", "input_mode",
-                          "TEXT NOT NULL DEFAULT 'ai_and_manual'")?;
+    add_column_if_missing(
+        conn,
+        "tag_facets",
+        "input_mode",
+        "TEXT NOT NULL DEFAULT 'ai_and_manual'",
+    )?;
 
     // ② 回填。实测库：6 个 enabledForAi=true → ai_and_manual；color(false) → manual_only。
     //    hint 并入 description（拼接不覆盖，instr 守卫防重跑重复拼）。
     let s = crate::db::settings::get_settings(conn)?;
     for cfg in &s.ai_facet_configs {
-        let mode = if cfg.enabled_for_ai { "ai_and_manual" } else { "manual_only" };
+        let mode = if cfg.enabled_for_ai {
+            "ai_and_manual"
+        } else {
+            "manual_only"
+        };
         conn.execute(
             "UPDATE tag_facets SET
                 input_mode = ?2,
@@ -1176,8 +1188,14 @@ fn migrate_v20(conn: &Connection) -> AppResult<()> {
                 display_name = COALESCE(NULLIF(trim(?4), ''), display_name),
                 updated_at = ?5
               WHERE key = ?1",
-            rusqlite::params![cfg.facet_key, mode, cfg.hint.trim(),
-                    cfg.display_name.as_deref().unwrap_or(""), now])?;
+            rusqlite::params![
+                cfg.facet_key,
+                mode,
+                cfg.hint.trim(),
+                cfg.display_name.as_deref().unwrap_or(""),
+                now
+            ],
+        )?;
     }
 
     // ③ 无 aiFacetConfigs 条目的分面（实测库：purpose / technical / custom 三个）
@@ -1187,7 +1205,8 @@ fn migrate_v20(conn: &Connection) -> AppResult<()> {
         "UPDATE tag_facets SET input_mode='manual_only', updated_at=?1
           WHERE key IN ('purpose','technical') AND is_system=1
             AND NOT EXISTS (SELECT 1 FROM tags WHERE facet_key = tag_facets.key)",
-        rusqlite::params![now])?;
+        rusqlite::params![now],
+    )?;
 
     // ④ 清空 JSON 侧（此后 Settings.ai_facet_configs 为 skip_serializing）
     let mut s2 = crate::db::settings::get_settings(conn)?;
@@ -1357,11 +1376,36 @@ fn migrate_v22a(conn: &Connection) -> AppResult<()> {
     let now = chrono::Utc::now().timestamp_millis();
 
     // ── F1-a：tag_facets 配置值列（记录用户意图，生命周期状态永不覆盖它们）──
-    add_column_if_missing(conn, "tag_facets", "cfg_visible_in_navigation", "INTEGER NOT NULL DEFAULT 1")?;
-    add_column_if_missing(conn, "tag_facets", "cfg_manual_assignable", "INTEGER NOT NULL DEFAULT 1")?;
-    add_column_if_missing(conn, "tag_facets", "cfg_ai_assignable", "INTEGER NOT NULL DEFAULT 1")?;
-    add_column_if_missing(conn, "tag_facets", "cfg_searchable", "INTEGER NOT NULL DEFAULT 1")?;
-    add_column_if_missing(conn, "tag_facets", "facet_kind", "TEXT NOT NULL DEFAULT 'tag'")?;
+    add_column_if_missing(
+        conn,
+        "tag_facets",
+        "cfg_visible_in_navigation",
+        "INTEGER NOT NULL DEFAULT 1",
+    )?;
+    add_column_if_missing(
+        conn,
+        "tag_facets",
+        "cfg_manual_assignable",
+        "INTEGER NOT NULL DEFAULT 1",
+    )?;
+    add_column_if_missing(
+        conn,
+        "tag_facets",
+        "cfg_ai_assignable",
+        "INTEGER NOT NULL DEFAULT 1",
+    )?;
+    add_column_if_missing(
+        conn,
+        "tag_facets",
+        "cfg_searchable",
+        "INTEGER NOT NULL DEFAULT 1",
+    )?;
+    add_column_if_missing(
+        conn,
+        "tag_facets",
+        "facet_kind",
+        "TEXT NOT NULL DEFAULT 'tag'",
+    )?;
 
     // 回填：manual_only → 不参与 AI（active 或 inactive 都算，保留用户原配置）
     conn.execute(
@@ -1459,7 +1503,12 @@ CREATE TABLE IF NOT EXISTS schema_features (
     )?;
 
     // ── F1-f：asset_tags.review_state 三态（保守回填：把已确认的当已确认）──
-    add_column_if_missing(conn, "asset_tags", "review_state", "TEXT NOT NULL DEFAULT 'ai_unreviewed'")?;
+    add_column_if_missing(
+        conn,
+        "asset_tags",
+        "review_state",
+        "TEXT NOT NULL DEFAULT 'ai_unreviewed'",
+    )?;
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS ix_at_review ON asset_tags(review_state, tag_id, asset_id);",
     )?;
@@ -1483,12 +1532,27 @@ CREATE TABLE IF NOT EXISTS schema_features (
     add_column_if_missing(conn, "ai_batches", "model_id", "TEXT NOT NULL DEFAULT ''")?;
     add_column_if_missing(conn, "ai_batches", "model_version", "TEXT")?;
     add_column_if_missing(conn, "ai_batches", "profile_id", "TEXT NOT NULL DEFAULT ''")?;
-    add_column_if_missing(conn, "ai_batches", "prompt_version", "TEXT NOT NULL DEFAULT ''")?;
-    add_column_if_missing(conn, "ai_batches", "request_config_hash", "TEXT NOT NULL DEFAULT ''")?;
+    add_column_if_missing(
+        conn,
+        "ai_batches",
+        "prompt_version",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    add_column_if_missing(
+        conn,
+        "ai_batches",
+        "request_config_hash",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
     add_column_if_missing(conn, "ai_batches", "request_config_json", "TEXT")?;
     add_column_if_missing(conn, "ai_suggestions", "raw_response", "TEXT")?;
     add_column_if_missing(conn, "ai_suggestions", "analysis_json", "TEXT")?;
-    add_column_if_missing(conn, "ai_suggestions", "analysis_schema_version", "INTEGER NOT NULL DEFAULT 1")?;
+    add_column_if_missing(
+        conn,
+        "ai_suggestions",
+        "analysis_schema_version",
+        "INTEGER NOT NULL DEFAULT 1",
+    )?;
 
     // F4（与 F1 同文件，并入 V22a 执行）：FTS 触发器条件从 status 换成
     // cfg_searchable（停用分面的标签仍可搜 —— 语义变更），改完立即 rebuild（铁律 3）
@@ -1540,11 +1604,7 @@ CREATE INDEX IF NOT EXISTS ix_terms_lookup
 /// 重跑直接跳过（避免与「新写入的词条」混淆；也保证冲突时 INSERT 会真实报错，
 /// 不因 OR IGNORE 静默吞掉 —— 冲突必须让预检拦住，而不是靠 IGNORE 掩盖）。
 fn backfill_tag_terms(conn: &Connection) -> AppResult<()> {
-    let existing: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM tag_terms",
-        [],
-        |r| r.get(0),
-    )?;
+    let existing: i64 = conn.query_row("SELECT COUNT(*) FROM tag_terms", [], |r| r.get(0))?;
     if existing > 0 {
         return Ok(());
     }
@@ -1794,9 +1854,18 @@ fn migrate_v24(conn: &Connection) -> AppResult<()> {
     for (ddl, col) in [
         ("ALTER TABLE tag_facets ADD COLUMN num_min REAL", "num_min"),
         ("ALTER TABLE tag_facets ADD COLUMN num_max REAL", "num_max"),
-        ("ALTER TABLE tag_facets ADD COLUMN num_unit TEXT NOT NULL DEFAULT ''", "num_unit"),
-        ("ALTER TABLE tag_facets ADD COLUMN num_decimals INTEGER NOT NULL DEFAULT 0", "num_decimals"),
-        ("ALTER TABLE tag_facets ADD COLUMN num_step REAL NOT NULL DEFAULT 1", "num_step"),
+        (
+            "ALTER TABLE tag_facets ADD COLUMN num_unit TEXT NOT NULL DEFAULT ''",
+            "num_unit",
+        ),
+        (
+            "ALTER TABLE tag_facets ADD COLUMN num_decimals INTEGER NOT NULL DEFAULT 0",
+            "num_decimals",
+        ),
+        (
+            "ALTER TABLE tag_facets ADD COLUMN num_step REAL NOT NULL DEFAULT 1",
+            "num_step",
+        ),
     ] {
         if !cols.iter().any(|c| c == col) {
             conn.execute_batch(ddl)?;
@@ -1825,7 +1894,9 @@ CREATE INDEX IF NOT EXISTS ix_afn_value ON asset_facet_numbers(facet_key, value,
         rows.filter_map(|r| r.ok()).collect()
     };
     if !item_cols.iter().any(|c| c == "item_kind") {
-        conn.execute_batch("ALTER TABLE ai_suggestion_items ADD COLUMN item_kind TEXT NOT NULL DEFAULT 'tag'")?;
+        conn.execute_batch(
+            "ALTER TABLE ai_suggestion_items ADD COLUMN item_kind TEXT NOT NULL DEFAULT 'tag'",
+        )?;
     }
     if !item_cols.iter().any(|c| c == "num_value") {
         conn.execute_batch("ALTER TABLE ai_suggestion_items ADD COLUMN num_value REAL")?;
@@ -2312,8 +2383,14 @@ mod tests {
             .unwrap();
         assert!(v >= 18, "全新库应至少迁移到 V18（实际 {v}）");
 
-        assert!(has_column(&c, "assets", "latitude").unwrap(), "latitude 列应存在");
-        assert!(has_column(&c, "assets", "longitude").unwrap(), "longitude 列应存在");
+        assert!(
+            has_column(&c, "assets", "latitude").unwrap(),
+            "latitude 列应存在"
+        );
+        assert!(
+            has_column(&c, "assets", "longitude").unwrap(),
+            "longitude 列应存在"
+        );
         for idx in ["idx_assets_latitude", "idx_assets_longitude"] {
             let n: i64 = c
                 .query_row(
@@ -2385,7 +2462,11 @@ mod tests {
             .unwrap();
         assert!(v >= 1);
         let tables: i64 = c
-            .query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table'", [], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert!(tables > 1, "全新库应有完整表结构");
 
@@ -2396,7 +2477,11 @@ mod tests {
         assert!(tx.execute_batch(broken).is_err(), "重复建表必须报错");
         tx.rollback().unwrap_or(());
         let leftover: i64 = c2
-            .query_row("SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'w0_t%'", [], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'w0_t%'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(leftover, 0, "事务失败后不得残留半截建表结果");
     }
@@ -2458,7 +2543,7 @@ mod tests {
         .unwrap();
         migrate_v20(&c).unwrap();
         migrate_v20(&c).unwrap(); // 幂等：description 不重复拼接
-        // color → manual_only；description 含 hint
+                                  // color → manual_only；description 含 hint
         let (mode, desc): (String, String) = c
             .query_row(
                 "SELECT input_mode, description FROM tag_facets WHERE key='color'",
@@ -2467,23 +2552,41 @@ mod tests {
             )
             .unwrap();
         assert_eq!(mode, "manual_only");
-        assert!(desc.contains("主色由算法呈现"), "hint 应并入 description: {desc}");
+        assert!(
+            desc.contains("主色由算法呈现"),
+            "hint 应并入 description: {desc}"
+        );
         let count = desc.matches("主色由算法呈现").count();
         assert_eq!(count, 1, "重跑不得重复拼接 hint");
         // purpose/technical（系统 + 0 标签）→ manual_only；custom 保持列默认 ai_and_manual
         for key in ["purpose", "technical"] {
             let m: String = c
-                .query_row("SELECT input_mode FROM tag_facets WHERE key=?1", [key], |r| r.get(0))
+                .query_row(
+                    "SELECT input_mode FROM tag_facets WHERE key=?1",
+                    [key],
+                    |r| r.get(0),
+                )
                 .unwrap();
             assert_eq!(m, "manual_only", "{key} 应为 manual_only");
         }
         let custom: String = c
-            .query_row("SELECT input_mode FROM tag_facets WHERE key='custom'", [], |r| r.get(0))
+            .query_row(
+                "SELECT input_mode FROM tag_facets WHERE key='custom'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
-        assert_eq!(custom, "ai_and_manual", "custom 是 AI 未知词落脚点，保持默认");
+        assert_eq!(
+            custom, "ai_and_manual",
+            "custom 是 AI 未知词落脚点，保持默认"
+        );
         // JSON 侧已清空（直接读原始 JSON：get_settings 会自动重建默认配置，不适合断言持久化状态）
         let raw: String = c
-            .query_row("SELECT value FROM settings WHERE key='app_settings'", [], |r| r.get(0))
+            .query_row(
+                "SELECT value FROM settings WHERE key='app_settings'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert!(
             !raw.contains("aiFacetConfigs") || raw.contains(r#""aiFacetConfigs":[]"#),
@@ -2525,7 +2628,11 @@ mod tests {
         assert_eq!(n, 3, "三个约束触发器应存在");
         // schema_features 登记
         let guard: i64 = c
-            .query_row("SELECT enabled FROM schema_features WHERE feature='tag_cycle_guard'", [], |r| r.get(0))
+            .query_row(
+                "SELECT enabled FROM schema_features WHERE feature='tag_cycle_guard'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(guard, 1, "tag_cycle_guard 应登记为启用");
     }
@@ -2561,7 +2668,11 @@ mod tests {
     fn cycle_creation_rejected() {
         let c = crate::db::init_memory().unwrap();
         let id_a: i64 = c
-            .query_row("INSERT INTO tags (name, facet_key) VALUES ('A','custom') RETURNING id", [], |r| r.get(0))
+            .query_row(
+                "INSERT INTO tags (name, facet_key) VALUES ('A','custom') RETURNING id",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         let id_b: i64 = c
             .query_row("INSERT INTO tags (name, parent_id, facet_key) VALUES ('B',?1,'custom') RETURNING id", [id_a], |r| r.get(0))
@@ -2570,11 +2681,13 @@ mod tests {
             .query_row("INSERT INTO tags (name, parent_id, facet_key) VALUES ('C',?1,'custom') RETURNING id", [id_b], |r| r.get(0))
             .unwrap();
         // 把 A 挂到 C 下 → 环
-        let err = c.execute("UPDATE tags SET parent_id=?1 WHERE id=?2", rusqlite::params![id_c, id_a]).unwrap_err();
-        assert!(
-            err.to_string().contains("循环"),
-            "应报环错误：{err}"
-        );
+        let err = c
+            .execute(
+                "UPDATE tags SET parent_id=?1 WHERE id=?2",
+                rusqlite::params![id_c, id_a],
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("循环"), "应报环错误：{err}");
     }
 
     /// F1-c：新父深度 6 + 被移动子树高度 4 = 10 层 → 拒绝（不能只查新父深度）。
@@ -2594,7 +2707,11 @@ mod tests {
         }
         // 另起 4 层子树：sub_root（顶部）→ sub1 → sub2 → sub3
         let sub_root: i64 = c
-            .query_row("INSERT INTO tags (name, facet_key) VALUES ('sub_root','custom') RETURNING id", [], |r| r.get(0))
+            .query_row(
+                "INSERT INTO tags (name, facet_key) VALUES ('sub_root','custom') RETURNING id",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         let mut child = sub_root;
         for i in 1..4 {
@@ -2609,7 +2726,10 @@ mod tests {
         // 把子树**顶部**（sub_root，高 4 含自身）挂到 anchor5（深 6）下
         // → anc(新父)=6 + des(sub_root 子树)=3 → 6+3=9 > 8 → 拒绝
         let err = c
-            .execute("UPDATE tags SET parent_id=?1 WHERE id=?2", rusqlite::params![anchor, sub_root])
+            .execute(
+                "UPDATE tags SET parent_id=?1 WHERE id=?2",
+                rusqlite::params![anchor, sub_root],
+            )
             .unwrap_err();
         assert!(
             err.to_string().contains("层级") || err.to_string().contains("8 层"),
@@ -2677,16 +2797,29 @@ mod tests {
     fn recursive_cte_terminates_on_existing_cycle() {
         let c = crate::db::init_memory().unwrap();
         let id_a: i64 = c
-            .query_row("INSERT INTO tags (name, facet_key) VALUES ('CA','custom') RETURNING id", [], |r| r.get(0))
+            .query_row(
+                "INSERT INTO tags (name, facet_key) VALUES ('CA','custom') RETURNING id",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         let id_b: i64 = c
             .query_row("INSERT INTO tags (name, parent_id, facet_key) VALUES ('CB',?1,'custom') RETURNING id", [id_a], |r| r.get(0))
             .unwrap();
         // 直接改 SQL 造环：B 的父已是 A，再把 A 的父改成 B（绕过触发器：先删触发器）
-        c.execute_batch("DROP TRIGGER trg_tags_no_cycle; DROP TRIGGER trg_tags_max_depth_au;").unwrap();
-        c.execute("UPDATE tags SET parent_id=?1 WHERE id=?2", rusqlite::params![id_b, id_a]).unwrap();
+        c.execute_batch("DROP TRIGGER trg_tags_no_cycle; DROP TRIGGER trg_tags_max_depth_au;")
+            .unwrap();
+        c.execute(
+            "UPDATE tags SET parent_id=?1 WHERE id=?2",
+            rusqlite::params![id_b, id_a],
+        )
+        .unwrap();
         // 另加一个正常根，保证 list_tree 顶层有内容（环节点成对互为父子，无根）
-        c.execute("INSERT INTO tags (name, facet_key) VALUES ('正常根','custom')", []).unwrap();
+        c.execute(
+            "INSERT INTO tags (name, facet_key) VALUES ('正常根','custom')",
+            [],
+        )
+        .unwrap();
         // list_tree 不应挂死（深度上限让递归终止）
         let tree = super::super::tags::list_tree(&c).unwrap();
         assert!(!tree.is_empty(), "至少应有正常根节点");
@@ -2748,11 +2881,19 @@ mod tests {
         // 再跑一次 V22a（幂等）触发回填 UPDATE
         migrate_v22a(&c).unwrap();
         let state: String = c
-            .query_row("SELECT review_state FROM asset_tags WHERE tag_id=?1", [tag_id], |r| r.get(0))
+            .query_row(
+                "SELECT review_state FROM asset_tags WHERE tag_id=?1",
+                [tag_id],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(state, "ai_reviewed", "已确认的 AI 标签应回填为 ai_reviewed");
         let manual_state: String = c
-            .query_row("SELECT review_state FROM asset_tags WHERE tag_id=?1", [tag_manual], |r| r.get(0))
+            .query_row(
+                "SELECT review_state FROM asset_tags WHERE tag_id=?1",
+                [tag_manual],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(manual_state, "manual");
     }

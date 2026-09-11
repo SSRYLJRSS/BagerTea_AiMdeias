@@ -1351,9 +1351,7 @@ fn w1_refill_real_library_rw2_dimensions() {
     println!("RW2 宽高缺失（回填前）: {before}");
     drop(conn);
 
-    let db = Arc::new(Mutex::new(
-        rusqlite::Connection::open(&db_path).unwrap(),
-    ));
+    let db = Arc::new(Mutex::new(rusqlite::Connection::open(&db_path).unwrap()));
     let cancel = AtomicBool::new(false);
     let ids = {
         let c = db.lock().unwrap();
@@ -1362,7 +1360,10 @@ fn w1_refill_real_library_rw2_dimensions() {
     println!("候选 id 数: {}", ids.len());
     let start = std::time::Instant::now();
     let summary = bagertea_ai_media_v2_lib::services::media_refill::rescan_assets_dimensions(
-        &db, &ids, &cancel, |p| {
+        &db,
+        &ids,
+        &cancel,
+        |p| {
             if p.done % 20 == 0 {
                 println!("进度 {}/{}", p.done, p.total);
             }
@@ -1371,7 +1372,11 @@ fn w1_refill_real_library_rw2_dimensions() {
     .unwrap();
     println!(
         "回填完成：total={} success={} failed={} skipped={} 耗时 {:?}",
-        summary.total, summary.success, summary.failed, summary.skipped, start.elapsed()
+        summary.total,
+        summary.success,
+        summary.failed,
+        summary.skipped,
+        start.elapsed()
     );
     let c = db.lock().unwrap();
     let after: i64 = c

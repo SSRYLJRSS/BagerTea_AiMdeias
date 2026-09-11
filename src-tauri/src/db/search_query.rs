@@ -67,7 +67,6 @@ pub const ALL_METADATA_KEYS: &[&str] = &[
     "longitude",
     "has_location",
     "rating",
-    "favorite",
     "taken_at",
     "created_at",
     "modified_at",
@@ -157,11 +156,6 @@ fn key_spec(key: &str) -> Option<KeySpec> {
         // W2-8：评级（0–5；0 = 未评级）。INTEGER 列自带 0 默认值，非 NULL 语义。
         "rating" => KeySpec {
             kind: ValueKind::Number,
-            null_guard: None,
-        },
-        // W2-8：收藏有无（分面用）：仿 has_location 编译为 CASE 表达式，值域 yes/no
-        "favorite" => KeySpec {
-            kind: ValueKind::String,
             null_guard: None,
         },
         "taken_at" | "created_at" | "modified_at" => KeySpec {
@@ -258,8 +252,13 @@ const ISO_PRESETS: &[(&str, f64)] = &[
     ("ISO 51200", 51200.0),
     ("ISO 102400", 102400.0),
 ];
-const FOCAL_PRESETS: &[(&str, f64)] =
-    &[("24mm", 24.0), ("35mm", 35.0), ("50mm", 50.0), ("85mm", 85.0), ("200mm", 200.0)];
+const FOCAL_PRESETS: &[(&str, f64)] = &[
+    ("24mm", 24.0),
+    ("35mm", 35.0),
+    ("50mm", 50.0),
+    ("85mm", 85.0),
+    ("200mm", 200.0),
+];
 
 /// §5.1 精确表：15 个数值型 key 的值域/单位/预设。追加新数值 key 必须同步加 spec
 /// （双向测试 numeric_domain_single_source 会抓漏）。
@@ -512,7 +511,7 @@ fn build_domain(s: &'static NumericSpec) -> NumericDomain {
 
 /// 全部内置数值 domain（get_numeric_domains 命令的数据源）。
 pub fn numeric_domains() -> Vec<NumericDomain> {
-    NUMERIC_SPECS.iter().map(|s| build_domain(s)).collect()
+    NUMERIC_SPECS.iter().map(build_domain).collect()
 }
 
 /// V24（§5.3/Phase 7-8）：数值分面的 domain —— 由 tag_facets 的 num_* 五列即时生成，
@@ -538,20 +537,22 @@ pub fn facet_numeric_domains(conn: &rusqlite::Connection) -> Vec<NumericDomain> 
     });
     let Ok(rows) = rows else { return Vec::new() };
     rows.filter_map(|r| r.ok())
-        .map(|(key, name, min, max, unit, decimals, step)| NumericDomain {
-            key: format!("facet:{key}"),
-            label: Some(name),
-            unit: "custom".into(),
-            unit_label: if unit.is_empty() { None } else { Some(unit) },
-            min,
-            max,
-            step,
-            decimals: decimals.clamp(0, 6) as u8,
-            presets: Vec::new(),
-            circular: false,
-            suspicious_below: None,
-            allowed_ops: NUMERIC_OPS.iter().map(|x| x.to_string()).collect(),
-        })
+        .map(
+            |(key, name, min, max, unit, decimals, step)| NumericDomain {
+                key: format!("facet:{key}"),
+                label: Some(name),
+                unit: "custom".into(),
+                unit_label: if unit.is_empty() { None } else { Some(unit) },
+                min,
+                max,
+                step,
+                decimals: decimals.clamp(0, 6) as u8,
+                presets: Vec::new(),
+                circular: false,
+                suspicious_below: None,
+                allowed_ops: NUMERIC_OPS.iter().map(|x| x.to_string()).collect(),
+            },
+        )
         .collect()
 }
 
@@ -577,8 +578,6 @@ fn allowed_ops(key: &str) -> &'static [&'static str] {
         "video_codec" | "audio_codec" | "camera" | "lens" | "shutter" => &["eq", "in", "contains"],
         "has_location" => &["eq", "in"],
         "palette_dominant" | "palette_top3" | "palette_any" => &["eq", "in"],
-        // W2-8：收藏有无
-        "favorite" => &["eq", "in"],
         "taken_at" | "created_at" | "modified_at" => &["gte", "lte", "between"],
         "folder" => &["eq", "in"],
         _ => &[],
@@ -613,8 +612,6 @@ fn value_expr(key: &str) -> String {
             "(CASE WHEN a.latitude IS NOT NULL AND a.longitude IS NOT NULL THEN 'yes' ELSE 'no' END)"
                 .into()
         }
-        // W2-8：收藏有无（favorite 列 0/1，分面侧呈现 yes/no）
-        "favorite" => "(CASE WHEN a.favorite = 1 THEN 'yes' ELSE 'no' END)".into(),
         "rating" => "a.rating".into(),
         "taken_at" => "a.taken_at".into(),
         "created_at" => "a.created_at".into(),
@@ -675,9 +672,9 @@ fn next_day_ms(s: &str) -> AppResult<i64> {
 /// 把「静默 0 结果」变成「0 结果 + 一句人话」。只对数值型键的单值/min/max 生效。
 /// C-1：palette_* 编译为对 asset_palette_colors 的 EXISTS（值 = 折叠色名 → 桶 id）。
 /// - palette_dominant → rank=0；palette_top3 → rank<3；palette_any → 不限 rank。
-/// 实测关系表覆盖索引（ix_apc_bucket）；like/字符串列是 SCAN，故不用。
-/// U-3：eq + 数字 min = 占比阈值（「前三色含红且红占 ≥50%」→ bucket=红 AND ratio>=0.5）。
-/// 复用数值条件的 min 字段表达阈值，allowed_ops 仍只 eq/in —— AI schema 与校验面不变。
+///   实测关系表覆盖索引（ix_apc_bucket）；like/字符串列是 SCAN，故不用。
+///   U-3：eq + 数字 min = 占比阈值（「前三色含红且红占 ≥50%」→ bucket=红 AND ratio>=0.5）。
+///   复用数值条件的 min 字段表达阈值，allowed_ops 仍只 eq/in —— AI schema 与校验面不变。
 fn compile_palette_meta(f: &MetadataFilter) -> AppResult<Option<CompiledMetadata>> {
     let rank_sql = match f.key.as_str() {
         "palette_dominant" => Some(" AND apc.rank = 0"),
@@ -742,7 +739,9 @@ fn compile_palette_meta(f: &MetadataFilter) -> AppResult<Option<CompiledMetadata
     let mut ids: Vec<i64> = Vec::new();
     for name in &names {
         let id = crate::db::palette_bucket::bucket_id_of_name(name).ok_or_else(|| {
-            AppError::msg(format!("未知色名：{name}（可用：红/橙/黄/黄绿/绿/青绿/青/天蓝/蓝/紫/品红/玫红/黑/灰/白）"))
+            AppError::msg(format!(
+                "未知色名：{name}（可用：红/橙/黄/黄绿/绿/青绿/青/天蓝/蓝/紫/品红/玫红/黑/灰/白）"
+            ))
         })?;
         ids.push(id);
     }
@@ -811,7 +810,11 @@ pub fn dimension_warnings(f: &MetadataFilter) -> Vec<String> {
             _ => None,
         };
         if let Some(m) = msg {
-            out.push(if tag.is_empty() { m } else { format!("{tag}：{m}") });
+            out.push(if tag.is_empty() {
+                m
+            } else {
+                format!("{tag}：{m}")
+            });
         }
     };
     if let Some(v) = &f.value {
@@ -1136,7 +1139,7 @@ fn compile_folder(f: &MetadataFilter, spec: &KeySpec) -> AppResult<Option<Compil
                 .value
                 .as_ref()
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| AppError::msg(format!("字段 folder 的 eq 需要路径 value")))?;
+                .ok_or_else(|| AppError::msg("字段 folder 的 eq 需要路径 value".to_string()))?;
             let mut params = Vec::new();
             let cond = dir_cond(v, &mut params)?;
             Ok(Some(CompiledMetadata { sql: cond, params }))
@@ -1145,7 +1148,7 @@ fn compile_folder(f: &MetadataFilter, spec: &KeySpec) -> AppResult<Option<Compil
             let values = f
                 .values
                 .as_ref()
-                .ok_or_else(|| AppError::msg(format!("字段 folder 的 in 需要 values 数组")))?;
+                .ok_or_else(|| AppError::msg("字段 folder 的 in 需要 values 数组".to_string()))?;
             if values.is_empty() {
                 return Err(AppError::msg("folder 的 in values 不能为空"));
             }
@@ -1261,7 +1264,9 @@ mod tests {
     #[test]
     fn latitude_longitude_numeric_ops_compile() {
         // between 正常区间（南半球负纬度合法）
-        let c = compile_metadata(&between("latitude", -45, 45)).unwrap().unwrap();
+        let c = compile_metadata(&between("latitude", -45, 45))
+            .unwrap()
+            .unwrap();
         assert!(c.sql.contains("a.latitude >= ?1") && c.sql.contains("a.latitude <= ?2"));
         assert!(c.sql.contains("IS NOT NULL"), "NULL 守卫不得命中无定位素材");
         // lt 负值（西经）不报「不能为负」
@@ -1289,7 +1294,11 @@ mod tests {
             max: None,
         };
         let c = compile_metadata(&eq).unwrap().unwrap();
-        assert!(c.sql.contains("CASE WHEN a.latitude IS NOT NULL"), "实际：{}", c.sql);
+        assert!(
+            c.sql.contains("CASE WHEN a.latitude IS NOT NULL"),
+            "实际：{}",
+            c.sql
+        );
         // 不支持 gt
         let gt = MetadataFilter {
             key: "has_location".into(),
@@ -1350,7 +1359,15 @@ mod tests {
         let number_keys: Vec<&str> = ALL_METADATA_KEYS
             .iter()
             .copied()
-            .filter(|k| matches!(key_spec(k), Some(KeySpec { kind: ValueKind::Number, .. })))
+            .filter(|k| {
+                matches!(
+                    key_spec(k),
+                    Some(KeySpec {
+                        kind: ValueKind::Number,
+                        ..
+                    })
+                )
+            })
             .collect();
         assert_eq!(
             spec_keys.len(),
@@ -1364,7 +1381,10 @@ mod tests {
             assert!(
                 matches!(
                     key_spec(k),
-                    Some(KeySpec { kind: ValueKind::Number, .. })
+                    Some(KeySpec {
+                        kind: ValueKind::Number,
+                        ..
+                    })
                 ),
                 "spec 里的 key 必须是 Number 类：{k}"
             );
@@ -1382,7 +1402,13 @@ mod tests {
                 s.key
             );
             let d = numeric_domain(s.key).expect("spec 有 domain");
-            assert_eq!(d.allowed_ops, NUMERIC_OPS.iter().map(|x| x.to_string()).collect::<Vec<_>>());
+            assert_eq!(
+                d.allowed_ops,
+                NUMERIC_OPS
+                    .iter()
+                    .map(|x| x.to_string())
+                    .collect::<Vec<_>>()
+            );
             assert_eq!(d.circular, s.circular, "{}", s.key);
             assert_eq!(d.suspicious_below, s.suspicious_below, "{}", s.key);
         }
@@ -1405,8 +1431,11 @@ mod tests {
         assert_eq!(all.len(), NUMERIC_SPECS.len());
         let iso = all.iter().find(|d| d.key == "iso").expect("iso domain");
         assert!(!iso.presets.is_empty(), "iso 应有档位预设");
-        assert!(iso.presets.iter().any(|(l, v)| l == "ISO 800" && (*v - 800.0).abs() < 1e-9));
-        let json = serde_json::to_value(&iso).unwrap();
+        assert!(iso
+            .presets
+            .iter()
+            .any(|(l, v)| l == "ISO 800" && (*v - 800.0).abs() < 1e-9));
+        let json = serde_json::to_value(iso).unwrap();
         assert_eq!(json["allowedOps"][0], "eq");
         assert!(json.get("unitLabel").is_none(), "iso 无单位后缀");
         let hue = all.iter().find(|d| d.key == "dominant_hue").unwrap();
@@ -1416,7 +1445,11 @@ mod tests {
         let focal = all.iter().find(|d| d.key == "focal").unwrap();
         assert_eq!(focal.unit_label.as_deref(), Some("mm"));
         let fs = all.iter().find(|d| d.key == "file_size").unwrap();
-        assert_eq!(fs.suspicious_below, Some(1024.0), "file_size 量纲阈值保持 1KB");
+        assert_eq!(
+            fs.suspicious_below,
+            Some(1024.0),
+            "file_size 量纲阈值保持 1KB"
+        );
     }
 
     /// Phase 4（§5.3）：dimension_warnings 的量纲阈值来自 domain（改了 spec 就改阈值，不另藏常数）。

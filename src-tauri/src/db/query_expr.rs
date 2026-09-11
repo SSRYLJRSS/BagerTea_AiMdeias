@@ -287,8 +287,8 @@ pub fn from_filter(
             cond: LeafCond::Metadata { filter: m.clone() },
         });
     }
-    if leaves.len() == 1 {
-        leaves.into_iter().next().unwrap()
+    if let [only] = leaves.as_slice() {
+        only.clone()
     } else {
         QueryExpr::And { children: leaves }
     }
@@ -310,7 +310,7 @@ pub fn compile_leaf_with(
     match cond {
         LeafCond::Search { value, scope } => {
             let pred = super::search::build_search_predicate(conn, value, *scope)?
-                .unwrap_or_else(|| super::search::SearchPredicate::empty());
+                .unwrap_or_else(super::search::SearchPredicate::empty);
             let sql = if pred.sql.is_empty() {
                 "1=0".to_string()
             } else {
@@ -343,7 +343,7 @@ pub fn compile_leaf_with(
             let valid_ids = filter_tags_by_facet(conn, facet_key, tag_ids, warnings);
             let mut ids = valid_ids;
             // S5：termQuery 先按 term_match 扩展成一组 tag_id，与显式 tag_ids 求并集
-            let has_term = term_query.as_deref().map(str::trim).map_or(false, |s| !s.is_empty());
+            let has_term = term_query.as_deref().is_some_and(|s| !s.trim().is_empty());
             if has_term {
                 let raw = term_query.as_deref().unwrap_or("").trim();
                 let normalized = super::tags::normalize_name(raw);
@@ -393,7 +393,9 @@ pub fn compile_leaf_with(
         }
         LeafCond::FacetHasAny { facet_key } => {
             if !facet_searchable(conn, facet_key) {
-                tracing::warn!("分面 {facet_key} 不存在或 cfg_searchable=0，剔除该条件（查询继续）");
+                tracing::warn!(
+                    "分面 {facet_key} 不存在或 cfg_searchable=0，剔除该条件（查询继续）"
+                );
                 warnings.push(format!("分面「{facet_key}」已停用或不存在，已忽略该条件。"));
                 return Ok(("1=1".to_string(), Vec::new()));
             }
@@ -406,7 +408,9 @@ pub fn compile_leaf_with(
         }
         LeafCond::FacetMissing { facet_key } => {
             if !facet_searchable(conn, facet_key) {
-                tracing::warn!("分面 {facet_key} 不存在或 cfg_searchable=0，剔除该条件（查询继续）");
+                tracing::warn!(
+                    "分面 {facet_key} 不存在或 cfg_searchable=0，剔除该条件（查询继续）"
+                );
                 warnings.push(format!("分面「{facet_key}」已停用或不存在，已忽略该条件。"));
                 return Ok(("1=1".to_string(), Vec::new()));
             }
@@ -455,9 +459,9 @@ pub fn compile_leaf_with(
                 return Ok(("1=1".to_string(), Vec::new()));
             }
             let mut params: Vec<Value> = vec![Value::Text(facet_key.clone())];
-            let mut sql = format!(
+            let mut sql =
                 "EXISTS (SELECT 1 FROM asset_facet_numbers afn WHERE afn.asset_id = a.id AND afn.facet_key = ?1"
-            );
+                    .to_string();
             match op.as_str() {
                 "eq" => {
                     params.push((*value).into());
@@ -528,7 +532,9 @@ fn filter_tags_by_facet(
     let dropped = tag_ids.len() - valid.len();
     if dropped > 0 {
         tracing::warn!("剔除 {dropped} 个不属于分面 {facet_key} 的标签（查询继续）");
-        warnings.push(format!("有 {dropped} 个标签不属于分面「{facet_key}」，已剔除。"));
+        warnings.push(format!(
+            "有 {dropped} 个标签不属于分面「{facet_key}」，已剔除。"
+        ));
     }
     valid
 }
@@ -539,9 +545,7 @@ fn filter_tags_by_facet(
 fn facet_searchable(conn: &Connection, facet_key: &str) -> bool {
     let searchable: Option<i64> = conn
         .query_row(
-            &format!(
-                "SELECT 1 FROM tag_facets f WHERE f.key = ?1 AND {EFF_SEARCH}"
-            ),
+            &format!("SELECT 1 FROM tag_facets f WHERE f.key = ?1 AND {EFF_SEARCH}"),
             [facet_key],
             |r| r.get(0),
         )
@@ -951,7 +955,11 @@ mod tests {
         assert_eq!(sql, "1=0", "零命中 → 不可满足（搜索框零结果归因于此）");
         // 条件本身未被改写
         match &leaf {
-            LeafCond::Tag { term_query, term_match, .. } => {
+            LeafCond::Tag {
+                term_query,
+                term_match,
+                ..
+            } => {
                 assert_eq!(term_query.as_deref(), Some("森材"), "termQuery 不得被改写");
                 assert_eq!(*term_match, tags::TermMatch::Alias, "termMatch 不得被改写");
             }
@@ -959,7 +967,9 @@ mod tests {
         }
         // 有可点建议：相近词命中「森林」
         assert!(
-            warnings.iter().any(|w| w.contains("试试相近的词") && w.contains("森林")),
+            warnings
+                .iter()
+                .any(|w| w.contains("试试相近的词") && w.contains("森林")),
             "零命中应建议相近词「森林」: {warnings:?}"
         );
 

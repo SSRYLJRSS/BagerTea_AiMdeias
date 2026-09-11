@@ -250,7 +250,10 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
 
   patchLocal: (ids, patch) => {
     const hit = new Set(ids);
-    set((s) => ({ items: s.items.map((a) => (hit.has(a.id) ? { ...a, ...patch } : a)) }));
+    set((s) => {
+      const items = s.items.map((a) => (hit.has(a.id) ? { ...a, ...patch } : a));
+      return { items, viewItems: applyKinshipView(items) };
+    });
   },
 
   refreshPaletteFields: async (updatedIds) => {

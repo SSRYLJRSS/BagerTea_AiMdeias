@@ -56,7 +56,9 @@ pub fn create_tag_facet(
 
 /// W2-2 + F8：合并编辑命令（6 字段一个事务）。旧 update_tag_facet_display /
 /// update_tag_facet_rules 两个即时写命令已在 F8 删除。
+// 参数即 IPC 契约（前端 invoke 按字段名传参），收进结构体会破坏前端调用，故平铺并豁免。
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub fn update_tag_facet(
     state: State<AppState>,
     key: String,
@@ -69,8 +71,14 @@ pub fn update_tag_facet(
 ) -> AppResult<()> {
     let conn = lock_db(&state)?;
     crate::db::tag_facets::update_facet(
-        &conn, &key, &display_name, &description, &input_mode,
-        &selection_mode, max_items, &applies_to,
+        &conn,
+        &key,
+        &display_name,
+        &description,
+        &input_mode,
+        &selection_mode,
+        max_items,
+        &applies_to,
     )
 }
 
@@ -158,11 +166,8 @@ pub fn create_canonical_tag(
     let conn = lock_db(&state)?;
     crate::db::tag_facets::get(&conn, &facet_key)?;
     if let Some(pid) = parent_id {
-        let parent_facet: String = conn.query_row(
-            "SELECT facet_key FROM tags WHERE id = ?1 AND status = 'active'",
-            [pid],
-            |r| r.get(0),
-        )?;
+        let parent_facet = tags::active_facet_key(&conn, pid)?
+            .ok_or_else(|| AppError::msg("父标签不存在或已停用"))?;
         if parent_facet != facet_key {
             return Err(AppError::msg("标签不能挂到其他分面下"));
         }
@@ -247,10 +252,7 @@ pub fn delete_tag(state: State<AppState>, id: i64) -> AppResult<()> {
 #[tauri::command]
 pub fn deactivate_tag(state: State<AppState>, id: i64) -> AppResult<()> {
     let conn = lock_db(&state)?;
-    let is_system: bool =
-        conn.query_row("SELECT is_system != 0 FROM tags WHERE id = ?1", [id], |r| {
-            r.get(0)
-        })?;
+    let is_system = tags::is_system(&conn, id)?;
     if is_system {
         return Err(AppError::msg("系统分面根标签不能停用"));
     }
@@ -328,7 +330,12 @@ pub fn list_tag_constraint_features(
     state: State<AppState>,
 ) -> AppResult<Vec<crate::db::schema_features::SchemaFeatureStatus>> {
     // 用缓存（启动/apply 后刷新）；缓存空时回退实时读
-    let cached = state.schema_features.lock().ok().map(|c| c.clone()).unwrap_or_default();
+    let cached = state
+        .schema_features
+        .lock()
+        .ok()
+        .map(|c| c.clone())
+        .unwrap_or_default();
     if !cached.is_empty() {
         return Ok(cached);
     }
@@ -450,7 +457,9 @@ pub fn convert_facet_kind(
 }
 
 /// V24（Phase 7-7）：分面类型设置（number→tag 禁止；已有标签的 tag→number 须走转换预览）。
+// 参数即 IPC 契约（前端 invoke 按字段名传参），收进结构体会破坏前端调用，故平铺并豁免。
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub fn set_facet_kind(
     state: State<AppState>,
     key: String,

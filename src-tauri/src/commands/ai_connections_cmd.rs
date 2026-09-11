@@ -57,7 +57,9 @@ pub fn list_ai_connections(state: State<AppState>) -> AppResult<Vec<AiConnection
 
 /// 保存连接档案。api_key 为 Some(非空) 时写入系统凭据（keyring）并置 api_key_ref；
 /// 为空/None 时保留原有密钥配置（不覆盖）。
+// 参数即 IPC 契约（前端 invoke 按字段名传参），收进结构体会破坏前端调用，故平铺并豁免。
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub fn save_ai_connection(
     state: State<AppState>,
     id: String,
@@ -134,7 +136,7 @@ pub fn set_ai_usage_binding(
     }
     let conn = lock_db(&state)?;
     let Some(cid) = connection_id.filter(|s| !s.is_empty()) else {
-        conn.execute("DELETE FROM ai_usage_bindings WHERE usage = ?1", [&usage])?;
+        ai_connections::unbind_usage(&conn, &usage)?;
         return Ok(());
     };
     // 校验连接存在
@@ -152,13 +154,7 @@ pub fn get_ai_usage_bindings(
     let conn = lock_db(&state)?;
     let mut out = std::collections::HashMap::new();
     for usage in ["super_search", "tagging"] {
-        let id: Option<String> = conn
-            .query_row(
-                "SELECT connection_id FROM ai_usage_bindings WHERE usage = ?1",
-                [usage],
-                |r| r.get(0),
-            )
-            .ok();
+        let id = ai_connections::binding_id(&conn, usage)?;
         out.insert(usage.to_string(), id);
     }
     Ok(out)

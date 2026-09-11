@@ -136,7 +136,7 @@ export function markImportCancelling() {
 }
 
 let subscribed = false;
-let unlisteners: UnlistenFn[] = [];
+const unlisteners: UnlistenFn[] = [];
 
 /** 订阅入库/导出进度事件（幂等，App 挂载时调用一次）。
  *  FB6 需求一：AI 打标进度不再进全局任务条——页面内 AiTaggingPage「当前批次」进度条是唯一

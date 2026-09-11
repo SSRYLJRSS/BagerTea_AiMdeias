@@ -18,6 +18,13 @@ use std::sync::{Condvar, Mutex};
 
 use image::{DynamicImage, GenericImageView};
 
+/// 读取常规图片或 RAW 文件的尺寸。RAW 由 rawler 兜底，调用方应在数据库锁外调用。
+pub fn probe_dimensions(src: &Path) -> Option<(u32, u32)> {
+    image::image_dimensions(src)
+        .ok()
+        .or_else(|| super::raw_decode::probe_dimensions(src))
+}
+
 // ---------------------------------------------------------------------------
 // 并发许可：最多 4 个解码并行（解码是 CPU 密集活，再多只会互相抢）
 // ---------------------------------------------------------------------------

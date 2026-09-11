@@ -7,7 +7,7 @@ import { useVirtualizer } from "@tanstack/react-virtual";
 import { useShallow } from "zustand/react/shallow";
 import AssetCard from "./AssetCard";
 import ContextMenu, { type MenuEntry } from "@/components/common/ContextMenu";
-import { getAssetUrls, revealInFolder, setFavorite, setRating } from "@/api/assets";
+import { getAssetUrls, revealInFolder, setRating } from "@/api/assets";
 import { openFileExternal } from "@/api/import";
 import { useElementSize, useEscape } from "@/hooks/hooks";
 import { useLibraryStore } from "@/stores/libraryStore";
@@ -44,6 +44,8 @@ export interface AssetGridViewProps extends LibraryGridActions {
   /** R0-5：清除筛选按钮的回调。素材库缺省清 useLibraryStore.filter；
    *  超级搜索传 clearConditions（否则按钮对超搜条件完全无效）。 */
   onClearFilter?: () => void;
+  /** 外部数据源（超级搜索）的局部更新；素材库未传时使用 libraryStore。 */
+  patchListItem?: (ids: number[], patch: Partial<Asset>) => void;
   /** U-7③：空结果时的归零条件列表（来自 C-2 诊断）—— 每条可单点移除 */
   zeroingActions?: { key: string; label: string; onRemove: () => void }[];
 }
@@ -78,6 +80,7 @@ export default function AssetGridView({
   onSearchDominant,
   hasActiveFilter: hasActiveFilterProp,
   onClearFilter,
+  patchListItem,
   zeroingActions,
 }: AssetGridViewProps) {
   const { selected, truncated, selectionTotal, toggle, rangeTo, clear, setAll, invert } = useSelectionStore(
@@ -271,31 +274,11 @@ export default function AssetGridView({
     };
   }, [stepCell, scrollElementRef, ref]);
 
-  // W5b（§W5b）：收藏/评级 = 乐观更新 + 失败回滚（patchLocal 走刷新代际，不整页重载）。
+  // W5b（§W5b）：评级 = 乐观更新 + 失败回滚（patchLocal 走刷新代际，不整页重载）。
   const patchLocal = useCallback(
-    (ids: number[], patch: Partial<Asset>) => useLibraryStore.getState().patchLocal(ids, patch),
-    [],
-  );
-
-  const toggleFavorite = useCallback(
-    (ids: number[]) => {
-      if (ids.length === 0) return;
-      // 以当前第一张为准取反（批量操作：全部设成「收藏」或「取消收藏」）
-      const first = useLibraryStore.getState().items.find((a) => a.id === ids[0]);
-      const target = first?.favorite !== 1;
-      const prev = new Map(
-        ids.map((id) => [
-          id,
-          useLibraryStore.getState().items.find((a) => a.id === id)?.favorite,
-        ]),
-      );
-      patchLocal(ids, { favorite: target ? 1 : 0 });
-      void setFavorite(ids, target).catch((e) => {
-        ids.forEach((id) => patchLocal([id], { favorite: prev.get(id) }));
-        console.warn("收藏更新失败，已回滚：", e);
-      });
-    },
-    [patchLocal],
+    (ids: number[], patch: Partial<Asset>) =>
+      patchListItem ? patchListItem(ids, patch) : useLibraryStore.getState().patchLocal(ids, patch),
+    [patchListItem],
   );
 
   const applyRating = useCallback(
@@ -318,7 +301,7 @@ export default function AssetGridView({
   );
 
   // FB2-01：Ctrl/Cmd + = / - 增减一档（复用既有 keydown 效果，避开 INPUT 与菜单打开态）
-  // W5b（§W5b）：选片手不离键盘 —— 1–5 设评级、0 清除、F 切收藏（无修饰键，选中的素材生效）
+  // W5b（§W5b）：选片手不离键盘 —— 1–5 设评级、0 清除（无修饰键，选中的素材生效）
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (menu) return;
@@ -332,11 +315,6 @@ export default function AssetGridView({
         if (e.key === "0") {
           e.preventDefault();
           applyRating(0);
-          return;
-        }
-        if (e.key === "f" || e.key === "F") {
-          e.preventDefault();
-          toggleFavorite(Array.from(selected));
           return;
         }
       }
@@ -357,7 +335,7 @@ export default function AssetGridView({
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [selectAll, invertAll, menu, stepCell, applyRating, toggleFavorite, selected]);
+  }, [selectAll, invertAll, menu, stepCell, applyRating]);
 
   const handleContextMenu = useCallback(
     (asset: Asset, _index: number, e: React.MouseEvent) => {
@@ -437,8 +415,7 @@ export default function AssetGridView({
         onClick: onDelete,
       },
       { divider: true },
-      // W5b（§W5b）：右键收藏 + 评级子菜单（对选中集批量生效）
-      { label: "收藏", onClick: () => toggleFavorite(Array.from(selected)) },
+      // W5b（§W5b）：评级子菜单（对选中集批量生效）
       {
         label: "评级",
         children: [
@@ -464,7 +441,7 @@ export default function AssetGridView({
       ...common,
       { label: "取消选择", onClick: clear },
     ];
-  }, [selected.size, truncated, selectAll, invertAll, guardTruncated, onAiTag, onAssignTags, onExport, onMove, onDelete, copyPaths, revealFirst, openFirstExternal, clear, toggleFavorite, applyRating]);
+  }, [selected.size, truncated, selectAll, invertAll, guardTruncated, onAiTag, onAssignTags, onExport, onMove, onDelete, copyPaths, revealFirst, openFirstExternal, clear, applyRating]);
 
   if (items.length === 0) {
     return (
@@ -571,7 +548,6 @@ export default function AssetGridView({
                     onPreview={handlePreview}
                     onContextMenu={handleContextMenu}
                     onSearchDominant={onSearchDominant}
-                    onToggleFavorite={(a) => toggleFavorite([a.id])}
                   />
                 );
               })}

@@ -316,9 +316,9 @@ pub fn parse_ffprobe_json(bytes: &[u8]) -> Result<VideoMeta, ProbeError> {
                         }
                     }
                 }
-                Some("audio") => {
+                Some("audio")
                     // 只取第一条音轨作为主音轨摘要（多音轨完整信息保留在 raw_json）
-                    if meta.audio_codec.is_none() {
+                    if meta.audio_codec.is_none() => {
                         meta.audio_codec = s.codec_name.clone();
                         meta.audio_sample_rate =
                             s.sample_rate.as_deref().and_then(|v| v.parse::<i64>().ok());
@@ -327,7 +327,6 @@ pub fn parse_ffprobe_json(bytes: &[u8]) -> Result<VideoMeta, ProbeError> {
                         // 缺失时保持 None（UI 显示「未提供」），不再误把 language/title 当布局。
                         meta.audio_layout = s.channel_layout.clone();
                     }
-                }
                 _ => {}
             }
         }
@@ -435,8 +434,7 @@ pub fn probe(path: &Path) -> Result<VideoMeta, ProbeError> {
             Err(_) => {
                 let _ = stdout_reader.join();
                 let _ = stderr_reader.join();
-                return Err(ProbeError::Spawn(std::io::Error::new(
-                    std::io::ErrorKind::Other,
+                return Err(ProbeError::Spawn(std::io::Error::other(
                     "等待 ffprobe 失败",
                 )));
             }
@@ -446,12 +444,8 @@ pub fn probe(path: &Path) -> Result<VideoMeta, ProbeError> {
     let stdout = stdout_reader.join().unwrap_or_default();
     let stderr_bytes = stderr_reader.join().unwrap_or_default();
 
-    let status = status.ok_or_else(|| {
-        ProbeError::Spawn(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "ffprobe 未返回状态",
-        ))
-    })?;
+    let status =
+        status.ok_or_else(|| ProbeError::Spawn(std::io::Error::other("ffprobe 未返回状态")))?;
     if !status.success() {
         let stderr = String::from_utf8_lossy(&stderr_bytes).trim().to_string();
         return Err(ProbeError::NonZeroExit {
@@ -571,8 +565,7 @@ pub fn transcode_to_h264(
         match child.try_wait() {
             Ok(Some(st)) => break Some(st),
             Ok(None) => {
-                if Instant::now() >= deadline || cancel.map_or(false, |c| c.load(Ordering::Relaxed))
-                {
+                if Instant::now() >= deadline || cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
                     let _ = child.kill();
                     let _ = child.wait();
                     let _ = stderr_reader.join();

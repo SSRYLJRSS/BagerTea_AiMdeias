@@ -20,11 +20,9 @@ use rusqlite::types::Value;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
-use super::query_expr::{
-    compile_expr_with, compile_leaf_with, validate_expr, LeafCond, QueryExpr,
-};
-use super::sql_utils::offset_placeholders;
+use super::query_expr::{compile_expr_with, compile_leaf_with, validate_expr, LeafCond, QueryExpr};
 use super::search_query::ALL_SORT_KEYS;
+use super::sql_utils::offset_placeholders;
 use crate::error::{AppError, AppResult};
 
 /// S6：plan 结构版本（加/删/改字段语义时 +1，须写 migrate 函数）。
@@ -81,7 +79,10 @@ pub enum Fusion {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum Ranking {
-    Field { key: String, dir: String },
+    Field {
+        key: String,
+        dir: String,
+    },
     /// 相关度排序（should 加权 + plan.retrievers 各路 RRF 融合）。本变体存在 = 走相关度。
     Relevance,
 }
@@ -178,7 +179,10 @@ impl SearchWarning {
 impl SearchPlanV3 {
     pub fn field_ranking(key: &str, dir: &str) -> SearchPlanV3 {
         SearchPlanV3 {
-            ranking: Ranking::Field { key: key.into(), dir: dir.into() },
+            ranking: Ranking::Field {
+                key: key.into(),
+                dir: dir.into(),
+            },
             ..Default::default()
         }
     }
@@ -265,7 +269,9 @@ pub fn validate_search_plan(plan: &SearchPlanV3) -> AppResult<()> {
                 sc.weight
             )));
         }
-        validate_expr(&QueryExpr::Leaf { cond: sc.cond.clone() })?;
+        validate_expr(&QueryExpr::Leaf {
+            cond: sc.cond.clone(),
+        })?;
     }
     for wr in &plan.retrievers.retrievers {
         if !wr.weight.is_finite() || wr.weight <= 0.0 {
@@ -410,7 +416,11 @@ pub fn compile_search_plan_with(
                 .ok_or_else(|| AppError::msg(format!("非法排序字段：{key}")))?;
             sortv_inner = format!(", {col} AS sortv");
             sortv_keep = ", x.sortv AS sortv".to_string();
-            let dir = if dir.eq_ignore_ascii_case("asc") { "ASC" } else { "DESC" };
+            let dir = if dir.eq_ignore_ascii_case("asc") {
+                "ASC"
+            } else {
+                "DESC"
+            };
             // B9（方案 A）：字段排序为主键，score DESC 为次级（同值命中优先项的排前面），
             // 尾缀仍为 id DESC → 分页稳定。
             order_sql = format!("sortv {dir}, score DESC, id DESC");
@@ -422,9 +432,7 @@ pub fn compile_search_plan_with(
     let inner_sel = if marker_sql.is_empty() {
         format!("SELECT a.id{sortv_inner}\n    FROM assets a\n   WHERE {base_sql}")
     } else {
-        format!(
-            "SELECT a.id, {marker_sql}{sortv_inner}\n    FROM assets a\n   WHERE {base_sql}"
-        )
+        format!("SELECT a.id, {marker_sql}{sortv_inner}\n    FROM assets a\n   WHERE {base_sql}")
     };
     let mid_sel = format!(
         "SELECT x.id, {score_expr} AS score, {hits_expr} AS hits{sortv_keep}\n    FROM (\n  {inner_sel}\n) x"
@@ -480,7 +488,11 @@ pub fn run_search_plan_with(
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt
         .query_map(rusqlite::params_from_iter(params.iter()), |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?, r.get::<_, f64>(2)?))
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, f64>(1)?,
+                r.get::<_, f64>(2)?,
+            ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(rows)
@@ -507,8 +519,7 @@ fn run_relevance_fused_with(
     if candidates.is_empty() {
         return Ok(Vec::new());
     }
-    let cand_set: std::collections::HashSet<i64> =
-        candidates.iter().map(|(id, _)| *id).collect();
+    let cand_set: std::collections::HashSet<i64> = candidates.iter().map(|(id, _)| *id).collect();
     // ② should 一路 = 候选集按 score 排序的排名
     let should_ranked: Vec<i64> = candidates.iter().map(|(id, _)| *id).collect();
     // ③ 各路检索器排名（各自 ≥0 条）
@@ -530,7 +541,11 @@ fn run_relevance_fused_with(
         .into_iter()
         .filter(|(id, _)| cand_set.contains(id))
         .skip(offset.max(0) as usize)
-        .take(limit.map(|l| l.clamp(0, 1000) as usize).unwrap_or(usize::MAX))
+        .take(
+            limit
+                .map(|l| l.clamp(0, 1000) as usize)
+                .unwrap_or(usize::MAX),
+        )
         .map(|(id, s)| (id, s, 0.0))
         .collect();
     Ok(page)
@@ -549,7 +564,11 @@ pub fn rrf_fuse(lists: &[(&[i64], f32)]) -> Vec<(i64, f64)> {
         }
     }
     let mut out: Vec<(i64, f64)> = acc.into_iter().collect();
-    out.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.0.cmp(&b.0)));
+    out.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
     out
 }
 
@@ -591,8 +610,12 @@ pub fn run_retriever(conn: &Connection, r: &Retriever) -> AppResult<Vec<i64>> {
             let facet = facet_key.as_deref().unwrap_or("");
             let normalized = crate::db::tags::normalize_name(text);
             // Alias 单点（canonical/synonym 均命中；cap 1 语义 = 单标签）
-            let lookup =
-                crate::db::tags::find_by_term(conn, facet, &normalized, crate::db::tags::TermMatch::Alias)?;
+            let lookup = crate::db::tags::find_by_term(
+                conn,
+                facet,
+                &normalized,
+                crate::db::tags::TermMatch::Alias,
+            )?;
             let Some(hit) = lookup.hits.into_iter().next() else {
                 return Ok(Vec::new());
             };
@@ -713,9 +736,7 @@ fn prune_expr(
                         ));
                         Ok(None)
                     } else {
-                        Ok(Some(QueryExpr::Not {
-                            child: Box::new(c),
-                        }))
+                        Ok(Some(QueryExpr::Not { child: Box::new(c) }))
                     }
                 }
             }
@@ -795,8 +816,6 @@ pub fn prune_invalid(
     Ok((pruned, warns))
 }
 
-
-
 /// 单个叶子条件的诊断。path = 从根到该叶子的子节点索引路径（OR/AND children 下标）。
 /// zone 标识叶子所在区（"filter" | "mustNot"）—— 仅凭 path 无法区分两区的同下标（§3.7 不变式 9）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -847,18 +866,40 @@ pub struct PlanDiagnostics {
 /// 返回的 warnings 与列表命令是同一批。
 /// filter/must_not 叶子进 LeafDiagnostic（带 zone）；should 单独进 ShouldDiagnostic
 /// （带 index，hit_count = 当前结果集 ∩ 该加分项，修 B3 分母错集）。
-pub fn diagnose_search_plan(conn: &Connection, plan: &SearchPlanV3, plan_revision: i64) -> AppResult<PlanDiagnostics> {
+pub fn diagnose_search_plan(
+    conn: &Connection,
+    plan: &SearchPlanV3,
+    plan_revision: i64,
+) -> AppResult<PlanDiagnostics> {
     validate_search_plan(plan)?;
     let (pruned, warnings) = prune_invalid(conn, plan)?;
     let result_count = count_plan(conn, &pruned)?;
     let mut leaves: Vec<LeafDiagnostic> = Vec::new();
     // filter 树叶子（zone=filter）
     if let Some(f) = &pruned.filter {
-        collect_leaves(conn, &pruned, f, &[], "filter", result_count, plan_revision, &mut leaves)?;
+        collect_leaves(
+            conn,
+            &pruned,
+            f,
+            &[],
+            "filter",
+            result_count,
+            plan_revision,
+            &mut leaves,
+        )?;
     }
     // must_not 树叶子（zone=mustNot；NOT 语境）
     if let Some(m) = &pruned.must_not {
-        collect_leaves(conn, &pruned, m, &[], "mustNot", result_count, plan_revision, &mut leaves)?;
+        collect_leaves(
+            conn,
+            &pruned,
+            m,
+            &[],
+            "mustNot",
+            result_count,
+            plan_revision,
+            &mut leaves,
+        )?;
     }
     // should 命中/总数（B3：分子 = 当前结果集内命中该加分项的素材数）
     let mut should_diag = Vec::new();
@@ -868,7 +909,7 @@ pub fn diagnose_search_plan(conn: &Connection, plan: &SearchPlanV3, plan_revisio
             index,
             plan_revision,
             label: if sc.label.is_empty() {
-                format!("加分项")
+                "加分项".to_string()
             } else {
                 sc.label.clone()
             },
@@ -911,13 +952,17 @@ fn count_intersection(conn: &Connection, plan: &SearchPlanV3, cond: &LeafCond) -
         "SELECT COUNT(*) FROM (\n{}\n) _si JOIN assets a ON a.id = _si.id WHERE ({shifted})",
         compiled.sql
     );
-    let n: i64 = conn.query_row(&sql, rusqlite::params_from_iter(params.iter()), |r| r.get(0))?;
+    let n: i64 = conn.query_row(&sql, rusqlite::params_from_iter(params.iter()), |r| {
+        r.get(0)
+    })?;
     Ok(n)
 }
 
 /// 递归收集叶子。pos = 相对当前树根的路径。
 /// zone："filter"（正向语境）| "mustNot"（NOT 语境）；叶子按所在区打标（§3.7 不变式 9），
 /// 且必须区叶子与排除区叶子的删除目标由此确定。
+/// 参数均为本次诊断的一次性上下文，聚合进结构体只会增加递归调用噪音，故保留平铺参数。
+#[allow(clippy::too_many_arguments)]
 fn collect_leaves(
     conn: &Connection,
     plan: &SearchPlanV3,
@@ -931,9 +976,11 @@ fn collect_leaves(
     match node {
         QueryExpr::Leaf { cond } => {
             // self_count：叶子单独执行（在 NOT 语境下也是「该条件本身」的命中数）
-            let mut solo = SearchPlanV3::default();
-            solo.filter = Some(QueryExpr::Leaf { cond: cond.clone() });
-            solo.minimum_should_match = 0;
+            let solo = SearchPlanV3 {
+                filter: Some(QueryExpr::Leaf { cond: cond.clone() }),
+                minimum_should_match: 0,
+                ..SearchPlanV3::default()
+            };
             let self_count = count_plan(conn, &solo)?;
             // without：从原树移除该叶子（按 prefix 定位）后重算
             let positive = zone == "filter";
@@ -969,7 +1016,16 @@ fn collect_leaves(
             // NOT 子树：仍在 filter 区，delta 语义在 remove_leaf 的 NOT 分支下自然成立
             let mut p = prefix.to_vec();
             p.push(0);
-            collect_leaves(conn, plan, child, &p, zone, result_count, plan_revision, out)
+            collect_leaves(
+                conn,
+                plan,
+                child,
+                &p,
+                zone,
+                result_count,
+                plan_revision,
+                out,
+            )
         }
     }
 }
@@ -1001,7 +1057,7 @@ fn remove_leaf(expr: Option<&QueryExpr>, path: &[usize]) -> Option<QueryExpr> {
             }
             match kids.len() {
                 0 => None,
-                1 => Some(kids.into_iter().next().unwrap()),
+                1 => kids.pop(),
                 _ => Some(match e {
                     QueryExpr::And { .. } => QueryExpr::And { children: kids },
                     _ => QueryExpr::Or { children: kids },
@@ -1013,19 +1069,19 @@ fn remove_leaf(expr: Option<&QueryExpr>, path: &[usize]) -> Option<QueryExpr> {
                 return Some(e.clone()); // 不会从 Not 上取叶子
             }
             let sub = remove_leaf(Some(child), &path[1..]);
-            match sub {
-                Some(n) => Some(QueryExpr::Not {
-                    child: Box::new(n),
-                }),
-                None => None,
-            }
+            sub.map(|n| QueryExpr::Not { child: Box::new(n) })
         }
     }
 }
 
 fn cond_label(cond: &LeafCond) -> String {
     match cond {
-        LeafCond::Tag { facet_key, tag_ids, term_query, .. } => {
+        LeafCond::Tag {
+            facet_key,
+            tag_ids,
+            term_query,
+            ..
+        } => {
             if let Some(tq) = term_query.as_deref().filter(|s| !s.is_empty()) {
                 format!("{facet_key}: {tq}")
             } else {
@@ -1156,7 +1212,9 @@ mod tests {
         assets::insert(c, path, "a.jpg", "jpg", 1024, "image/jpeg", 1700000000000).unwrap()
     }
     fn tag(c: &Connection, facet: &str, name: &str) -> i64 {
-        tags::create_in_facet(c, name, None, Some(facet)).unwrap().id
+        tags::create_in_facet(c, name, None, Some(facet))
+            .unwrap()
+            .id
     }
     fn tag_leaf(facet: &str, ids: Vec<i64>) -> LeafCond {
         LeafCond::Tag {
@@ -1226,19 +1284,18 @@ mod tests {
     #[test]
     fn min_should_match_filters() {
         let c = init_memory().unwrap();
-        let (grass, sky, night) =
-            (tag(&c, "scene", "草地"), tag(&c, "scene", "蓝天"), tag(&c, "scene", "夜景"));
+        let (grass, sky, night) = (
+            tag(&c, "scene", "草地"),
+            tag(&c, "scene", "蓝天"),
+            tag(&c, "scene", "夜景"),
+        );
         let a = insert_asset(&c, "d:/1.jpg");
         let b = insert_asset(&c, "d:/2.jpg");
         let d = insert_asset(&c, "d:/3.jpg");
         asset_tags::assign(&c, &[a], &[grass, sky, night], "manual").unwrap();
         asset_tags::assign(&c, &[b], &[grass, sky], "manual").unwrap();
         asset_tags::assign(&c, &[d], &[grass], "manual").unwrap();
-        let mut plan = tag_plan(
-            "scene",
-            grass,
-            &[("蓝天", sky, 1.0), ("夜景", night, 2.0)],
-        );
+        let mut plan = tag_plan("scene", grass, &[("蓝天", sky, 1.0), ("夜景", night, 2.0)]);
         plan.minimum_should_match = 2;
         let out = run_search_plan(&c, &plan, None, 0).unwrap();
         let ids: Vec<i64> = out.iter().map(|x| x.0).collect();
@@ -1272,30 +1329,42 @@ mod tests {
     #[test]
     fn should_sql_evaluated_once() {
         let c = init_memory().unwrap();
-        let (grass, sky, night) =
-            (tag(&c, "scene", "草地"), tag(&c, "scene", "蓝天"), tag(&c, "scene", "夜景"));
-        let _a = insert_asset(&c, "d:/1.jpg");
-        let plan = tag_plan(
-            "scene",
-            grass,
-            &[("蓝天", sky, 1.0), ("夜景", night, 2.0)],
+        let (grass, sky, night) = (
+            tag(&c, "scene", "草地"),
+            tag(&c, "scene", "蓝天"),
+            tag(&c, "scene", "夜景"),
         );
+        let _a = insert_asset(&c, "d:/1.jpg");
+        let plan = tag_plan("scene", grass, &[("蓝天", sky, 1.0), ("夜景", night, 2.0)]);
         let compiled = compile_search_plan(&c, &plan).unwrap();
         let count_case = compiled.sql.matches("CASE WHEN").count();
-        assert_eq!(count_case, 2, "每个 should 片段只应求值一次: {}", compiled.sql);
+        assert_eq!(
+            count_case, 2,
+            "每个 should 片段只应求值一次: {}",
+            compiled.sql
+        );
         // 每个分面 EXISTS 片段应各出现一次（含后代子查询体只出现一次）
-        assert_eq!(compiled.sql.matches("EXISTS").count(), 1 + 2, "filter 1 + should 2 各一次");
+        assert_eq!(
+            compiled.sql.matches("EXISTS").count(),
+            1 + 2,
+            "filter 1 + should 2 各一次"
+        );
     }
 
     #[test]
     fn validates_should_limit_and_sort_key() {
         let plan = SearchPlanV3 {
-            ranking: Ranking::Field { key: "magic".into(), dir: "desc".into() },
+            ranking: Ranking::Field {
+                key: "magic".into(),
+                dir: "desc".into(),
+            },
             ..Default::default()
         };
         assert!(validate_search_plan(&plan).is_err(), "非法排序字段必须拒绝");
-        let mut p2 = SearchPlanV3::default();
-        p2.minimum_should_match = 1; // should 空但 min>0
+        let p2 = SearchPlanV3 {
+            minimum_should_match: 1,
+            ..Default::default()
+        }; // should 空但 min>0
         assert!(validate_search_plan(&p2).is_err());
     }
 
@@ -1329,12 +1398,21 @@ mod tests {
         let b = insert_asset(&c, "d:/2.jpg"); // 低 rating 但有蓝天
         asset_tags::assign(&c, &[a], &[grass], "manual").unwrap();
         asset_tags::assign(&c, &[b], &[grass, sky], "manual").unwrap();
-        c.execute("UPDATE assets SET rating = ?1 WHERE id = ?2", rusqlite::params![5, a])
-            .unwrap();
-        c.execute("UPDATE assets SET rating = ?1 WHERE id = ?2", rusqlite::params![1, b])
-            .unwrap();
+        c.execute(
+            "UPDATE assets SET rating = ?1 WHERE id = ?2",
+            rusqlite::params![5, a],
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE assets SET rating = ?1 WHERE id = ?2",
+            rusqlite::params![1, b],
+        )
+        .unwrap();
         let mut plan = tag_plan("scene", grass, &[("蓝天", sky, 1.0)]);
-        plan.ranking = Ranking::Field { key: "rating".into(), dir: "desc".into() };
+        plan.ranking = Ranking::Field {
+            key: "rating".into(),
+            dir: "desc".into(),
+        };
         let out = run_search_plan(&c, &plan, None, 0).unwrap();
         let ids: Vec<i64> = out.iter().map(|x| x.0).collect();
         assert_eq!(ids[0], a, "显式 rating desc → 5 星排前（无视应蓝天加分）");
@@ -1350,8 +1428,16 @@ mod tests {
         c
     }
     fn s4_asset(c: &Connection, file_name: &str) -> i64 {
-        assets::insert(c, &format!("d:/{file_name}"), file_name, "jpg", 1024, "image/jpeg", 1700000000000)
-            .unwrap()
+        assets::insert(
+            c,
+            &format!("d:/{file_name}"),
+            file_name,
+            "jpg",
+            1024,
+            "image/jpeg",
+            1700000000000,
+        )
+        .unwrap()
     }
 
     /// S4：TagAlias 检索 —— 搜「海滨」经 tag_terms 命中「海边」→ 返回其素材。
@@ -1432,7 +1518,6 @@ mod tests {
         assert_eq!(ids[0], hit, "精确命中素材应排最前：{ids:?}");
         assert!(!ids.contains(&miss), "无关素材不得出现在 bm25 排序结果里");
     }
-
 
     // ═══════════════ C-2：AST 命中诊断 ═══════════════
     fn d_tag(facet: &str, id: i64) -> QueryExpr {
@@ -1589,10 +1674,16 @@ mod tests {
         let diag = diagnose_search_plan(&c, &plan, 7).unwrap();
         assert_eq!(diag.should.len(), 1);
         assert_eq!(diag.should[0].index, 0, "ShouldDiagnostic 带 index");
-        assert_eq!(diag.should[0].plan_revision, 7, "ShouldDiagnostic 回显 plan_revision");
+        assert_eq!(
+            diag.should[0].plan_revision, 7,
+            "ShouldDiagnostic 回显 plan_revision"
+        );
         assert_eq!(diag.should[0].hit_count, 1, "命中 = 当前结果集内 ∩ 加分项");
         assert_eq!(diag.should[0].total_count, 2);
-        assert!(diag.leaves.iter().all(|l| l.zone == "filter"), "叶子带 zone");
+        assert!(
+            diag.leaves.iter().all(|l| l.zone == "filter"),
+            "叶子带 zone"
+        );
     }
 
     // ═══════════════ Phase 2 契约测试（§4.1b 排除极性 / §4.2 prune / §4.3 校验 / B3 / B9） ═══════════════
@@ -1661,7 +1752,10 @@ mod tests {
         let plan = SearchPlanV3 {
             filter: Some(leaf_expr(scene_tag_leaf(grass))),
             must_not: Some(QueryExpr::Or {
-                children: vec![leaf_expr(scene_tag_leaf(sky)), leaf_expr(scene_tag_leaf(night))],
+                children: vec![
+                    leaf_expr(scene_tag_leaf(sky)),
+                    leaf_expr(scene_tag_leaf(night)),
+                ],
             }),
             ranking: Ranking::Relevance,
             ..Default::default()
@@ -1722,10 +1816,12 @@ mod tests {
 
     #[test]
     fn validate_rejects_bad_dir() {
-        let mut plan = SearchPlanV3::default();
-        plan.ranking = Ranking::Field {
-            key: "taken_at".into(),
-            dir: "sideways".into(),
+        let plan = SearchPlanV3 {
+            ranking: Ranking::Field {
+                key: "taken_at".into(),
+                dir: "sideways".into(),
+            },
+            ..Default::default()
         };
         assert!(validate_search_plan(&plan).is_err(), "非法方向必须拒绝");
     }
@@ -1749,8 +1845,10 @@ mod tests {
 
     #[test]
     fn validate_rejects_future_schema_version() {
-        let mut plan = SearchPlanV3::default();
-        plan.plan_schema_version = PLAN_SCHEMA_VERSION + 1;
+        let plan = SearchPlanV3 {
+            plan_schema_version: PLAN_SCHEMA_VERSION + 1,
+            ..Default::default()
+        };
         let e = validate_search_plan(&plan).unwrap_err();
         assert!(e.to_string().contains("更新版本"), "{e}");
     }
@@ -1778,7 +1876,11 @@ mod tests {
             "filter 必须原样保留"
         );
         assert_eq!(warns.len(), 1);
-        assert_eq!(warns[0].zone.as_deref(), Some("mustNot"), "warning 带区名：{warns:?}");
+        assert_eq!(
+            warns[0].zone.as_deref(),
+            Some("mustNot"),
+            "warning 带区名：{warns:?}"
+        );
         let out = run_search_plan(&c, &pruned, None, 0).unwrap();
         assert_eq!(out.len(), 2, "排除被剔除后不再清库");
     }
@@ -1798,7 +1900,10 @@ mod tests {
         let (pruned, warns) = prune_invalid(&c, &plan).unwrap();
         assert!(pruned.should.is_empty(), "恒真加分项应被整条删除");
         assert_eq!(pruned.minimum_should_match, 0, "min 收敛到新 should 长度");
-        assert!(warns.iter().any(|w| w.zone.as_deref() == Some("should")), "{warns:?}");
+        assert!(
+            warns.iter().any(|w| w.zone.as_deref() == Some("should")),
+            "{warns:?}"
+        );
         // 执行不再报错且集合不受污染
         let out = run_search_plan(&c, &pruned, None, 0).unwrap();
         assert_eq!(out.len(), 1);
@@ -1814,14 +1919,20 @@ mod tests {
         asset_tags::assign(&c, &[a, b], &[grass], "manual").unwrap();
         let plan = SearchPlanV3 {
             filter: Some(QueryExpr::And {
-                children: vec![leaf_expr(scene_tag_leaf(grass)), leaf_expr(facet_mismatch_leaf(grass))],
+                children: vec![
+                    leaf_expr(scene_tag_leaf(grass)),
+                    leaf_expr(facet_mismatch_leaf(grass)),
+                ],
             }),
             ranking: Ranking::Relevance,
             ..Default::default()
         };
         let (pruned, warns) = prune_invalid(&c, &plan).unwrap();
         let f = pruned.filter.expect("草地条件应保留");
-        assert!(matches!(f, QueryExpr::Leaf { .. }), "无效叶子删除后只剩草地：{f:?}");
+        assert!(
+            matches!(f, QueryExpr::Leaf { .. }),
+            "无效叶子删除后只剩草地：{f:?}"
+        );
         assert_eq!(warns.len(), 1);
         assert_eq!(warns[0].zone.as_deref(), Some("filter"));
     }
@@ -1835,19 +1946,28 @@ mod tests {
         asset_tags::assign(&c, &[a], &[grass], "manual").unwrap();
         let plan = SearchPlanV3 {
             filter: Some(QueryExpr::And {
-                children: vec![leaf_expr(scene_tag_leaf(grass)), leaf_expr(facet_mismatch_leaf(grass))],
+                children: vec![
+                    leaf_expr(scene_tag_leaf(grass)),
+                    leaf_expr(facet_mismatch_leaf(grass)),
+                ],
             }),
             ranking: Ranking::Relevance,
             ..Default::default()
         };
         let diag = diagnose_search_plan(&c, &plan, 3).unwrap();
         assert_eq!(diag.leaves.len(), 1, "无效叶子被剔除后不再诊断");
-        assert_eq!(diag.leaves[0].plan_revision, 3, "LeafDiagnostic 回显 plan_revision");
+        assert_eq!(
+            diag.leaves[0].plan_revision, 3,
+            "LeafDiagnostic 回显 plan_revision"
+        );
         assert_eq!(diag.leaves[0].zone, "filter");
         assert_eq!(diag.warnings.len(), 1, "诊断 warnings 与列表同批");
         let (pruned, pw) = prune_invalid(&c, &plan).unwrap();
         assert_eq!(diag.warnings, pw);
-        assert_eq!(diag.leaves[0].result_count, count_plan(&c, &pruned).unwrap());
+        assert_eq!(
+            diag.leaves[0].result_count,
+            count_plan(&c, &pruned).unwrap()
+        );
     }
 
     /// §3.7 不变式 9：叶子诊断带 zone + plan_revision ——
@@ -1874,10 +1994,15 @@ mod tests {
         };
         let diag = diagnose_search_plan(&c, &plan, 42).unwrap();
         assert_eq!(diag.leaves.len(), 4);
-        let mut fs: Vec<&LeafDiagnostic> = diag.leaves.iter().filter(|l| l.zone == "filter").collect();
+        let mut fs: Vec<&LeafDiagnostic> =
+            diag.leaves.iter().filter(|l| l.zone == "filter").collect();
         fs.sort_by_key(|l| l.path.clone());
         let f = fs[0];
-        let m = diag.leaves.iter().find(|l| l.zone == "mustNot").expect("mustNot 叶子");
+        let m = diag
+            .leaves
+            .iter()
+            .find(|l| l.zone == "mustNot")
+            .expect("mustNot 叶子");
         assert_eq!(f.path, vec![0]);
         assert_eq!(m.path, vec![0], "两区同为下标 [0] 也能区分");
         assert_eq!(f.plan_revision, 42);
@@ -1910,7 +2035,11 @@ mod tests {
         };
         let diag = diagnose_search_plan(&c, &plan, 1).unwrap();
         assert_eq!(diag.should.len(), 1);
-        assert_eq!(diag.should[0].hit_count, 1, "只有结果集内的 a1 算命中（outside 不算）：{:?}", diag.should);
+        assert_eq!(
+            diag.should[0].hit_count, 1,
+            "只有结果集内的 a1 算命中（outside 不算）：{:?}",
+            diag.should
+        );
         assert_eq!(diag.should[0].total_count, 2);
         assert!(diag.should[0].hit_count <= diag.should[0].total_count);
     }
@@ -1945,10 +2074,16 @@ mod tests {
         let low = insert_asset(&c, "d:/h2.jpg");
         asset_tags::assign(&c, &[high], &[grass], "manual").unwrap();
         asset_tags::assign(&c, &[low], &[grass, sky], "manual").unwrap(); // low 命中加分但 rating 低
-        c.execute("UPDATE assets SET rating = ?1 WHERE id = ?2", rusqlite::params![5, high])
-            .unwrap();
-        c.execute("UPDATE assets SET rating = ?1 WHERE id = ?2", rusqlite::params![1, low])
-            .unwrap();
+        c.execute(
+            "UPDATE assets SET rating = ?1 WHERE id = ?2",
+            rusqlite::params![5, high],
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE assets SET rating = ?1 WHERE id = ?2",
+            rusqlite::params![1, low],
+        )
+        .unwrap();
         let mut plan = tag_plan("scene", grass, &[("蓝天", sky, 1.0)]);
         plan.ranking = Ranking::Field {
             key: "rating".into(),
@@ -1956,7 +2091,10 @@ mod tests {
         };
         let out = run_search_plan(&c, &plan, None, 0).unwrap();
         let ids: Vec<i64> = out.iter().map(|r| r.0).collect();
-        assert_eq!(ids[0], high, "rating 5 必须排前（加分不能压过主键）：{ids:?}");
+        assert_eq!(
+            ids[0], high,
+            "rating 5 必须排前（加分不能压过主键）：{ids:?}"
+        );
     }
 
     /// B2：plan 列表分页与全选 ID 同源同序 —— 第 1 页 = ids 前段，集合一致。
@@ -2018,7 +2156,8 @@ mod tests {
 
     /// 数值分面夹具：「人数」0–50（与 v24_numbers::number_facet_setup 同语义）
     fn number_facet(c: &Connection) {
-        crate::db::tag_facets::create(c, "people_count", "人数", "", "single", None, "all").unwrap();
+        crate::db::tag_facets::create(c, "people_count", "人数", "", "single", None, "all")
+            .unwrap();
         c.execute(
             "UPDATE tag_facets SET facet_kind='number', num_min=0, num_max=50, num_unit='人',
              num_decimals=0, num_step=1 WHERE key='people_count'",
@@ -2055,15 +2194,31 @@ mod tests {
                 .map(|x| x.0)
                 .collect()
         };
-        assert_eq!(run(num_leaf("people_count", "gte", 10.0, None)), vec![b], "≥10 → 只有 20 的");
-        assert_eq!(run(num_leaf("people_count", "eq", 5.0, None)), vec![a], "=5 → 只有 5 的");
+        assert_eq!(
+            run(num_leaf("people_count", "gte", 10.0, None)),
+            vec![b],
+            "≥10 → 只有 20 的"
+        );
+        assert_eq!(
+            run(num_leaf("people_count", "eq", 5.0, None)),
+            vec![a],
+            "=5 → 只有 5 的"
+        );
         let between_ids = run(num_leaf("people_count", "between", 4.0, Some(20.0)));
         assert_eq!(
-            between_ids.iter().copied().collect::<std::collections::BTreeSet<_>>(),
-            [a, b].into_iter().collect::<std::collections::BTreeSet<_>>(),
+            between_ids
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>(),
+            [a, b]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
             "4~20 → 两个都有"
         );
-        assert!(run(num_leaf("people_count", "gte", 100.0, None)).is_empty(), "越界 → 0 结果");
+        assert!(
+            run(num_leaf("people_count", "gte", 100.0, None)).is_empty(),
+            "越界 → 0 结果"
+        );
     }
 
     /// §4.1b 极性白名单：FacetNumber 是正向谓词，进 must_not 语义 =「排除满足它的」
@@ -2082,7 +2237,10 @@ mod tests {
             }),
             ..Default::default()
         };
-        assert!(validate_search_plan(&plan).is_ok(), "正向数值谓词必须允许进 must_not");
+        assert!(
+            validate_search_plan(&plan).is_ok(),
+            "正向数值谓词必须允许进 must_not"
+        );
         let ids: Vec<i64> = run_search_plan(&c, &plan, None, 0)
             .unwrap()
             .into_iter()
@@ -2102,7 +2260,9 @@ mod tests {
         let plan = SearchPlanV3 {
             filter: Some(QueryExpr::And {
                 children: vec![
-                    QueryExpr::Leaf { cond: num_leaf("ghost_facet", "gte", 1.0, None) },
+                    QueryExpr::Leaf {
+                        cond: num_leaf("ghost_facet", "gte", 1.0, None),
+                    },
                     QueryExpr::Leaf {
                         cond: num_leaf("people_count", "gte", 1.0, None),
                     },

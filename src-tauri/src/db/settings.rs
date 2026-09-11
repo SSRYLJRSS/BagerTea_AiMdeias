@@ -351,7 +351,7 @@ fn default_strip_count() -> i64 {
 }
 
 /// 外观/交互子对象（批次 2 与批次 3/4 共用）
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Appearance {
     #[serde(default)]
@@ -417,16 +417,6 @@ impl Default for ColorStripAppearance {
             height: default_strip_height(),
             mode: default_strip_mode(),
             count: default_strip_count(),
-        }
-    }
-}
-impl Default for Appearance {
-    fn default() -> Self {
-        Self {
-            grid: GridAppearance::default(),
-            hover_preview: HoverPreviewAppearance::default(),
-            color_strip: ColorStripAppearance::default(),
-            kinship: KinshipAppearance::default(),
         }
     }
 }

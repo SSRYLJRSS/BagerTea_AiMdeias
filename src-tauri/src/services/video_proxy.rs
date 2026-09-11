@@ -6,7 +6,7 @@
 //!    许可在 ffmpeg 子进程启动前获取，转码结束/失败/取消时释放（RAII guard）；
 //!    等待队列期间不持数据库锁，且等待可被取消（cancel flag 轮询）；
 //!  - 代理不是替换原文件：清理缓存不影响原文件。
-//! 转码由调用方注入（便于单测注入 fake 转码；真实路径用 video::transcode_to_h264）。
+//!    转码由调用方注入（便于单测注入 fake 转码；真实路径用 video::transcode_to_h264）。
 
 use std::collections::HashMap;
 use std::fs;

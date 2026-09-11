@@ -31,16 +31,12 @@ pub fn stable_config_hash(v: &serde_json::Value) -> String {
     fn canon(v: &serde_json::Value) -> serde_json::Value {
         match v {
             serde_json::Value::Object(m) => {
-                let mut sorted: Vec<(String, serde_json::Value)> = m
-                    .iter()
-                    .map(|(k, val)| (k.clone(), canon(val)))
-                    .collect();
+                let mut sorted: Vec<(String, serde_json::Value)> =
+                    m.iter().map(|(k, val)| (k.clone(), canon(val))).collect();
                 sorted.sort_by(|a, b| a.0.cmp(&b.0));
                 serde_json::Value::Object(sorted.into_iter().collect())
             }
-            serde_json::Value::Array(a) => {
-                serde_json::Value::Array(a.iter().map(canon).collect())
-            }
+            serde_json::Value::Array(a) => serde_json::Value::Array(a.iter().map(canon).collect()),
             other => other.clone(),
         }
     }
@@ -126,6 +122,9 @@ pub struct MediaAnalysis {
     pub numbers: Vec<ai::NumberProposal>,
     /// A2：解析层告警（未知分面 key 等），随 AnalysisResult 的 analysis_json 一并落库溯源。
     pub warnings: Vec<String>,
+    /// 模型在 tags 对象中显式返回过的稳定分面 key；空数组也计入。
+    /// 用于区分“不适用所以返回 []”与“模型漏掉了整个分面”。
+    pub responded_tag_facets: std::collections::BTreeSet<String>,
     /// A2：该次请求的模型原始返回（逐字存储，不做任何清洗/剥围栏）
     pub raw_response: String,
     /// A2：该次请求的配置 JSON（溯源；批次级另存 request_config_json）
@@ -138,21 +137,25 @@ pub struct MediaAnalysis {
 /// 避免模型返回中文分类名导致归类不稳定，也确保 color 独立于 style。
 /// FB5-05（§7.4）：同时要求输出 description（一句话描述，最多 20 字，规则见下）。
 fn build_system_prompt() -> String {
-    let mut sys = String::from(
-        "你是图片素材打标助手。分析用户提供的图片，返回一句话描述与分面标签。\n",
-    );
+    let mut sys =
+        String::from("你是图片素材打标助手。分析用户提供的图片，返回一句话描述与分面标签。\n");
     sys.push_str("输出格式（严格遵守）：\n");
     sys.push_str("- 只返回一个 JSON 对象，不要任何其他文字、解释或代码围栏；\n");
-    sys.push_str("- 结构：{\"description\": \"一句话描述\", \"tags\": {\"分面key\": [\"标签\"]}}。\n");
+    sys.push_str(
+        "- 结构：{\"description\": \"一句话描述\", \"tags\": {\"分面key\": [\"标签\"]}}。\n",
+    );
     sys.push_str("description 规则：\n");
     sys.push_str("- 一句话中文描述画面内容（如「夜晚树下多人合影」），最多 20 个字符；\n");
     sys.push_str("- 不写文件质量、摄影建议，不以「这是一张」「这张图片展示」开头；\n");
     sys.push_str("- 不堆砌逗号标签；description 不得复制进任何 tags 数组。\n");
     sys.push_str("标签规则：\n");
+    sys.push_str("- tags 对象必须逐项包含用户列出的全部非数值分面 key；不适用或无法判断也必须显式写空数组 []，禁止省略 key；\n");
     sys.push_str("- 每个标签为中文 2–6 字（如「海边」「人像」「逆光」）；\n");
     sys.push_str("- 标签必须描述画面中可观察到的内容，不确定的分面给空数组，不要猜；\n");
     sys.push_str("- 一个标签只归入一个分面；\n");
-    sys.push_str("- 多值如实输出：一张图既是「海边」又是「日落」时，scene 里两个都写，不要只挑一个；\n");
+    sys.push_str(
+        "- 多值如实输出：一张图既是「海边」又是「日落」时，scene 里两个都写，不要只挑一个；\n",
+    );
     sys.push_str("- 用户给出候选词时，含义相同必须用已有词，不要造近义词（已有「海边」就不要写「海滨」）。\n");
     // W5a（a9）+ A1：置信度强类型协议 —— 标签可带置信度，写成 {"t":"标签","c":0.9}
     // （c 为 0 到 1 的数字；纯字符串仍是合法回退）。A1 起解析层强类型处理，不再吞标签。
@@ -191,6 +194,17 @@ pub fn build_user_prompt(facets: &[FacetPromptContext], top_tags: &[(String, Str
             } else {
                 format!("：{}", c.description)
             },
+        ));
+    }
+    let required_keys: Vec<&str> = facets
+        .iter()
+        .filter(|f| f.facet_kind != "number" && f.key != "custom")
+        .map(|f| f.key.as_str())
+        .collect();
+    if !required_keys.is_empty() {
+        user.push_str(&format!(
+            "\ntags 必须完整包含这些 key（允许值为 []，但不得漏 key）：{}\n",
+            required_keys.join(", ")
         ));
     }
     if !number_facets.is_empty() {
@@ -250,14 +264,21 @@ pub fn build_user_prompt(facets: &[FacetPromptContext], top_tags: &[(String, Str
                 .iter()
                 .map(|k| {
                     let w = real_word(k, alt).unwrap_or_default();
-                    format!("\"{k}\": {}", if w.is_empty() { "[]".to_string() } else { format!("[\"{w}\"]") })
+                    format!(
+                        "\"{k}\": {}",
+                        if w.is_empty() {
+                            "[]".to_string()
+                        } else {
+                            format!("[\"{w}\"]")
+                        }
+                    )
                 })
                 .collect();
             format!("{{{}}}", pairs.join(", "))
         };
-        user.push_str(&format!(
-            "\n输出示例（真实输入→输出对，结构参考；tags 只含该图真实可观察到的分类）：\n"
-        ));
+        user.push_str(
+            "\n输出示例（真实输入→输出对，结构参考；tags 只含该图真实可观察到的分类）：\n",
+        );
         user.push_str(&format!(
             "示例 A：输入「黄昏的海边，树下有一群人散步」→ 输出 {{\"description\": \"黄昏海边多人散步\", \"tags\": {}}}\n",
             tags_json(false)
@@ -274,7 +295,103 @@ pub fn build_user_prompt(facets: &[FacetPromptContext], top_tags: &[(String, Str
 
 /// W5a（a7）：动态 max_tokens —— 固定 500 在分面多时会把 JSON 截断 → 解析失败 → 整条 rejected。
 fn dynamic_max_tokens(facet_count: usize) -> i64 {
-    (300 + 120 * facet_count as i64).clamp(500, 1600)
+    (500 + 180 * facet_count as i64).clamp(800, 3200)
+}
+
+fn parse_json_candidate(content: &str) -> Option<serde_json::Value> {
+    let trimmed = content.trim();
+    serde_json::from_str(trimmed).ok().or_else(|| {
+        let start = trimmed.find('{')?;
+        let end = trimmed.rfind('}')?;
+        (start < end)
+            .then(|| serde_json::from_str(&trimmed[start..=end]).ok())
+            .flatten()
+    })
+}
+
+fn resolve_facet_key_with_display_name(
+    label: &str,
+    facets: &[FacetPromptContext],
+) -> Option<String> {
+    let trimmed = label.trim();
+    if let Some(facet) = facets
+        .iter()
+        .find(|f| f.key == trimmed || f.display_name.trim() == trimmed)
+    {
+        return Some(facet.key.clone());
+    }
+    let legacy = crate::db::tag_facets::key_for_legacy_name(trimmed);
+    facets
+        .iter()
+        .find(|f| f.key == legacy)
+        .map(|f| f.key.clone())
+}
+
+fn explicit_tag_facet_keys(
+    tags_content: &str,
+    facets: &[FacetPromptContext],
+) -> std::collections::BTreeSet<String> {
+    let mut out = std::collections::BTreeSet::new();
+    let Some(obj) = parse_json_candidate(tags_content).and_then(|v| v.as_object().cloned()) else {
+        return out;
+    };
+    for label in obj.keys() {
+        if let Some(key) = resolve_facet_key_with_display_name(label, facets) {
+            if facets
+                .iter()
+                .any(|f| f.key == key && f.facet_kind != "number")
+            {
+                out.insert(key);
+            }
+        }
+    }
+    out
+}
+
+fn required_tag_facet_keys(facets: &[FacetPromptContext]) -> Vec<String> {
+    facets
+        .iter()
+        .filter(|f| f.facet_kind != "number" && f.key != "custom")
+        .map(|f| f.key.clone())
+        .collect()
+}
+
+fn missing_tag_facet_keys(analysis: &MediaAnalysis, facets: &[FacetPromptContext]) -> Vec<String> {
+    required_tag_facet_keys(facets)
+        .into_iter()
+        .filter(|key| !analysis.responded_tag_facets.contains(key))
+        .collect()
+}
+
+fn merge_media_analysis(base: &mut MediaAnalysis, supplement: MediaAnalysis) {
+    if base.description.is_empty() {
+        base.description = supplement.description;
+    }
+    for (key, mut names) in supplement.tags {
+        let target = base.tags.entry(key).or_default();
+        for name in names.drain(..) {
+            if !target.contains(&name) {
+                target.push(name);
+            }
+        }
+    }
+    for proposal in supplement.proposals {
+        if !base
+            .proposals
+            .iter()
+            .any(|p| p.facet_key == proposal.facet_key && p.raw_name == proposal.raw_name)
+        {
+            base.proposals.push(proposal);
+        }
+    }
+    for number in supplement.numbers {
+        if !base.numbers.iter().any(|n| n.facet_key == number.facet_key) {
+            base.numbers.push(number);
+        }
+    }
+    base.warnings.extend(supplement.warnings);
+    base.responded_tag_facets
+        .extend(supplement.responded_tag_facets);
 }
 
 /// 数组元素 → 标签名（A1：支持纯字符串 与 {"t":"标签","c":0.9} 对象两种形态；对象取 t）。
@@ -283,7 +400,11 @@ fn elem_name(v: &serde_json::Value) -> Option<String> {
     match v {
         serde_json::Value::String(s) => {
             let t = s.trim().to_string();
-            if t.is_empty() { None } else { Some(t) }
+            if t.is_empty() {
+                None
+            } else {
+                Some(t)
+            }
         }
         serde_json::Value::Object(o) => o
             .get("t")
@@ -302,9 +423,16 @@ fn elem_name_conf(v: &serde_json::Value) -> (String, Option<f32>) {
             // 兼容旧协议把 {"t","c"} 整个塞成字符串元素
             if let Ok(inner) = serde_json::from_str::<serde_json::Value>(t) {
                 if let Some(o) = inner.as_object() {
-                    if let Some(name) = o.get("t").and_then(|x| x.as_str()).map(|x| x.trim().to_string()) {
+                    if let Some(name) = o
+                        .get("t")
+                        .and_then(|x| x.as_str())
+                        .map(|x| x.trim().to_string())
+                    {
                         if !name.is_empty() {
-                            let c = o.get("c").and_then(|x| x.as_f64()).map(|f| f.clamp(0.0, 1.0) as f32);
+                            let c = o
+                                .get("c")
+                                .and_then(|x| x.as_f64())
+                                .map(|f| f.clamp(0.0, 1.0) as f32);
                             return (name, c);
                         }
                     }
@@ -313,8 +441,16 @@ fn elem_name_conf(v: &serde_json::Value) -> (String, Option<f32>) {
             (t.to_string(), None)
         }
         serde_json::Value::Object(o) => {
-            let name = o.get("t").and_then(|x| x.as_str()).unwrap_or("").trim().to_string();
-            let c = o.get("c").and_then(|x| x.as_f64()).map(|f| f.clamp(0.0, 1.0) as f32);
+            let name = o
+                .get("t")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let c = o
+                .get("c")
+                .and_then(|x| x.as_f64())
+                .map(|f| f.clamp(0.0, 1.0) as f32);
             (name, c)
         }
         _ => (String::new(), None),
@@ -339,7 +475,11 @@ fn resolve_label_key(label: &str, valid_keys: &[&str]) -> Option<String> {
 
 /// A1：从 tags JSON 内容里为最终（已裁剪）标签补置信度 → typed 提议。
 /// 按「label 解析到的分面 key == 目标 key 且元素名一致」匹配（跨分面同名不会串）。
-fn collect_proposals(tags_content: &str, tags: &CategorizedTags, valid_keys: &[&str]) -> Vec<ai::TagProposal> {
+fn collect_proposals(
+    tags_content: &str,
+    tags: &CategorizedTags,
+    valid_keys: &[&str],
+) -> Vec<ai::TagProposal> {
     let mut proposals = Vec::new();
     let Ok(v) = serde_json::from_str::<serde_json::Value>(tags_content) else {
         return proposals;
@@ -348,7 +488,8 @@ fn collect_proposals(tags_content: &str, tags: &CategorizedTags, valid_keys: &[&
         return proposals;
     };
     // label → (元素名, 置信度) 原始表
-    let mut raw: Vec<(String, Vec<(String, Option<f32>)>)> = Vec::new();
+    type RawFacetTags = (String, Vec<(String, Option<f32>)>);
+    let mut raw: Vec<RawFacetTags> = Vec::new();
     for (label, val) in obj {
         if let Some(key) = resolve_label_key(label, valid_keys) {
             let elems: Vec<(String, Option<f32>)> = match val {
@@ -456,7 +597,9 @@ pub fn parse_categorized_checked_ex(
                 "未知分面 key「{trimmed}」已归入自定义，建议改用稳定 facetKey"
             ));
             "custom".to_string()
-        } else if manual_only_keys.iter().any(|m| m == trimmed) || manual_only_keys.iter().any(|m| m == mapped) {
+        } else if manual_only_keys.iter().any(|m| m == trimmed)
+            || manual_only_keys.iter().any(|m| m == mapped)
+        {
             warnings.push(format!(
                 "分类「{trimmed}」不参与 AI 自动打标（只手工填写），本次返回的标签已丢弃"
             ));
@@ -591,9 +734,9 @@ pub fn model_supports_vision(model: &str) -> bool {
 ///  1. 新协议：{"description": "…", "tags": {"subject": ["…"]}}
 ///  2. 旧协议：{"subject": ["…"]}（整个对象即标签对象，无 description）
 ///  3. 扁平数组 → 由 parse_categorized 收进「未分类」
-/// description 经 normalize_content_description（最多 20 字）；
-/// tags 经 parse_categorized_checked（未知 key → custom + warning，绝不静默丢）。
-/// 「标签为空但描述非空」= 有效分析（旧 parse_tags_strict 会直接拒绝，FB5-05 放宽）。
+///     description 经 normalize_content_description（最多 20 字）；
+///     tags 经 parse_categorized_checked（未知 key → custom + warning，绝不静默丢）。
+///     「标签为空但描述非空」= 有效分析（旧 parse_tags_strict 会直接拒绝，FB5-05 放宽）。
 pub fn parse_media_analysis(
     content: &str,
     valid_keys: &[&str],
@@ -632,10 +775,13 @@ pub fn parse_media_analysis(
             (String::new(), trimmed.to_string())
         };
     let description = normalize_content_description(&raw_desc);
-    let (mut tags, mut warnings) = parse_categorized_checked_ex(&tags_content, valid_keys, manual_keys);
+    let responded_tag_facets = explicit_tag_facet_keys(&tags_content, facets);
+    let (mut tags, mut warnings) =
+        parse_categorized_checked_ex(&tags_content, valid_keys, manual_keys);
     // V24（§6.4）：数值分面解析 —— 从 numbers 对象收集 NumberProposal（原文原样保留，
     // 歧义判定与越界校验统一在落库层 parse_number_proposal / validate_number_in_range）。
-    let (mut numbers, mut num_warnings): (Vec<ai::NumberProposal>, Vec<String>) = (Vec::new(), Vec::new());
+    let (mut numbers, mut num_warnings): (Vec<ai::NumberProposal>, Vec<String>) =
+        (Vec::new(), Vec::new());
     let kind_of = |key: &str| -> Option<&str> {
         facets
             .iter()
@@ -644,7 +790,7 @@ pub fn parse_media_analysis(
     };
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_candidate) {
         if let Some(nums) = v.get("numbers").and_then(|n| n.as_object()) {
-            for (key, val) in nums {
+            for (label, val) in nums {
                 let raw = match val {
                     serde_json::Value::String(s) => s.trim().to_string(),
                     serde_json::Value::Number(n) => n.to_string(),
@@ -653,14 +799,17 @@ pub fn parse_media_analysis(
                 if raw.is_empty() {
                     continue;
                 }
-                match kind_of(key) {
+                let resolved_key = resolve_facet_key_with_display_name(label, facets);
+                match resolved_key.as_deref().and_then(kind_of) {
                     Some("number") => numbers.push(ai::NumberProposal {
-                        facet_key: key.clone(),
+                        facet_key: resolved_key.unwrap(),
                         raw_text: raw,
                         value: 0.0,
                         confidence: None,
                     }),
-                    _ => num_warnings.push(format!("数值提议的分面「{key}」不存在或不是数值型。")),
+                    _ => {
+                        num_warnings.push(format!("数值提议的分面「{label}」不存在或不是数值型。"))
+                    }
                 }
             }
         }
@@ -684,7 +833,9 @@ pub fn parse_media_analysis(
                     });
                 }
             }
-            num_warnings.push(format!("数值分面「{key}」的输出误写在 tags 里，已转入数值提议。"));
+            num_warnings.push(format!(
+                "数值分面「{key}」的输出误写在 tags 里，已转入数值提议。"
+            ));
         }
     }
     warnings.extend(num_warnings);
@@ -695,7 +846,12 @@ pub fn parse_media_analysis(
             facets
                 .iter()
                 .find(|f| f.key == key)
-                .map(|f| (f.selection_mode == "single", f.max_items.map(|n| n as usize)))
+                .map(|f| {
+                    (
+                        f.selection_mode == "single",
+                        f.max_items.map(|n| n as usize),
+                    )
+                })
                 // R3-4：分面不在列表 → 该分面不参与 AI，不该裁到 5（max_items=NULL = 不限）
                 .unwrap_or((false, None))
         };
@@ -704,7 +860,10 @@ pub fn parse_media_analysis(
             let cap = if single { Some(1) } else { max };
             if let Some(cap) = cap {
                 if list.len() > cap {
-                    tracing::warn!("分面 {key} 标签超量（{} 个 > 上限 {cap}），已裁剪", list.len());
+                    tracing::warn!(
+                        "分面 {key} 标签超量（{} 个 > 上限 {cap}），已裁剪",
+                        list.len()
+                    );
                     list.truncate(cap);
                 }
             }
@@ -733,6 +892,7 @@ pub fn parse_media_analysis(
         proposals,
         numbers,
         warnings,
+        responded_tag_facets,
         // A2 溯源字段由调用方（request_analysis 的 enrich）补写，纯解析层置空
         raw_response: String::new(),
         request_config_json: None,
@@ -783,6 +943,9 @@ fn request_analysis(
         system_override.to_string()
     };
     let user = build_user_prompt(facets, top_tags);
+    let supplement_user = user.clone();
+    let supplement_system = system.clone();
+    let supplement_b64 = b64.clone();
     let max_tokens = dynamic_max_tokens(facets.len()); // a7：动态上限防 JSON 截断
     let base = cfg.base_url.trim_end_matches('/');
     // A2 溯源用（fetch 闭包会 move 走 system，先 clone 一份）
@@ -871,8 +1034,16 @@ fn request_analysis(
     let enrich = |mut a: MediaAnalysis, used_content: String| -> MediaAnalysis {
         a.raw_response = used_content;
         a.request_config_json = Some(
-            build_batch_request_config(&prov_system, facets, top_tags, &cfg.model, "image", max_tokens, cfg.is_local())
-                .to_string(),
+            build_batch_request_config(
+                &prov_system,
+                facets,
+                top_tags,
+                &cfg.model,
+                "image",
+                max_tokens,
+                cfg.is_local(),
+            )
+            .to_string(),
         );
         a.analysis_json = Some(
             serde_json::to_string(&ai::AnalysisResult {
@@ -885,7 +1056,55 @@ fn request_analysis(
         );
         a
     };
-    if let Ok(a) = parse_media_analysis(&content, &valid_keys, facets, manual_keys) {
+    if let Ok(mut a) = parse_media_analysis(&content, &valid_keys, facets, manual_keys) {
+        let missing = missing_tag_facet_keys(&a, facets);
+        if cfg.is_local() && !missing.is_empty() && cfg.api_mode != "anthropic" {
+            let supplement_prompt = format!(
+                "{}\n\n上一次响应漏掉了这些 tags key：{}。请重新检查同一张图片，只返回 JSON；tags 必须包含这些 key，每个 key 都必须出现，不适用时写 []。",
+                supplement_user,
+                missing.join(", ")
+            );
+            let mut body = serde_json::json!({
+                "model": cfg.model,
+                "messages": [{
+                    "role": "system",
+                    "content": supplement_system,
+                }, {
+                    "role": "user",
+                    "content": [
+                        { "type": "text", "text": supplement_prompt },
+                        { "type": "image_url", "image_url": { "url": format!("data:{mime};base64,{supplement_b64}") } }
+                    ]
+                }],
+                "max_tokens": max_tokens,
+                "response_format": { "type": "json_object" }
+            });
+            apply_keep_alive(&mut body, true);
+            if let Ok(response) = client
+                .post(format!("{base}/chat/completions"))
+                .bearer_auth(&cfg.api_key)
+                .json(&body)
+                .send()
+                .and_then(|r| r.json::<serde_json::Value>())
+            {
+                if let Some(extra_content) = response["choices"][0]["message"]["content"].as_str() {
+                    if let Ok(extra) =
+                        parse_media_analysis(extra_content, &valid_keys, facets, manual_keys)
+                    {
+                        merge_media_analysis(&mut a, extra);
+                        content.push_str("\n--- missing-facets supplement ---\n");
+                        content.push_str(extra_content);
+                    }
+                }
+            }
+            let still_missing = missing_tag_facet_keys(&a, facets);
+            if !still_missing.is_empty() {
+                return Err(AppError::msg(format!(
+                    "模型补全后仍漏掉必需分面：{}。本条不会作为成功结果落库，批处理将自动重试。",
+                    still_missing.join(", ")
+                )));
+            }
+        }
         return Ok(enrich(a, content));
     }
     // 本地档案失败自愈：任何解析失败（@@@@ 退化 / 乱码 / 答非所问）都先卸载重载一次再重试。
@@ -894,9 +1113,15 @@ fn request_analysis(
         unload_ollama_model(cfg);
         if let Ok(c) = fetch() {
             if let Ok(a) = parse_media_analysis(&c, &valid_keys, facets, manual_keys) {
-                return Ok(enrich(a, c));
+                let still_missing = missing_tag_facet_keys(&a, facets);
+                if still_missing.is_empty() {
+                    return Ok(enrich(a, c));
+                }
+                content = c;
+                tracing::warn!("Ollama 重载后仍漏掉必需分面：{}", still_missing.join(", "));
+            } else {
+                content = c;
             }
-            content = c;
         }
         if is_degenerate(&content) {
             // 重载后仍退化：服务本身已不可用，给用户明确指引
@@ -1249,7 +1474,7 @@ pub fn models_url(base_url: &str) -> String {
 ///  - 429 → 请求过于频繁
 ///  - 超时/网络 → 连接问题
 ///  - 200 但无可解析模型 → 同 404 文案
-/// 模型去重 + 不区分大小写排序；错误与 debug 输出不含 API Key（请求带 key，消息只用 base_url/status）。
+///    模型去重 + 不区分大小写排序；错误与 debug 输出不含 API Key（请求带 key，消息只用 base_url/status）。
 pub fn discover_models(
     base_url: &str,
     api_key: &str,
@@ -1307,7 +1532,7 @@ pub fn discover_models(
         return Err(AppError::msg("该服务未提供模型列表，请手动输入"));
     }
     // 去重 + 不区分大小写排序（§3.6）
-    models.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+    models.sort_by_key(|a| a.to_lowercase());
     models.dedup_by(|a, b| a.to_lowercase() == b.to_lowercase());
     Ok(models)
 }
@@ -1511,7 +1736,7 @@ pub fn merge_frame_tags(frames: &[CategorizedTags]) -> CategorizedTags {
     }
     // FB2-07（§13.5②）：阈值随帧数自适应 ceil(n/2)。固定 2 在 n=6 时过松（1/3 帧命中就通过），
     // n=2 时又过严。n=2→1、n=3→2、n=4→2、n=6→3、n=8→4
-    let threshold = (ok + 1) / 2;
+    let threshold = ok.div_ceil(2);
     let mut counts: std::collections::BTreeMap<(String, String), usize> =
         std::collections::BTreeMap::new();
     for t in frames {
@@ -1537,6 +1762,8 @@ pub fn merge_frame_tags(frames: &[CategorizedTags]) -> CategorizedTags {
 /// 标签按现有频次规则合并；描述取时间上最接近视频中点的成功帧描述（抽帧本身按段中点时间序采样，
 /// 成功帧序列的中间帧即近似中点；不为合并描述额外发第二次 AI 请求）。
 /// 抽帧/识别全失败返回 Err（单条置 rejected）；所有帧描述为空时保持空描述，不影响标签结果。
+// 8 参数为单次视频打标链路的稳定上下文（客户端/配置/分面/素材/帧数/提示词），收进结构体需同步改调用点，收益低。
+#[allow(clippy::too_many_arguments)]
 fn analyze_video_frames(
     client: &reqwest::blocking::Client,
     cfg: &ApiProfile,
@@ -1567,7 +1794,15 @@ fn analyze_video_frames(
     }
     let mut results: Vec<MediaAnalysis> = Vec::new();
     for f in &frames {
-        if let Ok(a) = request_analysis(client, cfg, facets, top_tags, manual_keys, f, system_override) {
+        if let Ok(a) = request_analysis(
+            client,
+            cfg,
+            facets,
+            top_tags,
+            manual_keys,
+            f,
+            system_override,
+        ) {
             results.push(a);
         }
     }
@@ -1592,6 +1827,10 @@ fn analyze_video_frames(
         proposals: Vec::new(),
         numbers: Vec::new(),
         warnings: Vec::new(),
+        responded_tag_facets: results
+            .iter()
+            .flat_map(|a| a.responded_tag_facets.iter().cloned())
+            .collect(),
         // 视频合并路径：单帧溯源已被逐帧 enrich 捕获，合并结果不再重复存储
         raw_response: String::new(),
         request_config_json: None,
@@ -1607,6 +1846,8 @@ const LOCAL_SUBBATCH_SIZE: usize = 15;
 /// 单项失败重试前退避（秒）：指数退避首段
 const RETRY_SECONDS: u64 = 1;
 
+// 8 参数为云端打标批处理链路的稳定上下文（DB/批次/配置/分面/上限/取消/进度回调），收进结构体需同步改全部调用点，收益低。
+#[allow(clippy::too_many_arguments)]
 pub fn run_cloud_batch<F: Fn(AiProgress)>(
     db: &Arc<Mutex<Connection>>,
     batch_id: i64,
@@ -1721,11 +1962,27 @@ pub fn run_cloud_batch<F: Fn(AiProgress)>(
                     &cfg.system_prompt_tagging,
                 ),
                 // cover（默认）：复用入库时生成的视频封面，needs 高清图优先
-                _ => request_analysis(&client, profile, kind_facets, &top_tags, &manual_keys, &pick_image(asset), &cfg.system_prompt_tagging),
+                _ => request_analysis(
+                    &client,
+                    profile,
+                    kind_facets,
+                    &top_tags,
+                    &manual_keys,
+                    &pick_image(asset),
+                    &cfg.system_prompt_tagging,
+                ),
             }
         } else {
             // 网络请求（可能耗时数十秒）：不持 DB 锁
-            request_analysis(&client, profile, kind_facets, &top_tags, &manual_keys, &pick_image(asset), &cfg.system_prompt_tagging)
+            request_analysis(
+                &client,
+                profile,
+                kind_facets,
+                &top_tags,
+                &manual_keys,
+                &pick_image(asset),
+                &cfg.system_prompt_tagging,
+            )
         }
     };
 
@@ -1789,8 +2046,8 @@ pub fn run_cloud_batch<F: Fn(AiProgress)>(
                         // A2：批次级溯源（prompt 版本 + 配置 JSON + 稳定 hash + 档案标识）——只写一次
                         if !batch_config_written {
                             if let Some(rcj) = &a.request_config_json {
-                                let cfg_val =
-                                    serde_json::from_str::<serde_json::Value>(rcj).unwrap_or_default();
+                                let cfg_val = serde_json::from_str::<serde_json::Value>(rcj)
+                                    .unwrap_or_default();
                                 let hash = stable_config_hash(&cfg_val);
                                 ai::set_batch_provenance(
                                     &conn,
@@ -1963,7 +2220,11 @@ mod tests {
             "自建分面 key 必须原样保留（R0-3）"
         );
         assert_eq!(tags.get("subject").unwrap(), &vec!["人".to_string()]);
-        assert!(warnings.is_empty(), "自建分面命中不应产生 warning：{:?}", warnings);
+        assert!(
+            warnings.is_empty(),
+            "自建分面命中不应产生 warning：{:?}",
+            warnings
+        );
     }
 
     // FB2-08（§14.3② / §14.14）：color 分面停用后，模型返回 color/色彩 key → 丢弃 + warning，不落回 color 分面。
@@ -1974,7 +2235,7 @@ mod tests {
             "{\"subject\":[\"人\"],\"color\":[\"青橙\"],\"色彩\":[\"蓝\"]}",
             &valid,
         );
-        assert!(tags.get("color").is_none(), "停用分面 color 的标签应被丢弃");
+        assert!(!tags.contains_key("color"), "停用分面 color 的标签应被丢弃");
         assert_eq!(tags.get("scene"), None);
         assert_eq!(tags.get("subject").unwrap(), &vec!["人".to_string()]);
         assert!(!warnings.is_empty());
@@ -2104,7 +2365,7 @@ mod tests {
             {"id": "qwen-VL-Max"}, {"id": "qwen-vl-max"}, {"id": "gpt-4.1"}, {"id": "gpt-4.1"}
         ]});
         let mut models = parse_model_ids(&raw);
-        models.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+        models.sort_by_key(|a| a.to_lowercase());
         models.dedup_by(|a, b| a.to_lowercase() == b.to_lowercase());
         // 不区分大小写排序 + 去重：大小写变体只保留输入顺序中的第一个
         assert_eq!(models, vec!["gpt-4.1", "qwen-VL-Max"]);
@@ -2232,10 +2493,111 @@ mod tests {
             &[],
         )
         .unwrap();
-        assert_eq!(a.numbers.len(), 1, "numbers 提议应收集 1 条：{:?}", a.numbers);
+        assert_eq!(
+            a.numbers.len(),
+            1,
+            "numbers 提议应收集 1 条：{:?}",
+            a.numbers
+        );
         assert_eq!(a.numbers[0].facet_key, "people_count");
         assert_eq!(a.numbers[0].raw_text, "5人");
-        assert!(a.tags.get("people_count").is_none(), "数值分面不得留在 tags");
+        assert!(
+            !a.tags.contains_key("people_count"),
+            "数值分面不得留在 tags"
+        );
+    }
+
+    #[test]
+    fn parse_media_analysis_resolves_number_display_name() {
+        let facets = vec![FacetPromptContext {
+            key: "people_count".into(),
+            display_name: "人数".into(),
+            selection_mode: "single".into(),
+            facet_kind: "number".into(),
+            ..Default::default()
+        }];
+        let valid = ["people_count"];
+        let a = super::parse_media_analysis(
+            r#"{"description":"两人合影","tags":{},"numbers":{"人数":"2"}}"#,
+            &valid,
+            &facets,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(a.numbers.len(), 1);
+        assert_eq!(a.numbers[0].facet_key, "people_count");
+        assert_eq!(a.numbers[0].raw_text, "2");
+    }
+
+    #[test]
+    fn completeness_distinguishes_empty_array_from_missing_key() {
+        let facets = vec![
+            FacetPromptContext {
+                key: "subject".into(),
+                facet_kind: "tag".into(),
+                ..Default::default()
+            },
+            FacetPromptContext {
+                key: "scene".into(),
+                display_name: "场景".into(),
+                facet_kind: "tag".into(),
+                ..Default::default()
+            },
+        ];
+        let valid = ["subject", "scene"];
+        let a = super::parse_media_analysis(
+            r#"{"description":"一棵树","tags":{"subject":["树"],"场景":[]}}"#,
+            &valid,
+            &facets,
+            &[],
+        )
+        .unwrap();
+        assert!(a.responded_tag_facets.contains("scene"));
+        assert!(super::missing_tag_facet_keys(&a, &facets).is_empty());
+
+        let b = super::parse_media_analysis(
+            r#"{"description":"一棵树","tags":{"subject":["树"]}}"#,
+            &valid,
+            &facets,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(super::missing_tag_facet_keys(&b, &facets), vec!["scene"]);
+    }
+
+    #[test]
+    fn merge_supplement_preserves_initial_tags_and_adds_missing_facets() {
+        let facets = vec![
+            FacetPromptContext {
+                key: "subject".into(),
+                facet_kind: "tag".into(),
+                ..Default::default()
+            },
+            FacetPromptContext {
+                key: "scene".into(),
+                facet_kind: "tag".into(),
+                ..Default::default()
+            },
+        ];
+        let valid = ["subject", "scene"];
+        let mut base = super::parse_media_analysis(
+            r#"{"description":"树下公园","tags":{"subject":["树"]}}"#,
+            &valid,
+            &facets,
+            &[],
+        )
+        .unwrap();
+        let extra = super::parse_media_analysis(
+            r#"{"description":"","tags":{"scene":["公园"]}}"#,
+            &valid,
+            &facets,
+            &[],
+        )
+        .unwrap();
+        super::merge_media_analysis(&mut base, extra);
+        assert_eq!(base.tags["subject"], vec!["树"]);
+        assert_eq!(base.tags["scene"], vec!["公园"]);
+        assert!(super::missing_tag_facet_keys(&base, &facets).is_empty());
     }
 
     /// V24：模型把数值误写进 tags（tags.people_count=["5"]）→ 摘出转成数值提议 + warning。
@@ -2273,8 +2635,13 @@ mod tests {
     fn parse_media_analysis_description_only_is_valid() {
         // 标签为空但描述非空 = 有效分析（§7.5 放宽）
         let valid = ["subject"];
-        let a =
-            super::parse_media_analysis(r#"{"description":"纯红底色","tags":{}}"#, &valid, &[], &[]).unwrap();
+        let a = super::parse_media_analysis(
+            r#"{"description":"纯红底色","tags":{}}"#,
+            &valid,
+            &[],
+            &[],
+        )
+        .unwrap();
         assert_eq!(a.description, "纯红底色");
         assert!(a.tags.is_empty());
         // 扁平旧数组也兼容（无描述；未知 key 归 custom）
@@ -2289,8 +2656,8 @@ mod tests {
     #[test]
     fn parse_media_analysis_both_empty_fails() {
         let valid = ["subject"];
-        let err =
-            super::parse_media_analysis(r#"{"description":"","tags":{}}"#, &valid, &[], &[]).unwrap_err();
+        let err = super::parse_media_analysis(r#"{"description":"","tags":{}}"#, &valid, &[], &[])
+            .unwrap_err();
         assert!(err.to_string().contains("模型未返回"));
         let err2 = super::parse_media_analysis("not json", &valid, &[], &[]).unwrap_err();
         assert!(err2.to_string().contains("模型未返回"));
@@ -2301,13 +2668,26 @@ mod tests {
     // 描述整句落 custom、真实 tags 全丢（线上「只打出 custom 标」第二层根因）。
     #[test]
     fn parse_media_analysis_fenced_json_new_protocol() {
-        let valid = ["subject", "scene", "style", "people", "composition", "lighting"];
+        let valid = [
+            "subject",
+            "scene",
+            "style",
+            "people",
+            "composition",
+            "lighting",
+        ];
         let raw = "```json\n{\n  \"description\": \"女孩斜站街旁\",\n  \"tags\": {\n    \"scene\": [\"街道\"],\n    \"style\": [\"清新\"],\n    \"people\": [\"女\", \"青少年\"],\n    \"subject\": [\"女孩\"],\n    \"composition\": [\"特写\"],\n    \"lighting\": [\"柔光\"]\n  }\n}\n```";
         let a = super::parse_media_analysis(raw, &valid, &[], &[]).unwrap();
         assert_eq!(a.description, "女孩斜站街旁");
         assert_eq!(a.tags.get("scene").unwrap(), &vec!["街道".to_string()]);
-        assert_eq!(a.tags.get("people").unwrap(), &vec!["女".to_string(), "青少年".to_string()]);
-        assert!(a.tags.get("custom").is_none(), "围栏剥除后不得再把描述落进 custom");
+        assert_eq!(
+            a.tags.get("people").unwrap(),
+            &vec!["女".to_string(), "青少年".to_string()]
+        );
+        assert!(
+            !a.tags.contains_key("custom"),
+            "围栏剥除后不得再把描述落进 custom"
+        );
     }
 
     #[test]

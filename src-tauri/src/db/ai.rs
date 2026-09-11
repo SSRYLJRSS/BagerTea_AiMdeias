@@ -6,6 +6,15 @@ use serde::{Deserialize, Serialize};
 use super::{asset_tags, tag_facets, tags};
 use crate::error::AppResult;
 
+/// 返回仍待处理或执行中的 AI 批次数量。
+pub fn count_pending_or_processing(conn: &Connection) -> AppResult<i64> {
+    Ok(conn.query_row(
+        "SELECT count(*) FROM ai_batches WHERE status IN ('pending', 'processing')",
+        [],
+        |row| row.get(0),
+    )?)
+}
+
 /// 分类标签：{ 分类名: [标签...] }（PRD 5.5；BTreeMap 保证序列化键序稳定）
 pub type CategorizedTags = std::collections::BTreeMap<String, Vec<String>>;
 
@@ -63,7 +72,20 @@ pub enum NumberParse {
 /// 约数限定词表（§6.5「数值解析的严格规则」）
 const APPROX_WORDS: &[&str] = &["约", "大约", "左右", "上下", "approximately", "approx"];
 /// 比较式限定词表
-const COMPARISON_WORDS: &[&str] = &["不少于", "不多于", "不超过", "超过", "以上", "以下", "至少", "最多", "大于", "小于", "多于", "少于"];
+const COMPARISON_WORDS: &[&str] = &[
+    "不少于",
+    "不多于",
+    "不超过",
+    "超过",
+    "以上",
+    "以下",
+    "至少",
+    "最多",
+    "大于",
+    "小于",
+    "多于",
+    "少于",
+];
 
 /// 提取文本中的全部数字 token（支持整数/小数/负号）。
 fn extract_number_tokens(text: &str) -> Vec<f64> {
@@ -73,7 +95,8 @@ fn extract_number_tokens(text: &str) -> Vec<f64> {
     let mut i = 0;
     while i < bytes.len() {
         let c = bytes[i];
-        if c.is_ascii_digit() || (c == '-' && i + 1 < bytes.len() && bytes[i + 1].is_ascii_digit()) {
+        if c.is_ascii_digit() || (c == '-' && i + 1 < bytes.len() && bytes[i + 1].is_ascii_digit())
+        {
             let start = i;
             let mut seen_dot = false;
             let mut j = i + 1;
@@ -81,7 +104,11 @@ fn extract_number_tokens(text: &str) -> Vec<f64> {
                 let d = bytes[j];
                 if d.is_ascii_digit() {
                     j += 1;
-                } else if d == '.' && !seen_dot && j + 1 < bytes.len() && bytes[j + 1].is_ascii_digit() {
+                } else if d == '.'
+                    && !seen_dot
+                    && j + 1 < bytes.len()
+                    && bytes[j + 1].is_ascii_digit()
+                {
                     seen_dot = true;
                     j += 1;
                 } else {
@@ -120,11 +147,15 @@ pub fn parse_number_proposal(raw: &str) -> NumberParse {
     let lower = s.to_lowercase();
     // ① 比较式（先判，避免「以上」等词被当普通文字）
     if COMPARISON_WORDS.iter().any(|w| lower.contains(w)) {
-        return NumberParse::Ambiguous { reason: "比较式".into() };
+        return NumberParse::Ambiguous {
+            reason: "比较式".into(),
+        };
     }
     // ② 约数
     if APPROX_WORDS.iter().any(|w| lower.contains(w)) {
-        return NumberParse::Ambiguous { reason: "约数".into() };
+        return NumberParse::Ambiguous {
+            reason: "约数".into(),
+        };
     }
     // ③ 范围：数字间夹着范围符号/范围词（「5~6」「5-6」「5 到 6」「5至6」「5—6」「5~ 6」）
     let tokens = extract_number_tokens(s);
@@ -155,7 +186,9 @@ pub fn parse_number_proposal(raw: &str) -> NumberParse {
                         seg.push(*ch);
                     }
                     if range_words.iter().any(|w| seg.trim().contains(w)) {
-                        return NumberParse::Ambiguous { reason: "范围".into() };
+                        return NumberParse::Ambiguous {
+                            reason: "范围".into(),
+                        };
                     }
                     break;
                 }
@@ -164,7 +197,9 @@ pub fn parse_number_proposal(raw: &str) -> NumberParse {
             String::new()
         };
         let _ = between;
-        return NumberParse::Ambiguous { reason: "多值".into() };
+        return NumberParse::Ambiguous {
+            reason: "多值".into(),
+        };
     }
     // ④ 单数字 + 剩余文字必须是纯标签性文字（字母数字中文，不含其他数字 —— 已由 tokens.len()==1 保证）
     if tokens.len() == 1 {
@@ -175,21 +210,43 @@ pub fn parse_number_proposal(raw: &str) -> NumberParse {
 }
 
 /// V24：按分面配置校验值域（越界 → Ambiguous「超出范围」，绝不裁到边界）。
-pub fn validate_number_in_range(value: f64, num_min: Option<f64>, num_max: Option<f64>) -> NumberParse {
+pub fn validate_number_in_range(
+    value: f64,
+    num_min: Option<f64>,
+    num_max: Option<f64>,
+) -> NumberParse {
     if !value.is_finite() {
-        return NumberParse::Ambiguous { reason: "超出范围".into() };
+        return NumberParse::Ambiguous {
+            reason: "超出范围".into(),
+        };
     }
     if let Some(lo) = num_min {
         if value < lo {
             return NumberParse::Ambiguous {
-                reason: format!("超出范围 {}–{}", num_min.map(|v| v.to_string()).unwrap_or_else(|| "−∞".into()), num_max.map(|v| v.to_string()).unwrap_or_else(|| "+∞".into())),
+                reason: format!(
+                    "超出范围 {}–{}",
+                    num_min
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "−∞".into()),
+                    num_max
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "+∞".into())
+                ),
             };
         }
     }
     if let Some(hi) = num_max {
         if value > hi {
             return NumberParse::Ambiguous {
-                reason: format!("超出范围 {}–{}", num_min.map(|v| v.to_string()).unwrap_or_else(|| "−∞".into()), num_max.map(|v| v.to_string()).unwrap_or_else(|| "+∞".into())),
+                reason: format!(
+                    "超出范围 {}–{}",
+                    num_min
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "−∞".into()),
+                    num_max
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "+∞".into())
+                ),
             };
         }
     }
@@ -202,7 +259,9 @@ impl AnalysisResult {
     pub fn to_categorized(&self) -> CategorizedTags {
         let mut out = CategorizedTags::new();
         for p in &self.proposals {
-            out.entry(p.facet_key.clone()).or_default().push(p.raw_name.clone());
+            out.entry(p.facet_key.clone())
+                .or_default()
+                .push(p.raw_name.clone());
         }
         out
     }
@@ -347,9 +406,8 @@ pub fn create_batch_with_retag(
             asset_ids.to_vec()
         } else {
             // 读全部 (id, file_path)，按 kinship_key 分组，每组保留非 RAW（若无非 RAW 保留第一个）
-            let mut stmt = tx.prepare(
-                "SELECT id, file_path FROM assets WHERE deleted_at IS NULL",
-            )?;
+            let mut stmt =
+                tx.prepare("SELECT id, file_path FROM assets WHERE deleted_at IS NULL")?;
             let rows: Vec<(i64, String)> = stmt
                 .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
                 .filter_map(|r| r.ok())
@@ -521,10 +579,11 @@ fn replace_suggestion_items(
         let normalized = tags::normalize_name(raw);
         // F3-a：tag_id 反查收敛到 find_by_term（mode=Alias）
         let mut decision_reason: Option<String> = None;
-        let tag_id: Option<i64> = tags::find_by_term(conn, &p.facet_key, &normalized, tags::TermMatch::Alias)
-            .ok()
-            .and_then(|l| l.hits.into_iter().next())
-            .map(|h| h.tag_id);
+        let tag_id: Option<i64> =
+            tags::find_by_term(conn, &p.facet_key, &normalized, tags::TermMatch::Alias)
+                .ok()
+                .and_then(|l| l.hits.into_iter().next())
+                .map(|h| h.tag_id);
         // F6-b：词表里没有精确命中 → 近似匹配「只提示，不自动改写」
         if tag_id.is_none() {
             if let Some((_, owner, reason)) =
@@ -587,10 +646,10 @@ impl Default for ConfidencePolicy {
 /// A4：带策略的结果写入（runner 用，取代无策略的 set_suggestion_result_typed）。
 ///  - confidence < min_suggest → 不入库（连 pending 都不进，suggested_tags 同步剔除）
 ///  - 精确命中 canonical/synonym：auto_accept_exact_terms → decision='accepted'
-///     并写 asset_tags（review_state='ai_unreviewed'，A3 状态机兜底）；否则 pending
+///    并写 asset_tags（review_state='ai_unreviewed'，A3 状态机兜底）；否则 pending
 ///  - 近似命中 → pending + decision_reason（F6-b 只提示，绝不自动改写）
 ///  - 完全新词 → pending；auto_adopt_new_terms 开启才 find_or_create + accepted + 写 asset_tags
-/// 永不因 confidence 高就自动建词（LLM 自报置信度不具校准意义）。
+///    永不因 confidence 高就自动建词（LLM 自报置信度不具校准意义）。
 pub fn set_suggestion_result_policy(
     conn: &Connection,
     id: i64,
@@ -619,7 +678,10 @@ pub fn set_suggestion_result_policy(
             let mut kept = Vec::new();
             'names: for n in names {
                 for p in proposals {
-                    let below = p.confidence.map(|c| (c as f64) < policy.min_suggest).unwrap_or(false);
+                    let below = p
+                        .confidence
+                        .map(|c| (c as f64) < policy.min_suggest)
+                        .unwrap_or(false);
                     if below && p.raw_name.trim() == n.trim() {
                         continue 'names;
                     }
@@ -654,19 +716,25 @@ pub fn set_suggestion_result_policy(
             continue;
         }
         let normalized = tags::normalize_name(raw);
-        let low_conf = p.confidence.map(|c| (c as f64) < policy.min_suggest).unwrap_or(false);
+        let low_conf = p
+            .confidence
+            .map(|c| (c as f64) < policy.min_suggest)
+            .unwrap_or(false);
         if low_conf {
             continue; // 低置信：不入库（连 pending 都不进）
         }
         let mut decision_reason: Option<String> = None;
         // F3-a：精确反查（canonical/synonym 命中 → tag_id Some）
-        let mut tag_id: Option<i64> = tags::find_by_term(conn, &p.facet_key, &normalized, tags::TermMatch::Alias)
-            .ok()
-            .and_then(|l| l.hits.into_iter().next())
-            .map(|h| h.tag_id);
+        let mut tag_id: Option<i64> =
+            tags::find_by_term(conn, &p.facet_key, &normalized, tags::TermMatch::Alias)
+                .ok()
+                .and_then(|l| l.hits.into_iter().next())
+                .map(|h| h.tag_id);
         // 近似命中：只提示不自动改写（F6-b）
         if tag_id.is_none() {
-            if let Some((_, owner, reason)) = tags::find_similar_tag(conn, &p.facet_key, &normalized)? {
+            if let Some((_, owner, reason)) =
+                tags::find_similar_tag(conn, &p.facet_key, &normalized)?
+            {
                 decision_reason = Some(match reason {
                     tags::SimilarReason::Substring => format!("疑似与「{owner}」重复"),
                     tags::SimilarReason::Spell => format!("拼写相近：「{owner}」"),
@@ -755,6 +823,8 @@ pub fn set_suggestion_provenance(
 
 /// A2：写批次级请求溯源（F1-g 列）——档案/模型标识 + 提示词版本 + 请求配置 JSON 及其稳定 hash。
 /// request_config_hash 由服务层对六项配置 JSON 做键排序稳定序列化后 sha256 前 16 位。
+// 8 参数为溯源记录字段的内聚集合，收进结构体需同步改全部调用点，收益低，集中豁免。
+#[allow(clippy::too_many_arguments)]
 pub fn set_batch_provenance(
     conn: &Connection,
     batch_id: i64,
@@ -938,7 +1008,9 @@ pub fn decide_suggestion_item(
         if kind == "number" {
             return match decision {
                 "accepted" => {
-                    if let Some(warn) = crate::db::facet_numbers::confirm_number_item(conn, item_id)? {
+                    if let Some(warn) =
+                        crate::db::facet_numbers::confirm_number_item(conn, item_id)?
+                    {
                         tracing::info!("数值建议确认跳过：{warn}");
                     }
                     Ok(())
@@ -977,13 +1049,15 @@ pub fn decide_suggestion_item(
                 Some(id)
             } else if let Some(name) = merge_name.clone().or_else(|| {
                 let r = raw_name.trim();
-                if r.is_empty() { None } else { Some(r.to_string()) }
+                if r.is_empty() {
+                    None
+                } else {
+                    Some(r.to_string())
+                }
             }) {
                 Some(tags::find_or_create_canonical(&tx, &facet_key, &name)?)
             } else {
-                return Err(crate::error::AppError::msg(
-                    "采纳为新词需要有效名称",
-                ));
+                return Err(crate::error::AppError::msg("采纳为新词需要有效名称"));
             }
         }
         "modified" => {
@@ -1054,7 +1128,9 @@ fn confirm_suggestion_inner(
                 .unwrap_or_else(|_| "custom".to_string());
             names.iter().filter_map(move |name| {
                 let normalized = tags::normalize_name(name);
-                if normalized.is_empty() { return None; }
+                if normalized.is_empty() {
+                    return None;
+                }
                 // F3-a：反查收敛到 find_by_term（mode=Alias）。不需要「跳转」逻辑 ——
                 // 合并时旧词已永久归属目标标签，find_by_term 命中即正确 tag。
                 let id = tags::find_by_term(conn, &facet_key, &normalized, tags::TermMatch::Alias)
@@ -1066,14 +1142,17 @@ fn confirm_suggestion_inner(
         })
         .collect();
     asset_tags::assign_inner(conn, &[asset_id], &tag_ids, source, Some(batch_id))?;
-    // A3：确认 = 用户审核通过 → 本批次该素材的 AI 来源行提升 ai_reviewed
-    //（铁律 10：此后 ReplaceAiOnly / 任何重跑都不再清它）；manual 行保持 manual。
-    conn.execute(
+    // A3：确认 = 用户审核通过。assign_inner 可能把同一批次的同一组标签同步给
+    // RAW/JPG 同源文件，因此按批次 + 本次确认的 tag_id 晋升全部实际写入行。
+    // 这样同源副本也受“审核后永不被重打清理”的铁律保护；manual 行保持 manual。
+    let placeholders = tag_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let sql = format!(
         "UPDATE asset_tags SET review_state = 'ai_reviewed'
-          WHERE asset_id = ?1 AND source_batch_id = ?2 AND source != 'manual'
-            AND review_state = 'ai_unreviewed'",
-        rusqlite::params![asset_id, batch_id],
-    )?;
+          WHERE source_batch_id = ?1 AND source != 'manual'
+            AND review_state = 'ai_unreviewed' AND tag_id IN ({placeholders})"
+    );
+    let params = std::iter::once(batch_id).chain(tag_ids.iter().copied());
+    conn.execute(&sql, rusqlite::params_from_iter(params))?;
     let original: String = conn.query_row(
         "SELECT suggested_tags FROM ai_suggestions WHERE id = ?1",
         [id],
@@ -1291,7 +1370,9 @@ mod number_tests {
         for s in ["5~6", "5-6", "5 到 6", "5至6", "5～6", "5—6"] {
             assert_eq!(
                 parse_number_proposal(s),
-                NumberParse::Ambiguous { reason: "范围".into() },
+                NumberParse::Ambiguous {
+                    reason: "范围".into()
+                },
                 "范围「{s}」不得静默取首个数字"
             );
         }
@@ -1302,7 +1383,9 @@ mod number_tests {
         for s in ["约5", "大约 5", "5左右", "5上下", "approximately 5"] {
             assert_eq!(
                 parse_number_proposal(s),
-                NumberParse::Ambiguous { reason: "约数".into() },
+                NumberParse::Ambiguous {
+                    reason: "约数".into()
+                },
                 "约数「{s}」必须进 pending"
             );
         }
@@ -1310,10 +1393,22 @@ mod number_tests {
 
     #[test]
     fn number_parse_rejects_comparison_words() {
-        for s in ["不少于5", "不多于5", "超过5", "5以上", "5以下", "至少5", "最多5", "大于5", "小于5"] {
+        for s in [
+            "不少于5",
+            "不多于5",
+            "超过5",
+            "5以上",
+            "5以下",
+            "至少5",
+            "最多5",
+            "大于5",
+            "小于5",
+        ] {
             assert_eq!(
                 parse_number_proposal(s),
-                NumberParse::Ambiguous { reason: "比较式".into() },
+                NumberParse::Ambiguous {
+                    reason: "比较式".into()
+                },
                 "比较式「{s}」必须进 pending"
             );
         }
@@ -1324,7 +1419,9 @@ mod number_tests {
         for s in ["3或4", "3、4", "3 个或 4 个"] {
             assert_eq!(
                 parse_number_proposal(s),
-                NumberParse::Ambiguous { reason: "多值".into() },
+                NumberParse::Ambiguous {
+                    reason: "多值".into()
+                },
                 "多值「{s}」不得自动裁决"
             );
         }
@@ -1339,21 +1436,32 @@ mod number_tests {
         // 非有限值与越界由 validate_number_in_range 拒绝（绝不裁到边界）
         assert_eq!(
             validate_number_in_range(f64::NAN, Some(0.0), Some(50.0)),
-            NumberParse::Ambiguous { reason: "超出范围".into() }
+            NumberParse::Ambiguous {
+                reason: "超出范围".into()
+            }
         );
         assert_eq!(
             validate_number_in_range(f64::INFINITY, Some(0.0), Some(50.0)),
-            NumberParse::Ambiguous { reason: "超出范围".into() }
+            NumberParse::Ambiguous {
+                reason: "超出范围".into()
+            }
         );
         assert_eq!(
             validate_number_in_range(51.0, Some(0.0), Some(50.0)),
-            NumberParse::Ambiguous { reason: "超出范围 0–50".into() }
+            NumberParse::Ambiguous {
+                reason: "超出范围 0–50".into()
+            }
         );
         assert_eq!(
             validate_number_in_range(-1.0, Some(0.0), Some(50.0)),
-            NumberParse::Ambiguous { reason: "超出范围 0–50".into() }
+            NumberParse::Ambiguous {
+                reason: "超出范围 0–50".into()
+            }
         );
-        assert_eq!(validate_number_in_range(50.0, Some(0.0), Some(50.0)), NumberParse::Value(50.0));
+        assert_eq!(
+            validate_number_in_range(50.0, Some(0.0), Some(50.0)),
+            NumberParse::Value(50.0)
+        );
     }
 
     #[test]
@@ -1377,7 +1485,12 @@ mod number_tests {
         let c = parse_number_proposal("05");
         let d = parse_number_proposal("5人");
         match (a, b, c, d) {
-            (NumberParse::Value(x), NumberParse::Value(y), NumberParse::Value(z), NumberParse::Value(w)) => {
+            (
+                NumberParse::Value(x),
+                NumberParse::Value(y),
+                NumberParse::Value(z),
+                NumberParse::Value(w),
+            ) => {
                 assert_eq!(x, 5.0);
                 assert_eq!(y, 5.0);
                 assert_eq!(z, 5.0);

@@ -3,10 +3,8 @@ node_modules/
 dist/
 *.local
 
-# Rust / Tauri
-src-tauri/target/
-src-tauri/target-codex-verify/
-src-tauri/target-test/
+# Rust / Tauri（通配：任何 target-* 构建产物目录都不入库，历史上曾出现 target-codex-verify 9.7G / target-test 8.4G）
+src-tauri/target*/
 src-tauri/gen/
 
 # 系统

@@ -42,7 +42,12 @@ pub struct ResetReport {
 
 impl ResetSelection {
     pub fn any(&self) -> bool {
-        self.assets || self.tags || self.ai_tasks || self.ai_connections || self.preferences || self.caches
+        self.assets
+            || self.tags
+            || self.ai_tasks
+            || self.ai_connections
+            || self.preferences
+            || self.caches
     }
 }
 
@@ -152,6 +157,20 @@ fn clear_cache_dirs(data_dir: &Path) -> AppResult<u64> {
     Ok(removed)
 }
 
+fn count_files(dir: &Path) -> u64 {
+    let mut n = 0u64;
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for entry in rd.flatten() {
+            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                n += count_files(&entry.path());
+            } else {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -173,25 +192,17 @@ mod tests {
         let facets = crate::db::tag_facets::list(&conn).unwrap();
         let keys: Vec<&str> = facets.iter().map(|f| f.key.as_str()).collect();
         assert!(keys.contains(&"subject"), "系统分面应重建：{keys:?}");
-        assert!(!keys.contains(&"color"), "color 应保持 inactive 不进 active 列表");
+        assert!(
+            !keys.contains(&"color"),
+            "color 应保持 inactive 不进 active 列表"
+        );
         let color = crate::db::tag_facets::get(&conn, "color").unwrap();
         assert_eq!(color.status, "inactive");
         // 重置后重启自愈不应再改动（幂等）
         crate::db::tag_facets::seed_system_facets_if_empty(&conn).unwrap();
-        assert_eq!(crate::db::tag_facets::list(&conn).unwrap().len(), facets.len());
+        assert_eq!(
+            crate::db::tag_facets::list(&conn).unwrap().len(),
+            facets.len()
+        );
     }
-}
-
-fn count_files(dir: &Path) -> u64 {
-    let mut n = 0u64;
-    if let Ok(rd) = std::fs::read_dir(dir) {
-        for entry in rd.flatten() {
-            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                n += count_files(&entry.path());
-            } else {
-                n += 1;
-            }
-        }
-    }
-    n
 }

@@ -1,0 +1,1540 @@
+[
+  {
+    "idx": 1,
+    "query": "草地的照片",
+    "ok": true,
+    "status": "full",
+    "ms": 1354,
+    "counts": {
+      "leaf": 0,
+      "tag": 0,
+      "exclude_tag": 0,
+      "metadata": 0,
+      "search": 0,
+      "asset_type": 0,
+      "untagged": 0,
+      "facet": 0,
+      "and": 0,
+      "or": 0,
+      "not": 0
+    },
+    "should": 0,
+    "min_should": 0,
+    "warnings": [],
+    "error": null,
+    "expr": {
+      "children": [
+        {
+          "cond": {
+            "type": "assetType",
+            "value": "image"
+          },
+          "op": "leaf"
+        },
+        {
+          "cond": {
+            "scope": "content",
+            "type": "search",
+            "value": "草地"
+          },
+          "op": "leaf"
+        }
+      ],
+      "op": "and"
+    }
+  },
+  {
+    "idx": 2,
+    "query": "有桥的素材",
+    "ok": true,
+    "status": "full",
+    "ms": 1629,
+    "counts": {
+      "leaf": 0,
+      "tag": 0,
+      "exclude_tag": 0,
+      "metadata": 0,
+      "search": 0,
+      "asset_type": 0,
+      "untagged": 0,
+      "facet": 0,
+      "and": 0,
+      "or": 0,
+      "not": 0
+    },
+    "should": 0,
+    "min_should": 0,
+    "warnings": [],
+    "error": null,
+    "expr": {
+      "cond": {
+        "facetKey": "subject",
+        "includeDescendants": true,
+        "mode": "any",
+        "tagIds": [
+          379
+        ],
+        "termMatch": "alias",
+        "termQuery": null,
+        "type": "tag"
+      },
+      "op": "leaf"
+    }
+  },
+  {
+    "idx": 3,
+    "query": "拍了行人的",
+    "ok": true,
+    "status": "full",
+    "ms": 813,
+    "counts": {
+      "leaf": 0,
+      "tag": 0,
+      "exclude_tag": 0,
+      "metadata": 0,
+      "search": 0,
+      "asset_type": 0,
+      "untagged": 0,
+      "facet": 0,
+      "and": 0,
+      "or": 0,
+      "not": 0
+    },
+    "should": 0,
+    "min_should": 0,
+    "warnings": [],
+    "error": null,
+    "expr": {
+      "children": [
+        {
+          "cond": {
+            "scope": "description",
+            "type": "search",
+            "value": "拍了"
+          },
+          "op": "leaf"
+        },
+        {
+          "cond": {
+            "facetKey": "people",
+            "includeDescendants": true,
+            "mode": "any",
+            "tagIds": [
+              365
+            ],
+            "termMatch": "alias",
+            "termQuery": null,
+            "type": "tag"
+          },
+          "op": "leaf"
+        }
+      ],
+      "op": "and"
+    }
+  },
+  {
+    "idx": 4,
+    "query": "现代风格的建筑",
+    "ok": true,
+    "status": "full",
+    "ms": 91232,
+    "counts": {
+      "leaf": 0,
+      "tag": 0,
+      "exclude_tag": 0,
+      "metadata": 0,
+      "search": 0,
+      "asset_type": 0,
+      "untagged": 0,
+      "facet": 0,
+      "and": 0,
+      "or": 0,
+      "not": 0
+    },
+    "should": 0,
+    "min_should": 0,
+    "warnings": [],
+    "error": null,
+    "expr": {
+      "children": [
+        {
+          "cond": {
+            "facetKey": "subject",
+            "includeDescendants": true,
+            "mode": "any",
+            "tagIds": [
+              369
+            ],
+            "termMatch": "alias",
+            "termQuery": null,
+            "type": "tag"
+          },
+          "op": "leaf"
+        },
+        {
+          "cond": {
+            "facetKey": "style",
+            "includeDescendants": true,
+            "mode": "any",
+            "tagIds": [
+              355
+            ],
+            "termMatch": "alias",
+            "termQuery": null,
+            "type": "tag"
+          },
+          "op": "leaf"
+        }
+      ],
+      "op": "and"
+    }
+  },
+  {
+    "idx": 5,
+    "query": "城市里的建筑",
+    "ok": true,
+    "status": "full",
+    "ms": 28922,
+    "counts": {
+      "leaf": 0,
+      "tag": 0,
+      "exclude_tag": 0,
+      "metadata": 0,
+      "search": 0,
+      "asset_type": 0,
+      "untagged": 0,
+      "facet": 0,
+      "and": 0,
+      "or": 0,
+      "not": 0
+    },
+    "should": 0,
+    "min_should": 0,
+    "warnings": [],
+    "error": null,
+    "expr": {
+      "children": [
+        {
+          "cond": {
+            "facetKey": "scene",
+            "includeDescendants": true,
+            "mode": "any",
+            "tagIds": [
+              373
+            ],
+            "termMatch": "alias",
+            "termQuery": null,
+            "type": "tag"
+          },
+          "op": "leaf"
+        },
+        {
+          "cond": {
+            "facetKey": "subject",
+            "includeDescendants": true,
+            "mode": "any",
+            "tagIds": [
+              369
+            ],
+            "termMatch": "alias",
+            "termQuery": null,
+            "type": "tag"
+          },
+          "op": "leaf"
+        }
+      ],
+      "op": "and"
+    }
+  },
+  {
+    "idx": 6,
+    "query": "河边的树",
+    "ok": true,
+    "status": "full",
+    "ms": 1687,
+    "counts": {
+      "leaf": 0,
+      "tag": 0,
+      "exclude_tag": 0,
+      "metadata": 0,
+      "search": 0,
+      "asset_type": 0,
+      "untagged": 0,
+      "facet": 0,
+      "and": 0,
+      "or": 0,
+      "not": 0
+    },
+    "should": 0,
+    "min_should": 0,
+    "warnings": [],
+    "error": null,
+    "expr": {
+      "children": [
+        {
+          "cond": {
+            "facetKey": "scene",
+            "includeDescendants": true,
+            "mode": "any",
+            "tagIds": [
+              378
+            ],
+            "termMatch": "alias",
+            "termQuery": null,
+            "type": "tag"
+          },
+          "op": "leaf"
+        },
+        {
+          "cond": {
+            "facetKey": "subject",
+            "includeDescendants": true,
+            "mode": "any",
+            "tagIds": [
+              356
+            ],
+            "termMatch": "alias",
+            "termQuery": null,
+            "type": "tag"
+          },
+          "op": "leaf"
+        }
+      ],
+      "op": "and"
+    }
+  },
+  {
+    "idx": 7,
+    "query": "白天拍的公园全景",
+    "ok": true,
+    "status": "partial",
+    "ms": 3518,
+    "counts": {
+      "leaf": 0,
+      "tag": 0,
+      "exclude_tag": 0,
+      "metadata": 0,
+      "search": 0,
+      "asset_type": 0,
+      "untagged": 0,
+      "facet": 0,
+      "and": 0,
+      "or": 0,
+      "not": 0
+    },
+    "should": 0,
+    "min_should": 0,
+    "warnings": [
+      "原文未明确提到「图片/照片」，已忽略类型条件。"
+    ],
+    "error": null,
+    "expr": {
+      "children": [
+        {
+          "cond": {
+            "facetKey": "lighting",
+            "includeDescendants": true,
+            "mode": "any",
+            "tagIds": [
+              374
+            ],
+            "termMatch": "alias",
+            "termQuery": null,
+            "type": "tag"
+          },
+          "op": "leaf"
+        },
+        {
+          "cond": {
+            "facetKey": "scene",
+            "includeDescendants": true,
+            "mode": "any",
+            "tagIds": [
+              354
+            ],
+            "termMatch": "alias",
+            "termQuery": null,
+            "type": "tag"
+          },
+          "op": "leaf"
+        },
+        {
+          "cond": {
+            "facetKey": "composition",
+            "includeDescendants": true,
+            "mode": "any",
+            "tagIds": [
+              363
+            ],
+            "termMatch": "alias",
+            "termQuery": null,
+            "type": "tag"
+          },
+          "op": "leaf"
+        }
+      ],
+      "op": "and"
+    }
+  },
+  {
+    "idx": 8,
+    "query": "阴天的单人中景",
+    "ok": true,
+    "status": "partial",
+    "ms": 1825,
+    "counts": {
+      "leaf": 0,
+      "tag": 0,
+      "exclude_tag": 0,
+      "metadata": 0,
+      "search": 0,
+      "asset_type": 0,
+      "untagged": 0,
+      "facet": 0,
+      "and": 0,
+      "or": 0,
+      "not": 0
+    },
+    "should": 0,
+    "min_should": 0,
+    "warnings": [
+      "不支持的排序字段「relevance」，已用默认排序。",
+      "输入没有明确的「或」关系，已将多组条件合并为一组全部满足。",
+      "多组条件已合并，加分项分组信息不再精确，已按必须条件执行。"
+    ],
+    "error": null,
+    "expr": {
+      "children": [
+        {
+          "cond": {
+            "scope": "content",
+            "type": "search",
+            "value": "阴天"
+          },
+          "op": "leaf"
+        },
+        {
+          "cond": {
+            "scope": "content",
+            "type": "search",
+            "value": "单人"
+          },
+          "op": "leaf"
+        },
+        {
+          "cond": {
+            "scope": "content",
+            "type": "search",
+            "value": "中景"
+          },
+          "op": "leaf"
+        },
+        {
+          "cond": {
+            "facetKey": "lighting",
+            "includeDescendants": true,
+            "mode": "any",
+            "tagIds": [
+              377
+            ],
+            "termMatch": "alias",
+            "termQuery": null,
+            "type": "tag"
+          },
+          "op": "leaf"
+        },
+        {
+          "cond": {
+            "facetKey": "people",
+            "includeDescendants": true,
+            "mode": "any",
+            "tagIds": [
+              380
+            ],
+            "termMatch": "alias",
+            "termQuery": null,
+            "type": "tag"
+          },
+          "op": "leaf"
+        },
+        {
+          "cond": {
+            "facetKey": "composition",
+            "includeDescendants": true,
+            "mode": "any",
+            "tagIds": [
+              353
+            ],
+            "termMatch": "alias",
+            "termQuery": null,
+            "type": "tag"
+          },
+          "op": "leaf"
+        }
+      ],
+      "op": "and"
+    }
+  },
+  {
+    "idx": 9,
+    "query": "草地或者绿地",
+    "ok": true,
+    "status": "partial",
+    "ms": 11133,
+    "counts": {
+      "leaf": 0,
+      "tag": 0,
+      "exclude_tag": 0,
+      "metadata": 0,
+      "search": 0,
+      "asset_type": 0,
+      "untagged": 0,
+      "facet": 0,
+      "and": 0,
+      "or": 0,
+      "not": 0
+    },
+    "should": 0,
+    "min_should": 0,
+    "warnings": [
+      "「或」关系未能准确分组，已按全部条件同时满足执行。"
+    ],
+    "error": null,
+    "expr": {
+      "children": [
+        {
+          "cond": {
+            "facetKey": "scene",
+            "includeDescendants": true,
+            "mode": "any",
+            "tagIds": [
+              370
+            ],
+            "termMatch": "alias",
+            "termQuery": null,
+            "type": "tag"
+          },
+          "op": "leaf"
+        },
+        {
+          "cond": {
+            "facetKey": "scene",
+            "includeDescendants": true,
+            "mode": "any",
+            "tagIds": [
+              368
+            ],
+            "termMatch": "alias",
+            "termQuery": null,
+            "type": "tag"
+          },
+          "op": "leaf"
+        }
+      ],
+      "op": "and"
+    }
+  },
+  {
+    "idx": 10,
+    "query": "桥或者河边",
+    "ok": true,
+    "status": "full",
+    "ms": 1583,
+    "counts": {
+      "leaf": 0,
+      "tag": 0,
+      "exclude_tag": 0,
+      "metadata": 0,
+      "search": 0,
+      "asset_type": 0,
+      "untagged": 0,
+      "facet": 0,
+      "and": 0,
+      "or": 0,
+      "not": 0
+    },
+    "should": 0,
+    "min_should": 0,
+    "warnings": [],
+    "error": null,
+    "expr": {
+      "children": [
+        {
+          "cond": {
+            "facetKey": "scene",
+            "includeDescendants": true,
+            "mode": "any",
+            "tagIds": [
+              375
+            ],
+            "termMatch": "alias",
+            "termQuery": null,
+            "type": "tag"
+          },
+          "op": "leaf"
+        },
+        {
+          "cond": {
+            "facetKey": "scene",
+            "includeDescendants": true,
+            "mode": "any",
+            "tagIds": [
+              378
+            ],
+            "termMatch": "alias",
+            "termQuery": null,
+            "type": "tag"
+          },
+          "op": "leaf"
+        }
+      ],
+      "op": "or"
+    }
+  },
+  {
+    "idx": 11,
+    "query": "建筑但不要行人",
+    "ok": true,
+    "status": "partial",
+    "ms": 2946,
+    "counts": {
+      "leaf": 0,
+      "tag": 0,
+      "exclude_tag": 0,
+      "metadata": 0,
+      "search": 0,
+      "asset_type": 0,
+      "untagged": 0,
+      "facet": 0,
+      "and": 0,
+      "or": 0,
+      "not": 0
+    },
+    "should": 0,
+    "min_should": 0,
+    "warnings": [
+      "部分条件同时被包含与排除，已按排除处理。"
+    ],
+    "error": null,
+    "expr": {
+      "children": [
+        {
+          "cond": {
+            "facetKey": "scene",
+            "includeDescendants": true,
+            "mode": "any",
+            "tagIds": [
+              358
+            ],
+            "termMatch": "alias",
+            "termQuery": null,
+            "type": "tag"
+          },
+          "op": "leaf"
+        },
+        {
+          "child": {
+            "cond": {
+              "facetKey": "subject",
+              "includeDescendants": true,
+              "mode": "any",
+              "tagIds": [
+                376
+              ],
+              "termMatch": "alias",
+              "termQuery": null,
+              "type": "tag"
+            },
+            "op": "leaf"
+          },
+          "op": "not"
+        }
+      ],
+      "op": "and"
+    }
+  },
+  {
+    "idx": 12,
+    "query": "白天的公园，不要树",
+    "ok": true,
+    "status": "keyword",
+    "ms": 8578,
+    "counts": {
+      "leaf": 0,
+      "tag": 0,
+      "exclude_tag": 0,
+      "metadata": 0,
+      "search": 0,
+      "asset_type": 0,
+      "untagged": 0,
+      "facet": 0,
+      "and": 0,
+      "or": 0,
+      "not": 0
+    },
+    "should": 0,
+    "min_should": 0,
+    "warnings": [
+      "未能理解搜索条件，已按关键词搜索。"
+    ],
+    "error": null,
+    "expr": {
+      "cond": {
+        "scope": "all",
+        "type": "search",
+        "value": "白天的公园，不要树"
+      },
+      "op": "leaf"
+    }
+  },
+  {
+    "idx": 13,
+    "query": "城市街景，最好有行人",
+    "ok": true,
+    "status": "full",
+    "ms": 2055,
+    "counts": {
+      "leaf": 0,
+      "tag": 0,
+      "exclude_tag": 0,
+      "metadata": 0,
+      "search": 0,
+      "asset_type": 0,
+      "untagged": 0,
+      "facet": 0,
+      "and": 0,
+      "or": 0,
+      "not": 0
+    },
+    "should": 1,
+    "min_should": 0,
+    "warnings": [],
+    "error": null,
+    "expr": {
+      "children": [
+        {
+          "cond": {
+            "facetKey": "scene",
+            "includeDescendants": true,
+            "mode": "any",
+            "tagIds": [
+              373
+            ],
+            "termMatch": "alias",
+            "termQuery": null,
+            "type": "tag"
+          },
+          "op": "leaf"
+        },
+        {
+          "cond": {
+            "scope": "content",
+            "type": "search",
+            "value": "街景"
+          },
+          "op": "leaf"
+        }
+      ],
+      "op": "and"
+    }
+  },
+  {
+    "idx": 14,
+    "query": "草地，优先近景，尽量自然光",
+    "ok": true,
+    "status": "partial",
+    "ms": 3191,
+    "counts": {
+      "leaf": 0,
+      "tag": 0,
+      "exclude_tag": 0,
+      "metadata": 0,
+      "search": 0,
+      "asset_type": 0,
+      "untagged": 0,
+      "facet": 0,
+      "and": 0,
+      "or": 0,
+      "not": 0
+    },
+    "should": 2,
+    "min_should": 0,
+    "warnings": [
+      "原文未明确提到「图片/照片」，已忽略类型条件。"
+    ],
+    "error": null,
+    "expr": {
+      "children": [
+        {
+          "cond": {
+            "facetKey": "scene",
+            "includeDescendants": true,
+            "mode": "any",
+            "tagIds": [
+              370
+            ],
+            "termMatch": "alias",
+            "termQuery": null,
+            "type": "tag"
+          },
+          "op": "leaf"
+        },
+        {
+          "cond": {
+            "facetKey": "lighting",
+            "includeDescendants": true,
+            "mode": "any",
+            "tagIds": [
+              364
+            ],
+            "termMatch": "alias",
+            "termQuery": null,
+            "type": "tag"
+          },
+          "op": "leaf"
+        },
+        {
+          "cond": {
+            "facetKey": "composition",
+            "includeDescendants": true,
+            "mode": "any",
+            "tagIds": [
+              372
+            ],
+            "termMatch": "alias",
+            "termQuery": null,
+            "type": "tag"
+          },
+          "op": "leaf"
+        }
+      ],
+      "op": "and"
+    }
+  },
+  {
+    "idx": 15,
+    "query": "视频素材",
+    "ok": true,
+    "status": "partial",
+    "ms": 3901,
+    "counts": {
+      "leaf": 0,
+      "tag": 0,
+      "exclude_tag": 0,
+      "metadata": 0,
+      "search": 0,
+      "asset_type": 0,
+      "untagged": 0,
+      "facet": 0,
+      "and": 0,
+      "or": 0,
+      "not": 0
+    },
+    "should": 0,
+    "min_should": 0,
+    "warnings": [
+      "一组条件为空，已忽略。",
+      "已忽略 1 组无法识别的条件。",
+      "多组条件已合并，加分项分组信息不再精确，已按必须条件执行。"
+    ],
+    "error": null,
+    "expr": null
+  },
+  {
+    "idx": 16,
+    "query": "草地的图片",
+    "ok": true,
+    "status": "full",
+    "ms": 2211,
+    "counts": {
+      "leaf": 0,
+      "tag": 0,
+      "exclude_tag": 0,
+      "metadata": 0,
+      "search": 0,
+      "asset_type": 0,
+      "untagged": 0,
+      "facet": 0,
+      "and": 0,
+      "or": 0,
+      "not": 0
+    },
+    "should": 0,
+    "min_should": 0,
+    "warnings": [],
+    "error": null,
+    "expr": {
+      "children": [
+        {
+          "cond": {
+            "type": "assetType",
+            "value": "image"
+          },
+          "op": "leaf"
+        },
+        {
+          "cond": {
+            "facetKey": "scene",
+            "includeDescendants": true,
+            "mode": "any",
+            "tagIds": [
+              370
+            ],
+            "termMatch": "alias",
+            "termQuery": null,
+            "type": "tag"
+          },
+          "op": "leaf"
+        }
+      ],
+      "op": "and"
+    }
+  },
+  {
+    "idx": 17,
+    "query": "大于5MB的素材",
+    "ok": true,
+    "status": "full",
+    "ms": 5159,
+    "counts": {
+      "leaf": 0,
+      "tag": 0,
+      "exclude_tag": 0,
+      "metadata": 0,
+      "search": 0,
+      "asset_type": 0,
+      "untagged": 0,
+      "facet": 0,
+      "and": 0,
+      "or": 0,
+      "not": 0
+    },
+    "should": 0,
+    "min_should": 0,
+    "warnings": [],
+    "error": null,
+    "expr": {
+      "cond": {
+        "key": "file_size",
+        "max": null,
+        "min": null,
+        "op": "gt",
+        "type": "metadata",
+        "value": 5242880,
+        "values": null
+      },
+      "op": "leaf"
+    }
+  },
+  {
+    "idx": 18,
+    "query": "10MB到50MB之间的视频",
+    "ok": true,
+    "status": "full",
+    "ms": 2949,
+    "counts": {
+      "leaf": 0,
+      "tag": 0,
+      "exclude_tag": 0,
+      "metadata": 0,
+      "search": 0,
+      "asset_type": 0,
+      "untagged": 0,
+      "facet": 0,
+      "and": 0,
+      "or": 0,
+      "not": 0
+    },
+    "should": 0,
+    "min_should": 0,
+    "warnings": [],
+    "error": null,
+    "expr": {
+      "children": [
+        {
+          "cond": {
+            "type": "assetType",
+            "value": "video"
+          },
+          "op": "leaf"
+        },
+        {
+          "cond": {
+            "key": "file_size",
+            "max": 52428800,
+            "min": 10485760,
+            "op": "between",
+            "type": "metadata",
+            "value": null,
+            "values": null
+          },
+          "op": "leaf"
+        }
+      ],
+      "op": "and"
+    }
+  },
+  {
+    "idx": 19,
+    "query": "小于2MB的图片",
+    "ok": true,
+    "status": "partial",
+    "ms": 1003,
+    "counts": {
+      "leaf": 0,
+      "tag": 0,
+      "exclude_tag": 0,
+      "metadata": 0,
+      "search": 0,
+      "asset_type": 0,
+      "untagged": 0,
+      "facet": 0,
+      "and": 0,
+      "or": 0,
+      "not": 0
+    },
+    "should": 0,
+    "min_should": 0,
+    "warnings": [
+      "已忽略无效的元数据条件（file_size lt）：字段 file_size 的 lt 需要 value",
+      "一组条件为空，已忽略。",
+      "已忽略 1 组无法识别的条件。",
+      "多组条件已合并，加分项分组信息不再精确，已按必须条件执行。"
+    ],
+    "error": null,
+    "expr": null
+  },
+  {
+    "idx": 20,
+    "query": "2025年拍的照片",
+    "ok": true,
+    "status": "full",
+    "ms": 893,
+    "counts": {
+      "leaf": 0,
+      "tag": 0,
+      "exclude_tag": 0,
+      "metadata": 0,
+      "search": 0,
+      "asset_type": 0,
+      "untagged": 0,
+      "facet": 0,
+      "and": 0,
+      "or": 0,
+      "not": 0
+    },
+    "should": 0,
+    "min_should": 0,
+    "warnings": [],
+    "error": null,
+    "expr": {
+      "children": [
+        {
+          "cond": {
+            "type": "assetType",
+            "value": "image"
+          },
+          "op": "leaf"
+        },
+        {
+          "cond": {
+            "key": "taken_at",
+            "max": "2025-12-31",
+            "min": "2025-01-01",
+            "op": "between",
+            "type": "metadata",
+            "value": null,
+            "values": null
+          },
+          "op": "leaf"
+        }
+      ],
+      "op": "and"
+    }
+  },
+  {
+    "idx": 21,
+    "query": "今年拍的白天素材",
+    "ok": true,
+    "status": "partial",
+    "ms": 1576,
+    "counts": {
+      "leaf": 0,
+      "tag": 0,
+      "exclude_tag": 0,
+      "metadata": 0,
+      "search": 0,
+      "asset_type": 0,
+      "untagged": 0,
+      "facet": 0,
+      "and": 0,
+      "or": 0,
+      "not": 0
+    },
+    "should": 0,
+    "min_should": 0,
+    "warnings": [
+      "已忽略无效的元数据条件（taken_at between）：无法解析日期（需 YYYY-MM-DD）：今年1月1日"
+    ],
+    "error": null,
+    "expr": {
+      "cond": {
+        "facetKey": "lighting",
+        "includeDescendants": true,
+        "mode": "any",
+        "tagIds": [
+          374
+        ],
+        "termMatch": "alias",
+        "termQuery": null,
+        "type": "tag"
+      },
+      "op": "leaf"
+    }
+  },
+  {
+    "idx": 22,
+    "query": "时长10秒以上的视频",
+    "ok": true,
+    "status": "full",
+    "ms": 1369,
+    "counts": {
+      "leaf": 0,
+      "tag": 0,
+      "exclude_tag": 0,
+      "metadata": 0,
+      "search": 0,
+      "asset_type": 0,
+      "untagged": 0,
+      "facet": 0,
+      "and": 0,
+      "or": 0,
+      "not": 0
+    },
+    "should": 0,
+    "min_should": 0,
+    "warnings": [],
+    "error": null,
+    "expr": {
+      "children": [
+        {
+          "cond": {
+            "type": "assetType",
+            "value": "video"
+          },
+          "op": "leaf"
+        },
+        {
+          "cond": {
+            "key": "duration_ms",
+            "max": null,
+            "min": 10000,
+            "op": "gte",
+            "type": "metadata",
+            "value": 10000,
+            "values": null
+          },
+          "op": "leaf"
+        }
+      ],
+      "op": "and"
+    }
+  },
+  {
+    "idx": 23,
+    "query": "5到30秒的短视频",
+    "ok": true,
+    "status": "full",
+    "ms": 2493,
+    "counts": {
+      "leaf": 0,
+      "tag": 0,
+      "exclude_tag": 0,
+      "metadata": 0,
+      "search": 0,
+      "asset_type": 0,
+      "untagged": 0,
+      "facet": 0,
+      "and": 0,
+      "or": 0,
+      "not": 0
+    },
+    "should": 0,
+    "min_should": 0,
+    "warnings": [],
+    "error": null,
+    "expr": {
+      "children": [
+        {
+          "cond": {
+            "type": "assetType",
+            "value": "video"
+          },
+          "op": "leaf"
+        },
+        {
+          "cond": {
+            "key": "duration_ms",
+            "max": 30000,
+            "min": 5000,
+            "op": "between",
+            "type": "metadata",
+            "value": null,
+            "values": null
+          },
+          "op": "leaf"
+        }
+      ],
+      "op": "and"
+    }
+  },
+  {
+    "idx": 24,
+    "query": "4K分辨率的素材",
+    "ok": true,
+    "status": "keyword",
+    "ms": 294,
+    "counts": {
+      "leaf": 0,
+      "tag": 0,
+      "exclude_tag": 0,
+      "metadata": 0,
+      "search": 0,
+      "asset_type": 0,
+      "untagged": 0,
+      "facet": 0,
+      "and": 0,
+      "or": 0,
+      "not": 0
+    },
+    "should": 0,
+    "min_should": 0,
+    "warnings": [
+      "未能理解搜索条件，已按关键词搜索。"
+    ],
+    "error": null,
+    "expr": {
+      "cond": {
+        "scope": "all",
+        "type": "search",
+        "value": "4K分辨率的素材"
+      },
+      "op": "leaf"
+    }
+  },
+  {
+    "idx": 25,
+    "query": "横构图的照片",
+    "ok": true,
+    "status": "keyword",
+    "ms": 290,
+    "counts": {
+      "leaf": 0,
+      "tag": 0,
+      "exclude_tag": 0,
+      "metadata": 0,
+      "search": 0,
+      "asset_type": 0,
+      "untagged": 0,
+      "facet": 0,
+      "and": 0,
+      "or": 0,
+      "not": 0
+    },
+    "should": 0,
+    "min_should": 0,
+    "warnings": [
+      "未能理解搜索条件，已按关键词搜索。"
+    ],
+    "error": null,
+    "expr": {
+      "cond": {
+        "scope": "all",
+        "type": "search",
+        "value": "横构图的照片"
+      },
+      "op": "leaf"
+    }
+  },
+  {
+    "idx": 26,
+    "query": "有拍摄定位的照片",
+    "ok": true,
+    "status": "keyword",
+    "ms": 305,
+    "counts": {
+      "leaf": 0,
+      "tag": 0,
+      "exclude_tag": 0,
+      "metadata": 0,
+      "search": 0,
+      "asset_type": 0,
+      "untagged": 0,
+      "facet": 0,
+      "and": 0,
+      "or": 0,
+      "not": 0
+    },
+    "should": 0,
+    "min_should": 0,
+    "warnings": [
+      "未能理解搜索条件，已按关键词搜索。"
+    ],
+    "error": null,
+    "expr": {
+      "cond": {
+        "scope": "all",
+        "type": "search",
+        "value": "有拍摄定位的照片"
+      },
+      "op": "leaf"
+    }
+  },
+  {
+    "idx": 27,
+    "query": "偏绿色调的图片",
+    "ok": true,
+    "status": "keyword",
+    "ms": 282,
+    "counts": {
+      "leaf": 0,
+      "tag": 0,
+      "exclude_tag": 0,
+      "metadata": 0,
+      "search": 0,
+      "asset_type": 0,
+      "untagged": 0,
+      "facet": 0,
+      "and": 0,
+      "or": 0,
+      "not": 0
+    },
+    "should": 0,
+    "min_should": 0,
+    "warnings": [
+      "未能理解搜索条件，已按关键词搜索。"
+    ],
+    "error": null,
+    "expr": {
+      "cond": {
+        "scope": "all",
+        "type": "search",
+        "value": "偏绿色调的图片"
+      },
+      "op": "leaf"
+    }
+  },
+  {
+    "idx": 28,
+    "query": "文件名包含IMG的素材",
+    "ok": true,
+    "status": "keyword",
+    "ms": 314,
+    "counts": {
+      "leaf": 0,
+      "tag": 0,
+      "exclude_tag": 0,
+      "metadata": 0,
+      "search": 0,
+      "asset_type": 0,
+      "untagged": 0,
+      "facet": 0,
+      "and": 0,
+      "or": 0,
+      "not": 0
+    },
+    "should": 0,
+    "min_should": 0,
+    "warnings": [
+      "未能理解搜索条件，已按关键词搜索。"
+    ],
+    "error": null,
+    "expr": {
+      "cond": {
+        "scope": "all",
+        "type": "search",
+        "value": "文件名包含IMG的素材"
+      },
+      "op": "leaf"
+    }
+  },
+  {
+    "idx": 29,
+    "query": "没有打标签的素材",
+    "ok": true,
+    "status": "keyword",
+    "ms": 275,
+    "counts": {
+      "leaf": 0,
+      "tag": 0,
+      "exclude_tag": 0,
+      "metadata": 0,
+      "search": 0,
+      "asset_type": 0,
+      "untagged": 0,
+      "facet": 0,
+      "and": 0,
+      "or": 0,
+      "not": 0
+    },
+    "should": 0,
+    "min_should": 0,
+    "warnings": [
+      "未能理解搜索条件，已按关键词搜索。"
+    ],
+    "error": null,
+    "expr": {
+      "cond": {
+        "scope": "all",
+        "type": "search",
+        "value": "没有打标签的素材"
+      },
+      "op": "leaf"
+    }
+  },
+  {
+    "idx": 30,
+    "query": "2025年白天在城市拍的建筑全景照片，大于3MB，不要行人，最好有自然光",
+    "ok": true,
+    "status": "partial",
+    "ms": 4281,
+    "counts": {
+      "leaf": 0,
+      "tag": 0,
+      "exclude_tag": 0,
+      "metadata": 0,
+      "search": 0,
+      "asset_type": 0,
+      "untagged": 0,
+      "facet": 0,
+      "and": 0,
+      "or": 0,
+      "not": 0
+    },
+    "should": 0,
+    "min_should": 0,
+    "warnings": [
+      "部分条件同时被包含与排除，已按排除处理。"
+    ],
+    "error": null,
+    "expr": {
+      "children": [
+        {
+          "cond": {
+            "type": "assetType",
+            "value": "image"
+          },
+          "op": "leaf"
+        },
+        {
+          "cond": {
+            "key": "file_size",
+            "max": null,
+            "min": null,
+            "op": "gt",
+            "type": "metadata",
+            "value": 3145728,
+            "values": null
+          },
+          "op": "leaf"
+        },
+        {
+          "cond": {
+            "scope": "content",
+            "type": "search",
+            "value": "2025"
+          },
+          "op": "leaf"
+        },
+        {
+          "cond": {
+            "facetKey": "lighting",
+            "includeDescendants": true,
+            "mode": "any",
+            "tagIds": [
+              374
+            ],
+            "termMatch": "alias",
+            "termQuery": null,
+            "type": "tag"
+          },
+          "op": "leaf"
+        },
+        {
+          "cond": {
+            "facetKey": "scene",
+            "includeDescendants": true,
+            "mode": "any",
+            "tagIds": [
+              373
+            ],
+            "termMatch": "alias",
+            "termQuery": null,
+            "type": "tag"
+          },
+          "op": "leaf"
+        },
+        {
+          "cond": {
+            "facetKey": "subject",
+            "includeDescendants": true,
+            "mode": "any",
+            "tagIds": [
+              369
+            ],
+            "termMatch": "alias",
+            "termQuery": null,
+            "type": "tag"
+          },
+          "op": "leaf"
+        },
+        {
+          "cond": {
+            "facetKey": "composition",
+            "includeDescendants": true,
+            "mode": "any",
+            "tagIds": [
+              363
+            ],
+            "termMatch": "alias",
+            "termQuery": null,
+            "type": "tag"
+          },
+          "op": "leaf"
+        },
+        {
+          "cond": {
+            "facetKey": "lighting",
+            "includeDescendants": true,
+            "mode": "any",
+            "tagIds": [
+              364
+            ],
+            "termMatch": "alias",
+            "termQuery": null,
+            "type": "tag"
+          },
+          "op": "leaf"
+        },
+        {
+          "child": {
+            "cond": {
+              "facetKey": "people",
+              "includeDescendants": true,
+              "mode": "any",
+              "tagIds": [
+                365
+              ],
+              "termMatch": "alias",
+              "termQuery": null,
+              "type": "tag"
+            },
+            "op": "leaf"
+          },
+          "op": "not"
+        }
+      ],
+      "op": "and"
+    }
+  }
+]

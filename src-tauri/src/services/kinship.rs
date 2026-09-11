@@ -73,7 +73,10 @@ mod tests {
         // 两个都是 RAW：key 相同但 is_kinship 为 false
         assert!(!is_kinship("d:/a/X.RW2", "d:/a/X.DNG"), "两个 RAW 不算同源");
         // 两个都是 JPG：同理
-        assert!(!is_kinship("d:/a/X.JPG", "d:/a/X.PNG"), "两个非 RAW 不算同源");
+        assert!(
+            !is_kinship("d:/a/X.JPG", "d:/a/X.PNG"),
+            "两个非 RAW 不算同源"
+        );
         // 一 RAW 一 JPG：算
         assert!(is_kinship("d:/a/X.JPG", "d:/a/X.RW2"));
     }

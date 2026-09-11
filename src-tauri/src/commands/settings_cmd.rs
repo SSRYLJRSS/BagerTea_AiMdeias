@@ -57,7 +57,9 @@ pub async fn reset_app_data(
         .refill_running
         .load(std::sync::atomic::Ordering::Relaxed)
     {
-        return Err(AppError::msg("正在执行回填/色板任务，请等它结束或取消后再重置"));
+        return Err(AppError::msg(
+            "正在执行回填/色板任务，请等它结束或取消后再重置",
+        ));
     }
     let db = std::sync::Arc::clone(&state.db);
     let data_dir = state.data_dir.clone();
@@ -86,7 +88,11 @@ pub async fn backup_db(state: State<'_, AppState>, target: String) -> AppResult<
 /// 校验（quick_check + user_version 只拒高版本 + 关键表）→ 运行中任务阻断
 /// → 现库 `.old` 保底 → 覆盖 → 迁移升级 → 热替换连接 → `app.restart()`（不返回）。
 #[tauri::command]
-pub async fn restore_db(app: tauri::AppHandle, state: State<'_, AppState>, source: String) -> AppResult<()> {
+pub async fn restore_db(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    source: String,
+) -> AppResult<()> {
     let source = std::path::PathBuf::from(&source);
     // ① 校验备份（锁外；失败直接给用户可读原因）
     crate::db::backup::validate_backup(&source)?;
@@ -148,11 +154,21 @@ pub async fn restore_db(app: tauri::AppHandle, state: State<'_, AppState>, sourc
 
 /// 恢复前运行中任务守卫：入库 / 回填类 / 导出 / AI 批次任一进行中即拒绝
 fn guard_no_running_tasks(state: &AppState, conn: &rusqlite::Connection) -> AppResult<()> {
-    if state.import_running.load(std::sync::atomic::Ordering::Relaxed) {
-        return Err(AppError::msg("文件入库进行中，请等它结束或取消后再恢复备份"));
+    if state
+        .import_running
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return Err(AppError::msg(
+            "文件入库进行中，请等它结束或取消后再恢复备份",
+        ));
     }
-    if state.refill_running.load(std::sync::atomic::Ordering::Relaxed) {
-        return Err(AppError::msg("回填/色板任务进行中，请等它结束或取消后再恢复备份"));
+    if state
+        .refill_running
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return Err(AppError::msg(
+            "回填/色板任务进行中，请等它结束或取消后再恢复备份",
+        ));
     }
     if !state
         .export_cancel
@@ -160,7 +176,9 @@ fn guard_no_running_tasks(state: &AppState, conn: &rusqlite::Connection) -> AppR
         .map_err(|_| AppError::msg("锁中毒"))?
         .is_empty()
     {
-        return Err(AppError::msg("导出任务进行中，请等它结束或取消后再恢复备份"));
+        return Err(AppError::msg(
+            "导出任务进行中，请等它结束或取消后再恢复备份",
+        ));
     }
     if !state
         .ai_cancel
@@ -168,13 +186,11 @@ fn guard_no_running_tasks(state: &AppState, conn: &rusqlite::Connection) -> AppR
         .map_err(|_| AppError::msg("锁中毒"))?
         .is_empty()
     {
-        return Err(AppError::msg("AI 打标批次进行中，请等它结束或取消后再恢复备份"));
+        return Err(AppError::msg(
+            "AI 打标批次进行中，请等它结束或取消后再恢复备份",
+        ));
     }
-    let n: i64 = conn.query_row(
-        "SELECT count(*) FROM ai_batches WHERE status IN ('pending', 'processing')",
-        [],
-        |r| r.get(0),
-    )?;
+    let n = crate::db::ai::count_pending_or_processing(conn)?;
     if n > 0 {
         return Err(AppError::msg(
             "有待处理的 AI 打标批次，请先取消批次后再恢复备份",

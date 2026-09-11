@@ -1,0 +1,33 @@
+[
+  {
+    "idx": 15,
+    "query": "视频素材",
+    "ok": true,
+    "status": "full",
+    "ms": 908,
+    "counts": {
+      "leaf": 1,
+      "tag": 0,
+      "exclude_tag": 0,
+      "metadata": 0,
+      "search": 0,
+      "asset_type": 1,
+      "untagged": 0,
+      "facet": 0,
+      "and": 0,
+      "or": 0,
+      "not": 0
+    },
+    "should": 0,
+    "min_should": 0,
+    "warnings": [],
+    "error": null,
+    "expr": {
+      "cond": {
+        "type": "assetType",
+        "value": "video"
+      },
+      "op": "leaf"
+    }
+  }
+]

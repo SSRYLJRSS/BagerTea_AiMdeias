@@ -179,3 +179,67 @@ describe("useScrollDirection（FB3-06 只在顶部自动展开）", () => {
     expect(result.current[0]).toBe("expanded");
   });
 });
+
+describe("useScrollDirection（防闪烁：自动收起后识别视口钳位事件）", () => {
+  function mountOnContainer(opts: Parameters<typeof useScrollDirection>[0]) {
+    const el = document.createElement("div");
+    document.body.appendChild(el);
+    // jsdom 下 clientHeight 恒 0，测试需手动模拟「收起导致视口变高」
+    Object.defineProperty(el, "clientHeight", { configurable: true, value: 500, writable: true });
+    const { result } = renderHook(() => useScrollDirection(opts));
+    act(() => {
+      result.current[1](el);
+    });
+    return { el, result };
+  }
+
+  function scroll(el: HTMLElement, top: number) {
+    act(() => {
+      el.scrollTop = top;
+      el.dispatchEvent(new Event("scroll"));
+    });
+  }
+
+  it("收起后视口变高、位置被钳回顶部区：不立即展开（旧实现会收起↔展开闪烁），用户再滚才展开", () => {
+    const { el, result } = mountOnContainer({ collapseThreshold: 24, expandThreshold: 12, minScrollTop: 48, suppressMs: 300 });
+    scroll(el, 100); // 下滚 → 自动收起（记录视口高 500）
+    expect(result.current[0]).toBe("collapsed");
+    // 收起后面板消失，滚动视口变高（+260），浏览器把 scrollTop 钳回顶部区并派发事件
+    Object.defineProperty(el, "clientHeight", { configurable: true, value: 760, writable: true });
+    scroll(el, 30);
+    expect(result.current[0]).toBe("collapsed"); // 旧实现在此又自动展开 → 闪烁
+    // 用户真实继续上滚（视口不再变化）→ 正常展开
+    scroll(el, 20);
+    expect(result.current[0]).toBe("expanded");
+  });
+
+  it("收起后视口变高但首个事件在非顶部区：不拦截，方向判定照常（保持收起）", () => {
+    const { el, result } = mountOnContainer({ collapseThreshold: 24, expandThreshold: 12, minScrollTop: 48, suppressMs: 300 });
+    scroll(el, 200);
+    expect(result.current[0]).toBe("collapsed");
+    Object.defineProperty(el, "clientHeight", { configurable: true, value: 760, writable: true });
+    scroll(el, 180); // 视口变高但仍在非顶部 → 不构成钳回顶部，正常处理（上滑保持收起）
+    expect(result.current[0]).toBe("collapsed");
+    scroll(el, 30); // 护栏已消费，真实回顶 → 展开
+    expect(result.current[0]).toBe("expanded");
+  });
+
+  it("视口尺寸没变（用户主动拖回顶部）：不拦截，立即展开", () => {
+    const { el, result } = mountOnContainer({ collapseThreshold: 24, expandThreshold: 12, minScrollTop: 48, suppressMs: 300 });
+    scroll(el, 100);
+    expect(result.current[0]).toBe("collapsed");
+    // clientHeight 保持 500（无布局变化）——用户拖滚动条回顶，必须能展开
+    scroll(el, 0);
+    expect(result.current[0]).toBe("expanded");
+  });
+
+  it("手动 setExpanded 清掉钳位护栏", () => {
+    const { el, result } = mountOnContainer({ collapseThreshold: 24, expandThreshold: 12, minScrollTop: 48, suppressMs: 0 });
+    scroll(el, 100);
+    expect(result.current[0]).toBe("collapsed");
+    act(() => {
+      result.current[2]("expanded");
+    });
+    expect(result.current[0]).toBe("expanded");
+  });
+});

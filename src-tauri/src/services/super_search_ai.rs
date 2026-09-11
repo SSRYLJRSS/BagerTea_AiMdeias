@@ -90,6 +90,9 @@ pub struct SearchGroupV2 {
     pub text_terms: Vec<IntentTextTerm>,
     #[serde(default)]
     pub metadata: Vec<MetadataFilter>,
+    /// 「没打标签 / 未分类 / 无标签」→ true，编译为 LeafCond::Untagged（硬条件：没有任何标签）
+    #[serde(default)]
+    pub untagged_only: bool,
 }
 
 fn default_asset_type() -> String {
@@ -181,6 +184,9 @@ pub struct SearchGroupV3 {
     pub text_terms: Vec<IntentTextTerm>,
     #[serde(default)]
     pub metadata: Vec<MetadataFilter>,
+    /// 「没打标签 / 未分类」→ true，编译为 LeafCond::Untagged
+    #[serde(default)]
+    pub untagged_only: bool,
     /// V3 新增：最好有 / 优先 / 尽量 / 更好 … → should（加分，不淘汰）
     #[serde(default)]
     pub preferred: Vec<SearchConceptV3>,
@@ -203,9 +209,7 @@ pub struct SearchIntentV3 {
 
 /// ③ 兜底用的「强偏好信号词」：只提示不降级。
 /// 注意故意**不含**「可有可无」——那是弱表达，原句只含它时记 info（见指南真值表）。
-pub const CORE_PREF_HINTS: &[&str] = &[
-    "最好", "优先", "尽量", "更好", "倾向", "接近", "偏",
-];
+pub const CORE_PREF_HINTS: &[&str] = &["最好", "优先", "尽量", "更好", "倾向", "接近", "偏"];
 
 /// S3：preferred 的 evidence 一致性守卫（纯函数；只降级，绝不反向升级）。
 /// ① evidence 必须是原句的**真子串**（trim + 全角/半角 + 大小写归一后比较）——
@@ -270,9 +274,8 @@ pub fn guard_preferred(input: &str, group: &mut SearchGroupV3) -> Vec<String> {
         }
         // ③ 原句没有强偏好词 → info（保留 preferred）
         if !core_hint {
-            warnings.push(format!(
-                "原文未见明显的偏好表述，已按加分项处理（可在下方改为必须）。"
-            ));
+            warnings
+                .push("原文未见明显的偏好表述，已按加分项处理（可在下方改为必须）。".to_string());
         }
     }
     // 倒序移回 concepts（保序）
@@ -430,15 +433,20 @@ fn validate_concept_shape(c: &SearchConceptV2) -> AppResult<()> {
 pub fn sanitize_metadata(intent: &mut SearchIntentV2) -> Vec<String> {
     let mut warnings = Vec::new();
     for g in &mut intent.groups {
-        g.metadata.retain(|f| match search_query::compile_metadata(f) {
-            Ok(_) => true,
-            Err(e) => {
-                let msg = format!("已忽略无效的元数据条件（{} {}）：{e}", f.key, f.op);
-                tracing::warn!("超级搜索丢弃非法元数据条件: key={} op={} 原因={e}", f.key, f.op);
-                warnings.push(msg);
-                false
-            }
-        });
+        g.metadata
+            .retain(|f| match search_query::compile_metadata(f) {
+                Ok(_) => true,
+                Err(e) => {
+                    let msg = format!("已忽略无效的元数据条件（{} {}）：{e}", f.key, f.op);
+                    tracing::warn!(
+                        "超级搜索丢弃非法元数据条件: key={} op={} 原因={e}",
+                        f.key,
+                        f.op
+                    );
+                    warnings.push(msg);
+                    false
+                }
+            });
     }
     warnings
 }
@@ -463,11 +471,13 @@ pub fn guard_intent(input: &str, intent: &mut SearchIntentV2) -> Vec<String> {
             concepts: Vec::new(),
             text_terms: Vec::new(),
             metadata: Vec::new(),
+            untagged_only: false,
         };
         for g in intent.groups.drain(..) {
             merged.concepts.extend(g.concepts);
             merged.text_terms.extend(g.text_terms);
             merged.metadata.extend(g.metadata);
+            merged.untagged_only |= g.untagged_only;
         }
         intent.groups = vec![merged];
     } else if has_or && intent.groups.len() == 1 {
@@ -591,8 +601,8 @@ enum ConceptOutcome {
 ///  2. alias 精确匹配；
 ///  3. facetHint 范围内只有一个前缀候选，且 confidence ≥ 0.85；
 ///  4. 其他包含/模糊多候选 → 不擅选（转 content 或 drop）。
-/// 无法可靠映射时：正向 concept 且 conf ≥ 0.55 → content 搜索 leaf（显式硬条件）；
-/// exclusion 且 conf ≥ 0.55 → 全局 NOT(content)；conf < 0.55 → 未采用 warning。
+///     无法可靠映射时：正向 concept 且 conf ≥ 0.55 → content 搜索 leaf（显式硬条件）；
+///     exclusion 且 conf ≥ 0.55 → 全局 NOT(content)；conf < 0.55 → 未采用 warning。
 fn resolve_concept(
     conn: &Connection,
     c: &SearchConceptV2,
@@ -674,7 +684,18 @@ pub fn build_expr_from_v2(
                 },
             });
         }
+        if g.untagged_only {
+            leaves.push(QueryExpr::Leaf {
+                cond: LeafCond::Untagged,
+            });
+        }
         for m in &g.metadata {
+            // 双保险：漏过 sanitize 的残缺/非法 metadata（如 gte 缺 value）在此就近跳过并提示，
+            // 绝不让一条坏条件进入 filter 导致整次 AI 解析失败（与 sanitize_metadata 同一判定，不漂移）。
+            if let Err(e) = search_query::compile_metadata(m) {
+                warnings.push(format!("已忽略无效的元数据条件（{} {}）：{e}", m.key, m.op));
+                continue;
+            }
             leaves.push(QueryExpr::Leaf {
                 cond: LeafCond::Metadata { filter: m.clone() },
             });
@@ -825,40 +846,41 @@ pub fn build_plan_from_v3(
         confidence: c.confidence,
     };
     // 概念解析为一个可编译 leaf 的 (QueryExpr, ResolvedTag[], warning[])；不捕获外部可变状态。
-    let concept_leaf = |c: &SearchConceptV3| -> AppResult<(Option<QueryExpr>, Vec<ResolvedTag>, Option<String>)> {
-        match resolve_concept(conn, &as_v2(c), false)? {
-            ConceptOutcome::Tag(r) => Ok((
-                Some(QueryExpr::Leaf {
-                    cond: LeafCond::Tag {
-                        // S5 5-3：回填 term_query —— termMatch（contains/prefix/fuzzy）
-                        // 只有在词查在场时才会被编译层扩展；恒发 None 会让五种匹配永远不可达。
-                        term_query: {
-                            let t = c.text.trim();
-                            (!t.is_empty()).then(|| t.to_string())
+    let concept_leaf =
+        |c: &SearchConceptV3| -> AppResult<(Option<QueryExpr>, Vec<ResolvedTag>, Option<String>)> {
+            match resolve_concept(conn, &as_v2(c), false)? {
+                ConceptOutcome::Tag(r) => Ok((
+                    Some(QueryExpr::Leaf {
+                        cond: LeafCond::Tag {
+                            // S5 5-3：回填 term_query —— termMatch（contains/prefix/fuzzy）
+                            // 只有在词查在场时才会被编译层扩展；恒发 None 会让五种匹配永远不可达。
+                            term_query: {
+                                let t = c.text.trim();
+                                (!t.is_empty()).then(|| t.to_string())
+                            },
+                            term_match: c.term_match,
+                            facet_key: r.facet_key.clone(),
+                            tag_ids: vec![r.tag_id],
+                            mode: Some("any".into()),
+                            include_descendants: true,
                         },
-                        term_match: c.term_match,
-                        facet_key: r.facet_key.clone(),
-                        tag_ids: vec![r.tag_id],
-                        mode: Some("any".into()),
-                        include_descendants: true,
-                    },
-                }),
-                vec![r],
-                None,
-            )),
-            ConceptOutcome::Content(term) => Ok((
-                Some(QueryExpr::Leaf {
-                    cond: LeafCond::Search {
-                        value: term,
-                        scope: crate::db::query_expr::SearchScope::Content,
-                    },
-                }),
-                Vec::new(),
-                None,
-            )),
-            ConceptOutcome::Dropped(w) => Ok((None, Vec::new(), Some(w))),
-        }
-    };
+                    }),
+                    vec![r],
+                    None,
+                )),
+                ConceptOutcome::Content(term) => Ok((
+                    Some(QueryExpr::Leaf {
+                        cond: LeafCond::Search {
+                            value: term,
+                            scope: crate::db::query_expr::SearchScope::Content,
+                        },
+                    }),
+                    Vec::new(),
+                    None,
+                )),
+                ConceptOutcome::Dropped(w) => Ok((None, Vec::new(), Some(w))),
+            }
+        };
     // 结果收集 helper：分离 warning
     fn collect(
         out_w: &mut Vec<String>,
@@ -883,7 +905,18 @@ pub fn build_plan_from_v3(
                 },
             });
         }
+        if g.untagged_only {
+            leaves.push(QueryExpr::Leaf {
+                cond: LeafCond::Untagged,
+            });
+        }
         for m in &g.metadata {
+            // 双保险：漏过 sanitize 的残缺/非法 metadata（如 gte 缺 value）在此就近跳过并提示，
+            // 绝不让一条坏条件进入 filter 导致整次 AI 解析失败（与 sanitize_metadata 同一判定，不漂移）。
+            if let Err(e) = search_query::compile_metadata(m) {
+                warnings.push(format!("已忽略无效的元数据条件（{} {}）：{e}", m.key, m.op));
+                continue;
+            }
             leaves.push(QueryExpr::Leaf {
                 cond: LeafCond::Metadata { filter: m.clone() },
             });
@@ -999,7 +1032,10 @@ pub fn build_plan_from_v3(
         Ranking::Relevance
     } else {
         Ranking::Field {
-            key: intent.sort_by.clone().unwrap_or_else(|| "created_at".into()),
+            key: intent
+                .sort_by
+                .clone()
+                .unwrap_or_else(|| "created_at".into()),
             dir: intent.sort_dir.clone().unwrap_or_else(|| "desc".into()),
         }
     };
@@ -1159,10 +1195,9 @@ pub fn collect_tag_dictionary(
                 longest = i;
             }
         }
-        if per_facet[longest].is_empty() {
+        let Some(dropped) = per_facet[longest].pop() else {
             break;
-        }
-        let dropped = per_facet[longest].pop().unwrap();
+        };
         total_chars -= dropped.chars().count();
     }
     Ok(per_facet.into_iter().flatten().collect())
@@ -1235,6 +1270,7 @@ pub fn v3_to_v2_view(intent: &SearchIntentV3) -> SearchIntentV2 {
                     .collect(),
                 text_terms: g.text_terms.clone(),
                 metadata: g.metadata.clone(),
+                untagged_only: g.untagged_only,
             })
             .collect(),
         exclusions: intent
@@ -1272,6 +1308,7 @@ pub fn v2_group_to_v3(g: &SearchGroupV2) -> SearchGroupV3 {
             .collect(),
         text_terms: g.text_terms.clone(),
         metadata: g.metadata.clone(),
+        untagged_only: g.untagged_only,
         preferred: Vec::new(),
     }
 }
@@ -1310,6 +1347,7 @@ pub fn keyword_intent_v3(text: &str) -> SearchIntentV3 {
                 scope: "all".into(),
             }],
             metadata: vec![],
+            untagged_only: false,
             preferred: Vec::new(),
         }],
         exclusions: vec![],
@@ -1318,12 +1356,12 @@ pub fn keyword_intent_v3(text: &str) -> SearchIntentV3 {
     }
 }
 
-/// 网络 + 解析 + 校验：由调用方在短锁内收集 facets/dict 后，再在锁外调用本函数。
-/// 不持有 DB 锁；text 已由命令层校验长度。
-///
-/// W6-2（§W6-2）三层降级：① strict 正常解析 → ② lenient 剔除非法项保留其余 + warning
-/// → ③ 关键词兜底（永不失败）。唯一例外：配置类错误（鉴权/连不上/超时）仍真报错
-/// —— 配置问题必须让用户知道，而不是假装搜到了。
+// 网络 + 解析 + 校验：由调用方在短锁内收集 facets/dict 后，再在锁外调用本函数。
+// 不持有 DB 锁；text 已由命令层校验长度。
+//
+// W6-2（§W6-2）三层降级：① strict 正常解析 → ② lenient 剔除非法项保留其余 + warning
+// → ③ 关键词兜底（永不失败）。唯一例外：配置类错误（鉴权/连不上/超时）仍真报错
+// —— 配置问题必须让用户知道，而不是假装搜到了。
 // ═══════════════ C-3：库能力注入（只告知，不改写） ═══════════════
 
 /// 库能力摘要缓存（60s TTL，全局单库）。措辞必须是陈述事实而非禁令。
@@ -1584,7 +1622,9 @@ pub fn degrade_parse_v3(
     }
     clean_concepts_v3(&mut intent.exclusions, &mut warnings, &mut total);
     if total > 20 {
-        warnings.push(format!("条件概念较多（{total} 个），已按置信度优先截取 20 个。"));
+        warnings.push(format!(
+            "条件概念较多（{total} 个），已按置信度优先截取 20 个。"
+        ));
     }
     if intent.groups.is_empty() && intent.exclusions.is_empty() {
         warnings.push("未能理解搜索条件，已按关键词搜索。".into());
@@ -1603,6 +1643,10 @@ pub fn degrade_parse_v3(
     if intent.groups.len() == v2_view.groups.len() {
         for (g3, g2) in intent.groups.iter_mut().zip(v2_view.groups.iter()) {
             g3.asset_type = g2.asset_type.clone();
+            // 关键：sanitize_all 在 V2 视图上丢弃了编译不过的 metadata（如 gte 缺 value、
+            // 未知 key、非法值），必须把清洗后的 metadata 回写 V3 —— 否则残缺条件仍留在 V3，
+            // build_plan_from_v3 编译时会以「字段 x 的 op 需要 value」整体报错，拖垮整次 AI 解析。
+            g3.metadata = g2.metadata.clone();
             // concepts 的 text/facet 已在 V2 清洗中 trim/去停用/去重 —— 直接替换
             //（preferred 不进 V2 视图，保留原 V3 值）
             g3.concepts = g2
@@ -1635,9 +1679,27 @@ pub fn degrade_parse_v3(
             })
             .collect();
     } else {
-        // guard_intent 合并了组（无 OR 词多组 → 单 AND 组）：preferred 无法安全映射，丢弃并提示
-        warnings.push("多组条件已合并，加分项分组信息不再精确，已按必须条件执行。".into());
-        intent = v2_to_v3(&v2_view);
+        // guard_intent 合并了组（无 OR 词多组 → 单 AND 组）。
+        // 旧实现直接 v2_to_v3 重建，会把模型误拆到独立组里的 preferred 加分项全部丢弃、
+        // 并经 concepts 通道升级成硬必须（「优先近景」被错误当成「必须近景」）。
+        // 这里改为：合并必须条件的同时，把原各组 preferred 汇总保留为加分项。
+        warnings.push("多组条件已合并为同时满足，其中的优先项仍按加分（不淘汰结果）处理。".into());
+        let rescued_preferred: Vec<SearchConceptV3> =
+            intent.groups.drain(..).flat_map(|g| g.preferred).collect();
+        let mut merged = v2_to_v3(&v2_view);
+        if !rescued_preferred.is_empty() {
+            if let Some(g0) = merged.groups.get_mut(0) {
+                // 互斥：已作为必须条件的同名概念不再重复加分
+                let required: std::collections::HashSet<String> =
+                    g0.concepts.iter().map(|c| c.text.clone()).collect();
+                for c in rescued_preferred {
+                    if !required.contains(&c.text) {
+                        g0.preferred.push(c);
+                    }
+                }
+            }
+        }
+        intent = merged;
     }
     (intent, warnings)
 }
@@ -1693,9 +1755,20 @@ fn clean_concepts_v3(
 pub fn is_config_error(e: &AppError) -> bool {
     let m = e.to_string().to_lowercase();
     [
-        "401", "403", "api key", "apikey", "unauthorized", "authentication",
-        "鉴权", "无法连接", "连接失败", "error sending request", "timeout",
-        "timed out", "超时", "请求失败",
+        "401",
+        "403",
+        "api key",
+        "apikey",
+        "unauthorized",
+        "authentication",
+        "鉴权",
+        "无法连接",
+        "连接失败",
+        "error sending request",
+        "timeout",
+        "timed out",
+        "超时",
+        "请求失败",
     ]
     .iter()
     .any(|k| m.contains(k))
@@ -1713,6 +1786,7 @@ pub fn keyword_intent(text: &str) -> SearchIntentV2 {
                 scope: "all".into(),
             }],
             metadata: vec![],
+            untagged_only: false,
         }],
         exclusions: vec![],
         sort_by: None,
@@ -1774,7 +1848,10 @@ pub fn sanitize_all(intent: &mut SearchIntentV2, facets: &[FacetPromptContext]) 
         for c in &mut g.concepts {
             if let Some(h) = &c.facet_hint {
                 if !known_keys.contains(&h.as_str()) {
-                    warnings.push(format!("「{}」的分类提示不在当前分类列表中，已按全部分类搜索。", c.text));
+                    warnings.push(format!(
+                        "「{}」的分类提示不在当前分类列表中，已按全部分类搜索。",
+                        c.text
+                    ));
                     c.facet_hint = None;
                 }
             }
@@ -1782,16 +1859,20 @@ pub fn sanitize_all(intent: &mut SearchIntentV2, facets: &[FacetPromptContext]) 
     }
     // 单条 metadata 非法 → 剔除该条（已有逻辑）
     warnings.extend(sanitize_metadata(intent));
-    // 空概念 text / 空 textTerm 剔除；清空后的 group（concepts+textTerms+metadata 全空）剔除
+    // 空概念 text / 空 textTerm 剔除；清空后的 group（concepts+textTerms+metadata 全空）剔除。
+    // 注意：纯素材类型组（assetType=image/video，如「视频素材」「照片」）必须保留 ——
+    // 漏算 asset_type 会把最基础的类型查询误判为空组删掉，导致 expr=null。
     let before = intent.groups.len();
     intent.groups.retain(|g| {
         let has_concept = g.concepts.iter().any(|c| !c.text.trim().is_empty());
         let has_term = g.text_terms.iter().any(|t| !t.text.trim().is_empty());
         let has_meta = !g.metadata.is_empty();
-        if !has_concept && !has_term && !has_meta {
+        let has_type = g.asset_type != "all";
+        let has_untagged = g.untagged_only;
+        if !has_concept && !has_term && !has_meta && !has_type && !has_untagged {
             warnings.push("一组条件为空，已忽略。".into());
         }
-        has_concept || has_term || has_meta
+        has_concept || has_term || has_meta || has_type || has_untagged
     });
     if intent.groups.len() < before {
         warnings.push(format!(
@@ -1809,6 +1890,13 @@ pub fn is_valid_sort_by(s: &str) -> bool {
 
 /// §9.2 Prompt 硬规则（停用词由 SEARCH_CONCEPT_STOPWORDS 生成，与本地清洗同一集合）。
 pub fn build_system_prompt(facets: &[FacetPromptContext]) -> String {
+    use chrono::Datelike;
+    let today = chrono::Local::now().date_naive();
+    let y = today.year();
+    let today_iso = today.format("%Y-%m-%d").to_string();
+    let this_year_start = format!("{y}-01-01");
+    let this_year_end = format!("{y}-12-31");
+    let last_year = y - 1;
     let stop = SEARCH_CONCEPT_STOPWORDS.join("、");
     let mut p = String::new();
     p.push_str(
@@ -1820,8 +1908,8 @@ pub fn build_system_prompt(facets: &[FacetPromptContext]) -> String {
     p.push_str("3. 同义概念只输出一次：如「多人、人群」按词典二选一，不同时输出。\n");
     p.push_str("4. assetType 只有用户明确说 图片/照片/相片/图像（image）或 视频/录像/片段/短片（video）时才填；「拍的」不算。\n");
     p.push_str("5. 「晚上拍的」解析为「夜间」或「夜景」概念，不保留整句。\n");
-    p.push_str("6. 能映射为标签或元数据的概念不进入 textTerms。\n");
-    p.push_str("7. 只有明确文件名片段、引号原文、专有名词或无法映射的具体内容才进 textTerms；scope 取 content（搜描述或文件名），不得把整句放进 all 或 description。\n");
+    p.push_str("6. 同一个词只允许出现一次：凡是能映射为标签（concepts）或元数据（metadata）的词，绝不再写进 textTerms；禁止对同一概念既出标签又出全文（如「草地」已进 concepts，就不得再出 textTerms「草地」）。\n");
+    p.push_str("7. 只有明确文件名片段、引号原文、专有名词或确实无法映射成任何标签/元数据的具体内容才进 textTerms；scope 取 content（搜描述或文件名），不得把整句放进 all 或 description。连接词、语气词、「拍了/画面/素材」这类泛词一律不进 textTerms。\n");
     p.push_str("8. 没有明确「或/或者/任一」时只输出一个 group；「或/或者/任一」连接的每个完整子句各输出一个 group，组内概念保持 AND。\n");
     p.push_str("9. 「不要/排除/除了」对应的原子概念放入全局 exclusions，不混入正向 group。\n");
     p.push_str("10. 不输出 tagId、SQL、分页、空字符串条件或 schema 之外字段。\n");
@@ -1830,6 +1918,8 @@ pub fn build_system_prompt(facets: &[FacetPromptContext]) -> String {
     p.push_str("必须 vs 加分的判断：\n");
     p.push_str("- 「一定要有 / 只要 / 必须」→ concepts（必须）；「不要 / 排除 / 除了」→ 全局 exclusions（排除）。\n");
     p.push_str("- 「最好有 / 优先 / 尽量 / 更好 / 可有可无 / 倾向 / 接近 / 偏」→ 该 group 的 preferred（加分，不淘汰结果）。\n");
+    p.push_str("- 互斥铁律：一个概念进了 preferred，就绝不能再出现在同一 group 的 concepts 里。preferred 是「可有可无、只影响排序」，concepts 是「必须有、不满足就不出现」；把同一个词两边都放等于把软偏好变成硬门槛，是错误。\n");
+    p.push_str("- 同组铁律：一句话里的必须项和它的优先项必须放在**同一个 group**（必须项进 concepts、优先项进该组 preferred），绝不能为「优先/尽量」的词单独再建一个 group——没有「或」的句子永远只输出一个 group。例「草地，优先近景，尽量自然光」→ 只有一个 group：concepts=[草地]、preferred=[近景,自然光]。\n");
     p.push_str("- 加分项必须填 evidence：从原句中**逐字摘出**让你判断为「加分」的片段（如 evidence: \"有蓝天更好\"）。摘不出原文片段就归必须。\n");
     p.push_str("- 权重只给三档：0.5（略微偏好）/ 1.0（一般偏好）/ 2.0（强偏好）。\n");
     p.push_str("- 不确定时归必须 —— 宁可少给结果，也不要让用户以为条件生效了但其实没生效。\n");
@@ -1839,22 +1929,29 @@ pub fn build_system_prompt(facets: &[FacetPromptContext]) -> String {
     p.push_str("- 用户明显打错字或用了近义词 → 仍用 alias。系统会在零结果时建议相近词。\n");
     p.push_str("- 不要主动用 prefix 或 fuzzy —— 那是零结果时的兜底，不是首选。\n");
     p.push_str("颜色是算法计算的文件属性，用 metadata（dominant_hue 0-359：红色 min=345 max=15 表示跨 0°；橙 15-45、黄 45-70、绿 70-155、青 155-225、蓝 225-295、紫 295-345；dominant_sat/dominant_lum 0-100；灰/黑/白用 dominant_sat lte 10），不写进 tags。\n");
-    p.push_str("元数据条件（metadata）能力清单——key 与 op 只能从下面选，单位与格式必须严格遵守：\n");
+    p.push_str(
+        "元数据条件（metadata）能力清单——key 与 op 只能从下面选，单位与格式必须严格遵守：\n",
+    );
     p.push_str("- file_size：文件大小，单位字节（1MB=1048576）。op 用 gt/gte/lt/lte/between。示例「10~105MB」→ {\"key\":\"file_size\",\"op\":\"between\",\"min\":10485760,\"max\":110100480}。\n");
     p.push_str("- file_size 注意：写区间必须换算成字节，禁止输出「5..10」这类 MB 原值（会查不到结果）。换算演示：5~10MB → min=5242880, max=10485760；50~100MB → min=52428800, max=104857600。\n");
-    p.push_str("- taken_at：拍摄日期，格式 YYYY-MM-DD，本地时区，区间左闭右开。op 只用 gte/lte/between。「8月份」（当前年份）→ {\"key\":\"taken_at\",\"op\":\"between\",\"min\":\"当年8月1日\",\"max\":\"当年8月31日\"}；「最近一周」按当前日期回推。\n");
+    p.push_str(&format!("- taken_at：拍摄日期，值必须是严格 YYYY-MM-DD 的**真实日期**字符串，本地时区，区间左闭右开；op 只用 gte/lte/between。今天是 {today_iso}、今年是 {y} 年。禁止把「今年」「当年」「上月」这类中文/相对词原样写进 min/max，必须换算成真实日期：「今年」→ between min=\"{this_year_start}\" max=\"{this_year_end}\"；「去年」→ between min=\"{last_year}-01-01\" max=\"{last_year}-12-31\"；「今年8月」→ between min=\"{y}-08-01\" max=\"{y}-08-31\"；「最近一周/最近N天」以 {today_iso} 为基准往前回推。\n"));
     p.push_str("- duration_ms：视频时长，单位毫秒（1秒=1000）。op 用 gt/gte/lt/lte/between；仅对视频有意义。\n");
-    p.push_str("- width/height：像素整数；resolution：宽×高总像素；aspect_ratio：宽÷高。均支持数值比较。\n");
+    p.push_str("- width/height：像素整数，op 用 gt/gte/lt/lte/between。分辨率档位按像素换算：「4K/UHD/超高清」→ {\"key\":\"width\",\"op\":\"gte\",\"value\":3840}；「2K」→ width gte 2048；「1080P/全高清」→ {\"key\":\"height\",\"op\":\"gte\",\"value\":1080}；「720P」→ height gte 720。resolution=宽×高总像素。\n");
+    p.push_str("- aspect_ratio=宽÷高，用于横竖构图：「横图/横构图/横屏」→ {\"key\":\"aspect_ratio\",\"op\":\"gte\",\"value\":1}（宽≥高）；「竖图/竖构图/竖屏」→ aspect_ratio lte 1；「方图/正方形」→ between 0.95 1.05。禁止把「4K」「横构图」这类词只写文字而不给数值，更不许丢进 textTerms。\n");
     p.push_str("- dominant_sat/dominant_lum：0-100（饱和/明度），与颜色教学配合使用。\n");
     p.push_str("- latitude/longitude：拍摄定位，有符号十进制度（北纬/东经为正，南纬/西经为负；纬度 -90~90、经度 -180~180）。op 用 eq/gt/gte/lt/lte/between。示例「杭州附近」→ {\"key\":\"latitude\",\"op\":\"between\",\"min\":29.8,\"max\":30.6} 与 {\"key\":\"longitude\",\"op\":\"between\",\"min\":119.6,\"max\":120.7}。注意：城市名只有能映射到标签时才进 concepts，经纬度区间才进 metadata。\n");
-    p.push_str("- 其他可用 key：iso、aperture、focal、camera、lens、shutter、file_ext、mime_type、video_codec、audio_codec、created_at、modified_at、folder（按字段含义使用，不确定就不输出）。\n");
+    p.push_str("- has_location：只用于判断「有没有拍摄定位/GPS」，值是字符串 \"yes\"/\"no\"，op 只用 eq。「有定位/带GPS/有地理位置/开了定位」→ {\"key\":\"has_location\",\"op\":\"eq\",\"value\":\"yes\"}；「没定位/无GPS」→ value \"no\"。只有问「有无」定位才用 has_location；找「某地附近」才用上面的经纬度区间，不要用经纬度 gte 去表达「有没有定位」。\n");
+    p.push_str("组级开关 untaggedOnly：用户说「没打标签/未打标/无标签/还没分类/没有任何标签」时，把该 group 的 untaggedOnly 设为 true（筛选没有任何标签的素材）。严禁编造 tags_count、tag_count 等不存在的 metadata key。它可与 assetType/metadata 共存，如「没打标签的视频」= assetType:\"video\" + untaggedOnly:true。\n");
+    p.push_str("- 其他可用 key：iso、aperture、focal、camera、lens、shutter、file_ext、mime_type、video_codec、audio_codec、created_at、modified_at、folder、rating（按字段含义使用，不确定就不输出）。\n");
     p.push_str("- 不确定的数值/日期/坐标不要猜：宁可不出 metadata 条件，也不要编造。\n");
-    p.push_str("相对日期依据当前日期。只生成查询，不创建标签。\n");
+    p.push_str(&format!("相对时间一律以今天 {today_iso} 为基准换算成真实日期，禁止输出中文相对词。只生成查询，不创建标签。\n"));
     p.push_str("元数据输出示例 A：输入「大于100MB的视频」→ metadata:[{\"key\":\"file_size\",\"op\":\"gt\",\"value\":104857600,\"values\":null,\"min\":null,\"max\":null}]，assetType 为 video。\n");
-    p.push_str("元数据输出示例 B：输入「今年8月份拍的照片」→ metadata:[{\"key\":\"taken_at\",\"op\":\"between\",\"value\":null,\"values\":null,\"min\":\"当年8月1日\",\"max\":\"当年8月31日\"}]。\n");
+    p.push_str(&format!("元数据输出示例 B：输入「今年拍的照片」（今年={y}）→ assetType image，metadata:[{{\"key\":\"taken_at\",\"op\":\"between\",\"value\":null,\"values\":null,\"min\":\"{this_year_start}\",\"max\":\"{this_year_end}\"}}]。\n"));
+    p.push_str("元数据输出示例 C：输入「4K横图」→ assetType image，metadata:[{\"key\":\"width\",\"op\":\"gte\",\"value\":3840},{\"key\":\"aspect_ratio\",\"op\":\"gte\",\"value\":1}]。\n");
+    p.push_str("元数据输出示例 D：输入「没打标签的视频」→ assetType video、untaggedOnly:true、concepts/textTerms/metadata 均为空。\n");
     // §9.2 回归基准：本轮截图用例
     p.push_str("示例 1：输入「晚上拍的然后有树还有多人」→ 期望：\n");
-    p.push_str("{\"groups\":[{\"assetType\":\"all\",\"concepts\":[{\"text\":\"夜间\",\"role\":\"lighting\",\"facetHint\":\"lighting\",\"confidence\":0.95},{\"text\":\"树\",\"role\":\"subject\",\"facetHint\":\"subject\",\"confidence\":0.95},{\"text\":\"多人\",\"role\":\"subject\",\"facetHint\":\"subject\",\"confidence\":0.9}],\"textTerms\":[],\"metadata\":[]}],\"exclusions\":[],\"sortBy\":null,\"sortDir\":null}\n");
+    p.push_str("{\"groups\":[{\"assetType\":\"all\",\"concepts\":[{\"text\":\"夜间\",\"role\":\"lighting\",\"facetHint\":\"lighting\",\"confidence\":0.95},{\"text\":\"树\",\"role\":\"subject\",\"facetHint\":\"subject\",\"confidence\":0.95},{\"text\":\"多人\",\"role\":\"subject\",\"facetHint\":\"subject\",\"confidence\":0.9}],\"textTerms\":[],\"metadata\":[],\"untaggedOnly\":false,\"preferred\":[]}],\"exclusions\":[],\"sortBy\":null,\"sortDir\":null}\n");
     p.push_str(
         "示例 2：输入「晚上拍的树或者白天拍的建筑」→ 两个 group：(夜间∧树) OR (白天∧建筑)。\n",
     );
@@ -1985,9 +2082,10 @@ fn intent_schema(facets: &[FacetPromptContext]) -> serde_json::Value {
             "concepts": {"type": "array", "maxItems": 20, "items": concept},
             "textTerms": {"type": "array", "maxItems": 10, "items": text_term},
             "metadata": {"type": "array", "maxItems": 20, "items": metadata_item},
+            "untaggedOnly": {"type": "boolean"},
             "preferred": {"type": "array", "maxItems": 12, "items": preferred_concept}
         },
-        "required": ["assetType", "concepts", "textTerms", "metadata", "preferred"]
+        "required": ["assetType", "concepts", "textTerms", "metadata", "untaggedOnly", "preferred"]
     });
     serde_json::json!({
         "type": "object",
@@ -2098,6 +2196,7 @@ mod tests {
             concepts,
             text_terms: vec![],
             metadata: vec![],
+            untagged_only: false,
         }
     }
 
@@ -2142,8 +2241,10 @@ mod tests {
 
     #[test]
     fn validates_rejects_bad_sort() {
-        let mut i = SearchIntentV2::default();
-        i.sort_by = Some("magic".into());
+        let i = SearchIntentV2 {
+            sort_by: Some("magic".into()),
+            ..SearchIntentV2::default()
+        };
         assert!(validate_intent(&i, &[]).is_err());
     }
 
@@ -2151,10 +2252,15 @@ mod tests {
     /// validate_intent 不得把它降级 —— 否则 rating 排序整个 intent 变关键词搜索。
     #[test]
     fn intent_with_rating_sort_is_not_degraded() {
-        let mut i = SearchIntentV2::default();
-        i.sort_by = Some("rating".into());
-        i.sort_dir = Some("desc".into());
-        assert!(validate_intent(&i, &[]).is_ok(), "rating 排序必须通过校验（R0-4）");
+        let i = SearchIntentV2 {
+            sort_by: Some("rating".into()),
+            sort_dir: Some("desc".into()),
+            ..SearchIntentV2::default()
+        };
+        assert!(
+            validate_intent(&i, &[]).is_ok(),
+            "rating 排序必须通过校验（R0-4）"
+        );
     }
 
     #[test]
@@ -2660,17 +2766,32 @@ mod tests {
             "latitude",
             "longitude",
             "有符号十进制度",
+            "aspect_ratio",
+            "has_location",
+            "untaggedOnly",
         ] {
             assert!(p.contains(needle), "提示词应教学：{needle}");
         }
         // 关键换算示例：10~105MB → 字节区间
         assert!(p.contains("10485760"), "file_size 示例应含 10MB 字节数");
         assert!(p.contains("110100480"), "file_size 示例应含 105MB 字节数");
-        // 完整 metadata 输出示例至少 2 个（file_size gt / taken_at between）
+        // 四个 metadata 输出示例（file_size / taken_at / 4K横图 / 未打标）
         assert!(p.contains("元数据输出示例 A"));
         assert!(p.contains("元数据输出示例 B"));
-        // 月份区间示例（between 当月首末日）
-        assert!(p.contains("8月份"));
+        assert!(p.contains("元数据输出示例 C"));
+        assert!(p.contains("元数据输出示例 D"));
+        // 分辨率档位 → 像素；横竖图 → aspect_ratio；优先互斥；禁止编造 tags_count
+        assert!(p.contains("3840"), "4K 应教学为 width gte 3840");
+        assert!(p.contains("互斥铁律"), "preferred/concepts 互斥必须强调");
+        assert!(p.contains("tags_count"), "必须明令禁止编造 tags_count");
+        // 相对日期：注入真实当前年份，且不再出现「当年」占位字样
+        let year = chrono::Local::now().format("%Y").to_string();
+        assert!(p.contains(&year), "taken_at 教学应注入当前真实年份 {year}");
+        // 不得再把「当年8月1日」这类占位中文当成 min/max 的值（禁令中可以提到「当年」这个词）
+        assert!(
+            !p.contains("当年8月1日"),
+            "taken_at 示例值必须是真实日期，不得是占位中文"
+        );
     }
 
     #[test]
@@ -2692,7 +2813,7 @@ mod tests {
         assert_eq!(keys, METADATA_KEYS, "enum 必须直接取自契约常量");
         assert_eq!(ops, METADATA_OPS, "enum 必须直接取自契约常量");
         // S0：单一事实源 —— METADATA_KEYS（= schema enum）= db/search_query.rs
-        // ALL_METADATA_KEYS（= key_spec 全部分支，含 rating/favorite/has_location）。
+        // ALL_METADATA_KEYS（= key_spec 全部分支，含 rating/has_location）。
         assert_eq!(
             METADATA_KEYS,
             crate::db::search_query::ALL_METADATA_KEYS,
@@ -2719,7 +2840,14 @@ mod tests {
                 asset_type: "all".into(),
                 metadata: vec![
                     // 未知 key → 丢弃
-                    mk_meta("magic_field", "eq", Some(serde_json::json!(1)), None, None, None),
+                    mk_meta(
+                        "magic_field",
+                        "eq",
+                        Some(serde_json::json!(1)),
+                        None,
+                        None,
+                        None,
+                    ),
                     // 白名单 key + 不支持的 op（taken_at 不支持 eq）→ 丢弃
                     mk_meta(
                         "taken_at",
@@ -2730,7 +2858,14 @@ mod tests {
                         None,
                     ),
                     // 白名单 key + 非法值（file_size 为负）→ 丢弃
-                    mk_meta("file_size", "gte", Some(serde_json::json!(-5)), None, None, None),
+                    mk_meta(
+                        "file_size",
+                        "gte",
+                        Some(serde_json::json!(-5)),
+                        None,
+                        None,
+                        None,
+                    ),
                     // 合法条件 → 保留
                     mk_meta(
                         "width",
@@ -2813,20 +2948,26 @@ mod tests {
                 selection_mode: "single".into(),
                 max_items: Some(3),
                 description: String::new(),
-            ..Default::default()
-        },
+                ..Default::default()
+            },
             FacetPromptContext {
                 key: "mood".into(),
                 display_name: "氛围".into(),
                 selection_mode: "multi".into(),
                 max_items: None,
                 description: String::new(),
-            ..Default::default()
-        },
+                ..Default::default()
+            },
         ];
         let schema = intent_schema(&facets);
-        let hint_enum = &schema["properties"]["groups"]["items"]["properties"]["concepts"]["items"]["properties"]["facetHint"]["anyOf"][0]["enum"];
-        let keys: Vec<&str> = hint_enum.as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+        let hint_enum = &schema["properties"]["groups"]["items"]["properties"]["concepts"]["items"]
+            ["properties"]["facetHint"]["anyOf"][0]["enum"];
+        let keys: Vec<&str> = hint_enum
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
         assert!(keys.contains(&"scene"));
         assert!(keys.contains(&"mood"));
         assert!(!keys.contains(&"不存在的分面"));
@@ -2839,10 +2980,16 @@ mod tests {
         let text = "海边日落";
         // 1. 空串
         let (i, w) = degrade_parse("", text, &facets);
-        assert!(is_keyword_fallback(&i, text), "空串应关键词兜底；warnings={w:?}");
+        assert!(
+            is_keyword_fallback(&i, text),
+            "空串应关键词兜底；warnings={w:?}"
+        );
         // 2. 非 JSON
         let (i, w) = degrade_parse("我觉得你搜不到", text, &facets);
-        assert!(is_keyword_fallback(&i, text), "非 JSON 应关键词兜底；warnings={w:?}");
+        assert!(
+            is_keyword_fallback(&i, text),
+            "非 JSON 应关键词兜底；warnings={w:?}"
+        );
         // 3. 未知 facet key → 保留 concept，清掉 hint（lenient）
         let (i, w) = degrade_parse(
             r#"{"groups":[{"assetType":"all","concepts":[{"text":"海边","role":"scene","facetHint":"not_a_facet","confidence":0.9}],"textTerms":[],"metadata":[]}],"exclusions":[],"sortBy":null,"sortDir":null}"#,
@@ -2850,7 +2997,10 @@ mod tests {
             &facets,
         );
         assert!(!is_keyword_fallback(&i, text), "未知 key 不应兜底");
-        assert!(i.groups[0].concepts[0].facet_hint.is_none(), "未知 hint 应清空");
+        assert!(
+            i.groups[0].concepts[0].facet_hint.is_none(),
+            "未知 hint 应清空"
+        );
         assert!(!w.is_empty(), "应有 warning");
         // 4. 非法 op → 剔除该条 metadata，保留其余
         let (i, w) = degrade_parse(
@@ -2875,7 +3025,10 @@ mod tests {
             text,
             &facets,
         );
-        assert!(is_keyword_fallback(&i, text), "空 groups 应兜底；warnings={w:?}");
+        assert!(
+            is_keyword_fallback(&i, text),
+            "空 groups 应兜底；warnings={w:?}"
+        );
         // 7. 超长概念 → 结构校验失败 → 兜底
         let long = "很".repeat(200);
         let (i, w) = degrade_parse(
@@ -2885,14 +3038,20 @@ mod tests {
             text,
             &facets,
         );
-        assert!(is_keyword_fallback(&i, text), "超长概念应兜底；warnings={w:?}");
+        assert!(
+            is_keyword_fallback(&i, text),
+            "超长概念应兜底；warnings={w:?}"
+        );
         // 8. 混入 markdown 围栏 → 剥围栏后正常解析（不兜底）
         let (i, w) = degrade_parse(
             "```json\n{\"groups\":[{\"assetType\":\"all\",\"concepts\":[{\"text\":\"海边\",\"role\":\"scene\",\"facetHint\":null,\"confidence\":0.9}],\"textTerms\":[],\"metadata\":[]}],\"exclusions\":[],\"sortBy\":null,\"sortDir\":null}\n```",
             text,
             &facets,
         );
-        assert!(!is_keyword_fallback(&i, text), "围栏剥除后应正常解析；warnings={w:?}");
+        assert!(
+            !is_keyword_fallback(&i, text),
+            "围栏剥除后应正常解析；warnings={w:?}"
+        );
     }
 
     /// W6-2 例外：配置类错误（鉴权/连不上/超时）仍应判定为真报错（命令层不降级）
@@ -2908,7 +3067,11 @@ mod tests {
             let e = AppError::msg(msg);
             assert!(is_config_error(&e), "应判定为配置错误: {msg}");
         }
-        for msg in ["AI 未返回可解析的 JSON", "非法排序字段：foo", "分组数量超出上限"] {
+        for msg in [
+            "AI 未返回可解析的 JSON",
+            "非法排序字段：foo",
+            "分组数量超出上限",
+        ] {
             let e = AppError::msg(msg);
             assert!(!is_config_error(&e), "不应判定为配置错误: {msg}");
         }
@@ -2925,7 +3088,10 @@ mod tests {
         let warnings = sanitize_all(&mut intent, &facets);
         assert!(intent.sort_by.is_none(), "非法 sortBy 应置默认");
         assert!(intent.sort_dir.is_none(), "非法 sortDir 应置默认");
-        assert_eq!(intent.groups[0].asset_type, "all", "非法 assetType 应改 all");
+        assert_eq!(
+            intent.groups[0].asset_type, "all",
+            "非法 assetType 应改 all"
+        );
         assert!(intent.groups[0].concepts[0].facet_hint.is_none());
         assert!(!warnings.is_empty());
     }
@@ -2949,6 +3115,106 @@ mod tests {
             &facets,
         );
         assert!(is_keyword_fallback(&i, "海边日落"));
+    }
+
+    /// 回归：纯素材类型组（assetType=video/image，无 concept/term/metadata，如「视频素材」）
+    /// 绝不能被当空组剔除 —— 修复前 sanitize_all 漏算 asset_type 导致整组被删、expr=null。
+    #[test]
+    fn sanitize_keeps_pure_asset_type_group() {
+        let facets: Vec<FacetPromptContext> = vec![];
+        let mut intent = serde_json::from_str::<SearchIntentV2>(
+            r#"{"groups":[{"assetType":"video","concepts":[],"textTerms":[],"metadata":[]}],"exclusions":[],"sortBy":null,"sortDir":null}"#,
+        )
+        .unwrap();
+        let _ = sanitize_all(&mut intent, &facets);
+        assert_eq!(intent.groups.len(), 1, "纯视频类型组必须保留");
+        assert_eq!(intent.groups[0].asset_type, "video");
+    }
+
+    /// 回归：纯 untaggedOnly 组（无 concept/term/metadata/类型）也不能被当空组剔除。
+    #[test]
+    fn sanitize_keeps_pure_untagged_group() {
+        let facets: Vec<FacetPromptContext> = vec![];
+        let mut intent = serde_json::from_str::<SearchIntentV2>(
+            r#"{"groups":[{"assetType":"all","concepts":[],"textTerms":[],"metadata":[],"untaggedOnly":true}],"exclusions":[],"sortBy":null,"sortDir":null}"#,
+        )
+        .unwrap();
+        let _ = sanitize_all(&mut intent, &facets);
+        assert_eq!(intent.groups.len(), 1, "纯未打标组必须保留");
+        assert!(intent.groups[0].untagged_only);
+    }
+
+    /// 「没打标签」→ 单个 Untagged 叶子；「没打标签的视频」→ AssetType(video) AND Untagged。
+    #[test]
+    fn build_expr_emits_untagged_leaf() {
+        use crate::db::query_expr::{LeafCond, QueryExpr};
+        let conn = init_memory().unwrap();
+        fn count_untagged(e: &QueryExpr) -> usize {
+            match e {
+                QueryExpr::And { children } | QueryExpr::Or { children } => {
+                    children.iter().map(count_untagged).sum()
+                }
+                QueryExpr::Not { child } => count_untagged(child),
+                QueryExpr::Leaf { cond } => usize::from(matches!(cond, LeafCond::Untagged)),
+            }
+        }
+        let pure = SearchIntentV2 {
+            groups: vec![SearchGroupV2 {
+                asset_type: "all".into(),
+                untagged_only: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let (expr, _, w) = build_expr_from_v2(&conn, &pure).unwrap();
+        let expr = expr.expect("纯未打标必须产出非空 expr");
+        assert_eq!(count_untagged(&expr), 1, "应产出 1 个 Untagged 叶子：{w:?}");
+
+        let vid = SearchIntentV2 {
+            groups: vec![SearchGroupV2 {
+                asset_type: "video".into(),
+                untagged_only: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let (expr2, _, _) = build_expr_from_v2(&conn, &vid).unwrap();
+        let expr2 = expr2.expect("未打标视频必须产出非空 expr");
+        assert_eq!(count_untagged(&expr2), 1);
+        match &expr2 {
+            QueryExpr::And { children } => {
+                let has_video = children.iter().any(|c| {
+                    matches!(c, QueryExpr::Leaf { cond: LeafCond::AssetType { value } } if value == "video")
+                });
+                assert!(has_video, "未打标视频应同时含 AssetType(video) 叶子");
+            }
+            other => panic!("未打标视频应为 And 组，实际：{other:?}"),
+        }
+    }
+
+    /// 回归（#14）：模型把「优先近景」误拆进独立 group 时，无 OR 词合并多组后，
+    /// 该优先项必须保留为 preferred（加分），而不是被 v2_to_v3 升级成硬必须 concepts。
+    #[test]
+    fn merge_groups_keeps_misplaced_preferred_soft() {
+        let raw = r#"{"groups":[
+          {"assetType":"all","concepts":[{"text":"草地","role":"scene","facetHint":"scene","confidence":0.95,"necessity":"required","evidence":null,"weight":null,"termMatch":"alias"}],"textTerms":[],"metadata":[],"untaggedOnly":false,"preferred":[]},
+          {"assetType":"all","concepts":[],"textTerms":[],"metadata":[],"untaggedOnly":false,"preferred":[{"text":"近景","role":"composition","facetHint":"composition","confidence":0.9,"necessity":"preferred","evidence":"优先近景","weight":1.0,"termMatch":"alias"}]}
+        ],"exclusions":[],"sortBy":null,"sortDir":null}"#;
+        let (out, _w) = degrade_parse_v3(raw, "草地，优先近景", &[]);
+        assert_eq!(out.groups.len(), 1, "无「或」词的多组应合并为一组");
+        let g = &out.groups[0];
+        assert!(
+            g.concepts.iter().any(|c| c.text == "草地"),
+            "必须项草地保留"
+        );
+        assert!(
+            g.preferred.iter().any(|c| c.text == "近景"),
+            "误拆到独立组的优先项应保留为 preferred"
+        );
+        assert!(
+            !g.concepts.iter().any(|c| c.text == "近景"),
+            "优先项近景不得被升级为硬必须"
+        );
     }
 
     // ═══════════════ S3：preferred evidence 守卫（纯函数真值表） ═══════════════
@@ -2983,16 +3249,24 @@ mod tests {
         ] {
             let (g, warns) = v3_group(input, pref, ev);
             assert!(
-                g.preferred.iter().any(|c| c.text == pref && c.necessity == Necessity::Preferred),
+                g.preferred
+                    .iter()
+                    .any(|c| c.text == pref && c.necessity == Necessity::Preferred),
                 "{input} 应保留为加分项（preferred={:?} concepts={:?}）",
                 g.preferred.iter().map(|c| &c.text).collect::<Vec<_>>(),
                 g.concepts.iter().map(|c| &c.text).collect::<Vec<_>>()
             );
-            assert!(!warns.iter().any(|w| w.contains("已按必须")), "{input} warns={warns:?}");
+            assert!(
+                !warns.iter().any(|w| w.contains("已按必须")),
+                "{input} warns={warns:?}"
+            );
         }
         // 「蓝天可有可无」：①② 过，原句无强偏好词（可有可无不在 CORE）→ info 但不降级
         let (g2, w2) = v3_group("蓝天可有可无", "蓝天", "蓝天可有可无");
-        assert!(g2.preferred.iter().any(|c| c.text == "蓝天"), "可有可无不得降级");
+        assert!(
+            g2.preferred.iter().any(|c| c.text == "蓝天"),
+            "可有可无不得降级"
+        );
         assert!(
             w2.iter().any(|w| w.contains("未见明显的偏好表述")),
             "应记 info：{w2:?}"
@@ -3005,7 +3279,10 @@ mod tests {
         // 原句「必须有蓝天」没有「最好」；模型编造 evidence「最好有蓝天」→ ① 降级
         let (g, warns) = v3_group("必须有蓝天", "蓝天", "最好有蓝天");
         assert!(g.preferred.is_empty(), "编造依据必须降级：{warns:?}");
-        assert!(g.concepts.iter().any(|c| c.text == "蓝天" && c.necessity == Necessity::Required));
+        assert!(g
+            .concepts
+            .iter()
+            .any(|c| c.text == "蓝天" && c.necessity == Necessity::Required));
         assert!(warns.iter().any(|w| w.contains("已按必须")), "{warns:?}");
     }
 
@@ -3063,8 +3340,14 @@ mod tests {
         };
         let _warns = guard_preferred("不要夜景，最好有蓝天", &mut g);
         // 夜景（required）仍在 concepts 且 necessity=Required
-        assert!(g.concepts.iter().any(|c| c.text == "夜景" && c.necessity == Necessity::Required));
-        assert!(!g.preferred.iter().any(|c| c.text == "夜景"), "required 不得升级为 preferred");
+        assert!(g
+            .concepts
+            .iter()
+            .any(|c| c.text == "夜景" && c.necessity == Necessity::Required));
+        assert!(
+            !g.preferred.iter().any(|c| c.text == "夜景"),
+            "required 不得升级为 preferred"
+        );
         // 蓝天（证据合法）保留加分
         assert!(g.preferred.iter().any(|c| c.text == "蓝天"));
     }
@@ -3095,7 +3378,10 @@ mod tests {
         let m = &s["properties"]["groups"]["items"]["properties"]["metadata"]["items"];
         // allOf[0] = if key==file_size then value/min/max number 需 >= 1024
         let cond = &m["allOf"][0];
-        assert_eq!(cond["if"]["properties"]["key"]["const"], "file_size", "条件分支必须锁 file_size");
+        assert_eq!(
+            cond["if"]["properties"]["key"]["const"], "file_size",
+            "条件分支必须锁 file_size"
+        );
         let then_props = &cond["then"]["properties"];
         for field in ["value", "min", "max"] {
             let anyof = &then_props[field]["anyOf"];
@@ -3107,7 +3393,10 @@ mod tests {
                 .collect::<Vec<_>>();
             assert!(!nums.is_empty(), "file_size 的 {field} 必须允许数值类型");
             for n in nums {
-                assert_eq!(n["minimum"], 1024.0, "file_size 的 {field} 数值下限必须 1024 字节");
+                assert_eq!(
+                    n["minimum"], 1024.0,
+                    "file_size 的 {field} 数值下限必须 1024 字节"
+                );
             }
         }
         // 非 file_size 的 key 不应被该条件误伤（latitude 允许负值/小数）
@@ -3123,20 +3412,50 @@ mod tests {
     fn library_stats_injected_as_facts_not_prohibitions() {
         let conn = init_memory().unwrap();
         // 小库：2 图 + 1 视频，含 GPS 与时间，验证聚合数字确实进文本
-        insert_asset_row(&conn, "d:/a/1.jpg", "image/jpeg", 6_272_000, Some(1_760_000_000_000), Some(31.2), Some(121.5));
-        insert_asset_row(&conn, "d:/a/2.jpg", "image/jpeg", 36_200_000, Some(1_760_000_000_000), None, None);
-        insert_asset_row(&conn, "d:/a/3.mp4", "video/mp4", 12_000_000, None, None, None);
+        insert_asset_row(
+            &conn,
+            "d:/a/1.jpg",
+            "image/jpeg",
+            6_272_000,
+            Some(1_760_000_000_000),
+            Some(31.2),
+            Some(121.5),
+        );
+        insert_asset_row(
+            &conn,
+            "d:/a/2.jpg",
+            "image/jpeg",
+            36_200_000,
+            Some(1_760_000_000_000),
+            None,
+            None,
+        );
+        insert_asset_row(
+            &conn,
+            "d:/a/3.mp4",
+            "video/mp4",
+            12_000_000,
+            None,
+            None,
+            None,
+        );
         let caps = library_capabilities(&conn).unwrap();
         // 陈述事实而非禁令：允许「该条件无结果仍输出」，不允许「不要输出 xxx」
         for banned in ["不要输出", "不要生成", "禁止输出", "绝不能", "只能"] {
-            assert!(!caps.contains(banned), "库能力摘要不得含禁令措辞「{banned}」：\n{caps}");
+            assert!(
+                !caps.contains(banned),
+                "库能力摘要不得含禁令措辞「{banned}」：\n{caps}"
+            );
         }
         // 事实数字在文本中
         assert!(caps.contains("3 张"), "应聚合出总数：{caps}");
         assert!(caps.contains("图片 2"), "应聚合出图片数：{caps}");
         assert!(caps.contains("视频 1"), "应聚合出视频数：{caps}");
         assert!(caps.contains("1 张有 GPS"), "应聚合出 GPS 数：{caps}");
-        assert!(caps.contains("如果用户的条件在本库必然无结果，仍要如实输出该条件"), "{caps}");
+        assert!(
+            caps.contains("如果用户的条件在本库必然无结果，仍要如实输出该条件"),
+            "{caps}"
+        );
     }
 
     /// C-3：用户明确搜无 GPS 条件 → 后端绝不因库统计剔除该条件（原则 P5）。
@@ -3146,19 +3465,48 @@ mod tests {
     fn gps_condition_survives_when_library_has_none() {
         let conn = init_memory().unwrap();
         // 库中没有任何 GPS 数据
-        insert_asset_row(&conn, "d:/a/1.jpg", "image/jpeg", 6_272_000, Some(1_760_000_000_000), None, None);
-        insert_asset_row(&conn, "d:/a/2.jpg", "image/jpeg", 36_200_000, Some(1_760_000_000_000), None, None);
+        insert_asset_row(
+            &conn,
+            "d:/a/1.jpg",
+            "image/jpeg",
+            6_272_000,
+            Some(1_760_000_000_000),
+            None,
+            None,
+        );
+        insert_asset_row(
+            &conn,
+            "d:/a/2.jpg",
+            "image/jpeg",
+            36_200_000,
+            Some(1_760_000_000_000),
+            None,
+            None,
+        );
         let caps = library_capabilities(&conn).unwrap();
-        assert!(caps.contains("0 张有 GPS"), "库能力摘要应如实说明 0 GPS：{caps}");
+        assert!(
+            caps.contains("0 张有 GPS"),
+            "库能力摘要应如实说明 0 GPS：{caps}"
+        );
         // AI 明确输出「有定位」条件 → 解析层不得剔除（has_location 值域 yes/no）
         let text = "有定位的照片";
         let raw = r#"{"groups":[{"assetType":"all","concepts":[],"textTerms":[],"metadata":[{"key":"has_location","op":"eq","value":"yes","values":null,"min":null,"max":null}]}],"exclusions":[],"sortBy":null,"sortDir":null}"#;
         let (intent, warnings) = degrade_parse(raw, text, &[]);
-        assert!(!is_keyword_fallback(&intent, text), "明确 GPS 条件不应被兜底：{warnings:?}");
-        assert_eq!(intent.groups[0].metadata.len(), 1, "GPS 条件必须保留（绝不做库统计剔除）");
+        assert!(
+            !is_keyword_fallback(&intent, text),
+            "明确 GPS 条件不应被兜底：{warnings:?}"
+        );
+        assert_eq!(
+            intent.groups[0].metadata.len(),
+            1,
+            "GPS 条件必须保留（绝不做库统计剔除）"
+        );
         assert_eq!(intent.groups[0].metadata[0].key, "has_location");
         // 该条件真实执行后应为 0 命中 —— 由编译层自然得出，这里验证 key 合法
-        assert!(crate::db::search_query::is_supported_metadata_key("has_location"), "has_location 必须在白名单内");
+        assert!(
+            crate::db::search_query::is_supported_metadata_key("has_location"),
+            "has_location 必须在白名单内"
+        );
     }
 
     /// C-3：build_user_prompt 把库能力摘要作为独立小节拼到查询之后（注入路径可测）。
@@ -3168,7 +3516,10 @@ mod tests {
         let facets: Vec<FacetPromptContext> = vec![];
         let caps = "本库现状：\n- 3 张，图片 2 / 视频 1\n如果用户的条件在本库必然无结果，仍要如实输出该条件 —— 系统会解释原因。";
         let p = build_user_prompt(&dict, &facets, "海边", caps);
-        assert!(p.contains("用户查询：<query>海边</query>"), "查询块保持完整：{p}");
+        assert!(
+            p.contains("用户查询：<query>海边</query>"),
+            "查询块保持完整：{p}"
+        );
         assert!(p.ends_with(caps), "能力摘要应拼在 prompt 最末尾：{p}");
         // 空 capabilities → 不注入（命令层短锁失败静默降级路径）
         let p2 = build_user_prompt(&dict, &facets, "海边", "");
@@ -3211,7 +3562,11 @@ mod tests {
         assert!(
             intent.groups[0].preferred.iter().any(|c| c.text == "蓝天"),
             "合法加分项应保留：preferred={:?} warnings={warnings:?}",
-            intent.groups[0].preferred.iter().map(|c| &c.text).collect::<Vec<_>>()
+            intent.groups[0]
+                .preferred
+                .iter()
+                .map(|c| &c.text)
+                .collect::<Vec<_>>()
         );
     }
 
@@ -3224,13 +3579,41 @@ mod tests {
         let facets: Vec<FacetPromptContext> = vec![];
         // ① 畸形输入（非 JSON）→ V3 管线落关键词（V3 形态）
         let (i1, w1) = degrade_parse_v3("模型在胡言乱语", "草地", &facets);
-        assert!(i1.groups[0].text_terms.iter().any(|t| t.text.contains("草地")), "应关键词兜底（整句进 textTerms）：{w1:?}");
+        assert!(
+            i1.groups[0]
+                .text_terms
+                .iter()
+                .any(|t| t.text.contains("草地")),
+            "应关键词兜底（整句进 textTerms）：{w1:?}"
+        );
         // ② V2 合法 JSON（无 preferred）→ V3 管线解析出与 V2 相同的概念集
         let v2_raw = r#"{"groups":[{"assetType":"all","concepts":[{"text":"草地","role":"scene","facetHint":null,"confidence":0.9}],"textTerms":[],"metadata":[]}],"exclusions":[],"sortBy":null,"sortDir":null}"#;
         let (v3i, _) = degrade_parse_v3(v2_raw, "草地", &facets);
         let v2i = v3_to_v2_view(&v3i);
-        assert_eq!(v2i.groups[0].concepts[0].text, "草地", "V2 JSON 应保持原语义");
+        assert_eq!(
+            v2i.groups[0].concepts[0].text, "草地",
+            "V2 JSON 应保持原语义"
+        );
         assert!(v3i.groups[0].preferred.is_empty(), "V2 无加分项");
+    }
+
+    /// 回归：V3 strict 路径里 metadata「file_size gte 缺 value」必须在 sanitize 后正确回写 V3，
+    /// 残缺条件被就近剔除、其余概念保留 —— 修复前漏回写 metadata，残缺条件留到 build_plan 整体报「需要 value」。
+    #[test]
+    fn v3_strict_drops_incomplete_metadata_after_sanitize() {
+        let facets: Vec<FacetPromptContext> = vec![];
+        let raw = r#"{"groups":[{"assetType":"all","concepts":[{"text":"海边","role":"scene","facetHint":null,"confidence":0.9}],"preferred":[],"textTerms":[],"metadata":[{"key":"file_size","op":"gte","value":null,"values":null,"min":null,"max":null}]}],"exclusions":[],"sortBy":null,"sortDir":null}"#;
+        let (intent, _warnings) = degrade_parse_v3(raw, "海边，大于5MB", &facets);
+        assert_eq!(intent.groups.len(), 1, "组应保留");
+        assert!(
+            intent.groups[0].metadata.is_empty(),
+            "残缺的 file_size gte（缺 value）必须被剔除，不能留到 build_plan 报错：{:?}",
+            intent.groups[0].metadata
+        );
+        assert!(
+            intent.groups[0].concepts.iter().any(|c| c.text == "海边"),
+            "其余合法概念必须保留"
+        );
     }
 
     /// S3：schema 已扩展 V3 字段 —— group.preferred 与 evidence/weight/termMatch 可被 json_schema 服务商接受。
@@ -3244,7 +3627,10 @@ mod tests {
         );
         let pref_items = &g["properties"]["preferred"]["items"];
         for field in ["evidence", "weight", "termMatch"] {
-            assert!(pref_items["properties"][field].is_object(), "加分项 schema 缺 {field}");
+            assert!(
+                pref_items["properties"][field].is_object(),
+                "加分项 schema 缺 {field}"
+            );
         }
     }
 
@@ -3314,23 +3700,33 @@ mod tests {
         crate::db::asset_tags::assign(&conn, &[a], &[grass.id, sky.id], "manual").unwrap();
         crate::db::asset_tags::assign(&conn, &[b], &[grass.id], "manual").unwrap();
         crate::db::asset_tags::assign(&conn, &[e], &[grass.id, night.id], "manual").unwrap();
-        let c3 = |text: &str, role: &str, necessity: Necessity, ev: Option<&str>, w: Option<f32>| SearchConceptV3 {
-            text: text.into(),
-            role: role.into(),
-            facet_hint: Some("scene".into()),
-            confidence: Some(0.95),
-            necessity,
-            weight: w,
-            evidence: ev.map(String::from),
-            term_match: crate::db::tags::TermMatch::Alias,
-        };
+        let c3 =
+            |text: &str, role: &str, necessity: Necessity, ev: Option<&str>, w: Option<f32>| {
+                SearchConceptV3 {
+                    text: text.into(),
+                    role: role.into(),
+                    facet_hint: Some("scene".into()),
+                    confidence: Some(0.95),
+                    necessity,
+                    weight: w,
+                    evidence: ev.map(String::from),
+                    term_match: crate::db::tags::TermMatch::Alias,
+                }
+            };
         let intent = SearchIntentV3 {
             groups: vec![SearchGroupV3 {
                 asset_type: "all".into(),
                 concepts: vec![c3("草地", "scene", Necessity::Required, None, None)],
-                preferred: vec![c3("蓝天", "scene", Necessity::Preferred, Some("最好有蓝天"), Some(1.0))],
+                preferred: vec![c3(
+                    "蓝天",
+                    "scene",
+                    Necessity::Preferred,
+                    Some("最好有蓝天"),
+                    Some(1.0),
+                )],
                 text_terms: vec![],
                 metadata: vec![],
+                untagged_only: false,
             }],
             exclusions: vec![c3("夜景", "scene", Necessity::Required, None, None)],
             sort_by: None,
@@ -3340,14 +3736,25 @@ mod tests {
         // filter = 草地（required）；must_not = 夜景；should = 蓝天 加分
         let leaf_ids = |e: &Option<QueryExpr>| -> Vec<i64> {
             let mut out = Vec::new();
-            if let Some(QueryExpr::Leaf { cond: crate::db::query_expr::LeafCond::Tag { tag_ids, .. } }) = e {
+            if let Some(QueryExpr::Leaf {
+                cond: crate::db::query_expr::LeafCond::Tag { tag_ids, .. },
+            }) = e
+            {
                 out.extend(tag_ids);
             }
             out
         };
-        assert_eq!(leaf_ids(&plan.filter), vec![grass.id], "filter 应只含草地（required）");
+        assert_eq!(
+            leaf_ids(&plan.filter),
+            vec![grass.id],
+            "filter 应只含草地（required）"
+        );
         assert_eq!(plan.should.len(), 1, "蓝天应是唯一加分项：{warns:?}");
-        assert_eq!(leaf_ids(&plan.must_not), vec![night.id], "must_not 应含夜景");
+        assert_eq!(
+            leaf_ids(&plan.must_not),
+            vec![night.id],
+            "must_not 应含夜景"
+        );
         assert!(resolved.iter().any(|r| r.tag_id == grass.id));
         assert!(resolved.iter().any(|r| r.tag_id == sky.id));
         // 执行：草地照都在（含无蓝天），夜景照被排除，蓝天加分排最前
@@ -3408,6 +3815,7 @@ mod tests {
                 preferred: vec![],
                 text_terms: vec![],
                 metadata: vec![],
+                untagged_only: false,
             }],
             exclusions: vec![],
             sort_by: None,
@@ -3415,8 +3823,19 @@ mod tests {
         };
         let (plan, _resolved, warns) = build_plan_from_v3(&conn, &intent).unwrap();
         match &plan.filter {
-            Some(QueryExpr::Leaf { cond: LeafCond::Tag { term_query, term_match, .. } }) => {
-                assert_eq!(term_query.as_deref(), Some("人"), "concept_leaf 必须回填 term_query");
+            Some(QueryExpr::Leaf {
+                cond:
+                    LeafCond::Tag {
+                        term_query,
+                        term_match,
+                        ..
+                    },
+            }) => {
+                assert_eq!(
+                    term_query.as_deref(),
+                    Some("人"),
+                    "concept_leaf 必须回填 term_query"
+                );
                 assert_eq!(*term_match, crate::db::tags::TermMatch::Contains);
             }
             other => panic!("filter 应为 Tag leaf：{other:?}"),
@@ -3424,7 +3843,10 @@ mod tests {
         // 扩展发生在编译层：contains「人」应命中 人物+单人两张照，森林不命中
         let out = run_search_plan(&conn, &plan, None, 0).unwrap();
         let ids: Vec<i64> = out.iter().map(|r| r.0).collect();
-        assert!(ids.contains(&b) && ids.contains(&c_img), "contains 应命中 人物+单人：{ids:?} {warns:?}");
+        assert!(
+            ids.contains(&b) && ids.contains(&c_img),
+            "contains 应命中 人物+单人：{ids:?} {warns:?}"
+        );
         assert!(!ids.contains(&a), "森林不得命中");
 
         // 对照：默认 alias 时同概念走精确解析（resolve_concept 直接映射不到 → content 搜索），
@@ -3436,13 +3858,17 @@ mod tests {
                 preferred: vec![],
                 text_terms: vec![],
                 metadata: vec![],
+                untagged_only: false,
             }],
             exclusions: vec![],
             sort_by: None,
             sort_dir: None,
         };
         let (plan2, _, _) = build_plan_from_v3(&conn, &intent2).unwrap();
-        if let Some(QueryExpr::Leaf { cond: LeafCond::Tag { term_query, .. } }) = &plan2.filter {
+        if let Some(QueryExpr::Leaf {
+            cond: LeafCond::Tag { term_query, .. },
+        }) = &plan2.filter
+        {
             assert_eq!(term_query.as_deref(), Some("人"), "alias 也回填 term_query");
         }
     }

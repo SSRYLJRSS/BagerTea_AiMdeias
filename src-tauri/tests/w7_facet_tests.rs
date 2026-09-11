@@ -76,8 +76,12 @@ fn canonical_hits_alias() {
 fn merge_guardrails() {
     let conn = setup();
     let (facet, a) = make_facet_tag(&conn, "w7mood");
-    let b = tags::create_in_facet(&conn, "B", None, Some(&facet)).unwrap().id;
-    let c = tags::create_in_facet(&conn, "C", None, Some(&facet)).unwrap().id;
+    let b = tags::create_in_facet(&conn, "B", None, Some(&facet))
+        .unwrap()
+        .id;
+    let c = tags::create_in_facet(&conn, "C", None, Some(&facet))
+        .unwrap()
+        .id;
     // 自合并
     assert!(tags::merge_preserve_alias(&conn, a, a).is_err());
     // 跨分面
@@ -86,7 +90,10 @@ fn merge_guardrails() {
     assert!(tags::merge_preserve_alias(&conn, a, d).is_err());
     // 后代环：b 挂到 a 下后，把 a 合并进 b（b 是 a 的后代）
     tags::update(&conn, b, None, Some(Some(a))).unwrap();
-    assert!(tags::merge_preserve_alias(&conn, a, b).is_err(), "不能合并到自己的子标签");
+    assert!(
+        tags::merge_preserve_alias(&conn, a, b).is_err(),
+        "不能合并到自己的子标签"
+    );
     let _ = c;
 }
 
@@ -107,7 +114,13 @@ fn undo_batch_rules() {
         [],
     )
     .unwrap();
-    let batch_id = conn.query_row("SELECT id FROM ai_batches ORDER BY id DESC LIMIT 1", [], |r| r.get(0)).unwrap();
+    let batch_id = conn
+        .query_row(
+            "SELECT id FROM ai_batches ORDER BY id DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
     conn.execute(
         "INSERT INTO tag_ops (batch_id, asset_id, tag_id, op, actor, created_at)
          VALUES (?1, ?2, ?3, 'add', 'ai', 1), (?1, ?4, ?3, 'remove', 'manual', 2)",
@@ -141,7 +154,10 @@ fn undo_batch_rules() {
         .unwrap();
     assert_eq!(a1_gone, 0, "D-3：本批次写入的 AI 关联应被撤销");
     // a3 的手工关联保留
-    let a3_kept: i64 = count(&conn, &format!("SELECT COUNT(*) FROM asset_tags WHERE asset_id={a3} AND tag_id={tag}"));
+    let a3_kept: i64 = count(
+        &conn,
+        &format!("SELECT COUNT(*) FROM asset_tags WHERE asset_id={a3} AND tag_id={tag}"),
+    );
     assert_eq!(a3_kept, 1, "D-3：手工确认的关联不能被 undo 删除");
     // D-5：remove 撤销后 a2 被重插，且不带 source_batch_id
     let a2_row: Option<i64> = conn
@@ -168,7 +184,13 @@ fn manual_override_clears_source_batch() {
         [],
     )
     .unwrap();
-    let batch_id = conn.query_row("SELECT id FROM ai_batches ORDER BY id DESC LIMIT 1", [], |r| r.get(0)).unwrap();
+    let batch_id = conn
+        .query_row(
+            "SELECT id FROM ai_batches ORDER BY id DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
     asset_tags::assign(&conn, &[a1], &[tag], "ai").unwrap();
     conn.execute(
         "UPDATE asset_tags SET source_batch_id=?1, source='ai' WHERE asset_id=?2 AND tag_id=?3",
@@ -191,7 +213,11 @@ fn manual_override_clears_source_batch() {
         .unwrap();
     assert!(batch_after.is_none(), "D-2：手工覆盖必须清 source_batch_id");
     // 撤销批次 → 不应删除该关联（source 已是 manual 且 batch 已清）
-    assert_eq!(tag_ops::undo_batch(&conn, batch_id).unwrap(), 0, "D-1：撤销不误删手工标签");
+    assert_eq!(
+        tag_ops::undo_batch(&conn, batch_id).unwrap(),
+        0,
+        "D-1：撤销不误删手工标签"
+    );
     let kept: i64 = count(
         &conn,
         &format!("SELECT COUNT(*) FROM asset_tags WHERE asset_id={a1} AND tag_id={tag}"),
@@ -232,13 +258,22 @@ fn kinship_sync_assign_and_remove_symmetric() {
 
     // 默认开关开（kinship.sync_tags_to_siblings = true）
     asset_tags::assign(&conn, &[jpg], &[tag], "manual").unwrap();
-    let raw_has: i64 = count(&conn, &format!("SELECT COUNT(*) FROM asset_tags WHERE asset_id={raw} AND tag_id={tag}"));
+    let raw_has: i64 = count(
+        &conn,
+        &format!("SELECT COUNT(*) FROM asset_tags WHERE asset_id={raw} AND tag_id={tag}"),
+    );
     assert_eq!(raw_has, 1, "同源 RAW 应同步打标");
 
     // remove 对称摘除
     asset_tags::remove(&conn, &[jpg], &[tag]).unwrap();
-    let jpg_has: i64 = count(&conn, &format!("SELECT COUNT(*) FROM asset_tags WHERE asset_id={jpg} AND tag_id={tag}"));
-    let raw_has: i64 = count(&conn, &format!("SELECT COUNT(*) FROM asset_tags WHERE asset_id={raw} AND tag_id={tag}"));
+    let jpg_has: i64 = count(
+        &conn,
+        &format!("SELECT COUNT(*) FROM asset_tags WHERE asset_id={jpg} AND tag_id={tag}"),
+    );
+    let raw_has: i64 = count(
+        &conn,
+        &format!("SELECT COUNT(*) FROM asset_tags WHERE asset_id={raw} AND tag_id={tag}"),
+    );
     assert_eq!(jpg_has, 0);
     assert_eq!(raw_has, 0, "remove 应同步摘除同源 RAW");
 }
@@ -256,6 +291,9 @@ fn kinship_sync_disabled_keeps_independent() {
     settings::save_settings(&conn, &s).unwrap();
 
     asset_tags::assign(&conn, &[jpg], &[tag], "manual").unwrap();
-    let raw_has: i64 = count(&conn, &format!("SELECT COUNT(*) FROM asset_tags WHERE asset_id={raw} AND tag_id={tag}"));
+    let raw_has: i64 = count(
+        &conn,
+        &format!("SELECT COUNT(*) FROM asset_tags WHERE asset_id={raw} AND tag_id={tag}"),
+    );
     assert_eq!(raw_has, 0, "关闭同步后 RAW 不应被打标");
 }

@@ -102,14 +102,16 @@ export const useAiStore = create<AiState>((set, get) => ({
   },
 
   openBatch: async (batchId) => {
+    const requestId = ++latestOpenBatchRequest;
     set({ currentBatchId: batchId });
     try {
       const list = await aiListSuggestions(batchId);
-      // P1-02：写入前校验当前批次未变——快速 A→B 切换时，A 的慢响应不得覆盖 B 的内容
-      if (get().currentBatchId !== batchId) return;
+      // 同时守住跨批次与同批次竞态：进度事件会连续触发回载，较早请求可能更晚返回，
+      // 只有最近发起的请求可以写入，避免旧快照把刚出现的标签反盖成空白。
+      if (get().currentBatchId !== batchId || requestId !== latestOpenBatchRequest) return;
       set({ suggestions: list });
     } catch (e) {
-      if (get().currentBatchId !== batchId) return;
+      if (get().currentBatchId !== batchId || requestId !== latestOpenBatchRequest) return;
       set({ error: e instanceof Error ? e.message : String(e) });
     }
   },
@@ -187,3 +189,5 @@ export const useAiStore = create<AiState>((set, get) => ({
 
 /** 进度事件驱动的 suggestions 实时回载节流时间戳（模块级，跨 set 调用共享） */
 let lastLiveReloadAt = 0;
+/** 最近一次建议回载请求序号；防止同一批次的旧快照晚到后覆盖新快照。 */
+let latestOpenBatchRequest = 0;

@@ -250,7 +250,8 @@ describe("superSearchStore", () => {
     await useSuperSearchStore.getState().applyAiSearch("标签");
     useSuperSearchStore.getState().setPlanFilter({ op: "leaf", cond: { type: "assetType", value: "image" } });
     const kept = useSuperSearchStore.getState().plan;
-    expect(kept?.should).toEqual(plan.should);
+    expect(kept?.should?.[0].cond).toEqual(plan.should[0].cond);
+    expect(kept?.should?.[0].weight).toBe(2);
     expect(kept?.mustNot).toEqual(plan.mustNot);
     expect(kept?.filter).toEqual({ op: "leaf", cond: { type: "assetType", value: "image" } });
   });
@@ -275,7 +276,7 @@ describe("superSearchStore", () => {
   it("minimumShouldMatch 随 should 长度自动收敛（不变式 4）", () => {
     useSuperSearchStore.getState().setPlanShould([{ cond: { type: "search", value: "a" }, weight: 1, label: "a" }], 5);
     let plan = useSuperSearchStore.getState().plan;
-    expect(plan?.minimumShouldMatch).toBe(1);
+    expect(plan?.minimumShouldMatch).toBe(0);
     // should 清空（且 filter/mustNot 也为空）→ 不变式 3：plan 置 null
     useSuperSearchStore.getState().setPlanShould([], 1);
     plan = useSuperSearchStore.getState().plan;

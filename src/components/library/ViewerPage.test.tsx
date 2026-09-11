@@ -119,6 +119,30 @@ describe("ViewerPage 视频识别（§7.1）", () => {
   });
 });
 
+describe("ViewerPage 过片数据集可注入（超级搜索联动）", () => {
+  it("传入 listItems/listTotal 时胶片条与位置计数用注入集；不回退混入素材库 store 列表", () => {
+    // 素材库 store 里是另一批 3 项（旧实现下查看器只会读它，导致超搜 2 项却显示 x/3）
+    const lib = [
+      mkAsset({ id: 301, fileName: "l1.jpg", filePath: "d:/lib/l1.jpg" }),
+      mkAsset({ id: 302, fileName: "l2.jpg", filePath: "d:/lib/l2.jpg" }),
+      mkAsset({ id: 303, fileName: "l3.jpg", filePath: "d:/lib/l3.jpg" }),
+    ];
+    useLibraryStore.setState({ items: lib, total: 3 });
+    const injected = [
+      mkAsset({ id: 401, mimeType: "image/jpeg", fileExt: "jpg", fileName: "s1.jpg", filePath: "d:/s/s1.jpg", placeholderPath: "t401.jpg" }),
+      mkAsset({ id: 402, mimeType: "image/jpeg", fileExt: "jpg", fileName: "s2.jpg", filePath: "d:/s/s2.jpg", placeholderPath: "t402.jpg" }),
+    ];
+    render(<ViewerPage asset={injected[0]} onClose={vi.fn()} listItems={injected} listTotal={2} />);
+    // 位置计数走注入集
+    expect(screen.getByText("1 / 2")).toBeInTheDocument();
+    expect(screen.queryByText(/\/ 3/)).not.toBeInTheDocument();
+    // 胶片条只渲染注入集
+    expect(screen.getByRole("button", { name: "第 1 张：s1.jpg" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "第 2 张：s2.jpg" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /l\d\.jpg/ })).not.toBeInTheDocument();
+  });
+});
+
 describe("ViewerPage 查看器色条（FB3-10 §12.2）", () => {
   it("showInViewer 开启且有 palette 时在标签栏上方渲染色条；无 palette 不渲染", async () => {
     const { useSettingsStore: sstore, DEFAULT_APPEARANCE: DA } = await import("@/stores/settingsStore");

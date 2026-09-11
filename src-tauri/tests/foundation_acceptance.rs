@@ -6,7 +6,7 @@
 //!   C 波次 → 组 7；全部绿 + 四关全绿 → foundation-verified。
 
 use bagertea_ai_media_v2_lib::db::{
-    ai, facet_numbers, init_memory, asset_tags, assets, migrations, query_expr, schema_features, tag_facets, tags,
+    ai, asset_tags, assets, init_memory, migrations, query_expr, schema_features, tag_facets, tags,
 };
 use bagertea_ai_media_v2_lib::error::AppResult;
 
@@ -84,7 +84,9 @@ fn effective_value_sql_matches_rust() {
                         let s_manual = sql_eff(&c, "eff", tag_facets::EFF_MANUAL);
                         let s_ai = sql_eff(&c, "eff", tag_facets::EFF_AI);
                         let s_search = sql_eff(&c, "eff", tag_facets::EFF_SEARCH);
-                        let tag = format!("status={status} vis={vis} manual={manual} ai={ai} search={search}");
+                        let tag = format!(
+                            "status={status} vis={vis} manual={manual} ai={ai} search={search}"
+                        );
                         assert_eq!(eff.visible, s_visible, "visible 不符：{tag}");
                         assert_eq!(eff.manual, s_manual, "manual 不符：{tag}");
                         assert_eq!(eff.ai, s_ai, "ai 不符：{tag}");
@@ -115,19 +117,28 @@ fn facet_deactivate_restore_preserves_config() {
     let inactive = tag_facets::get(&c, key).unwrap();
     assert_eq!(inactive.status, "inactive");
     assert!(inactive.cfg_ai_assignable, "停用不清配置值（恢复时要还原）");
-    assert_eq!(inactive.input_mode, "ai_and_manual", "cfg_ai=1 → 派生 ai_and_manual");
+    assert_eq!(
+        inactive.input_mode, "ai_and_manual",
+        "cfg_ai=1 → 派生 ai_and_manual"
+    );
     // 恢复 → 仍是 ai_and_manual
     tag_facets::restore(&c, key).unwrap();
     let restored = tag_facets::get(&c, key).unwrap();
     assert_eq!(restored.status, "active");
-    assert_eq!(restored.input_mode, "ai_and_manual", "停用→恢复必须还原原配置");
+    assert_eq!(
+        restored.input_mode, "ai_and_manual",
+        "停用→恢复必须还原原配置"
+    );
     assert!(restored.cfg_ai_assignable);
     // manual_only 同理
     tag_facets::update_facet(&c, key, "我的分面", "", "manual_only", "multi", None, "all").unwrap();
     tag_facets::deactivate(&c, key).unwrap();
     tag_facets::restore(&c, key).unwrap();
     let back = tag_facets::get(&c, key).unwrap();
-    assert_eq!(back.input_mode, "manual_only", "manual_only 停用→恢复仍是 manual_only");
+    assert_eq!(
+        back.input_mode, "manual_only",
+        "manual_only 停用→恢复仍是 manual_only"
+    );
     assert!(!back.cfg_ai_assignable);
 }
 
@@ -156,7 +167,11 @@ fn cycle_creation_rejected() {
 }
 
 /// 直接执行 UPDATE（绕过 tags::update 的应用层防环，验证触发器兜底）
-fn crate_private_update_parent(c: &rusqlite::Connection, id: i64, parent: Option<i64>) -> AppResult<()> {
+fn crate_private_update_parent(
+    c: &rusqlite::Connection,
+    id: i64,
+    parent: Option<i64>,
+) -> AppResult<()> {
     c.execute(
         "UPDATE tags SET parent_id = ?1 WHERE id = ?2",
         rusqlite::params![parent, id],
@@ -205,7 +220,11 @@ fn v22b_applies_when_clean_and_registers_features() {
     migrations::apply_v22b_constraints(&c).unwrap();
     // tag_terms 有 canonical（种子分面无标签，但 apply 后表存在）
     let n: i64 = c
-        .query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='tag_terms'", [], |r| r.get(0))
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='tag_terms'",
+            [],
+            |r| r.get(0),
+        )
         .unwrap();
     assert_eq!(n, 1);
     // 特征登记（命令层做 set_feature；这里验证表 + 手动登记 API 可用）
@@ -232,7 +251,10 @@ fn term_alias_equals_other_canonical_rejected() {
         .unwrap();
     let report = tags::detect_tag_conflicts(&c).unwrap();
     assert!(
-        report.term_conflicts.iter().any(|g| g.facet_key == "scene" && g.term == "海边" && g.entries.len() >= 2),
+        report
+            .term_conflicts
+            .iter()
+            .any(|g| g.facet_key == "scene" && g.term == "海边" && g.entries.len() >= 2),
         "应发现 scene 分面「海边」重名：{report:?}"
     );
     let _ = t1;
@@ -305,12 +327,21 @@ fn terms_facet_syncs_on_tag_update() {
     migrations::apply_v22b_constraints(&c).unwrap();
     // 把标签迁到 scene 分面
     let scene_facet_exists: i64 = c
-        .query_row("SELECT COUNT(*) FROM tag_facets WHERE key='scene'", [], |r| r.get(0))
+        .query_row(
+            "SELECT COUNT(*) FROM tag_facets WHERE key='scene'",
+            [],
+            |r| r.get(0),
+        )
         .unwrap();
     assert_eq!(scene_facet_exists, 1);
-    c.execute("UPDATE tags SET facet_key='scene' WHERE id=?1", [t.id]).unwrap();
+    c.execute("UPDATE tags SET facet_key='scene' WHERE id=?1", [t.id])
+        .unwrap();
     let terms_facet: String = c
-        .query_row("SELECT facet_key FROM tag_terms WHERE tag_id=?1", [t.id], |r| r.get(0))
+        .query_row(
+            "SELECT facet_key FROM tag_terms WHERE tag_id=?1",
+            [t.id],
+            |r| r.get(0),
+        )
         .unwrap();
     assert_eq!(terms_facet, "scene", "改 tags.facet_key 应同步 tag_terms");
 }
@@ -351,7 +382,11 @@ fn facet_mismatch_blocks_feature_enable() {
     migrations::apply_v22b_constraints(&c).unwrap();
     c.execute_batch("DROP TRIGGER trg_terms_facet_match_au; DROP TRIGGER trg_terms_sync_facet;")
         .unwrap();
-    c.execute("UPDATE tag_terms SET facet_key='scene' WHERE tag_id=?1", [t.id]).unwrap();
+    c.execute(
+        "UPDATE tag_terms SET facet_key='scene' WHERE tag_id=?1",
+        [t.id],
+    )
+    .unwrap();
     let report = tags::detect_tag_conflicts(&c).unwrap();
     assert!(
         !report.facet_mismatches.is_empty(),
@@ -377,7 +412,11 @@ fn facet_delete_restrict_blocks_raw_delete() {
     let report = tag_facets::delete_facet(&c, "tmp_f").unwrap();
     assert!(report.tags_deleted >= 1);
     let leftover: i64 = c
-        .query_row("SELECT COUNT(*) FROM tag_facets WHERE key='tmp_f'", [], |r| r.get(0))
+        .query_row(
+            "SELECT COUNT(*) FROM tag_facets WHERE key='tmp_f'",
+            [],
+            |r| r.get(0),
+        )
         .unwrap();
     assert_eq!(leftover, 0);
 }
@@ -393,7 +432,11 @@ fn delete_facet_cascades_all_refs() {
     let aid = f4_insert_asset(&c, "d:/facet_del.jpg");
     asset_tags::assign(&c, &[aid], &[t.id], "manual").unwrap(); // asset_tags + tag_ops 各 1
     let batch = ai::create_batch(&c, &[aid], "cloud").unwrap();
-    let sug = ai::list_suggestions(&c, batch.id).unwrap().into_iter().next().unwrap();
+    let sug = ai::list_suggestions(&c, batch.id)
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
     c.execute(
         "INSERT INTO ai_suggestion_items (suggestion_id, facet_key, raw_name, normalized_name, tag_id, confidence, decision, created_at)
          VALUES (?1, 'tmp_g', '标签B', '标签B', ?2, NULL, 'pending', 1)",
@@ -402,16 +445,30 @@ fn delete_facet_cascades_all_refs() {
     .unwrap();
     let report = tag_facets::delete_facet(&c, "tmp_g").unwrap();
     assert!(report.tags_deleted >= 1, "标签必须级联删除");
-    assert_eq!(report.ops_deleted, 1, "tag_ops 引用必须等量级联删：{report:?}");
-    assert_eq!(report.items_deleted, 1, "ai_suggestion_items 引用必须等量级联删：{report:?}");
+    assert_eq!(
+        report.ops_deleted, 1,
+        "tag_ops 引用必须等量级联删：{report:?}"
+    );
+    assert_eq!(
+        report.items_deleted, 1,
+        "ai_suggestion_items 引用必须等量级联删：{report:?}"
+    );
     // tags 已删 → tag_terms 因 FK CASCADE 清空（验证不残留脏词条）
     let terms_left: i64 = c
-        .query_row("SELECT COUNT(*) FROM tag_terms WHERE tag_id=?1", [t.id], |r| r.get(0))
+        .query_row(
+            "SELECT COUNT(*) FROM tag_terms WHERE tag_id=?1",
+            [t.id],
+            |r| r.get(0),
+        )
         .unwrap();
     assert_eq!(terms_left, 0, "标签删除后其 tag_terms 应 CASCADE 清空");
     // asset_tags 也随删
     let at_left: i64 = c
-        .query_row("SELECT COUNT(*) FROM asset_tags WHERE tag_id=?1", [t.id], |r| r.get(0))
+        .query_row(
+            "SELECT COUNT(*) FROM asset_tags WHERE tag_id=?1",
+            [t.id],
+            |r| r.get(0),
+        )
         .unwrap();
     assert_eq!(at_left, 0);
 }
@@ -420,7 +477,9 @@ fn delete_facet_cascades_all_refs() {
 #[test]
 fn foreign_keys_pragma_is_on() {
     let c = mem();
-    let on: i64 = c.query_row("PRAGMA foreign_keys", [], |r| r.get(0)).unwrap();
+    let on: i64 = c
+        .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(on, 1, "foreign_keys 必须为 ON（CASCADE 的前提）");
 }
 
@@ -437,10 +496,15 @@ fn detect_conflicts_finds_all_six_types() {
     )
     .unwrap();
     // ② 孤儿：直接插一个 facet_key 不存在分面的标签（此时 F2-d 触发器未启用）
-    c.execute("INSERT INTO tags (name, facet_key) VALUES ('孤儿', 'ghost_facet')", []).unwrap();
+    c.execute(
+        "INSERT INTO tags (name, facet_key) VALUES ('孤儿', 'ghost_facet')",
+        [],
+    )
+    .unwrap();
     // ③ 跨面挂父：把 custom 标签挂到 scene 标签下（绕过 trg_tags_parent_facet_ai）
     let scene_tag = tags::create_in_facet(&c, "山", None, Some("scene")).unwrap();
-    c.execute_batch("DROP TRIGGER trg_tags_parent_facet_ai;").unwrap();
+    c.execute_batch("DROP TRIGGER trg_tags_parent_facet_ai;")
+        .unwrap();
     c.execute(
         "INSERT INTO tags (name, parent_id, facet_key) VALUES ('山下', ?1, 'custom')",
         [scene_tag.id],
@@ -463,7 +527,11 @@ fn detect_conflicts_finds_all_six_types() {
     // ④ 环：独立 A↔B（A 根，B 挂 A 下，再把 A 挂 B 下成环；绕过环触发器）
     c.execute_batch("DROP TRIGGER trg_tags_no_cycle;").unwrap();
     let cyc_a: i64 = c
-        .query_row("INSERT INTO tags (name, facet_key) VALUES ('CA','custom') RETURNING id", [], |r| r.get(0))
+        .query_row(
+            "INSERT INTO tags (name, facet_key) VALUES ('CA','custom') RETURNING id",
+            [],
+            |r| r.get(0),
+        )
         .unwrap();
     let cyc_b: i64 = c
         .query_row(
@@ -490,12 +558,24 @@ fn detect_conflicts_finds_all_six_types() {
     .unwrap();
 
     let report = tags::detect_tag_conflicts(&c).unwrap();
-    assert!(!report.term_conflicts.is_empty(), "① term 冲突未发现：{report:?}");
+    assert!(
+        !report.term_conflicts.is_empty(),
+        "① term 冲突未发现：{report:?}"
+    );
     assert!(!report.orphans.is_empty(), "② 孤儿未发现：{report:?}");
-    assert!(!report.cross_facet_children.is_empty(), "③ 跨面挂父未发现：{report:?}");
+    assert!(
+        !report.cross_facet_children.is_empty(),
+        "③ 跨面挂父未发现：{report:?}"
+    );
     assert!(!report.cycle_edges.is_empty(), "④ 环未发现：{report:?}");
-    assert!(!report.over_deep_subtrees.is_empty(), "⑤ 超深未发现：{report:?}");
-    assert!(!report.facet_mismatches.is_empty(), "⑥ facet 不一致未发现：{report:?}");
+    assert!(
+        !report.over_deep_subtrees.is_empty(),
+        "⑤ 超深未发现：{report:?}"
+    );
+    assert!(
+        !report.facet_mismatches.is_empty(),
+        "⑥ facet 不一致未发现：{report:?}"
+    );
 }
 
 // ═══════════════ 组 9 前缀：next_prefix 边界 + find_by_term（F3） ═══════════════
@@ -506,14 +586,34 @@ fn next_prefix_boundaries() {
     use bagertea_ai_media_v2_lib::db::tags::next_prefix;
     assert_eq!(next_prefix("term123"), Some("term124".to_string()), "ASCII");
     assert_eq!(next_prefix("青"), Some("靓".to_string()), "中文");
-    assert_eq!(next_prefix("海边"), Some("海辺".to_string()), "只改最后一个字符");
+    assert_eq!(
+        next_prefix("海边"),
+        Some("海辺".to_string()),
+        "只改最后一个字符"
+    );
     assert_eq!(next_prefix("😀"), Some("😁".to_string()), "emoji（BMP 外）");
     assert_eq!(next_prefix("a😀"), Some("a😁".to_string()), "混合");
-    assert_eq!(next_prefix("\u{FFFF}"), Some("\u{10000}".to_string()), "跨越 BMP 边界");
-    assert_eq!(next_prefix("a\u{FFFF}"), Some("a\u{10000}".to_string()), "同上");
+    assert_eq!(
+        next_prefix("\u{FFFF}"),
+        Some("\u{10000}".to_string()),
+        "跨越 BMP 边界"
+    );
+    assert_eq!(
+        next_prefix("a\u{FFFF}"),
+        Some("a\u{10000}".to_string()),
+        "同上"
+    );
     assert_eq!(next_prefix("\u{10FFFF}"), None, "char::MAX");
-    assert_eq!(next_prefix("a\u{10FFFF}"), Some("b".to_string()), "末字符到顶→前一个递增");
-    assert_eq!(next_prefix("\u{D7FF}"), Some("\u{E000}".to_string()), "跳过 surrogate");
+    assert_eq!(
+        next_prefix("a\u{10FFFF}"),
+        Some("b".to_string()),
+        "末字符到顶→前一个递增"
+    );
+    assert_eq!(
+        next_prefix("\u{D7FF}"),
+        Some("\u{E000}".to_string()),
+        "跳过 surrogate"
+    );
     assert_eq!(next_prefix(""), None, "空串");
 }
 
@@ -522,7 +622,14 @@ fn next_prefix_boundaries() {
 fn next_prefix_covers_all_children() {
     use bagertea_ai_media_v2_lib::db::tags::next_prefix;
     let prefixes = [
-        "term123", "青", "海边", "😀", "a😀", "\u{FFFF}", "a\u{FFFF}", "\u{D7FF}",
+        "term123",
+        "青",
+        "海边",
+        "😀",
+        "a😀",
+        "\u{FFFF}",
+        "a\u{FFFF}",
+        "\u{D7FF}",
     ];
     for p in prefixes {
         let Some(hi) = next_prefix(p) else { continue };
@@ -543,10 +650,7 @@ fn next_prefix_covers_all_children() {
         // 字典序更大的兄弟（同一长度 + 递增末字符）应在区间外
         let bigger = next_prefix(p).unwrap();
         let sibling = next_prefix(&bigger).unwrap_or_else(|| bigger.clone());
-        assert!(
-            sibling >= hi,
-            "兄弟「{sibling}」应在区间 [{p}, {hi}) 外"
-        );
+        assert!(sibling >= hi, "兄弟「{sibling}」应在区间 [{p}, {hi}) 外");
     }
 }
 
@@ -559,10 +663,18 @@ fn find_by_term_alias_hits_synonym() {
     tags::add_alias(&c, t.id, "海滨", None, "synonym").unwrap();
     // 旧表路径（tag_unique_terms 未启用）
     let lookup = tags::find_by_term(&c, "scene", "海滨", tags::TermMatch::Alias).unwrap();
-    assert_eq!(lookup.hits.len(), 1, "别名应精确命中：{:?}", lookup.warnings);
+    assert_eq!(
+        lookup.hits.len(),
+        1,
+        "别名应精确命中：{:?}",
+        lookup.warnings
+    );
     assert_eq!(lookup.hits[0].tag_id, t.id);
     assert!(
-        lookup.warnings.iter().any(|w| w.contains("海滨") && w.contains("海边")),
+        lookup
+            .warnings
+            .iter()
+            .any(|w| w.contains("海滨") && w.contains("海边")),
         "别名命中应告知归入：{:?}",
         lookup.warnings
     );
@@ -600,8 +712,16 @@ fn enable_terms(conn: &rusqlite::Connection) {
 
 /// F4 辅助：插入一张图片素材，返回 id。
 fn f4_insert_asset(conn: &rusqlite::Connection, path: &str) -> i64 {
-    assets::insert(conn, path, path.rsplit('/').next().unwrap_or("a.jpg"), "jpg", 1024, "image/jpeg", 1700000000000)
-        .expect("插入素材失败")
+    assets::insert(
+        conn,
+        path,
+        path.rsplit('/').next().unwrap_or("a.jpg"),
+        "jpg",
+        1024,
+        "image/jpeg",
+        1700000000000,
+    )
+    .expect("插入素材失败")
 }
 
 /// F4：status × cfg_* 组合下，数据层消费点（侧栏树 list_tree / 提示词 build_prompt_context /
@@ -623,11 +743,66 @@ fn facet_capability_matrix() {
         detail_effective: bool,
     }
     let rows = [
-        Row { name: "active+全cfg=1", status: "active", visible: true, ai: true, searchable: true, nav: true, prompt: true, top: true, search: true, detail_effective: true },
-        Row { name: "active+cfg_ai=0", status: "active", visible: true, ai: false, searchable: true, nav: true, prompt: false, top: false, search: true, detail_effective: true },
-        Row { name: "active+cfg_visible=0", status: "active", visible: false, ai: true, searchable: true, nav: false, prompt: true, top: true, search: true, detail_effective: true },
-        Row { name: "active+cfg_searchable=0", status: "active", visible: true, ai: true, searchable: false, nav: true, prompt: true, top: true, search: false, detail_effective: true },
-        Row { name: "inactive（cfg保持）", status: "inactive", visible: true, ai: true, searchable: true, nav: false, prompt: false, top: false, search: true, detail_effective: false },
+        Row {
+            name: "active+全cfg=1",
+            status: "active",
+            visible: true,
+            ai: true,
+            searchable: true,
+            nav: true,
+            prompt: true,
+            top: true,
+            search: true,
+            detail_effective: true,
+        },
+        Row {
+            name: "active+cfg_ai=0",
+            status: "active",
+            visible: true,
+            ai: false,
+            searchable: true,
+            nav: true,
+            prompt: false,
+            top: false,
+            search: true,
+            detail_effective: true,
+        },
+        Row {
+            name: "active+cfg_visible=0",
+            status: "active",
+            visible: false,
+            ai: true,
+            searchable: true,
+            nav: false,
+            prompt: true,
+            top: true,
+            search: true,
+            detail_effective: true,
+        },
+        Row {
+            name: "active+cfg_searchable=0",
+            status: "active",
+            visible: true,
+            ai: true,
+            searchable: false,
+            nav: true,
+            prompt: true,
+            top: true,
+            search: false,
+            detail_effective: true,
+        },
+        Row {
+            name: "inactive（cfg保持）",
+            status: "inactive",
+            visible: true,
+            ai: true,
+            searchable: true,
+            nav: false,
+            prompt: false,
+            top: false,
+            search: true,
+            detail_effective: false,
+        },
     ];
     for r in &rows {
         let c = mem();
@@ -642,7 +817,10 @@ fn facet_capability_matrix() {
         )
         .unwrap();
 
-        let in_nav = tags::list_tree(&c).unwrap().iter().any(|n| n.tag.facet_key == "cap");
+        let in_nav = tags::list_tree(&c)
+            .unwrap()
+            .iter()
+            .any(|n| n.tag.facet_key == "cap");
         assert_eq!(in_nav, r.nav, "[{}] 侧栏可见性不符", r.name);
 
         let in_prompt = tag_facets::build_prompt_context(&c, "image")
@@ -658,18 +836,26 @@ fn facet_capability_matrix() {
         assert_eq!(in_top, r.top, "[{}] AI 候选词不符", r.name);
 
         let cands = tags::search_candidates(&c, None, "能力词").unwrap();
-        assert_eq!(cands.len() > 0, r.search, "[{}] 候选搜索不符", r.name);
+        assert_eq!(!cands.is_empty(), r.search, "[{}] 候选搜索不符", r.name);
 
         let detail = asset_tags::get_asset_tags(&c, aid).unwrap();
-        let dtag = detail.iter().find(|x| x.id == t.id).expect("详情恒显示（不过滤）");
+        let dtag = detail
+            .iter()
+            .find(|x| x.id == t.id)
+            .expect("详情恒显示（不过滤）");
         assert_eq!(
             dtag.facet_effective, r.detail_effective,
             "[{}] 详情「已停用」角标不符",
             r.name
         );
 
-        let (frag, _) = query_expr::compile_leaf(&c, &query_expr::LeafCond::FacetHasAny { facet_key: "cap".into() })
-            .unwrap();
+        let (frag, _) = query_expr::compile_leaf(
+            &c,
+            &query_expr::LeafCond::FacetHasAny {
+                facet_key: "cap".into(),
+            },
+        )
+        .unwrap();
         let dropped = frag.trim() == "1=1";
         assert_eq!(dropped, !r.searchable, "[{}] 条件叶子剔除策略不符", r.name);
     }
@@ -682,19 +868,56 @@ fn facet_capability_matrix() {
     asset_tags::assign(&c, &[aid2], &[t2.id], "manual").unwrap();
     tag_facets::deactivate(&c, "cap2").unwrap();
     // inactive：侧栏/提示词/AI候选停；详情仍显示 + 角标；可搜保持
-    assert!(!tags::list_tree(&c).unwrap().iter().any(|n| n.tag.facet_key == "cap2"));
-    assert!(!tag_facets::build_prompt_context(&c, "image").unwrap().iter().any(|f| f.key == "cap2"));
-    assert!(!tags::top_tags_per_facet(&c, 200).unwrap().iter().any(|(f, _)| f == "cap2"));
-    assert!(!tags::search_candidates(&c, None, "能力词2").unwrap().is_empty(), "停用分面标签仍可搜");
+    assert!(!tags::list_tree(&c)
+        .unwrap()
+        .iter()
+        .any(|n| n.tag.facet_key == "cap2"));
+    assert!(!tag_facets::build_prompt_context(&c, "image")
+        .unwrap()
+        .iter()
+        .any(|f| f.key == "cap2"));
+    assert!(!tags::top_tags_per_facet(&c, 200)
+        .unwrap()
+        .iter()
+        .any(|(f, _)| f == "cap2"));
+    assert!(
+        !tags::search_candidates(&c, None, "能力词2")
+            .unwrap()
+            .is_empty(),
+        "停用分面标签仍可搜"
+    );
     let detail2 = asset_tags::get_asset_tags(&c, aid2).unwrap();
-    assert!(!detail2.iter().find(|x| x.id == t2.id).unwrap().facet_effective, "停用分面详情打角标");
+    assert!(
+        !detail2
+            .iter()
+            .find(|x| x.id == t2.id)
+            .unwrap()
+            .facet_effective,
+        "停用分面详情打角标"
+    );
     // restore：回原配置
     tag_facets::restore(&c, "cap2").unwrap();
-    assert!(tags::list_tree(&c).unwrap().iter().any(|n| n.tag.facet_key == "cap2"));
-    assert!(tag_facets::build_prompt_context(&c, "image").unwrap().iter().any(|f| f.key == "cap2"));
-    assert!(tags::top_tags_per_facet(&c, 200).unwrap().iter().any(|(f, _)| f == "cap2"));
+    assert!(tags::list_tree(&c)
+        .unwrap()
+        .iter()
+        .any(|n| n.tag.facet_key == "cap2"));
+    assert!(tag_facets::build_prompt_context(&c, "image")
+        .unwrap()
+        .iter()
+        .any(|f| f.key == "cap2"));
+    assert!(tags::top_tags_per_facet(&c, 200)
+        .unwrap()
+        .iter()
+        .any(|(f, _)| f == "cap2"));
     let detail3 = asset_tags::get_asset_tags(&c, aid2).unwrap();
-    assert!(detail3.iter().find(|x| x.id == t2.id).unwrap().facet_effective, "恢复后角标消失");
+    assert!(
+        detail3
+            .iter()
+            .find(|x| x.id == t2.id)
+            .unwrap()
+            .facet_effective,
+        "恢复后角标消失"
+    );
 }
 
 /// F4：停用分面的标签仍可搜 —— FTS 全文搜索 + 候选搜索都保持命中
@@ -724,9 +947,14 @@ fn deactivated_facet_tags_still_searchable() {
         "停用分面的标签仍进候选"
     );
     // 对照：cfg_searchable=0 后候选搜索实时剔除（live 读）
-    c.execute("UPDATE tag_facets SET cfg_searchable = 0 WHERE key = 'mood_x'", [])
-        .unwrap();
-    assert!(tags::search_candidates(&c, None, "松弛").unwrap().is_empty());
+    c.execute(
+        "UPDATE tag_facets SET cfg_searchable = 0 WHERE key = 'mood_x'",
+        [],
+    )
+    .unwrap();
+    assert!(tags::search_candidates(&c, None, "松弛")
+        .unwrap()
+        .is_empty());
 }
 
 /// F4：停用分面的标签不得作为「已有候选词」喂给 AI（top_tags_per_facet 收口 AI_ASSIGNABLE_TAG）。
@@ -739,12 +967,18 @@ fn top_tags_excludes_inactive_facet() {
     let aid = f4_insert_asset(&c, "d:/top.jpg");
     asset_tags::assign(&c, &[aid], &[t.id], "manual").unwrap();
     assert!(
-        tags::top_tags_per_facet(&c, 200).unwrap().iter().any(|(f, _)| f == key),
+        tags::top_tags_per_facet(&c, 200)
+            .unwrap()
+            .iter()
+            .any(|(f, _)| f == key),
         "active 分面应进 AI 候选"
     );
     tag_facets::deactivate(&c, key).unwrap();
     assert!(
-        !tags::top_tags_per_facet(&c, 200).unwrap().iter().any(|(f, _)| f == key),
+        !tags::top_tags_per_facet(&c, 200)
+            .unwrap()
+            .iter()
+            .any(|(f, _)| f == key),
         "停用分面不得进 AI 候选（避免 AI 照产出后又被解析层丢弃的自相矛盾）"
     );
 }
@@ -762,15 +996,27 @@ fn prompt_context_respects_applies_to() {
         .iter()
         .map(|f| f.key.clone())
         .collect();
-    assert!(img_keys.contains(&"f_all".into()) && img_keys.contains(&"f_img".into()), "图片上下文应含 all+image: {img_keys:?}");
-    assert!(!img_keys.contains(&"f_vid".into()), "视频专属分面不得进图片上下文: {img_keys:?}");
+    assert!(
+        img_keys.contains(&"f_all".into()) && img_keys.contains(&"f_img".into()),
+        "图片上下文应含 all+image: {img_keys:?}"
+    );
+    assert!(
+        !img_keys.contains(&"f_vid".into()),
+        "视频专属分面不得进图片上下文: {img_keys:?}"
+    );
     let vid_keys: Vec<String> = tag_facets::build_prompt_context(&c, "video")
         .unwrap()
         .iter()
         .map(|f| f.key.clone())
         .collect();
-    assert!(vid_keys.contains(&"f_all".into()) && vid_keys.contains(&"f_vid".into()), "视频上下文应含 all+video: {vid_keys:?}");
-    assert!(!vid_keys.contains(&"f_img".into()), "图片专属分面不得进视频上下文: {vid_keys:?}");
+    assert!(
+        vid_keys.contains(&"f_all".into()) && vid_keys.contains(&"f_vid".into()),
+        "视频上下文应含 all+video: {vid_keys:?}"
+    );
+    assert!(
+        !vid_keys.contains(&"f_img".into()),
+        "图片专属分面不得进视频上下文: {vid_keys:?}"
+    );
     // 'all'：全量（超级搜索词典需要跨类型）——含系统分面 + 自定义三档
     let all_keys: Vec<String> = tag_facets::build_prompt_context(&c, "all")
         .unwrap()
@@ -834,15 +1080,15 @@ fn update_rejects_cross_facet_parent() {
     let subject = tags::create_in_facet(&c, "人像", None, Some("subject")).unwrap();
     let scene = tags::create_in_facet(&c, "海边", None, Some("scene")).unwrap();
     let err = tags::update(&c, scene.id, None, Some(Some(subject.id))).unwrap_err();
-    assert!(
-        err.to_string().contains("分面"),
-        "跨分面挂父应报错: {err}"
-    );
+    assert!(err.to_string().contains("分面"), "跨分面挂父应报错: {err}");
     // 同分面移动成功（防环由触发器守：挂到自己后代仍被拒）
     let child = tags::create_in_facet(&c, "沙滩", Some(scene.id), Some("scene")).unwrap();
     tags::update(&c, child.id, None, Some(Some(scene.id))).unwrap();
     let cycle_err = tags::update(&c, scene.id, None, Some(Some(child.id))).unwrap_err();
-    assert!(!cycle_err.to_string().is_empty(), "挂到自己子标签下应被触发器拒绝");
+    assert!(
+        !cycle_err.to_string().is_empty(),
+        "挂到自己子标签下应被触发器拒绝"
+    );
 }
 
 /// F5：启用 tag_unique_terms 后 add_alias 写 tag_terms，ux_terms 冲突被翻译成人话。
@@ -855,7 +1101,10 @@ fn add_alias_conflict_message_is_human_readable() {
     tags::add_alias(&c, t1.id, "海滨", None, "synonym").unwrap();
     let err = tags::add_alias(&c, t2.id, "海滨", None, "synonym").unwrap_err();
     let msg = err.to_string();
-    assert!(msg.contains("海滨") && msg.contains("海边") && msg.contains("已被"), "冲突消息应点明两个词: {msg}");
+    assert!(
+        msg.contains("海滨") && msg.contains("海边") && msg.contains("已被"),
+        "冲突消息应点明两个词: {msg}"
+    );
     // 同标签幂等：重复添加同一词不报错
     tags::add_alias(&c, t1.id, "海滨", None, "synonym").unwrap();
 }
@@ -877,10 +1126,19 @@ fn merge_moves_all_terms_to_target() {
         .unwrap()
         .filter_map(|r| r.ok())
         .collect();
-    let kinds: Vec<&str> = rows.iter().map(|(_, k)| k.as_str()).collect();
-    assert!(rows.iter().any(|(t, k)| t == "海岸" && k == "canonical"), "目标 canonical 保留: {rows:?}");
-    assert!(rows.iter().any(|(t, k)| t == "海边" && k == "synonym"), "源 canonical 合并为 synonym（F6-c）: {rows:?}");
-    assert!(rows.iter().any(|(t, k)| t == "海滨" && k == "synonym"), "源 synonym 保留: {rows:?}");
+    let _kinds: Vec<&str> = rows.iter().map(|(_, k)| k.as_str()).collect();
+    assert!(
+        rows.iter().any(|(t, k)| t == "海岸" && k == "canonical"),
+        "目标 canonical 保留: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|(t, k)| t == "海边" && k == "synonym"),
+        "源 canonical 合并为 synonym（F6-c）: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|(t, k)| t == "海滨" && k == "synonym"),
+        "源 synonym 保留: {rows:?}"
+    );
     assert_eq!(rows.len(), 3, "词条应完整迁移: {rows:?}");
 }
 
@@ -893,7 +1151,8 @@ fn merge_skips_conflicting_term() {
     enable_terms(&c);
     // 造脏：dst 直插一条与 src canonical 同 normalized 的 canonical（先撤两个唯一索引才能插：
     // ux_terms 管 facet+词唯一，ux_terms_canonical 管同标签单 canonical）
-    c.execute_batch("DROP INDEX ux_terms; DROP INDEX ux_terms_canonical;").unwrap();
+    c.execute_batch("DROP INDEX ux_terms; DROP INDEX ux_terms_canonical;")
+        .unwrap();
     c.execute(
         "INSERT INTO tag_terms (tag_id, facet_key, normalized_term, term, locale, term_kind, is_searchable, created_at)
          VALUES (?1, 'scene', '海边', '海边', '', 'canonical', 1, 1)",
@@ -922,7 +1181,9 @@ fn deprecated_tag_has_no_terms() {
     tags::add_alias(&c, src.id, "海滨", None, "synonym").unwrap();
     tags::merge_preserve_alias(&c, src.id, dst.id).unwrap();
     let status: String = c
-        .query_row("SELECT status FROM tags WHERE id=?1", [src.id], |r| r.get(0))
+        .query_row("SELECT status FROM tags WHERE id=?1", [src.id], |r| {
+            r.get(0)
+        })
         .unwrap();
     assert_eq!(status, "deprecated", "源标签应置 deprecated");
     let name: String = c
@@ -947,11 +1208,19 @@ fn search_old_name_hits_merge_target() {
     let dst = tags::create_in_facet(&c, "海岸", None, Some("scene")).unwrap();
     enable_terms(&c);
     tags::merge_preserve_alias(&c, src.id, dst.id).unwrap();
-    let lk = tags::find_by_term(&c, "scene", &tags::normalize_name("海边"), tags::TermMatch::Alias)
-        .unwrap();
+    let lk = tags::find_by_term(
+        &c,
+        "scene",
+        &tags::normalize_name("海边"),
+        tags::TermMatch::Alias,
+    )
+    .unwrap();
     assert_eq!(lk.hits.len(), 1, "旧词应精确命中: {:?}", lk.warnings);
     assert_eq!(lk.hits[0].tag_id, dst.id, "旧词「海边」应指向合并目标");
-    assert_eq!(lk.hits[0].term_kind, "synonym", "合并写 synonym（F6-c），改名才写 old_name");
+    assert_eq!(
+        lk.hits[0].term_kind, "synonym",
+        "合并写 synonym（F6-c），改名才写 old_name"
+    );
 }
 
 /// F5-d：find_by_term 尊重 feature gate —— 关闭读旧表、开启读 tag_terms，各断言一次。
@@ -961,15 +1230,23 @@ fn find_by_term_respects_feature_gate() {
     let c0 = mem();
     let t0 = tags::create_in_facet(&c0, "海边", None, Some("scene")).unwrap();
     tags::add_alias(&c0, t0.id, "海滨", None, "synonym").unwrap();
-    let lk0 = tags::find_by_term(&c0, "scene", &tags::normalize_name("海滨"), tags::TermMatch::Alias)
-        .unwrap();
+    let lk0 = tags::find_by_term(
+        &c0,
+        "scene",
+        &tags::normalize_name("海滨"),
+        tags::TermMatch::Alias,
+    )
+    .unwrap();
     assert_eq!(lk0.hits.len(), 1, "关闭态别名（tag_aliases）应命中");
     assert_eq!(lk0.hits[0].tag_id, t0.id);
     // 关闭态不读 tag_terms：即便手工造了词条行也不参与
-    c0.execute_batch("CREATE TABLE IF NOT EXISTS tag_terms (
+    c0.execute_batch(
+        "CREATE TABLE IF NOT EXISTS tag_terms (
         tag_id INTEGER NOT NULL, facet_key TEXT NOT NULL, normalized_term TEXT NOT NULL,
         term TEXT NOT NULL, locale TEXT NOT NULL DEFAULT '', term_kind TEXT NOT NULL,
-        is_searchable INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL)").unwrap();
+        is_searchable INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL)",
+    )
+    .unwrap();
     let another = tags::create_in_facet(&c0, "森林", None, Some("scene")).unwrap();
     c0.execute(
         "INSERT INTO tag_terms (tag_id, facet_key, normalized_term, term, locale, term_kind, is_searchable, created_at)
@@ -977,8 +1254,13 @@ fn find_by_term_respects_feature_gate() {
         [another.id],
     )
     .unwrap();
-    let lk0b = tags::find_by_term(&c0, "scene", &tags::normalize_name("森林"), tags::TermMatch::Exact)
-        .unwrap();
+    let lk0b = tags::find_by_term(
+        &c0,
+        "scene",
+        &tags::normalize_name("森林"),
+        tags::TermMatch::Exact,
+    )
+    .unwrap();
     assert_eq!(lk0b.hits.len(), 1, "关闭态仍按旧表命中（tags 规范名）");
 
     // 状态 1：开启 → 别名事实源 tag_terms（写入词条表），find_by_term Alias 命中词条
@@ -986,8 +1268,13 @@ fn find_by_term_respects_feature_gate() {
     let t1 = tags::create_in_facet(&c1, "海边", None, Some("scene")).unwrap();
     enable_terms(&c1);
     tags::add_alias(&c1, t1.id, "海滨", None, "synonym").unwrap();
-    let lk1 = tags::find_by_term(&c1, "scene", &tags::normalize_name("海滨"), tags::TermMatch::Alias)
-        .unwrap();
+    let lk1 = tags::find_by_term(
+        &c1,
+        "scene",
+        &tags::normalize_name("海滨"),
+        tags::TermMatch::Alias,
+    )
+    .unwrap();
     assert_eq!(lk1.hits.len(), 1, "开启态别名（tag_terms）应命中");
     assert_eq!(lk1.hits[0].tag_id, t1.id);
     let terms_n: i64 = c1
@@ -997,7 +1284,10 @@ fn find_by_term_respects_feature_gate() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(terms_n, 2, "开启态 canonical+synonym 都在 tag_terms（绝不双写）");
+    assert_eq!(
+        terms_n, 2,
+        "开启态 canonical+synonym 都在 tag_terms（绝不双写）"
+    );
     let aliases_n: i64 = c1
         .query_row(
             "SELECT COUNT(*) FROM tag_aliases WHERE tag_id=?1",
@@ -1005,7 +1295,10 @@ fn find_by_term_respects_feature_gate() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(aliases_n, 0, "开启态 tag_aliases 冻结只读，新增别名不得双写");
+    assert_eq!(
+        aliases_n, 0,
+        "开启态 tag_aliases 冻结只读，新增别名不得双写"
+    );
 }
 
 /// F5-d：未启用词表时 Prefix/Contains/Fuzzy 返回空 + 指引 warning。
@@ -1084,7 +1377,11 @@ fn candidate_merge_writes_synonym_not_old_name() {
     let sug = f6_one_suggestion(&c);
     let tags = ai::CategorizedTags::from([("scene".to_string(), vec!["一个人".to_string()])]);
     ai::set_suggestion_tags(&c, sug.id, &tags).unwrap();
-    let item = ai::list_suggestion_items(&c, sug.id).unwrap().into_iter().next().unwrap();
+    let item = ai::list_suggestion_items(&c, sug.id)
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
     assert!(item.tag_id.is_none());
     // 用户选「合并到单人」
     ai::decide_suggestion_item(&c, item.id, "modified", Some(target.id), None, None).unwrap();
@@ -1125,7 +1422,11 @@ fn find_similar_detects_substring_and_edit_distance() {
     assert_eq!(spell.1, "森林");
     assert_eq!(spell.2, tags::SimilarReason::Spell);
     // 不相关的词不误报
-    assert!(tags::find_similar_tag(&c, "scene", &tags::normalize_name("城市")).unwrap().is_none());
+    assert!(
+        tags::find_similar_tag(&c, "scene", &tags::normalize_name("城市"))
+            .unwrap()
+            .is_none()
+    );
 }
 
 /// F6-d：疑似重复扫描 —— 连通分量把 单人/一个人/一个 聚成一组。
@@ -1142,9 +1443,9 @@ fn scan_duplicate_tags_finds_known_groups() {
         .flat_map(|g| g.members.iter().map(|m| m.name.clone()))
         .collect();
     for expect in [&a.id, &b.id, &d.id] {
-        let in_group = groups.iter().any(|g| {
-            g.facet_key == "scene" && g.members.iter().any(|m| m.tag_id == *expect)
-        });
+        let in_group = groups
+            .iter()
+            .any(|g| g.facet_key == "scene" && g.members.iter().any(|m| m.tag_id == *expect));
         assert!(in_group, "「{expect}」应出现在疑似重复组");
     }
     assert!(
@@ -1199,7 +1500,11 @@ fn restore_then_deactivate_roundtrip() {
     tag_facets::restore(&c, "subject").unwrap();
     assert_eq!(tag_facets::get(&c, "subject").unwrap().status, "active");
     tag_facets::deactivate(&c, "subject").unwrap();
-    assert_eq!(tag_facets::get(&c, "subject").unwrap().status, "inactive", "恢复后仍能停用回去");
+    assert_eq!(
+        tag_facets::get(&c, "subject").unwrap().status,
+        "inactive",
+        "恢复后仍能停用回去"
+    );
     // cfg 配置全程不被生命周期覆盖（F1 不变式）
     let f = tag_facets::get(&c, "subject").unwrap();
     assert!(f.cfg_visible_in_navigation && f.cfg_ai_assignable && f.cfg_searchable);
@@ -1228,7 +1533,10 @@ fn top_tags_per_facet_is_per_facet() {
     let out = tags::top_tags_per_facet(&c, 5).unwrap();
     let keys: Vec<&str> = out.iter().map(|(f, _)| f.as_str()).collect();
     for want in ["f_a", "f_b", "f_c"] {
-        assert!(keys.contains(&want), "每个分面都应有候选词（实际 {keys:?}）");
+        assert!(
+            keys.contains(&want),
+            "每个分面都应有候选词（实际 {keys:?}）"
+        );
     }
     for (facet, line) in &out {
         let words: Vec<&str> = line.split('/').filter(|w| !w.is_empty()).collect();
@@ -1254,7 +1562,10 @@ fn top_tags_quota_is_shared_fairly() {
     let out = tags::top_tags_per_facet(&c, 200).unwrap();
     let keys: Vec<&str> = out.iter().map(|(f, _)| f.as_str()).collect();
     for want in ["big_f", "s1", "s2"] {
-        assert!(keys.contains(&want), "小分面不得被大分面挤掉（实际 {keys:?}）");
+        assert!(
+            keys.contains(&want),
+            "小分面不得被大分面挤掉（实际 {keys:?}）"
+        );
     }
     // 均摊配额 = 1500 / 3 = 500 字符左右；大分面行不应失控（< 520，含分隔符余量）
     let big = out.iter().find(|(f, _)| f == "big_f").unwrap();
@@ -1279,8 +1590,16 @@ fn analysis_result_roundtrips() {
     let ar = ai::AnalysisResult {
         description: "黄昏海边".to_string(),
         proposals: vec![
-            ai::TagProposal { facet_key: "scene".into(), raw_name: "海边".into(), confidence: Some(0.9) },
-            ai::TagProposal { facet_key: "scene".into(), raw_name: "日落".into(), confidence: None },
+            ai::TagProposal {
+                facet_key: "scene".into(),
+                raw_name: "海边".into(),
+                confidence: Some(0.9),
+            },
+            ai::TagProposal {
+                facet_key: "scene".into(),
+                raw_name: "日落".into(),
+                confidence: None,
+            },
         ],
         numbers: vec![],
         warnings: vec!["未知分面已归入 custom".into()],
@@ -1292,7 +1611,10 @@ fn analysis_result_roundtrips() {
     assert!(json.contains("\"facetKey\""), "{json}");
     // 兼容分类视图
     let cat = ar.to_categorized();
-    assert_eq!(cat.get("scene").unwrap(), &vec!["海边".to_string(), "日落".to_string()]);
+    assert_eq!(
+        cat.get("scene").unwrap(),
+        &vec!["海边".to_string(), "日落".to_string()]
+    );
 }
 
 /// A1：对象形态（{"t","c"}）解析 → typed proposals → items 落库 confidence=0.9。
@@ -1301,8 +1623,13 @@ fn confidence_object_form_reaches_db() {
     use bagertea_ai_media_v2_lib::services::ai_cloud::parse_media_analysis;
     let c = mem();
     let sug = f6_one_suggestion(&c);
-    let ma = parse_media_analysis(r#"{"scene":[{"t":"海边","c":0.9}]}"#, &["scene"], &[], &[]).unwrap();
-    assert_eq!(ma.tags.get("scene").unwrap(), &vec!["海边".to_string()], "对象形态不得丢标签（R0-3 回归）");
+    let ma =
+        parse_media_analysis(r#"{"scene":[{"t":"海边","c":0.9}]}"#, &["scene"], &[], &[]).unwrap();
+    assert_eq!(
+        ma.tags.get("scene").unwrap(),
+        &vec!["海边".to_string()],
+        "对象形态不得丢标签（R0-3 回归）"
+    );
     assert_eq!(ma.proposals.len(), 1);
     assert_eq!(ma.proposals[0].raw_name, "海边");
     let conf = ma.proposals[0].confidence.expect("对象形态应带置信度");
@@ -1322,8 +1649,14 @@ fn legacy_string_form_still_works() {
     let c = mem();
     let sug = f6_one_suggestion(&c);
     let ma = parse_media_analysis(r#"{"scene":["海边","沙滩"]}"#, &["scene"], &[], &[]).unwrap();
-    assert_eq!(ma.tags.get("scene").unwrap(), &vec!["海边".to_string(), "沙滩".to_string()]);
-    assert!(ma.proposals.iter().all(|p| p.confidence.is_none()), "纯字符串无置信度");
+    assert_eq!(
+        ma.tags.get("scene").unwrap(),
+        &vec!["海边".to_string(), "沙滩".to_string()]
+    );
+    assert!(
+        ma.proposals.iter().all(|p| p.confidence.is_none()),
+        "纯字符串无置信度"
+    );
     ai::set_suggestion_result_typed(&c, sug.id, &ma.tags, &ma.proposals, &ma.description).unwrap();
     let items = ai::list_suggestion_items(&c, sug.id).unwrap();
     assert_eq!(items.len(), 2);
@@ -1367,12 +1700,14 @@ fn raw_response_stored_verbatim() {
         "analysis_json 不得被改写"
     );
     // analysis_json 可无损往返回 AnalysisResult
-    let back: ai::AnalysisResult =
-        serde_json::from_str(db_analysis.unwrap().as_str()).unwrap();
+    let back: ai::AnalysisResult = serde_json::from_str(db_analysis.unwrap().as_str()).unwrap();
     assert_eq!(back.description, ma.description);
     assert_eq!(back.proposals.len(), 1);
     let conf = back.proposals[0].confidence.expect("对象形态应带置信度");
-    assert!((conf - 0.9).abs() < 1e-6, "analysis_json 置信度应保真，实际 {conf}");
+    assert!(
+        (conf - 0.9).abs() < 1e-6,
+        "analysis_json 置信度应保真，实际 {conf}"
+    );
 }
 
 /// A2：请求配置 hash —— 同输入同 hash（16 位），改任一项（模型/maxTokens/system）则变。
@@ -1388,8 +1723,8 @@ fn request_config_hash_is_stable() {
         description: "画面场景".into(),
         selection_mode: "multi".into(),
         max_items: Some(3),
-            ..Default::default()
-        }];
+        ..Default::default()
+    }];
     let top = vec![("scene".to_string(), "海边/森林/室内".to_string())];
     let h = |sys: &str, model: &str, max_tokens: i64| {
         stable_config_hash(&build_batch_request_config(
@@ -1398,10 +1733,26 @@ fn request_config_hash_is_stable() {
     };
     let base = h("你是打标助手", "qwen2.5-vl", 1180);
     assert_eq!(base.len(), 16, "sha256 前 16 位 hex");
-    assert_eq!(base, h("你是打标助手", "qwen2.5-vl", 1180), "同输入必须同 hash");
-    assert_ne!(base, h("你是打标助手", "qwen2.5-vl-7b", 1180), "改模型必须变");
-    assert_ne!(base, h("你是打标助手", "qwen2.5-vl", 2048), "改 maxTokens 必须变");
-    assert_ne!(base, h("你是打标助手（覆盖版）", "qwen2.5-vl", 1180), "改 system 段必须变");
+    assert_eq!(
+        base,
+        h("你是打标助手", "qwen2.5-vl", 1180),
+        "同输入必须同 hash"
+    );
+    assert_ne!(
+        base,
+        h("你是打标助手", "qwen2.5-vl-7b", 1180),
+        "改模型必须变"
+    );
+    assert_ne!(
+        base,
+        h("你是打标助手", "qwen2.5-vl", 2048),
+        "改 maxTokens 必须变"
+    );
+    assert_ne!(
+        base,
+        h("你是打标助手（覆盖版）", "qwen2.5-vl", 1180),
+        "改 system 段必须变"
+    );
 }
 
 /// A2：request_config_json 六项全在 —— 顶层字段 + facets 每项六字段（key/displayName/
@@ -1418,8 +1769,8 @@ fn request_config_json_contains_all_inputs() {
         description: "画面的地理或场景".into(),
         selection_mode: "multi".into(),
         max_items: Some(3),
-            ..Default::default()
-        }];
+        ..Default::default()
+    }];
     let top = vec![("scene".to_string(), "海边/森林/室内".to_string())];
     let cfg = build_batch_request_config(
         "你是图片打标助手（用户覆盖版）",
@@ -1431,7 +1782,11 @@ fn request_config_json_contains_all_inputs() {
         true,
     );
     let o = cfg.as_object().expect("配置应为对象");
-    assert_eq!(o["promptVersion"], serde_json::json!(PROMPT_VERSION), "带提示词版本");
+    assert_eq!(
+        o["promptVersion"],
+        serde_json::json!(PROMPT_VERSION),
+        "带提示词版本"
+    );
     assert_eq!(
         o["systemPrompt"],
         serde_json::json!("你是图片打标助手（用户覆盖版）"),
@@ -1443,7 +1798,14 @@ fn request_config_json_contains_all_inputs() {
         .as_array()
         .and_then(|a| a.first())
         .expect("facets 非空");
-    for k in ["key", "displayName", "description", "selectionMode", "maxItems", "appliesTo"] {
+    for k in [
+        "key",
+        "displayName",
+        "description",
+        "selectionMode",
+        "maxItems",
+        "appliesTo",
+    ] {
         assert!(f0.get(k).is_some(), "facets[0] 缺输入字段 {k}");
     }
     assert_eq!(f0["key"], serde_json::json!("scene"));
@@ -1546,7 +1908,11 @@ fn replace_ai_only_deletes_unreviewed() {
     a3_row(&c, aid, tag.id, Some(old.id), "ai_cloud", "ai_unreviewed");
     // Append 重跑：不清（默认最安全）
     ai::create_batch_with_retag(&c, &[aid], "cloud", ai::RetagMode::Append).unwrap();
-    assert_eq!(a3_row_state(&c, aid, tag.id), "ai_unreviewed", "Append 不得清未审核行");
+    assert_eq!(
+        a3_row_state(&c, aid, tag.id),
+        "ai_unreviewed",
+        "Append 不得清未审核行"
+    );
     // ReplaceAiOnly 重跑：建批同事务清掉未审核 AI 行
     ai::create_batch_with_retag(&c, &[aid], "cloud", ai::RetagMode::ReplaceAiOnly).unwrap();
     let left: i64 = c
@@ -1595,8 +1961,7 @@ fn confirm_promotes_to_ai_reviewed() {
     let c = mem();
     let sug = f6_one_suggestion(&c);
     let tag = tags::create_in_facet(&c, "海边", None, Some("scene")).unwrap();
-    let tags_map =
-        ai::CategorizedTags::from([("scene".to_string(), vec!["海边".to_string()])]);
+    let tags_map = ai::CategorizedTags::from([("scene".to_string(), vec!["海边".to_string()])]);
     ai::confirm_suggestion(&c, sug.id, &tags_map).unwrap();
     assert_eq!(
         a3_row_state(&c, sug.asset_id, tag.id),
@@ -1617,8 +1982,7 @@ fn manual_override_promotes_to_manual() {
     let c = mem();
     let sug = f6_one_suggestion(&c);
     let tag = tags::create_in_facet(&c, "海边", None, Some("scene")).unwrap();
-    let tags_map =
-        ai::CategorizedTags::from([("scene".to_string(), vec!["海边".to_string()])]);
+    let tags_map = ai::CategorizedTags::from([("scene".to_string(), vec!["海边".to_string()])]);
     // 先 AI 确认（ai_reviewed）→ 再手工重打同标签（覆盖）
     ai::confirm_suggestion(&c, sug.id, &tags_map).unwrap();
     asset_tags::assign(&c, &[sug.asset_id], &[tag.id], "manual").unwrap();
@@ -1688,8 +2052,15 @@ fn exact_term_auto_accepted() {
         raw_name: "海边".into(),
         confidence: Some(0.9),
     }];
-    ai::set_suggestion_result_policy(&c, sug.id, &tags_map, &proposals, "", &ConfidencePolicy::default())
-        .unwrap();
+    ai::set_suggestion_result_policy(
+        &c,
+        sug.id,
+        &tags_map,
+        &proposals,
+        "",
+        &ConfidencePolicy::default(),
+    )
+    .unwrap();
     let items = ai::list_suggestion_items(&c, sug.id).unwrap();
     assert_eq!(items.len(), 1);
     assert_eq!(items[0].decision, "accepted", "精确命中应自动接收");
@@ -1702,7 +2073,10 @@ fn exact_term_auto_accepted() {
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .unwrap();
-    assert_eq!(rs, "ai_unreviewed", "自动接收的行保持未审核态，等用户确认升级");
+    assert_eq!(
+        rs, "ai_unreviewed",
+        "自动接收的行保持未审核态，等用户确认升级"
+    );
     assert_eq!(src, "ai_cloud");
     assert_eq!(sb, Some(sug.batch_id));
 }
@@ -1719,8 +2093,15 @@ fn new_term_goes_to_pending() {
         raw_name: "太空漫步".into(),
         confidence: Some(0.8),
     }];
-    ai::set_suggestion_result_policy(&c, sug.id, &tags_map, &proposals, "", &ConfidencePolicy::default())
-        .unwrap();
+    ai::set_suggestion_result_policy(
+        &c,
+        sug.id,
+        &tags_map,
+        &proposals,
+        "",
+        &ConfidencePolicy::default(),
+    )
+    .unwrap();
     let items = ai::list_suggestion_items(&c, sug.id).unwrap();
     assert_eq!(items.len(), 1);
     assert_eq!(items[0].decision, "pending", "新词绝不自动建词");
@@ -1756,8 +2137,15 @@ fn low_confidence_dropped_entirely() {
         raw_name: "低可信词".into(),
         confidence: Some(0.1),
     }];
-    ai::set_suggestion_result_policy(&c, sug.id, &tags_map, &proposals, "", &ConfidencePolicy::default())
-        .unwrap();
+    ai::set_suggestion_result_policy(
+        &c,
+        sug.id,
+        &tags_map,
+        &proposals,
+        "",
+        &ConfidencePolicy::default(),
+    )
+    .unwrap();
     assert_eq!(
         ai::list_suggestion_items(&c, sug.id).unwrap().len(),
         0,
@@ -1770,7 +2158,10 @@ fn low_confidence_dropped_entirely() {
             |r| r.get(0),
         )
         .unwrap();
-    assert!(!raw.contains("低可信词"), "suggested_tags 应剔除低置信词: {raw}");
+    assert!(
+        !raw.contains("低可信词"),
+        "suggested_tags 应剔除低置信词: {raw}"
+    );
     let at: i64 = c
         .query_row(
             "SELECT COUNT(*) FROM asset_tags WHERE asset_id=?1",
@@ -1806,9 +2197,7 @@ fn whitelist_single_source() {
     use bagertea_ai_media_v2_lib::db::search_query::{
         is_metadata_key, is_supported_metadata_key, ALL_METADATA_KEYS, ALL_SORT_KEYS,
     };
-    use bagertea_ai_media_v2_lib::services::super_search_ai::{
-        validate_intent, SearchIntentV2,
-    };
+    use bagertea_ai_media_v2_lib::services::super_search_ai::{validate_intent, SearchIntentV2};
     // 正向：全集每个 key 都必须有 key_spec（加 key 忘 spec → 编译期断言失败）
     for k in ALL_METADATA_KEYS {
         assert!(is_metadata_key(k), "白名单常量自身应认识 {k}");
@@ -1826,17 +2215,24 @@ fn whitelist_single_source() {
             "ALL_SORT_KEYS 里的 {k} 必须被 is_valid_sort_by 接受"
         );
     }
-    assert!(ALL_SORT_KEYS.contains(&"rating"), "rating 必须在排序白名单（R0-4 回归）");
+    assert!(
+        ALL_SORT_KEYS.contains(&"rating"),
+        "rating 必须在排序白名单（R0-4 回归）"
+    );
     assert!(
         !bagertea_ai_media_v2_lib::services::super_search_ai::is_valid_sort_by("magic"),
         "白名单之外必须拒绝"
     );
     // validate_intent 走同一常量：rating 合法、magic 拒绝
-    let mut i = SearchIntentV2::default();
-    i.sort_by = Some("rating".into());
+    let i = SearchIntentV2 {
+        sort_by: Some("rating".into()),
+        ..SearchIntentV2::default()
+    };
     assert!(validate_intent(&i, &[]).is_ok(), "rating 排序不得被降级");
-    let mut i2 = SearchIntentV2::default();
-    i2.sort_by = Some("magic".into());
+    let i2 = SearchIntentV2 {
+        sort_by: Some("magic".into()),
+        ..SearchIntentV2::default()
+    };
     assert!(validate_intent(&i2, &[]).is_err());
 }
 
@@ -1851,11 +2247,17 @@ fn term_match_exact_only_canonical() {
     let t = tags::create_in_facet(&c, "海边", None, Some("scene")).unwrap();
     tags::add_alias(&c, t.id, "海滨", None, "synonym").unwrap();
     // synonym 名精确查（Alias）命中；Exact（仅 canonical）不命中
-    let by_alias = find_by_term(&c, "scene", &tags::normalize_name("海滨"), TermMatch::Alias).unwrap();
+    let by_alias =
+        find_by_term(&c, "scene", &tags::normalize_name("海滨"), TermMatch::Alias).unwrap();
     assert_eq!(by_alias.hits.len(), 1);
     assert_eq!(by_alias.hits[0].tag_id, t.id);
-    let by_exact = find_by_term(&c, "scene", &tags::normalize_name("海滨"), TermMatch::Exact).unwrap();
-    assert!(by_exact.hits.is_empty(), "Exact 不得命中 synonym：{:?}", by_exact.hits);
+    let by_exact =
+        find_by_term(&c, "scene", &tags::normalize_name("海滨"), TermMatch::Exact).unwrap();
+    assert!(
+        by_exact.hits.is_empty(),
+        "Exact 不得命中 synonym：{:?}",
+        by_exact.hits
+    );
     // canonical 名 Exact 命中
     let canon = find_by_term(&c, "scene", &tags::normalize_name("海边"), TermMatch::Exact).unwrap();
     assert_eq!(canon.hits.len(), 1);
@@ -1871,15 +2273,24 @@ fn term_match_contains_respects_cap() {
         let name = format!("人{i:02}");
         tags::create_in_facet(&c, &name, None, Some("scene")).unwrap();
     }
-    let (hits, warns) =
-        expand_term_query(&c, "scene", &tags::normalize_name("人"), TermMatch::Contains, 10).unwrap();
+    let (hits, warns) = expand_term_query(
+        &c,
+        "scene",
+        &tags::normalize_name("人"),
+        TermMatch::Contains,
+        10,
+    )
+    .unwrap();
     assert_eq!(hits.len(), 10, "Contains 必须截断到 10");
     assert!(
         warns.iter().any(|w| w.contains("只用了前 10")),
         "截断必须给出 warning：{warns:?}"
     );
     // 名字长度升序（「人」最短的不存在；长度 3 的全部排在长度 3 前）
-    let lens: Vec<usize> = hits.iter().map(|h| h.matched_term.chars().count()).collect();
+    let lens: Vec<usize> = hits
+        .iter()
+        .map(|h| h.matched_term.chars().count())
+        .collect();
     let mut sorted = lens.clone();
     sorted.sort();
     assert_eq!(lens, sorted, "Contains 命中按名字长度升序");
@@ -1907,12 +2318,24 @@ fn term_match_fuzzy_two_stage() {
     };
     let got = names_of("一人");
     for want in ["一个", "一个人", "单人"] {
-        assert!(got.contains(&want.to_string()), "「一人」应命中 {want}：{got:?}");
+        assert!(
+            got.contains(&want.to_string()),
+            "「一人」应命中 {want}：{got:?}"
+        );
     }
-    assert!(!got.contains(&"森林".to_string()), "无关词不得命中：{got:?}");
+    assert!(
+        !got.contains(&"森林".to_string()),
+        "无关词不得命中：{got:?}"
+    );
     let got2 = names_of("女该");
-    assert!(got2.contains(&"女孩".to_string()), "「女该」→女孩：{got2:?}");
-    assert!(got2.contains(&"女性".to_string()), "「女该」→女性：{got2:?}");
+    assert!(
+        got2.contains(&"女孩".to_string()),
+        "「女该」→女孩：{got2:?}"
+    );
+    assert!(
+        got2.contains(&"女性".to_string()),
+        "「女该」→女性：{got2:?}"
+    );
     assert!(names_of("青少").contains(&"青少年".to_string()));
     assert!(names_of("森材").contains(&"森林".to_string()));
     // 距离升序：距离 0 不应出现在 fuzzy（fuzzy 只管 ≥1；0 由 Alias 精确路径处理）
@@ -1933,17 +2356,15 @@ fn term_query_expands_in_tag_leaf() {
     let aid2 = f4_insert_asset(&c, "d:/s5b.jpg");
     asset_tags::assign(&c, &[aid1], &[t1.id], "manual").unwrap();
     asset_tags::assign(&c, &[aid2], &[t2.id], "manual").unwrap();
-    let leaf = |term_query: Option<String>, match_mode: TermMatch| {
-        QueryExpr::Leaf {
-            cond: LeafCond::Tag {
-                facet_key: "scene".into(),
-                tag_ids: Vec::new(),
-                mode: Some("any".into()),
-                include_descendants: true,
-                term_query,
-                term_match: match_mode,
-            },
-        }
+    let leaf = |term_query: Option<String>, match_mode: TermMatch| QueryExpr::Leaf {
+        cond: LeafCond::Tag {
+            facet_key: "scene".into(),
+            tag_ids: Vec::new(),
+            mode: Some("any".into()),
+            include_descendants: true,
+            term_query,
+            term_match: match_mode,
+        },
     };
     // 词查前缀「海」→ 命中海边与海景两张
     let (sql, _) = compile_expr(&c, &leaf(Some("海".into()), TermMatch::Prefix)).unwrap();
@@ -2096,7 +2517,7 @@ fn compile_warnings_reach_dto() {
 fn suspicious_file_size_warns_but_executes() {
     use bagertea_ai_media_v2_lib::db::search_query::MetadataFilter;
     let c = mem();
-    let aid = f4_insert_asset(&c, "d:/r22.jpg");
+    let _aid = f4_insert_asset(&c, "d:/r22.jpg");
     let filter = assets::AssetFilter {
         metadata_filters: vec![MetadataFilter {
             key: "file_size".into(),
@@ -2140,9 +2561,9 @@ fn create_batch_reports_merged_groups() {
 fn c1_palette_json(segs: &[(u8, u8, u8, f32)]) -> String {
     let arr: Vec<serde_json::Value> = segs
         .iter()
-        .map(|(r, g, b, ratio)| {
-            serde_json::json!({"hex":"#000000","r":r,"g":g,"b":b,"ratio":ratio})
-        })
+        .map(
+            |(r, g, b, ratio)| serde_json::json!({"hex":"#000000","r":r,"g":g,"b":b,"ratio":ratio}),
+        )
         .collect();
     serde_json::to_string(&arr).unwrap()
 }
@@ -2160,7 +2581,11 @@ fn c1_set_palette(c: &rusqlite::Connection, id: i64, json: &str) {
 fn palette_ratio_threshold_works() {
     let c = mem();
     let a = f4_insert_asset(&c, "d:/c1_red.jpg");
-    c1_set_palette(&c, a, &c1_palette_json(&[(224, 32, 32, 0.6), (32, 32, 224, 0.3)]));
+    c1_set_palette(
+        &c,
+        a,
+        &c1_palette_json(&[(224, 32, 32, 0.6), (32, 32, 224, 0.3)]),
+    );
     let n = assets::rescan_palette_colors(&c).unwrap();
     assert!(n >= 2, "应写入主色+次色行：{n}");
     let hits: i64 = c
@@ -2200,7 +2625,11 @@ fn palette_intersect_two_colors() {
     let a = f4_insert_asset(&c, "d:/c1_ab.jpg");
     let b = f4_insert_asset(&c, "d:/c1_b.jpg");
     // A 前三色含红+蓝；B 只含红
-    c1_set_palette(&c, a, &c1_palette_json(&[(224, 32, 32, 0.5), (100, 20, 255, 0.4)]));
+    c1_set_palette(
+        &c,
+        a,
+        &c1_palette_json(&[(224, 32, 32, 0.5), (100, 20, 255, 0.4)]),
+    );
     c1_set_palette(&c, b, &c1_palette_json(&[(224, 32, 32, 0.8)]));
     assets::rescan_palette_colors(&c).unwrap();
     let both: Vec<i64> = c
@@ -2214,7 +2643,10 @@ fn palette_intersect_two_colors() {
         .unwrap()
         .filter_map(|r| r.ok())
         .collect();
-    assert!(both.contains(&a) && !both.contains(&b), "交集应只有 A：{both:?}");
+    assert!(
+        both.contains(&a) && !both.contains(&b),
+        "交集应只有 A：{both:?}"
+    );
     // 编译层：palette_top3 in [红,蓝] → EXISTS(IN(0,8) AND rank<3)，经 list 端到端命中 A
     let f_red = MetadataFilter {
         key: "palette_top3".into(),
@@ -2232,7 +2664,9 @@ fn palette_intersect_two_colors() {
         min: None,
         max: None,
     };
-    let compiled = compile_metadata(&f_red).unwrap().expect("palette_top3 可编译");
+    let compiled = compile_metadata(&f_red)
+        .unwrap()
+        .expect("palette_top3 可编译");
     assert!(
         compiled.sql.contains("rank < 3") && compiled.sql.contains("color_bucket IN (?1)"),
         "{}",
@@ -2256,8 +2690,16 @@ fn palette_top3_ratio_min_filters() {
     let hi = f4_insert_asset(&c, "d:/c1_hi.jpg");
     let lo = f4_insert_asset(&c, "d:/c1_lo.jpg");
     // hi：前三色 = 红 60% / 蓝 30%；lo：红仅 10%（其余 90% 蓝）
-    c1_set_palette(&c, hi, &c1_palette_json(&[(224, 32, 32, 0.6), (32, 32, 224, 0.3)]));
-    c1_set_palette(&c, lo, &c1_palette_json(&[(224, 32, 32, 0.1), (32, 32, 224, 0.9)]));
+    c1_set_palette(
+        &c,
+        hi,
+        &c1_palette_json(&[(224, 32, 32, 0.6), (32, 32, 224, 0.3)]),
+    );
+    c1_set_palette(
+        &c,
+        lo,
+        &c1_palette_json(&[(224, 32, 32, 0.1), (32, 32, 224, 0.9)]),
+    );
     assets::rescan_palette_colors(&c).unwrap();
     let f = MetadataFilter {
         key: "palette_top3".into(),
@@ -2295,7 +2737,11 @@ fn alias_reaches_fts_after_gate_enabled() {
 
     // 修复前：FTS 词源仍读 tag_aliases，别名进不了 FTS → 此处必 miss
     let hits = bagertea_ai_media_v2_lib::db::search::search_asset_ids_all(&c, "茶饮料").unwrap();
-    assert_eq!(hits, vec![aid], "gate 开启后新增别名应能经 FTS 命中：{hits:?}");
+    assert_eq!(
+        hits,
+        vec![aid],
+        "gate 开启后新增别名应能经 FTS 命中：{hits:?}"
+    );
     // canonical 路径不受影响（回源仍是 tags.name）
     let canon = bagertea_ai_media_v2_lib::db::search::search_asset_ids_all(&c, "茶").unwrap();
     assert_eq!(canon, vec![aid]);
@@ -2310,7 +2756,10 @@ fn tag_aliases_field_reads_terms_when_gated() {
     let t = tags::create_in_facet(&c, "海", None, Some("scene")).unwrap();
     tags::add_alias(&c, t.id, "海边", None, "synonym").unwrap();
     let off = tags::aliases(&c, t.id).unwrap();
-    assert!(off.iter().any(|a| a == "海边"), "gate 关应读 tag_aliases：{off:?}");
+    assert!(
+        off.iter().any(|a| a == "海边"),
+        "gate 关应读 tag_aliases：{off:?}"
+    );
 
     // gate 开：add_alias 只写 tag_terms → aliases() 必须同 gate 读 tag_terms
     let c2 = mem();

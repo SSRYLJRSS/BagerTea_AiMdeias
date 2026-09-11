@@ -55,9 +55,7 @@ export interface Asset {
   // V18：GPS 定位（有符号十进制度，北纬东经为正；无定位为 null）
   latitude?: number | null;
   longitude?: number | null;
-  // V19（W3-1）：收藏/评级/手动旋转/phash（可选 + 默认值兼容旧响应）
-  /** 收藏标记（0/1；后端 NOT NULL DEFAULT 0） */
-  favorite?: number;
+  // V19（W3-1）：评级/手动旋转/phash（可选 + 默认值兼容旧响应）
   /** 评级 0–5（0 = 未评级） */
   rating?: number;
   /** 用户手动旋转（0/90/180/270；与 ffprobe 的 rotation 语义分离） */
@@ -142,7 +140,6 @@ export type MetadataFilterKey =
   // V18：GPS 定位（带符号十进制度）与定位有无分面（值域 yes/no）
   | "latitude"
   | "rating"
-  | "favorite"
   | "longitude"
   | "has_location";
 

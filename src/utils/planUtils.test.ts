@@ -4,7 +4,7 @@ import type { QueryExpr } from "@/types/queryExpr";
 import type { LeafCond } from "@/types/queryExpr";
 import type { ResolvedSearchQuery } from "@/types/asset";
 import type { SearchPlanV3, ShouldClause } from "@/types/superSearch";
-import { appendPlanMerge, MAX_SHOULD_CLAUSES, migratePlanV3, PLAN_SCHEMA_VERSION, resolvedQueryToPlan } from "./planUtils";
+import { appendPlanMerge, MAX_SHOULD_CLAUSES, migratePlanV3, normalizeSearchPlan, normalizeShouldByPosition, PLAN_SCHEMA_VERSION, reorderShould, resolvedQueryToPlan, weightForShouldPosition } from "./planUtils";
 
 function baseQuery(): ResolvedSearchQuery {
   return {
@@ -146,7 +146,7 @@ describe("§4.8 AI 追加模式合并", () => {
     expect((again.plan.mustNot as { op: "leaf"; cond: LeafCond }).cond.type).toBe("tag");
   });
 
-  it("append_concats_should_and_caps_at_12_by_weight", () => {
+  it("append_concats_should_and_caps_at_12_by_position", () => {
     const make = (n: number, w: number, base: number) =>
       Array.from({ length: n }, (_, i) => ({
         cond: tagCond("scene", [base + i]),
@@ -156,9 +156,7 @@ describe("§4.8 AI 追加模式合并", () => {
       }));
     const { plan, warnings } = appendPlanMerge(planWith(null, null, make(7, 0.5, 1)), planWith(null, null, make(8, 2.0, 100)));
     expect(plan.should).toHaveLength(MAX_SHOULD_CLAUSES);
-    // 8 条权重 2.0 的全部保留且排最前（按权重降序截断到 12）
-    expect(plan.should.slice(0, 8).every((s) => s.weight === 2.0)).toBe(true);
-    expect(plan.should.slice(8).every((s) => s.weight === 0.5)).toBe(true);
+    expect(plan.should.map((s) => s.weight)).toEqual([2, 2, 2, 2, 1, 1, 1, 1, 0.5, 0.5, 0.5, 0.5]);
     expect(warnings.some((w) => w.zone === "should" && w.message.includes("12 条"))).toBe(true);
   });
 
@@ -194,5 +192,47 @@ describe("§4.4 版本矩阵", () => {
     expect(migrated!.planSchemaVersion).toBe(PLAN_SCHEMA_VERSION);
     expect(JSON.stringify(migrated!.filter)).toBe(JSON.stringify(plan.filter));
     expect(migrated!.should).toHaveLength(1);
+  });
+});
+
+describe("优先区位置归一化纯函数", () => {
+  it("三分桶覆盖 N=0..13，超过上限按可见顺序截断", () => {
+    expect([0, 1, 2, 3, 4, 5, 12, 13].map((n) => Array.from({ length: n }, (_, i) => weightForShouldPosition(i, n)))).toEqual([
+      [],
+      [2],
+      [2, 1],
+      [2, 1, 0.5],
+      [2, 2, 1, 0.5],
+      [2, 2, 1, 1, 0.5],
+      [2, 2, 2, 2, 1, 1, 1, 1, 0.5, 0.5, 0.5, 0.5],
+      [2, 2, 2, 2, 2, 1, 1, 1, 1, 0.5, 0.5, 0.5, 0.5],
+    ]);
+    const clauses = Array.from({ length: 13 }, (_, i) => ({ cond: tagCond("scene", [i]), weight: 99, label: `c${i}` }));
+    expect(normalizeShouldByPosition(clauses)).toHaveLength(MAX_SHOULD_CLAUSES);
+    expect(normalizeShouldByPosition(clauses).map((s) => s.label)).toEqual(Array.from({ length: 12 }, (_, i) => `c${i}`));
+  });
+
+  it("覆盖非法旧 weight、固定 min=0、保持输入不可变且幂等", () => {
+    const input = Array.from({ length: 3 }, (_, i) => ({ cond: tagCond("scene", [i + 1]), weight: Number.NaN, label: `x${i}`, evidence: i === 1 ? "原文" : null }));
+    const plan = planWith(null, null, input);
+    plan.minimumShouldMatch = 99;
+    const before = JSON.stringify(plan);
+    const normalized = normalizeSearchPlan(plan);
+    expect(JSON.stringify(plan)).toBe(before);
+    expect(normalized.minimumShouldMatch).toBe(0);
+    expect(normalized.should.map((s) => s.weight)).toEqual([2, 1, 0.5]);
+    expect(normalized.should[1].evidence).toBe("原文");
+    expect(normalizeSearchPlan(normalized)).toEqual(normalized);
+  });
+
+  it("reorderShould 返回新数组，支持首尾和相同位置", () => {
+    const source = ["a", "b", "c"];
+    expect(reorderShould(source, 2, 0)).toEqual(["c", "a", "b"]);
+    expect(reorderShould(source, 0, 2)).toEqual(["b", "c", "a"]);
+    const same = reorderShould(source, 1, 1);
+    expect(same).toEqual(source);
+    expect(same).not.toBe(source);
+    expect(reorderShould(source, -1, 0)).toEqual(source);
+    expect(reorderShould(source, 0, 9)).toEqual(source);
   });
 });

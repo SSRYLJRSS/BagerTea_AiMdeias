@@ -1342,12 +1342,19 @@ fn v10_migrates_legacy_tag_categories_to_facet_configs() -> AppResult<()> {
     assert!(s.tag_categories.is_empty(), "旧分类应被清空");
     // scene 的旧 hint 由 V20 并入 tag_facets.description
     let scene_desc: String = conn.query_row(
-        "SELECT description FROM tag_facets WHERE key='scene'", [],
-        |r| r.get(0))?;
-    assert!(scene_desc.contains("如公园/街道"), "旧 hint 应并入 description: {scene_desc}");
+        "SELECT description FROM tag_facets WHERE key='scene'",
+        [],
+        |r| r.get(0),
+    )?;
+    assert!(
+        scene_desc.contains("如公园/街道"),
+        "旧 hint 应并入 description: {scene_desc}"
+    );
     let scene_mode: String = conn.query_row(
-        "SELECT input_mode FROM tag_facets WHERE key='scene'", [],
-        |r| r.get(0))?;
+        "SELECT input_mode FROM tag_facets WHERE key='scene'",
+        [],
+        |r| r.get(0),
+    )?;
     assert_eq!(scene_mode, "ai_and_manual", "scene 应参与 AI");
     // 其他设置字段不丢失
     assert_eq!(s.theme, "dark");
@@ -1358,8 +1365,10 @@ fn v10_migrates_legacy_tag_categories_to_facet_configs() -> AppResult<()> {
     conn.pragma_update(None, "user_version", 9)?;
     migrations::migrate(&conn)?;
     let scene_desc2: String = conn.query_row(
-        "SELECT description FROM tag_facets WHERE key='scene'", [],
-        |r| r.get(0))?;
+        "SELECT description FROM tag_facets WHERE key='scene'",
+        [],
+        |r| r.get(0),
+    )?;
     assert_eq!(scene_desc2, scene_desc, "重跑不得重复拼接 hint");
     Ok(())
 }
@@ -1396,24 +1405,32 @@ fn v11_adds_color_facet_to_existing_settings() -> AppResult<()> {
     // （ai_facet_configs 已 skip_serializing，JSON 侧不再持久化）——description 承载的是
     // 最终生效的默认 hint，语义正确。
     let scene_mode: String = conn.query_row(
-        "SELECT input_mode FROM tag_facets WHERE key='scene'", [],
-        |r| r.get(0))?;
+        "SELECT input_mode FROM tag_facets WHERE key='scene'",
+        [],
+        |r| r.get(0),
+    )?;
     assert_eq!(scene_mode, "ai_and_manual", "scene 应参与 AI");
     let color_mode: String = conn.query_row(
-        "SELECT input_mode FROM tag_facets WHERE key='color'", [],
-        |r| r.get(0))?;
+        "SELECT input_mode FROM tag_facets WHERE key='color'",
+        [],
+        |r| r.get(0),
+    )?;
     assert_eq!(color_mode, "manual_only", "V16 起 color 不参与 AI");
 
     // 幂等：再跑一次不重复
     conn.pragma_update(None, "user_version", 10)?;
     migrations::migrate(&conn)?;
     let scene_mode2: String = conn.query_row(
-        "SELECT input_mode FROM tag_facets WHERE key='scene'", [],
-        |r| r.get(0))?;
+        "SELECT input_mode FROM tag_facets WHERE key='scene'",
+        [],
+        |r| r.get(0),
+    )?;
     assert_eq!(scene_mode2, "ai_and_manual");
     let color_mode2: String = conn.query_row(
-        "SELECT input_mode FROM tag_facets WHERE key='color'", [],
-        |r| r.get(0))?;
+        "SELECT input_mode FROM tag_facets WHERE key='color'",
+        [],
+        |r| r.get(0),
+    )?;
     assert_eq!(color_mode2, "manual_only");
     Ok(())
 }
@@ -1443,13 +1460,29 @@ fn prompt_context_reflects_facet_config_overrides() -> AppResult<()> {
 #[test]
 fn prompt_context_excludes_manual_only_and_includes_description() -> AppResult<()> {
     let conn = setup();
-    tag_facets::create(&conn, "manual_field", "手工字段", "只手工填写", "multi", None, "all")?;
+    tag_facets::create(
+        &conn,
+        "manual_field",
+        "手工字段",
+        "只手工填写",
+        "multi",
+        None,
+        "all",
+    )?;
     // F4：参与 AI 的事实源是 cfg_ai_assignable（input_mode 已降级为派生列），置 0 = 不进提示词
     conn.execute(
         "UPDATE tag_facets SET cfg_ai_assignable = 0 WHERE key = 'manual_field'",
         [],
     )?;
-    tag_facets::create(&conn, "ai_field", "AI字段", "这段描述会原样给 AI 看", "multi", None, "all")?;
+    tag_facets::create(
+        &conn,
+        "ai_field",
+        "AI字段",
+        "这段描述会原样给 AI 看",
+        "multi",
+        None,
+        "all",
+    )?;
     let ctx = db::tag_facets::build_prompt_context(&conn, "all")?;
     assert!(
         !ctx.iter().any(|c| c.key == "manual_field"),
@@ -1704,7 +1737,13 @@ fn fb5_confirm_all_applies_per_suggestion_description() -> AppResult<()> {
 fn deactivate_facet_hides_from_fts() -> AppResult<()> {
     let conn = setup();
     tag_facets::create(&conn, "mood", "氛围", "", "multi", None, "all")?;
-    let id = add_asset(&conn, "d:/p/photo010.jpg", "photo010.jpg", "jpg", "image/jpeg");
+    let id = add_asset(
+        &conn,
+        "d:/p/photo010.jpg",
+        "photo010.jpg",
+        "jpg",
+        "image/jpeg",
+    );
     let tag = tags::create_in_facet(&conn, "海边", None, Some("mood"))?;
     asset_tags::assign(&conn, &[id], &[tag.id], "manual")?;
     assert_eq!(db::search::search_asset_ids_all(&conn, "海边")?, vec![id]);
@@ -1721,7 +1760,13 @@ fn deactivate_facet_hides_from_fts() -> AppResult<()> {
 fn restore_facet_shows_in_fts() -> AppResult<()> {
     let conn = setup();
     tag_facets::create(&conn, "mood", "氛围", "", "multi", None, "all")?;
-    let id = add_asset(&conn, "d:/p/photo011.jpg", "photo011.jpg", "jpg", "image/jpeg");
+    let id = add_asset(
+        &conn,
+        "d:/p/photo011.jpg",
+        "photo011.jpg",
+        "jpg",
+        "image/jpeg",
+    );
     let tag = tags::create_in_facet(&conn, "山野", None, Some("mood"))?;
     asset_tags::assign(&conn, &[id], &[tag.id], "manual")?;
     tag_facets::deactivate(&conn, "mood")?;
@@ -1740,7 +1785,13 @@ fn restore_facet_shows_in_fts() -> AppResult<()> {
 fn deactivate_facet_keeps_asset_tags() -> AppResult<()> {
     let conn = setup();
     tag_facets::create(&conn, "mood", "氛围", "", "multi", None, "all")?;
-    let id = add_asset(&conn, "d:/p/photo012.jpg", "photo012.jpg", "jpg", "image/jpeg");
+    let id = add_asset(
+        &conn,
+        "d:/p/photo012.jpg",
+        "photo012.jpg",
+        "jpg",
+        "image/jpeg",
+    );
     let tag = tags::create_in_facet(&conn, "日落", None, Some("mood"))?;
     asset_tags::assign(&conn, &[id], &[tag.id], "manual")?;
     tag_facets::deactivate(&conn, "mood")?;
@@ -1760,7 +1811,15 @@ fn deactivate_facet_keeps_asset_tags() -> AppResult<()> {
 fn user_created_facet_full_pipeline() -> AppResult<()> {
     let conn = setup();
     // ① 用户自建分面 clothing_color
-    tag_facets::create(&conn, "clothing_color", "人物服装颜色", "人物服装的主色", "multi", None, "all")?;
+    tag_facets::create(
+        &conn,
+        "clothing_color",
+        "人物服装颜色",
+        "人物服装的主色",
+        "multi",
+        None,
+        "all",
+    )?;
 
     // ② build_prompt_context 含它（V20 后 input_mode=ai_and_manual 默认参与 AI）
     let ctx = bagertea_ai_media_v2_lib::db::tag_facets::build_prompt_context(&conn, "all")?;
@@ -1800,7 +1859,10 @@ fn user_created_facet_full_pipeline() -> AppResult<()> {
         [],
         |r| r.get(0),
     )?;
-    assert_eq!(facet, "clothing_color", "自建分面的标签必须挂在该分面下，不是 custom");
+    assert_eq!(
+        facet, "clothing_color",
+        "自建分面的标签必须挂在该分面下，不是 custom"
+    );
 
     // ⑤ list_tags_by_facet 能查到
     let nodes = tags::list_by_facet(&conn, "clothing_color")?;
@@ -1811,7 +1873,11 @@ fn user_created_facet_full_pipeline() -> AppResult<()> {
 
     // ⑥ 删分面后残留为 0（W2-3 的级联删除；走真实 delete_facet 命令）
     let report = tag_facets::delete_facet(&conn, "clothing_color")?;
-    assert!(report.tags_deleted >= 1, "删除报告应含被删标签数: {:?}", report);
+    assert!(
+        report.tags_deleted >= 1,
+        "删除报告应含被删标签数: {:?}",
+        report
+    );
     let leftover: i64 = conn.query_row(
         "SELECT COUNT(*) FROM tags WHERE facet_key='clothing_color'",
         [],
@@ -1825,7 +1891,15 @@ fn user_created_facet_full_pipeline() -> AppResult<()> {
 #[test]
 fn resolve_facet_key_three_branches() -> AppResult<()> {
     let conn = setup();
-    tag_facets::create(&conn, "clothing_color", "人物服装颜色", "", "multi", None, "all")?;
+    tag_facets::create(
+        &conn,
+        "clothing_color",
+        "人物服装颜色",
+        "",
+        "multi",
+        None,
+        "all",
+    )?;
     // ① DB 存在 → 原样返回（自建分面）
     let (k1, _) = tag_facets::resolve_facet_key(&conn, "clothing_color")?;
     assert_eq!(k1, "clothing_color");
@@ -1847,26 +1921,52 @@ fn resolve_facet_key_three_branches() -> AppResult<()> {
 #[test]
 fn update_facet_single_transaction() -> AppResult<()> {
     let conn = setup();
-    tag_facets::create(&conn, "my_field", "原名字", "原描述", "multi", Some(3), "all")?;
+    tag_facets::create(
+        &conn,
+        "my_field",
+        "原名字",
+        "原描述",
+        "multi",
+        Some(3),
+        "all",
+    )?;
     // 非法 input_mode → 报错且 DB 不变
     let err = tag_facets::update_facet(
-        &conn, "my_field", "新名字", "新描述", "bad_mode", "multi", Some(5), "all",
+        &conn,
+        "my_field",
+        "新名字",
+        "新描述",
+        "bad_mode",
+        "multi",
+        Some(5),
+        "all",
     );
     assert!(err.is_err());
     let (name, mode, _max): (String, String, Option<i64>) = conn.query_row(
         "SELECT display_name, input_mode, max_items FROM tag_facets WHERE key='my_field'",
-        [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )?;
     assert_eq!(name, "原名字", "非法时全部不生效（单事务）");
     assert_eq!(mode, "ai_and_manual");
     // 合法路径：全字段一次生效
     tag_facets::update_facet(
-        &conn, "my_field", "新名字", "新描述", "manual_only", "single", None, "video",
+        &conn,
+        "my_field",
+        "新名字",
+        "新描述",
+        "manual_only",
+        "single",
+        None,
+        "video",
     )?;
     let (name2, mode2, max2, applies): (String, String, Option<i64>, String) = conn.query_row(
         "SELECT display_name, input_mode, max_items, applies_to FROM tag_facets WHERE key='my_field'",
         [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
-    assert_eq!((name2.as_str(), mode2.as_str(), max2, applies.as_str()),
-        ("新名字", "manual_only", Some(1), "video"));
+    assert_eq!(
+        (name2.as_str(), mode2.as_str(), max2, applies.as_str()),
+        ("新名字", "manual_only", Some(1), "video")
+    );
     Ok(())
 }
 
@@ -1918,7 +2018,10 @@ fn delete_facet_rejects_system() -> AppResult<()> {
     let conn = setup();
     assert!(tag_facets::delete_facet(&conn, "scene").is_err());
     let still: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM tag_facets WHERE key='scene'", [], |r| r.get(0))?;
+        "SELECT COUNT(*) FROM tag_facets WHERE key='scene'",
+        [],
+        |r| r.get(0),
+    )?;
     assert_eq!(still, 1);
     Ok(())
 }
@@ -1934,11 +2037,21 @@ fn candidates_include_inactive_facet_but_exclude_searchable_off() -> AppResult<(
     tag_facets::deactivate(&conn, "mood2")?;
     // F4 语义变更：停用分面（cfg 保持）的标签仍可搜 —— SEARCHABLE_TAG 不看 f.status
     let hits2 = tags::search_candidates(&conn, None, "宁静")?;
-    assert_eq!(hits2.len(), 1, "停用分面标签仍可搜（cfg_searchable 保持 1）");
+    assert_eq!(
+        hits2.len(),
+        1,
+        "停用分面标签仍可搜（cfg_searchable 保持 1）"
+    );
     // 真正退出候选的是 cfg_searchable = 0
-    conn.execute("UPDATE tag_facets SET cfg_searchable = 0 WHERE key = 'mood2'", [])?;
+    conn.execute(
+        "UPDATE tag_facets SET cfg_searchable = 0 WHERE key = 'mood2'",
+        [],
+    )?;
     let hits3 = tags::search_candidates(&conn, None, "宁静")?;
-    assert!(hits3.is_empty(), "cfg_searchable=0 分面的标签不得出现在候选");
+    assert!(
+        hits3.is_empty(),
+        "cfg_searchable=0 分面的标签不得出现在候选"
+    );
     Ok(())
 }
 
@@ -2002,34 +2115,54 @@ fn facet_has_any_and_missing_compile() -> AppResult<()> {
     asset_tags::assign(&conn, &[a1], &[t.id], "manual")?;
 
     // has_any：命中打了 scene 标签的 a1
-    let has_any = assets::list(&conn, &AssetFilter {
-        expr: Some(QueryExpr::Leaf { cond: LeafCond::FacetHasAny { facet_key: "scene".into() } }),
-        ..Default::default()
-    })?;
+    let has_any = assets::list(
+        &conn,
+        &AssetFilter {
+            expr: Some(QueryExpr::Leaf {
+                cond: LeafCond::FacetHasAny {
+                    facet_key: "scene".into(),
+                },
+            }),
+            ..Default::default()
+        },
+    )?;
     assert_eq!(has_any.total, 1);
 
     // missing：命中没打 scene 标签的 a2
-    let missing = assets::list(&conn, &AssetFilter {
-        expr: Some(QueryExpr::Leaf { cond: LeafCond::FacetMissing { facet_key: "scene".into() } }),
-        ..Default::default()
-    })?;
+    let missing = assets::list(
+        &conn,
+        &AssetFilter {
+            expr: Some(QueryExpr::Leaf {
+                cond: LeafCond::FacetMissing {
+                    facet_key: "scene".into(),
+                },
+            }),
+            ..Default::default()
+        },
+    )?;
     assert_eq!(missing.total, 1);
 
     // F4：未知/不可搜分面 → warning + 整叶剔除（1=1），不再报错整次查询
     let (frag, _params) = bagertea_ai_media_v2_lib::db::query_expr::compile_leaf(
-        &conn, &LeafCond::FacetHasAny { facet_key: "nope".into() },
+        &conn,
+        &LeafCond::FacetHasAny {
+            facet_key: "nope".into(),
+        },
     )?;
     assert_eq!(frag, "1=1", "未知分面剔除为恒真条件，查询继续");
     // validate_expr 覆盖新变体：空 key 报错
     assert!(
         bagertea_ai_media_v2_lib::db::query_expr::validate_expr(&QueryExpr::Leaf {
-            cond: LeafCond::FacetMissing { facet_key: "  ".into() }
-        }).is_err()
+            cond: LeafCond::FacetMissing {
+                facet_key: "  ".into()
+            }
+        })
+        .is_err()
     );
     Ok(())
 }
 
-// ── W2-8：收藏/评级 ──
+// ── W2-8：评级 ──
 
 #[test]
 fn rating_compiles_and_filters() -> AppResult<()> {
@@ -2039,21 +2172,27 @@ fn rating_compiles_and_filters() -> AppResult<()> {
     assets::set_rating(&conn, &[a1], 5)?;
     assets::set_rating(&conn, &[a2], 2)?;
     // rating gte 3 只命中 a1
-    let page = assets::list(&conn, &AssetFilter {
-        metadata_filters: vec![serde_json::from_value(serde_json::json!(
-            {"key": "rating", "op": "gte", "value": 3}
-        ))?],
-        ..Default::default()
-    })?;
+    let page = assets::list(
+        &conn,
+        &AssetFilter {
+            metadata_filters: vec![serde_json::from_value(serde_json::json!(
+                {"key": "rating", "op": "gte", "value": 3}
+            ))?],
+            ..Default::default()
+        },
+    )?;
     assert_eq!(page.total, 1);
     // 按评级排序：5 星在前，未评级（rating=0）最后
     let a3 = add_asset(&conn, "d:/p/r3.jpg", "r3.jpg", "jpg", "image/jpeg");
     let _ = a3;
-    let sorted = assets::list(&conn, &AssetFilter {
-        sort_by: Some("rating".into()),
-        sort_dir: Some("desc".into()),
-        ..Default::default()
-    })?;
+    let sorted = assets::list(
+        &conn,
+        &AssetFilter {
+            sort_by: Some("rating".into()),
+            sort_dir: Some("desc".into()),
+            ..Default::default()
+        },
+    )?;
     let first = sorted.items.first().expect("非空");
     assert_eq!(first.rating, 5, "评级排序：5 星应排第一");
     assert_eq!(sorted.items.last().unwrap().rating, 0, "未评级排最后");
@@ -2067,42 +2206,17 @@ fn rating_compiles_and_filters() -> AppResult<()> {
 }
 
 #[test]
-fn favorite_compiles_case_expr() -> AppResult<()> {
-    let conn = setup();
-    let a1 = add_asset(&conn, "d:/p/f1.jpg", "f1.jpg", "jpg", "image/jpeg");
-    let _a2 = add_asset(&conn, "d:/p/f2.jpg", "f2.jpg", "jpg", "image/jpeg");
-    assets::set_favorite(&conn, &[a1], true)?;
-    // favorite = yes 只命中 a1（CASE 表达式编译）
-    let page = assets::list(&conn, &AssetFilter {
-        metadata_filters: vec![serde_json::from_value(serde_json::json!(
-            {"key": "favorite", "op": "eq", "value": "yes"}
-        ))?],
-        ..Default::default()
-    })?;
-    assert_eq!(page.total, 1);
-    // 再取消
-    assets::set_favorite(&conn, &[a1], false)?;
-    let page2 = assets::list(&conn, &AssetFilter {
-        metadata_filters: vec![serde_json::from_value(serde_json::json!(
-            {"key": "favorite", "op": "eq", "value": "yes"}
-        ))?],
-        ..Default::default()
-    })?;
-    assert_eq!(page2.total, 0);
-    Ok(())
-}
-
-#[test]
 fn rating_facet_appears() -> AppResult<()> {
     let conn = setup();
     let a1 = add_asset(&conn, "d:/p/g1.jpg", "g1.jpg", "jpg", "image/jpeg");
     assets::set_rating(&conn, &[a1], 5)?;
-    assets::set_favorite(&conn, &[a1], true)?;
     let facets = assets::list_metadata_facets(&conn, None)?;
     let rating = facets.iter().find(|f| f.key == "rating").expect("评级分面");
-    assert!(rating.items.iter().any(|i| i.value == "5"), "评级分面应有 5 星桶");
-    let favorite = facets.iter().find(|f| f.key == "favorite").expect("收藏分面");
-    assert!(favorite.items.iter().any(|i| i.value == "yes"), "收藏分面应有已收藏桶");
+    assert!(
+        rating.items.iter().any(|i| i.value == "5"),
+        "评级分面应有 5 星桶"
+    );
+    assert!(facets.iter().all(|f| f.key != "favorite"));
     Ok(())
 }
 
@@ -2138,9 +2252,15 @@ fn top_tags_respects_char_cap() -> AppResult<()> {
     }
     let top = tags::top_tags_per_facet(&conn, 100)?;
     let words_total: usize = top.iter().map(|(_, w)| w.chars().count()).sum();
-    assert!(words_total <= 1500, "候选词总字符应受 1500 上限约束，实际 {words_total}");
+    assert!(
+        words_total <= 1500,
+        "候选词总字符应受 1500 上限约束，实际 {words_total}"
+    );
     // 每个分面至少保留 1 个词（大分面不得把词丢光）
-    assert!(top.iter().all(|(_, w)| !w.is_empty()), "每分面至少 1 个词：{top:?}");
+    assert!(
+        top.iter().all(|(_, w)| !w.is_empty()),
+        "每分面至少 1 个词：{top:?}"
+    );
     Ok(())
 }
 
@@ -2159,7 +2279,10 @@ fn assign_syncs_to_kinship_siblings() -> AppResult<()> {
     // 给 JPG 打标 → RAW 也有
     asset_tags::assign(&conn, &[jpg], &[t.id], "manual")?;
     let raw_tags = asset_tags::get_asset_tags(&conn, raw)?;
-    assert!(raw_tags.iter().any(|x| x.id == t.id), "给 JPG 打标应同步到同源 RAW");
+    assert!(
+        raw_tags.iter().any(|x| x.id == t.id),
+        "给 JPG 打标应同步到同源 RAW"
+    );
     Ok(())
 }
 
@@ -2183,10 +2306,13 @@ fn assign_records_ops_for_both() -> AppResult<()> {
 fn undo_reverts_both() -> AppResult<()> {
     let conn = setup();
     let (jpg, raw) = add_kinship_pair(&conn);
-    let t = tags::create_in_facet(&conn, "海边", None, Some("scene"))?;
+    let _t = tags::create_in_facet(&conn, "海边", None, Some("scene"))?;
     // R2-4：走真实 assign_inner 同源展开（ai::confirm_suggestion），不手写 INSERT
     let batch = ai::create_batch(&conn, &[jpg], "cloud")?;
-    let sug = ai::list_suggestions(&conn, batch.id)?.into_iter().next().unwrap();
+    let sug = ai::list_suggestions(&conn, batch.id)?
+        .into_iter()
+        .next()
+        .unwrap();
     let tags_map = ai::CategorizedTags::from([("scene".to_string(), vec!["海边".to_string()])]);
     ai::confirm_suggestion(&conn, sug.id, &tags_map)?;
     // assign_inner 同源展开写了两条（jpg + raw）且都带本批次流水
@@ -2202,6 +2328,40 @@ fn undo_reverts_both() -> AppResult<()> {
     let raw_tags = asset_tags::get_asset_tags(&conn, raw)?;
     assert!(jpg_tags.is_empty(), "撤销应回滚 JPG 的标签");
     assert!(raw_tags.is_empty(), "撤销应回滚同源 RAW 的标签");
+    Ok(())
+}
+
+#[test]
+fn confirming_ai_tags_reviews_kinship_sibling_rows() -> AppResult<()> {
+    let conn = setup();
+    let (jpg, raw) = add_kinship_pair(&conn);
+    let batch = ai::create_batch(&conn, &[jpg], "local")?;
+    let suggestion = ai::list_suggestions(&conn, batch.id)?
+        .into_iter()
+        .next()
+        .expect("JPG suggestion");
+    let tags_map = ai::CategorizedTags::from([("scene".to_string(), vec!["海边".to_string()])]);
+
+    ai::confirm_suggestion(&conn, suggestion.id, &tags_map)?;
+
+    let states: Vec<(i64, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT asset_id, review_state FROM asset_tags
+              WHERE source_batch_id = ?1 ORDER BY asset_id",
+        )?;
+        let rows = stmt
+            .query_map([batch.id], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<Result<_, _>>()?;
+        rows
+    };
+    assert_eq!(
+        states,
+        vec![(jpg, "ai_reviewed".into()), (raw, "ai_reviewed".into())],
+        "确认代表图后，同批同步到 RAW/JPG 的标签都必须受审核保护"
+    );
+
+    let removed = asset_tags::retag_clear_unreviewed(&conn, &[jpg, raw])?;
+    assert_eq!(removed, 0, "ReplaceAiOnly 不得清理已确认的同源标签");
     Ok(())
 }
 

@@ -459,12 +459,6 @@ pub fn resolve_sources_ordered(
 ) -> Vec<DownloadSource> {
     let all = all_sources(custom);
 
-    // 判断 preferred 是否有效
-    let mut valid_preferred = false;
-    if preferred != "auto" {
-        valid_preferred = all.iter().any(|s| s.id == preferred);
-    }
-
     // 测速 index: id -> speed_bps（失败/未测视为 None）
     let speed_of = |id: &str| -> Option<u64> {
         probes
@@ -473,8 +467,14 @@ pub fn resolve_sources_ordered(
             .and_then(|p| p.speed_bps)
     };
 
-    if !valid_preferred {
-        // 无效 id（含 "auto"）→ 按测速降序，未测速的保持内置顺序兜底
+    // 有效 preferred（"auto" 永不视为具体源）：该源置顶，其余按测速降序。
+    // 无效 id（含 "auto"）→ 按测速降序，未测速的保持内置顺序兜底。
+    let preferred_source = if preferred != "auto" {
+        all.iter().find(|s| s.id == preferred).cloned()
+    } else {
+        None
+    };
+    let Some(pref) = preferred_source else {
         let mut list = all;
         list.sort_by(|a, b| {
             let sa = speed_of(&a.id);
@@ -487,10 +487,8 @@ pub fn resolve_sources_ordered(
             }
         });
         return list;
-    }
+    };
 
-    // 有效 preferred：该源置顶，其余按测速降序
-    let pref = all.iter().find(|s| s.id == preferred).cloned().unwrap();
     let mut rest: Vec<DownloadSource> = all.into_iter().filter(|s| s.id != preferred).collect();
     rest.sort_by(|a, b| {
         let sa = speed_of(&a.id);
@@ -1047,7 +1045,9 @@ mod tests {
     fn probe_concurrency_covers_all_sources() {
         // 内置源 + 自定义源总数可能超过单批并发上限，probe_sources 必须分批覆盖全部，
         // 否则最后一个源永远测不到。此断言防止未来调参时回归。
-        assert!(BUILTIN_SOURCE_COUNT + MAX_CUSTOM_SOURCES > MAX_PROBE_CONCURRENCY);
+        const {
+            assert!(BUILTIN_SOURCE_COUNT + MAX_CUSTOM_SOURCES > MAX_PROBE_CONCURRENCY);
+        }
         // 即便总数超上限，分批逻辑也返回与输入等长的结果（数量守恒）
         let mut all: Vec<DownloadSource> = builtin_sources();
         for i in 0..MAX_CUSTOM_SOURCES {

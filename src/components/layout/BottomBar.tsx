@@ -1,3 +1,4 @@
+import { useEffect, useRef, useState } from "react";
 import clsx from "clsx";
 import ProgressBar from "@/components/common/ProgressBar";
 import { useTaskStore } from "@/stores/taskStore";
@@ -12,6 +13,8 @@ const TABS: { key: TabKey; label: string }[] = [
   { key: "ai", label: "打标" },
 ];
 
+const SUPER_SEARCH_HINT_DELAY_MS = 500;
+
 interface BottomBarProps {
   current: TabKey | "settings" | "superSearch";
   onNavigate: (tab: TabKey) => void;
@@ -24,6 +27,8 @@ interface BottomBarProps {
  *  P2.3：素材库按钮支持双击进入超级搜索（单击延时导航，双击取消） */
 export default function BottomBar({ current, onNavigate, onOpenSuperSearch }: BottomBarProps) {
   const tasks = useTaskStore((s) => s.tasks);
+  const [showSuperSearchHint, setShowSuperSearchHint] = useState(false);
+  const hintTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // 当前页为超级搜索时，底栏仍高亮「素材库」；其余按原映射
   const activeTab = (key: TabKey): boolean =>
@@ -36,6 +41,22 @@ export default function BottomBar({ current, onNavigate, onOpenSuperSearch }: Bo
   );
 
   const clickProps = (tab: TabKey) => (tab === "library" ? doubleAction : {});
+  const clearHintTimer = () => {
+    if (hintTimer.current) clearTimeout(hintTimer.current);
+    hintTimer.current = null;
+  };
+  const openHintAfterDelay = () => {
+    clearHintTimer();
+    hintTimer.current = setTimeout(() => {
+      hintTimer.current = null;
+      setShowSuperSearchHint(true);
+    }, SUPER_SEARCH_HINT_DELAY_MS);
+  };
+  const closeHint = () => {
+    clearHintTimer();
+    setShowSuperSearchHint(false);
+  };
+  useEffect(() => () => clearHintTimer(), []);
 
   return (
     <>
@@ -49,21 +70,39 @@ export default function BottomBar({ current, onNavigate, onOpenSuperSearch }: Bo
       )}
 
       <nav className="fixed inset-x-0 bottom-0 z-30 flex h-14 items-center justify-center gap-10 border-t border-[var(--color-border)] bg-[var(--color-bg)]/96 backdrop-blur">
-      {TABS.map((tab) => (
-        <button
-          key={tab.key}
-          onClick={() => onNavigate(tab.key)}
-          {...clickProps(tab.key)}
-          className={clsx(
-            "relative px-2 py-1 text-sm tracking-[0.18em] transition-colors",
-            activeTab(tab.key)
-              ? "font-medium text-[var(--color-text)] after:absolute after:inset-x-2 after:-bottom-1 after:h-0.5 after:rounded-full after:bg-[var(--color-status)]"
-              : "text-[var(--color-text-secondary)] hover:text-[var(--color-text)]",
-          )}
-        >
-          {tab.label}
-        </button>
-      ))}
+      {TABS.map((tab) => {
+        const isLibrary = tab.key === "library";
+        return (
+          <button
+            key={tab.key}
+            onClick={() => onNavigate(tab.key)}
+            {...clickProps(tab.key)}
+            onMouseEnter={isLibrary ? openHintAfterDelay : undefined}
+            onMouseLeave={isLibrary ? closeHint : undefined}
+            onFocus={isLibrary ? openHintAfterDelay : undefined}
+            onBlur={isLibrary ? closeHint : undefined}
+            aria-label={isLibrary ? tab.label : undefined}
+            aria-describedby={isLibrary && showSuperSearchHint ? "super-search-entry-hint" : undefined}
+            className={clsx(
+              "relative px-2 py-1 text-sm tracking-[0.18em] transition-colors",
+              activeTab(tab.key)
+                ? "font-medium text-[var(--color-text)] after:absolute after:inset-x-2 after:-bottom-1 after:h-0.5 after:rounded-full after:bg-[var(--color-status)]"
+                : "text-[var(--color-text-secondary)] hover:text-[var(--color-text)]",
+            )}
+          >
+            {tab.label}
+            {isLibrary && showSuperSearchHint && (
+              <span
+                id="super-search-entry-hint"
+                role="tooltip"
+                className="pointer-events-none absolute bottom-full left-1/2 mb-2 -translate-x-1/2 whitespace-nowrap rounded-[var(--radius-item)] border border-[var(--color-border)] bg-[var(--color-surface-raised)] px-2 py-1 text-[11px] font-normal tracking-normal text-[var(--color-text-secondary)] shadow-[var(--shadow-soft)]"
+              >
+                双击进入超级搜索
+              </span>
+            )}
+          </button>
+        );
+      })}
       </nav>
     </>
   );

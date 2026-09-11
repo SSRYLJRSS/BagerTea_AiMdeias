@@ -117,7 +117,12 @@ impl ThumbnailService {
     /// 提取/生成占位图（永不失败：全链路失败 → 通用类型占位图）。
     /// W5d：返回 (占位图路径, dHash) —— 图片解码成功时顺带算出感知哈希（零额外解码），
     /// 视频/失败为 None。入库用它搭车写 assets.phash（回填命令照抄 palette 骨架）。
-    pub fn extract_placeholder(&self, asset_id: i64, src: &Path, mime_type: &str) -> (PathBuf, Option<u64>) {
+    pub fn extract_placeholder(
+        &self,
+        asset_id: i64,
+        src: &Path,
+        mime_type: &str,
+    ) -> (PathBuf, Option<u64>) {
         let out = self.placeholder_path(asset_id);
         if out.exists() {
             return (out, None);
@@ -132,7 +137,9 @@ impl ThumbnailService {
             })
         } else if is_video {
             let _permit = imaging::acquire();
-            atomic_generate(&out, |tmp| video::extract_frame(src, 0, tmp, PLACEHOLDER_SIZE))
+            atomic_generate(&out, |tmp| {
+                video::extract_frame(src, 0, tmp, PLACEHOLDER_SIZE)
+            })
         } else {
             false
         };
