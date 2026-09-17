@@ -4,6 +4,7 @@ dist/
 *.local
 
 # Rust / Tauri（通配：任何 target-* 构建产物目录都不入库，历史上曾出现 target-codex-verify 9.7G / target-test 8.4G）
+/target/
 src-tauri/target*/
 src-tauri/gen/
 

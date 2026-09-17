@@ -4,10 +4,10 @@
 # Note: keep this file ASCII-only comments; PowerShell 5.1 parses
 # BOM-less UTF-8 as ANSI and garbles CJK comments (parser errors).
 # Explicit `exit $LASTEXITCODE` avoids pwsh misreporting cargo's stderr
-# progress as a non-zero exit (see docs/TEST_EXECUTION_REPORT_2026-08-22.md F4).
+# progress as a non-zero exit (see docs/TEST_STRATEGY.md).
 # Flaky handling: network integration tests (local TCP mock) occasionally
-# fail once with "error sending request" on Windows (environment-level,
-# docs/TEST_EXECUTION_REPORT F15) -> run serialized with --test-threads=1
+# fail once with "error sending request" on Windows (environment-level flaky)
+# -> run serialized with --test-threads=1
 # and retry once on failure; the stable group runs in parallel.
 # ============================================================
 $ErrorActionPreference = "Continue" # keep native stderr (cargo progress) from aborting steps

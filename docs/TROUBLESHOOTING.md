@@ -1,137 +1,338 @@
-# 茶包素材 V2 — 踩坑与疑难手册
+# 排障手册
 
-> 版本 v1.1 ｜ 2026-08-17
-> 定位：**真实踩过的坑全记录**——症状、根因、修法。遇到"看不懂的防御性代码"先来这查；新踩的坑修完必须追加。
+> 更新日期：2026-09-16
+>
+> 本文档记录高价值故障模式。先取证，再修改；不要根据症状直接删除数据库或缓存。
 
----
+## 1. 通用排查顺序
 
-## 一、后端 / Rust
+1. 记录时间、操作、素材 ID、批次 ID、命令名、错误提示，以及前端提供的 `requestId` /
+   `sessionId`（如有）。
+2. 收集 `%APPDATA%\bagertea_ai_media_v2\logs\` 中的日志；优先查看 `fatal.log`，
+   再查 `app.log.*`。
+3. 判断是前端状态、IPC、服务层、数据库还是文件系统问题。
+4. 对状态机问题画出实际转移。
+5. 对性能问题先确认构建类型和缓存状态。
+6. 修复后增加最小回归测试。
 
-### 1. 大图加载不出（打标页占位框不动）
+外部 SQLite 工具连接应用库时可能缺少自注册的 `cjk_bigram` 函数。外部连接只适合 SELECT 和诊断，禁止直接 UPDATE/DELETE 业务数据。
 
-- **根因**：`get_or_create_hd` 解码大图期间持 DB 锁 → 饿死全部其他请求
-- **修法**：改 `Arc<Mutex>` 短暂持锁，解码放锁外
-- **教训**：DB 锁内禁止耗时操作
+## 2. 启动与数据库
 
-### 2. 缩略图极慢（17.9s/张）三真凶
+### 2.1 启动时提示数据库升级失败
 
-| 真凶 | 修法 |
-|---|---|
-| JPEG 内嵌预览的 IFD 偏移**相对 TIFF 基准而非文件头**（kamadak 不吐基准） | 自写 TIFF 遍历 `locate_tiff_base`（APP1 定位） |
-| debug 构建全图解码 12.7s | `[profile.dev.package.*] opt-level = 3` |
-| 串行解码 | 4 许可信号量并发 |
+可能原因：
 
-### 3. cut_jpeg 误杀内嵌图
+- 旧库处于半迁移状态。
+- 手工修改导致 schema capability 与实际结构漂移。
+- 数据库文件损坏或磁盘不可写。
 
-- **根因**：严格 SOI/EOI 校验——老板相机内嵌图尾部有 FF 填充字节
-- **修法**：前 64 字节找 SOI、末尾 `rfind` EOI（piexif 对照验证过）
+处理：
 
-### 4. marker_scan 抓回 7.5MB 主图
+1. 保留 `library.db` 和日志，不要反复覆盖。
+2. 检查是否有备份。
+3. 如果迁移代码已修复，重新启动触发幂等迁移。
+4. 无法自动恢复时使用应用内备份恢复。
+5. 不要把 `user_version` 手改为更高值来跳过迁移。
 
-- **根因**：对 `.jpg` 做 FFD8 标记扫描会命中主图自己
-- **修法**：`.jpg` 禁用标记扫描兜底
+### 2.2 查询报 `no such function: cjk_bigram`
 
-### 5. jpeg-decoder "优化"反而更慢
+原因：`cjk_bigram` 在应用启动时注册，外部 SQLite 客户端没有该函数。
 
-- **实测**：DCT 缩放 1.5s 慢于 zune-jpeg O3 全解码 0.37s
-- **修法**：砍依赖。**教训：先在正确编译优化级别下测量，再决定方案**
+处理：
 
-### 6. 打标没结果（v2.12 修复，最重要状态机坑）
+- 外部连接只读取简单表或做人工取证。
+- 清数据、删除、迁移必须通过应用内功能。
 
-- **症状**：按「开始打标」没反应
-- **根因 A**：`ai_start_batch` 对 `done` 状态直接报错 →「仅打标前 N 张」后剩余 pending 永远无法续跑，前端错误只有一行小字
-- **根因 B**：模型返回不可解析内容 → 空 map 被当成功写入 `{}`（mimo-v2.5 经中转站，疑似不支持视觉）
-- **修法**：done/cancelled 可续跑 pending（仅 processing 拒绝）；`parse_tags_strict` 空解析即 Err 走单条失败
-- **排查手法**：直接查 DB 现场（批次状态/processed/建议 tags 值），别猜
+### 2.3 设置看似丢失
 
-### 7. 配置"丢失"假象
+设置表只有一个业务 key：`app_settings`，值是完整 JSON。
 
-- **症状**：`SELECT … WHERE key='settings'` 查不到
-- **真相**：settings 表 key 是 **`app_settings`**，JSON 整体存取
+处理：
 
-### 8. settings_roundtrip 测试断言失败
+- 不按旧字段名查表。
+- 检查 normalize 迁移是否成功。
+- 先备份数据库，再确认是否存在旧配置和新配置同时读取。
 
-- **根因**：AI 配置改多档案结构（profiles[]）后测试还断言旧扁平字段
-- **修法**：迁移 `normalize()` 只读旧字段（skip_serializing），测试改档案结构断言。**教训：结构迁移必同步测试**
+### 2.4 应用无窗口退出或启动日志缺失
 
-### 9. 某格式黑图排查路径（Phase 2 多格式）
+检查：
 
-黑图 = `decode_thumb` 全链路返回 None。按策略链逐级定位（`imaging.rs` 四级链）：
+1. `logs/fatal.log` 是否有 `database_init_failed` 或 panic 摘要。
+2. `logs/app.log.*` 的最后一条启动阶段记录。
+3. 数据目录和 `logs/` 是否可写。
+4. 是否存在旧进程占用数据库或非阻塞 writer 尚未刷盘的边界场景。
 
-1. **确认扩展名在白名单**（`utils/mime.rs`）：不在则入库就被拒，不是黑图而是漏收；avif 故意不放行（无解码器）
-2. **占位层（≤320px）只有内嵌链**：TIFF 遍历 → CR3 ISOBMFF → 标记扫描（jpg 禁用）。内嵌图缺失的 RAW 占位层黑图是**设计如此**（红线：真解码不进占位路径），高清图层会兜底
-3. **高清层黑图**：`image::open` 失败后走 `special_decode`——heic/heif 查 `heic_decode`（128MB 上限/libheif 报错），其余查 `raw_decode`（rawler 不支持的机型/Float RAW/>150MP 上限会拒绝）
-4. **取证**：`cargo test --test perf_probe -- --ignored --nocapture` 跑 `probe_real_files`/`probe_raw_library_walk`，直接看每级耗时与成败
-5. **常见归因**：X-Trans 机型只出灰度预览（binning 不适用）；CR3 占位层未命中时靠高清层 rawler 兜底；HEIC 超 128MB 直接放弃
+启动阶段不要只依赖异步文件日志；致命错误必须有同步落盘证据。若诊断包可用，导出后一并提供
+`diagnostics.json` 和日志文件，但不要手工加入 API Key 或完整请求体。
 
-### 10. RAW EXIF 读不到相机型号（F05）
+## 3. 图片与缩略图
 
-- **根因**：CR3 是 ISOBMFF 容器、RW2 用非标 TIFF 魔数（0x55），kamadak-exif 读不了
-- **修法**：`exif_meta::raw_fallback` 用 rawler 轻量识别（`get_decoder` + `raw_metadata`，只解元数据不解像素）补缺，只填 None 字段不覆盖
+### 3.1 大图加载不出或占位框不动
 
-## 二、前端 / React
+常见根因：
 
-### 11. 右键菜单项全部失效（"你不会只做了 ui 吧"）
+- 解码期间持有数据库锁，其他请求被饿死。
+- RAW/HEIC 解码失败。
+- 占位层错误进入昂贵真解码。
+- 缓存路径不可写。
 
-- **根因**：ContextMenu 点外关闭用**捕获阶段**监听，把菜单项自己的点击也拦了
-- **修法**：捕获回调里 `if (ref.current?.contains(e.target)) return` 排除菜单内部
+处理：
 
-### 12. Alt+滚轮缩放拦不住页面滚动
+1. 查 imaging 和缩略图日志；占位图失败会记录降级并尝试通用占位图。
+2. 确认数据库锁外解码。
+3. 确认占位层只走快速预览。
+4. 高清层再进入 HEIC/RAW 专用解码。
 
-- **根因**：React `onWheel` 是 passive 监听，preventDefault 无效
-- **修法**：原生 `addEventListener('wheel', fn, { passive: false })`
+### 3.2 缩略图极慢
 
-### 13. aiCreateBatch 参数顺序传反
+历史三真凶：
 
-- **症状**：建批失败/模式错乱
-- **修法**：`(ids, mode)` 顺序，tsc 抓获。**教训：invoke 封装函数签名改参数顺序后全仓搜索调用点**
+1. TIFF IFD 偏移按文件头解析，导致内嵌预览找不到。
+2. dev 构建没有为关键依赖启用优化。
+3. 解码无限并发或串行等待错误。
 
-### 14. 缩放锚点漂移
+当前规则：
 
-- **公式**：`imgP = (cursor - center - pan) / scale; pan' = cursor - center - imgP * nextScale`
-- 查看器缩放/平移必须以光标为锚，改这块先用大图验证手感
+- TIFF 偏移相对 TIFF 基准。
+- 关键图像依赖保持 dev O3。
+- 并发有界，数据库锁外执行。
 
-## 三、工具链 / 环境
+### 3.3 cut_jpeg 误杀内嵌图
 
-### 15. `npm : 无法将"npm"项识别为…`
+某些相机预览尾部有填充字节。JPEG 裁剪需要在合理范围内寻找 SOI/EOI，而不是要求文件起始和末尾严格对齐。
 
-- **根因**：便携 Node 不在系统 PATH
-- **修法**：见 DEVELOPMENT.md 第一节；VSCode 终端需重启或配置 profile
+### 3.4 JPG 被误抓成主图
 
-### 16. bash 里 cargo 找不到
+对普通 JPG 做 FFD8 标记扫描可能扫到主图本身。`.jpg` 禁止该兜底，只对 RAW/容器格式使用。
 
-- **修法**：`export PATH="/c/Users/33887/.cargo/bin:$PATH"`（每个新 shell 都要）
+### 3.5 某格式黑图
 
-### 17. python sqlite3 清数据报 `no such function: cjk_bigram`
+排查链：
 
-- **根因**：FTS 触发器依赖应用启动时注册的自定义分词函数，外部连接没有
-- **修法**：**外部连接只能 SELECT**；清数据用应用内删除功能
+1. 扩展名是否在 `mime.rs` 白名单。
+2. 占位层是否有可用内嵌预览。
+3. 高清层是否进入正确专用解码器。
+4. 文件是否超过大小或像素保护上限。
+5. 用 format matrix 和 `perf_probe` 复现。
 
-### 18. CRLF 行尾导致补丁工具匹配失败 / bash heredoc 断裂
+RAW 没有内嵌预览时，占位层黑图可能是设计结果；高清层应走真解码兜底。
 
-- **修法**：复杂补丁写 python .py 文件执行（读文件归一 `\r\n`→`\n` 处理，写回恢复）；禁止 heredoc 传含特殊字符的长文本
+### 3.6 RAW EXIF 缺失
 
-### 19. tauri dev 日志丢失 / 后端没重编译
+CR3、RW2 等容器不一定能被通用 EXIF 库完整识别。实现会使用 RAW 元数据解析作为补充，只填缺失字段，不覆盖已有 EXIF。
 
-- **现象**：/tmp 日志电脑重启后丢失；vite 1420 活着但 exe 是旧的
-- **修法**：确认 cargo watcher 进程在跑；拿不准就重启 `npm run tauri dev`
+### 3.7 HEIC 构建失败
 
-### 20. heif-rs 环境三件套（F02，新机器必做）
+检查：
 
-- **症状**：heif-rs 构建失败（下载拒绝/缺 libclang/LNK2019）
-- **修法**：① `heif-bin/` 预编译库 + `.cargo/config.toml` HEIF_BINARIES_DIR；② winget 装 LLVM（bindgen）；③ `msvc_stl_shim.cpp` 补 STL ABI 符号（Build Tools 升 14.45+ 后删）
-- **教训**：GitHub 直连不通时 gh-proxy.com + curl -C - 分段续传可救
+- `heif-bin/` 是否存在。
+- `.cargo/config.toml` 是否指向预编译库。
+- LLVM/libclang 是否可用。
+- MSVC STL 版本与 shim 是否匹配。
+- 网络下载失败时是否使用了完整、未损坏的预编译包。
 
-### 21. 编辑工具报"save failed"但实际已部分写入
+## 4. 搜索
 
-- **症状**：SearchReplace 报保存失败，重试后文件出现重复段落，编译报 `unexpected closing delimiter`
-- **修法**：写入报错后先 `Read`/`grep` 核实文件真实状态再动手；小文件直接用 Write 整体重写
-- **教训**：工具报错≠没写入，盲目重试是重复内容的根源
+### 4.1 搜索无结果但标签存在
 
-## 四、排查方法论（新 bug 来了怎么做）
+检查：
 
-1. **先取证后动手**：DB 现场（批次/建议/settings 实际值）、日志、网络响应——三类现场先固定
-2. **状态机问题画出来**：把状态流转写在纸上，找"哪个转移被谁挡住"（打标 bug 就是这么破的）
-3. **性能问题先查编译优化级别**，再查算法
-4. **"没反应"类 bug 先找被吞的错误**：前端 catch 后只 set error 小字、后端 Err 被 `?` 静默传递，都是高发区
-5. 修复必须配回归测试（解析类纯函数最好测）
+1. FTS 触发器是否同步。
+2. 普通库条件和超级搜索条件是否混用了两套语义。
+3. 分面 key 是否与 UI 展示名混淆。
+4. 查询是否错误包含回收站。
+5. 特殊字符是否经过 FTS/LIKE 安全处理。
+
+### 4.2 中文“海边”误命中“上海湖边”
+
+原因通常是逐字索引没有加短语约束。中文查询需要短语查询和短查询 LIKE 兜底配合。
+
+### 4.3 超级搜索必须区结果错误
+
+检查 `mustNot` 极性：
+
+- `mustNot` 内只允许正向条件。
+- `ExcludeTag` 和 `QueryExpr::Not` 不允许进入 `mustNot`。
+- 多层 NOT 必须由计划层统一处理。
+
+### 4.4 优先区顺序不生效
+
+检查：
+
+- plan 是否经过统一 `normalizeSearchPlan`。
+- should 是否被截断为 12 条。
+- minimumShouldMatch 是否为 0。
+- 位置权重是否为 2.0/1.0/0.5。
+- 当前 ranking 是否被字段排序掩盖。
+
+验证应使用 relevance，或确保字段排序键值相同。
+
+### 4.5 AI 搜索变红字
+
+三层降级设计下，只有配置错误应真报错。
+
+- 鉴权、连接、超时：检查连接配置。
+- 非 JSON、未知字段、空组：应剔除或降级关键词，不应整次失败。
+- 若没有降级，检查 `is_config_error` 和 sanitize 路径。
+
+## 5. 标签与分面
+
+### 5.1 分面名称改了但历史数据读不到
+
+分面 key 是机器协议，display name 只是展示。不得把展示名当 key。旧中文名称只用于历史迁移映射。
+
+### 5.2 合并或删除标签后计数/FTS不一致
+
+检查事务是否完整覆盖：
+
+- `asset_tags`
+- `tag_ops`
+- `ai_suggestion_items`
+- `tag_aliases`
+- `tags`
+- FTS 触发器
+
+### 5.3 撤销 AI 批次误删手工标签
+
+手工覆盖应清理 `source_batch_id`。撤销只处理属于该批次且来源不是 manual 的关联。
+
+## 6. AI 打标与本地模型
+
+### 6.1 按开始打标没反应
+
+检查：
+
+- 批次是否停留在 processing。
+- 是否重启后遗留，应由启动维护标记 interrupted。
+- 是否没有 pending 项。
+- 前端错误是否被吞成小字。
+
+done/cancelled/interrupted 可以续跑 pending，processing 拒绝重复启动。
+
+### 6.2 模型返回空结果
+
+空解析视为单条失败，不写空标签成功。检查模型是否支持视觉输入、模型名是否正确、中转站是否截断响应。
+
+### 6.3 云端连接失败
+
+检查：
+
+- base URL 是否包含正确 API 路径。
+- API mode 与供应商协议是否匹配。
+- Key、额度和模型权限。
+- 网络代理、超时和证书。
+
+### 6.4 Ollama 未检测到
+
+检查：
+
+- `ollama serve` 是否运行。
+- 默认端口 11434 是否可访问。
+- base URL 的 `/v1` 与原生 `/api` 根地址是否正确区分。
+- 模型是否已 pull。
+
+### 6.5 本地模型推荐错误
+
+显存探测优先使用 NVIDIA 工具。Win32 AdapterRAM 存在 32 位上限问题，不能作为唯一依据。探测不到时必须诚实显示未知，不猜测。
+
+## 7. 删除、导出和恢复
+
+### 7.1 删除文件失败但列表消失
+
+这是严重数据一致性问题。必须检查文件删除是否成功、数据库是否只在成功后更新。失败时保留数据库记录和可重试状态。
+
+### 7.2 move 导出后查看器死链
+
+移动文件成功后必须同步素材路径。检查部分成功、取消、同名冲突和数据库更新顺序。
+
+### 7.3 恢复备份后任务状态异常
+
+恢复前应拒绝运行中的导入、导出和 AI 批次。旧库保留为 `library.db.old`，恢复后重新迁移和自检。
+
+### 7.4 外部工具清数据后触发器报错
+
+触发器依赖应用注册函数。不要绕过应用直接 DELETE/UPDATE。使用应用内删除或重置功能。
+
+### 7.5 导入完成但出现警告
+
+扫描阶段的路径不存在、目录不可读等非致命问题进入 `warnings`，不应计入 `failed` 或伪装成
+重复。先核对扫描路径和权限；真正的单文件哈希、暂存、写库失败仍进入 `errors` 和失败计数。
+
+## 8. 前端与 UI
+
+### 8.1 右键菜单全部失效
+
+点外关闭监听如果捕获阶段拦截了菜单内部点击，会导致菜单项失效。关闭逻辑必须排除菜单自身节点。
+
+### 8.2 Alt+滚轮仍滚动页面
+
+React `onWheel` 可能是 passive，无法 `preventDefault`。需要原生监听并设置 `{ passive: false }`。
+
+### 8.3 缩放锚点漂移
+
+缩放和平移必须以光标位置为锚，修改后使用大图、自定义缩放比例和窗口尺寸变化复测。
+
+### 8.4 设置页或某页面白屏
+
+检查页面边界是否捕获错误、settings normalize 是否失败、组件是否访问不存在字段。错误页必须提供返回素材库或重试路径。
+
+### 8.5 前端错误没有进入日志
+
+检查：
+
+1. `src/utils/logger.ts` 是否仍在模块初始化早期注册全局 error/rejection 监听。
+2. `log_frontend` 是否仍使用原始 Tauri invoke；不要把它改走 `src/api/client.ts`，否则会递归。
+3. 日志级别是否为 `info` 以上；`debug` 回传只有切到相应级别后才更容易保留。
+4. 用 `requestId` 查同一次 IPC 失败，用 `sessionId` + `sequence` 查页面会话前后事件；这两个
+   基础设施字段不应被业务 context 覆盖。
+5. 消息是否被长度限制截断。回传失败是刻意静默的，不能把日志通道当成业务错误通道。
+
+### 8.6 暗色模式下状态不可见
+
+检查是否硬编码颜色。修复应回到 `theme.css` 语义变量，不在组件里增加主题分支。
+
+## 9. 工具链
+
+### 9.1 `npm` 或 `cargo` 找不到
+
+修正当前终端 PATH，不要提交个人机器绝对路径。PowerShell 中分别检查：
+
+```powershell
+node --version
+npm --version
+rustc --version
+cargo --version
+```
+
+### 9.2 Git Bash 下 cargo 链接失败
+
+Windows 上优先在 PowerShell 运行 cargo。若 GNU `link` 抢占 MSVC linker，使用 Developer PowerShell 或修正 PATH。
+
+### 9.3 Vite 端口占用
+
+开发配置要求 1420 端口。找到占用进程或结束旧 `tauri dev`，不要让 Vite 静默换端口，否则 Tauri devUrl 不一致。
+
+### 9.4 后端没有重新编译
+
+确认 cargo watcher 进程存在。不确定时结束旧的 `npm run tauri dev`，然后重新启动。
+
+### 9.5 测试/构建产物污染 Git 状态
+
+确认 `.gitignore` 覆盖 `src-tauri/target*/`、`dist/`、日志和缓存。不要把这些目录加入提交。
+
+## 10. 修改代码后的最低回归
+
+```powershell
+git diff --check
+npm run lint
+npm run typecheck
+npm run test:unit
+
+cd src-tauri
+cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-features
+```
+
+涉及数据、搜索、AI、文件操作或发布时，追加 `pwsh ./scripts/smoke.ps1` 和真机 UAT。

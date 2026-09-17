@@ -1,11 +1,12 @@
-# 超级搜索查询协议 V2（SearchIntentV2 → QueryExpr）
+# 超级搜索 AI 查询协议 V2
 
-> 版本：v2（W6 健壮化冻结）
-> 日期：2026-08-31
-> 依据：`开发执行计划书-定稿-2026-08-31.md` W6 + `super-search-contract-v1.md`（历史协议，V1 已由 V2 取代）
-> 性质：机器协议，不可随意变更；变更必须同步改 schema / TS / Rust / 测试矩阵。
+> 状态：Frozen
+>
+> 更新日期：2026-09-13
+>
+> 机器协议，不可随意变更。变更必须同步 Rust schema、TypeScript 类型和测试矩阵。
 
-本文档定义超级搜索二期协议：SearchIntentV2 结构、JSON Schema enum 收窄、三层降级、部分剔除规则、`facet_has_any` / `facet_missing` 语义。
+本文档定义超级搜索 V2 协议：SearchIntentV2 结构、JSON Schema enum 收窄、三层降级、部分剔除规则、`facet_has_any` / `facet_missing` 语义。
 
 ---
 
@@ -43,7 +44,7 @@ QueryExpr               ← 唯一执行事实源（前端从 expr 构建筛选�
 
 语义：组内 AND、组间 OR；exclusions 全局 NOT；metadata 用规范 key/op/单位。
 
-### 2.1 JSON Schema enum 收窄（W6-1）
+### 2.1 JSON Schema enum 收窄
 
 - `facetHint`：enum = **实时分面 key**（新建分面后自动包含；支持 json_schema 的服务商在服务端拒绝非法 key）。
 - `metadata.key`：enum = METADATA_KEYS 白名单常量。
@@ -52,7 +53,7 @@ QueryExpr               ← 唯一执行事实源（前端从 expr 构建筛选�
 - `assetType`：enum = all/image/video。
 - `sortDir`：enum = asc/desc。
 
-## 3. 三层降级（W6-2，永不红字报错）
+## 3. 三层降级（永不红字报错）
 
 | 层 | 触发 | 结果 |
 |---|---|---|
@@ -62,7 +63,7 @@ QueryExpr               ← 唯一执行事实源（前端从 expr 构建筛选�
 
 **例外**：`is_config_error`（鉴权 / 连不上 / 超时）仍真报错 —— 配置问题必须让用户知道。
 
-### 3.1 部分剔除规则（W6-3，原则「能救一条算一条」）
+### 3.1 部分剔除规则（原则「能救一条算一条」）
 
 | 输入 | 处理 |
 |---|---|
@@ -77,7 +78,7 @@ QueryExpr               ← 唯一执行事实源（前端从 expr 构建筛选�
 
 ## 4. 执行对象补充（facet_has_any / facet_missing）
 
-除精确标签筛选外，V2 支持两类「缺 / 有」条件（配合 W5g 精准补漏）：
+除精确标签筛选外，V2 支持两类「缺 / 有」条件：
 
 - `facet_has_any(facetKey)`：该分面下**至少有一个**标签的素材（如「有主体标签的图片」）。
 - `facet_missing(facetKey)`：该分面下**没有任何**标签的素材（如「没有场景标签的图片」）。
@@ -88,7 +89,7 @@ QueryExpr               ← 唯一执行事实源（前端从 expr 构建筛选�
 
 1. `expr` 是唯一执行事实源；前端不得从扁平 query 反推筛选树。
 2. AI 结果经本地 `guard_intent` 确定性守卫（OR 合并 / assetType 纠偏 / concept 清洗 / confidence 钳制）后才执行。
-3. 解析状态三态（W6-5）：`full`（完全理解）/ `partial`（部分理解 + warning）/ `keyword`（按关键词搜索），前端据此渲染黄字而非红字。
+3. 解析状态三态：`full`（完全理解）/ `partial`（部分理解 + warning）/ `keyword`（按关键词搜索），前端据此渲染黄字而非红字。
 4. metadata 条件校验以 `search_query::compile_metadata` 为唯一判定（sanitize 与执行层同一校验，绝不漂移）。
 
 ## 6. 相关文件

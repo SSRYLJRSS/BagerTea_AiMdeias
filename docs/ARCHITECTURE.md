@@ -1,151 +1,357 @@
-# 茶包素材 V2 — 架构现状手册
+# 架构说明
 
-> 版本 v1.0 ｜ 2026-08-12 ｜ 对应代码：PRD v2.12 实现态
-> 定位：**代码实际结构的权威描述**，随代码同步更新。
+> 更新日期：2026-09-16
+>
+> 本文档描述代码当前实际结构和不可违反的设计约束。数据库、搜索、分面和 AI 协议变化时，必须同步更新本文及相关契约。
 
----
+## 1. 总览
 
-## 一、总览
-
-```
-┌──────────────────────────── 前端（React 19 + Zustand + Tailwind v4）────────────────────────────┐
-│  pages（5 页） ──► stores（8 个） ──► api/（invoke 封装） ──► types（与 Rust serde 对齐）        │
-│  components/（common · layout · library · import · ai · dialogs）                                │
-└──────────────────────────────────────┬─────────────────────────────────────────────────────────┘
-                                       │ Tauri invoke / 事件（ai://progress 等）
-┌──────────────────────────────────────┴─────────────────────────────────────────────────────────┐
-│  Rust 后端（src-tauri）                                                                          │
-│  commands/（薄壳：参数校验 + 锁 + 事件）──► services/（业务逻辑）──► db/（SQL + 迁移）            │
-│  state.rs（AppState：DB 连接 + 取消注册表）  error.rs（统一 AppError）  utils/（纯函数）          │
-└────────────────────────────────────────────────────────────────────────────────────────────────┘
+```text
+React 19 + TypeScript
+pages -> stores -> api -> Tauri invoke/events
+                              |
+                              v
+Rust commands -> services -> db
+                     |
+                     +-> filesystem / image / video / HTTP / Ollama
 ```
 
-**分层铁律**：commands 是薄壳（不写业务），services 持业务逻辑（可单测），db 只管 SQL。任何"一个函数全写一个文件"的写法都是违规。
+目标不是“薄应用”，而是让每一层只承担一种责任：
 
-## 二、后端模块职责（src-tauri/src）
+- `pages/` 负责页面编排和组合。
+- `stores/` 负责跨组件状态和动作。
+- `api/` 是所有 Tauri 调用的唯一前端入口。
+- `commands/` 负责 IPC 参数、锁、事件和异步边界。
+- `services/` 负责可测试的业务逻辑。
+- `db/` 负责 SQL、事务和迁移。
 
-### 2.1 services/（业务核心）
+## 2. 前端结构
 
-| 模块 | 职责 | 关键机制 |
+### 2.1 页面
+
+| 页面 | 文件 | 职责 |
 |---|---|---|
-| `imaging.rs` | **全局唯一图像解码引擎**（老板点名"全局公用一个"） | 内嵌策略链 + 4 许可信号量 + 宽容裁剪，详见第四节 |
-| `preview.rs` | 待入库预览（瘦壳） | 缓存键 + 委托 imaging |
-| `thumbnail.rs` | 已入库双层缩略图（瘦壳） | 占位图/高清图 + LRU 清理（B05）；`get_or_create_hd` 短持锁（解码放锁外） |
-| `importer.rs` | 入库管线 | 复制入分库 → 改名模板 → EXIF 提取 → 占位图 → 落库 |
-| `exif_meta.rs` | EXIF 提取 | kamadak-exif：camera/lens/iso/aperture/shutter/focal/taken_at；`parse_exif_datetime` 本地时区 |
-| `ai_cloud.rs` | 云端/本地统一打标管线 | OpenAI 兼容 + Anthropic 双协议 + `parse_tags_strict`（v2.12）+ Ollama 退化输出自愈（卸载重载）+ 进度回调 + 取消 |
-| `export_local.rs` | 本地导出 | copy/move + 同名唯一化（B06b）+ R-26 子目录（by_tag/by_date）+ CSV 清单（公式注入转义）+ 任务持久化 + 完成软提示 |
-| `video.rs` | 视频封面帧/关键帧提取 | 内嵌封面优先 + 抽帧打标（P3-02） |
-| `dedup.rs` | 哈希去重（v4 索引 + 入库去重 + 去重扫描） | M3-02 去重对话框 |
-| `heic_decode.rs` / `raw_decode.rs` | HEIC/RAW 解码兜底层 | libheif 静态链 + darktable rawler |
-| `ollama_setup.rs` / `ollama_installer.rs` | 本地模型一键配置/安装（A2/A3） | ping/probe/pull + 多源降级 + 断点续传 + 自动安装 |
+| 入库 | `src/pages/ImportPage.tsx` | 待入库清单、改名、托管选项、导入任务 |
+| 素材库 | `src/pages/LibraryPage.tsx` | 网格、筛选、批量操作、对话框和查看器入口 |
+| 超级搜索 | `src/pages/SuperSearchPage.tsx` | 三区条件、AI 搜索、警告、诊断和结果网格 |
+| 打标 | `src/pages/AiTaggingPage.tsx` | 批次、主图/胶片条、建议确认、标签编辑 |
+| 设置 | `src/pages/SettingsPage.tsx` | AI 连接、本地模型、入库、外观、数据与恢复 |
 
-### 2.2 db/（数据层）
+全局导航由 `src/App.tsx` 和 `src/components/layout/BottomBar.tsx` 管理。查看器打开时隐藏底栏。
+
+### 2.2 状态层
+
+`src/stores/` 当前包含：
+
+- `libraryStore`：素材列表、筛选、分页、查看器上下文和刷新。
+- `selectionStore`：选择集合、范围选择、截断信息。
+- `tagStore`：标签树、分面和治理状态。
+- `aiStore`：批次、建议、进度和确认状态。
+- `settingsStore`：设置加载、保存、主题和错误状态。
+- `taskStore`：导入、导出、AI 等全局任务进度。
+- `superSearchStore`：SearchPlanV3、AI 合并、持久化和诊断。
+- `metadataStore`：元数据筛选项和派生值。
+- `numericDomainStore`：数值分面范围和类型信息。
+
+跨页核心状态不得放在页面局部 state 中，也不得复制到第二个 store。
+
+### 2.3 API 层
+
+`src/api/` 按域拆分：
+
+- `client.ts`：统一 invoke 和错误封装。
+- `assets.ts` / `thumbnail.ts` / `preview.ts`
+- `import.ts` / `export.ts` / `video.ts`
+- `ai.ts` / `connections.ts` / `ollama.ts`
+- `tags.ts` / `settings.ts` / `superSearch.ts`
+
+约束：
+
+1. 页面和组件不直接 import `invoke`。
+2. Rust serde 字段变化必须同步 `src/types/`。
+3. 事件监听集中在 hooks/api 封装，组件负责卸载和清理。
+4. `src/utils/logger.ts` 是唯一允许直接调用 `invoke` 的例外：日志必须使用原始
+   `@tauri-apps/api/core`，不能经过 `src/api/client.ts`，否则 IPC 失败会递归触发日志。
+   它只承载前端日志回传，不承载业务命令。
+
+### 2.4 主要组件域
+
+| 目录 | 内容 |
+|---|---|
+| `components/common/` | Modal、ContextMenu、Button、ModelCombobox、错误边界、进度条 |
+| `components/layout/` | TitleBar、BottomBar |
+| `components/library/` | 网格、卡片、侧栏、标签树、元数据、颜色条、查看器入口 |
+| `components/viewer/` | 全屏查看器、媒体视口、胶片条、信息栏、标签栏 |
+| `components/supersearch/` | AI 搜索、QueryBuilder、条件 chips |
+| `components/ai/` | Filmstrip、Workbench、进度和分面标签输入 |
+| `components/settings/` | AI 连接、分面、治理、本地模型和服务管理 |
+| `components/media/` | 视频播放器和播放控件 |
+
+复杂组件应按职责拆分。拆分必须先移动、后改行为，不与功能修复混在同一批。
+
+## 3. Rust 后端结构
+
+### 3.1 commands 层
+
+`src-tauri/src/commands/` 按域组织：
+
+- `assets_cmd`、`thumbnail_cmd`、`media_cmd`
+- `import_cmd`、`export_cmd`
+- `tags_cmd`、`super_search_cmd`
+- `ai_cmd`、`ai_connections_cmd`
+- `ollama_cmd`、`settings_cmd`
+- `observability_cmd`：前端日志回传和脱敏诊断包导出
+
+commands 只允许：
+
+- 解析和校验 IPC 参数。
+- 获取 `AppState`、短锁读状态。
+- 把耗时任务放到 `spawn_blocking` 或后台线程。
+- 发 Tauri 事件。
+- 调用 services/db 并映射错误。
+
+commands 不允许：
+
+- 直接拼业务 SQL。
+- 在数据库锁内执行网络、解码或大文件 IO。
+- 承载可独立测试的复杂业务逻辑。
+
+### 3.2 services 层
 
 | 模块 | 职责 |
 |---|---|
-| `migrations.rs` | 版本化迁移（v2 EXIF 列 / v3 FTS 重建 / v4 去重索引 / v5 排序+回收站+tag_ops / v6 last_error / v7 导出任务 warning / **v9 查询索引 / v10 旧 tagCategories→facet configs / v11 独立 color 分面补齐**） |
-| `assets.rs` | 素材 CRUD + `set_exif`；Asset 含 EXIF 字段；`AssetFilter{metadata_filters, sort_by/sort_dir, …}` + `validate()` 参数校验 |
-| `search.rs` | FTS5 查询：库内谓词 `SearchPredicate{sql, params}`（不返回大 ID 列表）；`build_search_predicate` 编译 FTS/LIKE 分支 |
-| `search_query.rs` | 元数据白名单编译：`MetadataFilter{key, op, value, values, min, max}` → 参数化 SQL；key×op 校验、NULL 排除、日期左闭右开、resolution/aspect_ratio 派生表达式 |
-| `tags.rs` | 父子层级标签树；`find_or_create_root/child`；`search_candidates`（规范名/别名/候选） |
-| `tag_facets.rs` | 稳定分面（key 是机器协议）；`FacetPromptContext` + `build_prompt_context`（合并 AI facet 配置与 DB tag_facets） |
-| `asset_tags.rs` | 素材-标签关联 |
-| `tag_ops.rs` | 打标流水（R-25）：add/remove + 批次撤销 |
-| `ai.rs` | 批次/建议表；`CategorizedTags = BTreeMap<String, Vec<String>>`；`parse_tags_json` 兼容旧扁平数组→「未分类」 |
-| `settings.rs` | `ApiProfile{id,name,api_mode,kind,base_url,api_key,model}` + `profiles[]/active_profile` + `AiFacetConfig{facet_key,hint,enabled_for_ai,display_name,visible_in_workbench}`（tag_categories 已弃用仅作迁移输入；`visible_in_workbench` 独立于 `enabled_for_ai` 控制工作台显隐，缺省前端按 `WORKBENCH_DEFAULT_KEYS` 白名单决定）；`normalize()` 旧扁平字段迁移（skip_serializing 只读，拒绝双数据源） |
-| `export.rs` | 导出任务持久化（copy/move/CSV 统一任务模型，含 warning 软提示列） |
-| `cloud.rs` | 网盘账号（M2 预留，前端置灰） |
+| `imaging.rs` | 全局图片解码入口、策略链、尺寸探测、并发许可 |
+| `thumbnail.rs` / `preview.rs` | 双层缩略图和待入库预览瘦壳 |
+| `importer.rs` | 扫描、哈希、改名、托管、元数据和落库管线 |
+| `exif_meta.rs` | EXIF 提取与 RAW 元数据兜底 |
+| `video.rs` / `video_proxy.rs` | 视频元数据、抽帧、兼容代理 |
+| `export_local.rs` | 复制/移动、目录布局、CSV 和任务状态 |
+| `dedup.rs` / `perceptual.rs` | 文件哈希去重、dHash、相似图和同源关系 |
+| `palette.rs` | 主色提取、色板状态和回填 |
+| `kinship.rs` | 同源/连拍关系判定 |
+| `media_refill.rs` | 存量媒体元数据、GPS、尺寸和色板回填 |
+| `ai_cloud.rs` | OpenAI 兼容/Anthropic 请求、解析、批次执行、取消和重试 |
+| `super_search_ai.rs` | SearchIntentV2、Schema、降级、守卫和解析 |
+| `ollama_setup.rs` / `ollama_installer.rs` / `ollama_runtime.rs` | 检测、推荐、拉取、安装和服务生命周期 |
+| `credentials.rs` | 系统凭据读写 |
+| `heic_decode.rs` / `raw_decode.rs` | imaging 的专用解码下游 |
 
-**settings 表只有一个 key：`app_settings`**（JSON 整体存取）。排查配置问题时别查 `key='settings'`。
+`error.rs` 是命令错误的统一序列化边界：`AppError` 返回 `{ code, message, cause? }`。
+`code` 使用稳定的机器码，业务校验优先使用 `invalid_arg` / `not_found` / `conflict` /
+`cancelled` / `timeout` / `file_locked` / `ai_rate_limited` / `unauthorized` /
+`unsupported` / `internal`；`cause` 保留 thiserror 的底层 source，前端 `AppError`
+会同时保留 `code`、`message` 和 `cause`，用于差异化提示和排障。
 
-### 2.3 commands/（Tauri 命令薄壳）
+根模块 `src-tauri/src/observability.rs` 负责统一日志初始化和安全边界：
 
-ai_cmd / assets_cmd / import_cmd / thumbnail_cmd / tags_cmd / settings_cmd / export_cmd / ollama_cmd / super_search_cmd。
-网络请求一律 `spawn_blocking` 不堵主线程；进度走 `app.emit("ai://progress" / "export://progress" /
-"import://progress" / "ollama://pull-progress", …)`。超级搜索 `ai_parse_search_query` 同样短锁读配置→放锁→spawn_blocking 网络→短锁解析 tagId。
+- 同时输出到 stdout 和 `data_dir/logs/app.log.*`，文件 writer 使用非阻塞队列；启动后清理
+  过期日志并把 `app.log*` 总量压到 50 MB 以内，始终保留最新文件。
+- 安装 panic hook；同步写入 `fatal.log`，保证启动期和异步队列未刷盘时仍有证据。
+- 提供 `info` / `debug` / `trace` 运行时级别切换，设置值落库后热生效。
+- 对前端回传的 message/context 做长度限制和高置信度凭据脱敏。
+- 导出诊断包时只读取摘要和日志文件，不读取素材原文件、提示词或完整请求体；日志总量上限
+  20 MB、单文件上限 4 MB，超限时保留最新文件的尾部并在摘要中标记 `truncatedLogs`。
 
-## 三、前端结构（src/）
+### 3.3 db 层
 
-| 层 | 内容 |
+| 模块 | 职责 |
 |---|---|
-| `pages/` | ImportPage（编排层瘦身）/ LibraryPage / AiTaggingPage / SettingsPage / SuperSearchPage |
-| `stores/` | 8 个：libraryStore / selectionStore / tagStore / aiStore / settingsStore / taskStore（全局任务条，M3-04）/ superSearchStore（独立 query，防污染普通素材库）/ metadataStore（文件属性分面） |
-| `api/` | invoke 封装 + 模块级缓存（preview.ts）；`client.ts` 统一错误；superSearch.ts 把 ResolvedSearchQuery 转 AssetFilter |
-| `types/` | 与 Rust 结构体 serde 对齐（改 Rust 字段必须同步改这里） |
+| `migrations.rs` | 版本迁移、幂等修复、schema 初始化 |
+| `schema_features.rs` | 可选约束能力登记和实际结构自检 |
+| `assets.rs` | 素材 CRUD、筛选、排序、分页 |
+| `search.rs` | FTS5/LIKE 原子谓词 |
+| `search_query.rs` | 元数据字段和运算符白名单编译 |
+| `query_expr.rs` | QueryExpr 布尔树编译 |
+| `search_plan.rs` | SearchPlanV3 校验、编译、评分和诊断 |
+| `tags.rs` / `tag_facets.rs` / `facet_numbers.rs` | 层级标签、分面和数值分面 |
+| `asset_tags.rs` / `tag_ops.rs` | 标签关联和撤销流水 |
+| `ai.rs` / `ai_connections.rs` | AI 批次、建议和连接绑定 |
+| `settings.rs` | 设置 JSON、normalize 和兼容迁移 |
+| `export.rs` / `dedup.rs` / `backup.rs` / `video_proxy.rs` | 任务和持久化模型 |
 
-**关键组件**：
+### 3.4 AppState
 
-- 素材库：`AssetGrid`（虚拟滚动 + 单击选中/再击取消 + 右键菜单）→ `GridToolbar`（搜索+操作条+计数）→ `SideBar`（类型区+标签区）→ `ViewerPage`（全屏查看器）
-- 通用：`ContextMenu`（右键菜单，**捕获关闭必须排除菜单内部**）、`ModelSelect`（模型自动拉取+手输兜底）
-- 入库：`RenameBuilder`（改名按钮构造器：点选变色排序、序号位数手输）+ `PendingList`（双视图，固定 36px 头部，列表模式纯文字）
-- 打标：`Filmstrip`（胶片条）+ `Workbench`（工作台：悬浮导航条+两列分类+max 约束+恢复按钮）
+`src-tauri/src/state.rs` 统一持有：
 
-## 四、关键机制（改代码前必读）
+- SQLite 连接。
+- 取消注册表。
+- 缩略图/媒体相关共享状态。
+- Ollama runtime 状态。
+- schema capability 缓存。
 
-### 4.1 imaging 全局图像引擎（性能命脉）
+服务层尽量接收纯参数或 `Connection`，避免与 `AppHandle` 耦合；事件发送留在 commands。
 
+## 4. 数据库与迁移
+
+### 4.1 版本模型
+
+- `PRAGMA user_version` 当前推进到 V22。
+- V23 色板关系表和 V24 数值分面采用无条件幂等修复，不推进 `user_version`，存量库每次启动可自愈补齐。
+- 已发布迁移禁止修改，只能追加新迁移或幂等修复。
+- 新列只追加到表尾，读取使用列名映射，禁止依赖物理位置。
+
+### 4.2 关键数据原则
+
+- 设置表只有一个业务 key：`app_settings`，内容为完整 JSON。
+- `tag_facets` 是分面唯一事实源，旧 JSON 配置只作为历史迁移输入。
+- `tag_terms` 与 `tag_aliases` 的唯一约束由 `schema_features` 控制，禁止双写。
+- 回收站通过 `assets.deleted_at` 软删实现。
+- 标签操作流水用于批次撤销；手工覆盖应清理批次来源，避免误撤销。
+- 外部工具直接改库前必须了解 FTS 触发器和自定义 `cjk_bigram` 依赖。普通 SQLite 客户端只适合 SELECT。
+
+### 4.3 备份与恢复
+
+- 备份使用 SQLite `VACUUM INTO` 生成单文件快照。
+- 恢复前必须校验快照，并保留旧库为 `library.db.old`。
+- 运行中的导入、导出或打标任务存在时拒绝恢复。
+- 恢复后重新执行迁移和启动自检。
+
+## 5. 关键机制
+
+### 5.1 图像与缩略图
+
+所有通用图片解码经 `services/imaging.rs`：
+
+1. 读取尺寸或内嵌预览。
+2. 尝试 TIFF/CR3 等容器预览。
+3. 必要时进入 `heic_decode` 或 `raw_decode`。
+4. 使用全局许可限制并发。
+
+占位层优先快速预览，禁止对 RAW 做昂贵全解码。高清层按需生成并缓存。dev 和 release 的图像依赖必须保持合理优化配置，新增图像依赖要核对 `Cargo.toml`。
+
+### 5.2 普通搜索
+
+普通素材库查询由 `AssetFilter` 表达：
+
+1. `search.rs` 生成 FTS5/LIKE 原子谓词。
+2. `search_query.rs` 编译元数据条件。
+3. `assets.rs` 组合筛选、排序和分页。
+
+FTS5 使用独立内容表和触发器同步，自注册 `cjk_bigram` 处理中文。查询必须参数化，不能把所有命中 ID 拉回 Rust 再拼长 IN。
+
+### 5.3 超级搜索
+
+超级搜索的机器协议由 `SearchPlanV3` 统一：
+
+- `filter`：必须满足。
+- `should`：软排序，数组顺序就是优先级。
+- `mustNot`：只存正向条件，由计划层统一取反。
+- `ranking`：字段排序或 relevance。
+
+列表、总数、全选 ID 和诊断必须走同一计划编译器。详情见 [contracts/search-plan-v3.md](contracts/search-plan-v3.md)。
+
+AI 解析先形成 `SearchIntentV2`，再由后端转为受限查询结构。AI 不生成 SQL、tagId、分页或物理执行计划。详情见 [contracts/super-search-ai-v2.md](contracts/super-search-ai-v2.md)。
+
+- 标签词典在每次 AI 搜索请求时从活动标签和可搜索别名实时读取，并附带父类路径；人工确认后的新词无需重启即可被后续搜索识别。
+- 精确规范名/别名直接解析为标签；无法可靠映射但置信度达到阈值时降级为内容搜索，低置信度概念给出未采用 warning。
+
+### 5.4 标签与分面
+
+- 标签父子关系使用递归逻辑和安全检查，禁止环。
+- 分面 key 是机器协议，显示名只用于 UI 和提示词。
+- `input_mode` 决定分面是否进入 AI 提示词。
+- 新库、重置标签和空标签恢复库会播种 `subject` / `scene` / `people` 的默认层级；父节点用于浏览和宽泛筛选，AI 输出叶子。
+- 核心分面的 AI 新词经人工确认后落到该分面「其他」父类；普通和自建分面保持原有创建语义。
+- 手工覆盖标签时清理批次来源，保证撤销安全。
+- 删除分面按契约顺序级联清理标签、关联、建议和流水。
+
+详情见 [contracts/facets-v2.md](contracts/facets-v2.md)。
+
+### 5.5 AI 打标
+
+批次状态：
+
+```text
+pending -> processing -> done
+                  |
+                  +-> cancelled
+                  +-> interrupted（重启后修复）
 ```
-decode_thumb(path, target_px)
-  └─ 策略链：① 自写 TIFF 遍历取内嵌预览（locate_tiff_base：JPEG 容器 APP1 定位，
-     IFD 偏移相对 TIFF 基准而非文件头；RW2 magic 0x55 / 标准 0x2A；0x0201/0x0202
-     + Panasonic 0x2E UNDEF count 即长度）
-     ② FFD8 标记扫描兜底（.jpg 禁用——防误抓 7.5MB 主图）
-     ③ 全图解码兜底
-  └─ cut_jpeg 宽容裁剪：前 64 字节找 SOI、末尾 rfind EOI（某些相机有 FF 填充字节）
-  └─ 并发控制：4 许可信号量（Mutex<usize> + Condvar，RAII guard）
-```
 
-配套：`Cargo.toml` 对 image/zune-jpeg/png/kamadak-exif/rayon 强制 `[profile.dev.package.*] opt-level=3`（debug 全解码 12.7s→0.37s）。**新增图像依赖必须同步加 O3**。
+规则：
 
-### 4.2 打标状态机（v2.12 修订）
+- done/cancelled/interrupted 可续跑剩余 pending。
+- processing 不允许重复启动。
+- 单条失败只标记该项，不阻塞整批。
+- 空解析视为失败，不写成空标签成功。
+- 视觉输出使用 V2 结构：`description`、`peoplePresence`、`tags`、`numbers`；不再解析旧字符串标签和旧顶层分面协议。
+- 人物在 `subject` 中统一写「人」；人数档位、性别、年龄段、穿着和动作只进入 `people`，混合人群按图片级原子属性多值输出。
+- `subject` / `scene` / `people` 默认上限分别为 3 / 3 / 8；场景只记录空间、环境和地点，不接收树木、水面、楼梯等主体物。
+- `confidenceMinSuggest` 保持 0.30；核心分面新词不硬拒绝，但确认时统一归入「其他」，便于后续治理。
+- 请求层优先使用结构化输出：本地 Ollama 原生 JSON Schema、OpenAI 兼容 `json_schema`、Anthropic tool use；不可用时按批次缓存并降级为 `json_object` 或纯文本。
+- 无效结构、必需分面缺失、描述过短或人物判断矛盾时最多修复一次；网络、鉴权和额度错误不触发修复。
+- 主体为空且描述非空时同样最多修复一次；修复后仍为空则保留空值并显示为「未识别」，不生成占位标签。
+- 低于 `confidenceMinSuggest` 的标签直接拦截，其余建议全部保持 pending，确认后才写正式标签。
+- 续跑以是否已有分析结果为判断依据，不把低置信度全被拦截或纯描述结果误判为未处理。
+- 批量确认按页提交并在页间释放数据库锁，避免整批建议形成长时间单一写事务。
+- 视频多帧结果按证据合并，保留合并标签的置信度；失败帧记录 warning，单帧噪声不直接进入建议。
+- 打标工作台不区分 AI/手动模式；批次创建后可立即手工填写，也可启动 AI 生成建议。
+- 批次创建和执行都以 `ai_usage_bindings.tagging` 当前绑定的连接为准；允许建批后切换服务，开始/续跑时按新连接执行，不回退旧 `settings.ai` 激活档案。
 
-```
-批次：pending ──► processing ──► done
-                    │           ▲
-                    └──► cancelled ─┘  ← done/cancelled 均可再次启动，续跑剩余 pending（仅 processing 拒绝）
-建议：pending ──► confirmed（确认写入标签树）
-        │  └──► rejected（可 ai_restore_suggestion 恢复，防误触）
-        └── 单条失败（含空解析）自动置 rejected + tracing::warn，不阻塞批次
-```
+### 5.6 日志、前端异常与诊断
 
-- 前端流程：素材库选好 → `createBatch`（只建批不调 AI；manual 建完即 done）→ 打标页展示全部图片 → 老板手动点「开始打标」→ `startBatch(limit?)`（打标全部 / 仅前 N 张）
-- AI 配置多档案：`profiles[]` + `active_profile` 自由切换（多中转站场景）
+- 后端业务代码只记录结构化事实，不在模块内自行创建文件 appender、过滤器或第二套日志器。
+- AI 打标批次日志使用 `operation = "ai_tagging"`，并带 `batch_id`、`asset_id`、`stage`、
+  `error_code` 与可确认的 `http_status`；不记录完整响应体，避免把模型原文或凭据带入日志。
+- 前端统一通过 `src/utils/logger.ts` 记录 `debug` / `info` / `warn` / `error`；生产 WebView
+  控制台通常不可见，异常通过 `log_frontend` 回传 Rust。
+- 每条前端日志由 logger 写入不可被业务上下文覆盖的 `sessionId` 和递增 `sequence`；每次
+  `src/api/client.ts` invoke 生成唯一 `requestId`，失败日志同时带 `command`、`durationMs`
+  和 `cause`，用于把一次 IPC 失败与前后端上下文关联起来。
+- 全局捕获 `window.error` 和 `unhandledrejection`。回传失败不得反向制造业务失败。
+- 日志可包含路径、命令名、任务 ID、阶段和错误摘要；不得记录完整 API Key、Authorization、
+  用户提示词、完整请求体或素材内容。
+- 日志按天滚动，保留 30 个文件，并在启动时清理过期文件、把总量控制在 50 MB 内。
+  `fatal.log` 是启动失败和 panic 的同步兜底证据。
+- 诊断包包含 `diagnostics.json`、`logs/app.log*`、`fatal.log` 和存在的 `panic.log`；摘要仅含
+  版本、系统、schema、数量、日志级别和最近 AI 批次状态；日志收集上限为总量 20 MB、
+  单文件 4 MB，超限尾部截断并在摘要中记录。数据库锁只在读取摘要时短暂持有。
 
-### 4.3 标签体系
+### 5.7 删除、导出和恢复
 
-- **EXIF 自身标签**：入库自动提取，只读展示，打标界面不显示、不参与 AI 打标
-- **AI 分类标签**：`CategorizedTags`（分类名→标签数组）；分类即父标签复用标签树（零新表）；分面上限读 `tag_facets.max_items`（V20 合表后单一事实源，`TagCategory.max` 已随 JSON 侧废除）写入提示词"可多选 1-N 个"；设置页可自定义分类与上限
+- 软删：保留文件，写入 `deleted_at`。
+- 彻底删除：删除文件成功后才移除或更新数据库记录。
+- 设置页“原始素材文件”重置复用彻底删除流程，覆盖在库与回收站；删除失败的文件保留素材记录并回报失败数量。
+- move 导出：文件移动成功后同步素材路径。
+- 所有批处理都要区分成功、失败、重复和取消。
+- 失败必须保留可恢复信息，不允许 UI 假成功。
 
-### 4.4 中文搜索与超级搜索
+## 6. 状态流
 
-**中文搜索**：FTS5 `fts_content` 独立表 + 触发器同步 + 自注册 `cjk_bigram` 分词（逐字切分）+ 短语查询 + ≤2 字 LIKE 兜底。**P1A 改造**：不再把全部命中 ID 拉回 Rust 拼长 IN 列表，`search.rs::build_search_predicate` 编译为 `SearchPredicate{sql, params}` 谓词（FTS 子查询 / LIKE EXISTS / 并集 OR），在数据库内与其他条件组合。
-
-**超级搜索**（一期）：两层查询对象——AI 输出 `SearchIntent`（文字/字段/op，无 id/SQL/分页），后端解析为 `ResolvedSearchQuery`（已解析 tagId + 合法字段）。元数据筛选走 `search_query.rs` 白名单编译（key×op 双白名单、全部参数绑定、NULL 排除、日期左闭右开、resolution=width*height、aspect_ratio=width/height）。`tag_facets.key` 是唯一机器协议，`selection_mode/max_items` 以数据库为准，设置不再存第二份。查询语义：同分面默认 OR、分面间 AND、父标签默认含后代、排除默认含后代、默认不查回收站、排序尾缀 `a.id DESC` 稳定分页。AI 搜索零数据库写入。**注意**：外部工具（python sqlite3）连接此库只能 SELECT，DELETE/UPDATE 会因缺 `cjk_bigram` 函数报错——清数据必须用应用内功能。
-
-### 4.5 UI 规范（全局约束）
-
-- 黑白灰高级感；主 CTA（开始打标/确认写入/全部确认）黑色实心，其余幽灵文字按钮
-- 苹果式简约动效；背景不透明（查看器等效新界面）
-- CSS 变量主题（`--color-danger` 等），深色模式/定制主题走变量不换结构
-
-## 五、数据流速查
-
-| 链路 | 路径 |
+| 链路 | 流程 |
 |---|---|
-| 入库 | ImportPage（本地 state）→ import_cmd → importer（复制/改名/EXIF/占位图）→ assets 落库 |
-| 缩略图 | Thumbnail.tsx → thumbnail_cmd → thumbnail.rs → imaging.rs → 缓存目录 |
-| AI 打标 | LibraryPage 选图 → aiStore.createBatch → ai_cmd → ai.create_batch（pending 占位）→ AiTaggingPage → startBatch → run_cloud_batch（逐条 request_tags→set_suggestion_tags，失败置 rejected）→ emit 进度 → Workbench 确认 → ai_confirm_suggestion（单条确认写标签；批量套用走 apply_tags） |
-| 本地模型 | LocalModelGroup → ollama_cmd → ollama_setup/ollama_installer（检测/推荐/拉取/一键安装） |
-| 搜索 | SearchInput（防抖）→ assets_cmd.list_assets → search.rs（FTS5 三策略） |
-| 超级搜索 | BottomBar 双击素材库 → SuperSearchPage → superSearchStore → assets.list（库内谓词） |
-| AI 超级搜索 | SuperSearchPage AiSearchBar → superSearchStore.applyAiSearch → ai_parse_search_query → super_search_ai（三级降级）→ resolve_query → superSearchStore 回填芯片并刷新 |
-| 配置 | SettingsPage → settingsStore → settings_cmd → settings.rs（normalize 迁移） |
+| 入库 | ImportPage -> import API -> command -> importer -> db/预览 -> 事件 -> taskStore |
+| 缩略图 | Thumbnail -> api -> command -> thumbnail -> imaging -> 缓存 |
+| 普通搜索 | LibraryPage -> libraryStore -> assets API -> AssetFilter -> db |
+| 超级搜索 | SuperSearchPage -> superSearchStore -> SearchPlanV3 -> command -> db |
+| AI 搜索 | AiSearchBar -> ai_parse_search_query -> SearchIntentV2 -> QueryExpr/SearchPlan |
+| AI 打标 | 选图 -> 建批 -> 执行 -> 进度事件 -> 建议确认 -> 标签/FTS |
+| 本地模型 | SettingsPage -> ollama API -> command -> installer/runtime/setup |
+| 恢复 | SettingsPage -> backup API -> command -> 校验/替换/迁移/重启 |
+| 分类重置 | SettingsPage -> settings API -> command ->（可选）原文件逐项删除 -> DB 事务/缓存清理 |
+| 日志回传 | 前端 logger -> raw invoke -> observability -> 文件日志 |
+| 诊断包 | SettingsPage -> exportDiagnostics -> command -> zip 摘要/日志文件 |
 
-## 六、已知设计约束（不要违反）
+## 7. 设计约束
 
-1. 图像解码**只允许**走 imaging.rs（preview/thumbnail 是瘦壳，禁止另起解码逻辑）
-2. DB 写操作必须短暂持锁；耗时操作（解码/网络）放锁外
-3. 拒绝/删除不做物理删除，翻转状态（防误触）；物理删除仅 R-31 双策略弹窗确认后
-4. 分类上限 500 张/批（batch_limit）；prompt 里分类 max 约束必须与实际 UI 一致
-5. 旧字段迁移用 `normalize()` 只读模式，禁止新旧双数据源并行写
+1. 前端不直连 invoke，commands 不写业务和业务 SQL。
+2. 图片解码只有一个统一入口，专用解码器不能成为平行主链。
+3. 数据库锁内不执行阻塞任务。
+4. 所有输入路径必须校验，所有 SQL 必须绑定参数。
+5. 所有破坏性操作都必须明确结果，禁止静默覆盖和假删除。
+6. 已发布迁移不回改，schema 变化必须有恢复路径。
+7. 搜索计划、分面 key 和 AI 意图是机器协议，改协议必须同步 Rust、TypeScript 和测试。
+8. UI 只使用语义主题变量，状态不能只靠颜色表达。
+9. 性能路径不引入第二个缓存或第二个事实源，除非契约明确。
+10. 文档只保留当前事实，过程历史交给 Git。
+11. 日志只能在统一可观测性边界内落盘；前端日志例外使用 raw invoke，且不得传递敏感原文。
+
+## 8. 分发与许可
+
+项目使用 MIT 许可证，但以下依赖需要对外分发前复核：
+
+- `rawler` 及其 LGPL/GPL 许可条件。
+- `heif-rs`、libheif、libde265、x265 等静态链接组件。
+- 其他图像、视频或模型依赖的再分发条款。
+
+内部自用风险与对外商业分发不同。发布安装包前必须核对许可证，并保留动态链接、替换库或更换依赖的备选方案。
