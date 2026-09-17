@@ -91,23 +91,38 @@ fn next_task_id() -> String {
 
 /// 展开输入路径为候选文件列表（目录递归 + 类型过滤）。
 /// on_scan 每发现一个候选文件上报一次当前计数（供 scanning 阶段进度展示）。
-fn collect_files(paths: &[String], on_scan: impl Fn(i64) + Sync) -> Vec<PathBuf> {
+/// 无法读取的路径进入 warnings，不再由 flatten() 静默丢弃。
+fn collect_files(paths: &[String], on_scan: impl Fn(i64) + Sync) -> (Vec<PathBuf>, Vec<String>) {
     let mut out = Vec::new();
+    let mut warnings = Vec::new();
     for p in paths {
         let pb = PathBuf::from(p);
         if pb.is_dir() {
-            for e in WalkDir::new(&pb).follow_links(false).into_iter().flatten() {
-                if e.file_type().is_file() && is_supported(e.path()) {
-                    out.push(e.path().to_path_buf());
-                    on_scan(out.len() as i64);
+            for entry in WalkDir::new(&pb).follow_links(false) {
+                match entry {
+                    Ok(e) => {
+                        if e.file_type().is_file() && is_supported(e.path()) {
+                            out.push(e.path().to_path_buf());
+                            on_scan(out.len() as i64);
+                        }
+                    }
+                    Err(e) => {
+                        let path = e
+                            .path()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_else(|| pb.display().to_string());
+                        warnings.push(format!("{path}: {e}"));
+                    }
                 }
             }
         } else if pb.is_file() && is_supported(&pb) {
             out.push(pb);
             on_scan(out.len() as i64);
+        } else {
+            warnings.push(format!("{}: 路径不存在或不受支持", pb.display()));
         }
     }
-    out
+    (out, warnings)
 }
 
 fn is_supported(p: &Path) -> bool {
@@ -433,6 +448,13 @@ enum ProcResult {
     New(Processed),
     Duplicate,
     Failed(String),
+    Cancelled,
+}
+
+enum HashOutcome {
+    Ready(String),
+    Failed(String),
+    Cancelled,
 }
 
 /// B01：单文件写库（insert + set_hash + write_meta），事务内调用
@@ -449,6 +471,29 @@ fn write_one(conn: &Connection, p: &Processed) -> AppResult<i64> {
     assets::set_hash(conn, id, &p.hash)?;
     write_meta(conn, id, &p.meta, &p.mime_type)?;
     Ok(id)
+}
+
+/// 托管模式下，写库失败要清理已复制副本，避免磁盘文件和数据库记录长期不一致。
+/// 原位索引模式的 src 就是用户原文件，调用方必须保证不会进入这里。
+fn cleanup_staged_file(path: &Path, task_id: &str) {
+    match std::fs::remove_file(path) {
+        Ok(()) => tracing::warn!(
+            operation = "import",
+            task_id = %task_id,
+            stage = "cleanup",
+            file = %path.display(),
+            "导入失败后已清理托管副本"
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => tracing::warn!(
+            operation = "import",
+            task_id = %task_id,
+            stage = "cleanup",
+            file = %path.display(),
+            error = %e,
+            "导入失败后清理托管副本失败"
+        ),
+    }
 }
 
 /// 发送 done 阶段事件（含最终 imported/duplicates/failed 统计）。
@@ -489,26 +534,51 @@ pub fn import_paths<F: Fn(ImportProgress) + Sync>(
     }
     // 阶段 1 契约：后端只发阶段进度，task_id 隔离新旧任务事件。
     let task_id = next_task_id();
+    let started_at = std::time::Instant::now();
+    tracing::info!(
+        operation = "import",
+        task_id = %task_id,
+        path_count = paths.len(),
+        managed = opts.library_root.is_some(),
+        "导入任务开始"
+    );
     // queued：任务已接受
     let mut queued = ImportProgress::new(&task_id, ImportPhase::Queued);
     queued.message = Some("准备入库".into());
     progress(queued);
     // scanning：目录递归收集候选文件（phaseTotal 未知 → 前端显示不确定进度）
-    let files = collect_files(paths, |n| {
+    let (files, scan_warnings) = collect_files(paths, |n| {
         let mut sc = ImportProgress::new(&task_id, ImportPhase::Scanning);
         sc.phase_current = n;
         sc.phase_total = None;
         sc.message = Some("正在扫描目录".into());
         progress(sc);
     });
+    for warning in &scan_warnings {
+        tracing::warn!(
+            operation = "import",
+            task_id = %task_id,
+            stage = "scan",
+            error = %warning,
+            "导入扫描警告"
+        );
+    }
     let total = files.len() as i64;
     let mut result = ImportResult {
         imported: 0,
         failed: 0,
         duplicates: 0,
         errors: Vec::new(),
+        warnings: scan_warnings,
     };
     if files.is_empty() {
+        tracing::info!(
+            operation = "import",
+            task_id = %task_id,
+            warnings = result.warnings.len(),
+            duration_ms = started_at.elapsed().as_millis() as u64,
+            "导入结束：未发现可入库文件"
+        );
         let mut done = ImportProgress::new(&task_id, ImportPhase::Done);
         done.message = Some("未发现可入库文件".into());
         progress(done);
@@ -517,13 +587,16 @@ pub fn import_paths<F: Fn(ImportProgress) + Sync>(
 
     // ① 并行 hash（hashing 阶段；取消在②③阶段间仍生效，此处每文件上报进度）
     let hash_done = AtomicI64::new(0);
-    let hashes: Vec<Option<String>> = files
+    let hashes: Vec<HashOutcome> = files
         .par_iter()
         .map(|f| {
             if cancel.load(Ordering::Relaxed) {
-                return None;
+                return HashOutcome::Cancelled;
             }
-            let h = crate::utils::hash::sha256_16(f).ok();
+            let hash = match crate::utils::hash::sha256_16(f) {
+                Ok(hash) => HashOutcome::Ready(hash),
+                Err(e) => HashOutcome::Failed(format!("{}: {e}", f.display())),
+            };
             let n = hash_done.fetch_add(1, Ordering::Relaxed) + 1;
             let mut he = ImportProgress::new(&task_id, ImportPhase::Hashing);
             he.phase_current = n;
@@ -535,7 +608,7 @@ pub fn import_paths<F: Fn(ImportProgress) + Sync>(
                     .into_owned(),
             );
             progress(he);
-            h
+            hash
         })
         .collect();
 
@@ -547,7 +620,7 @@ pub fn import_paths<F: Fn(ImportProgress) + Sync>(
         .map(|(idx, file)| {
             // B01：cancel 在②a 生效
             if cancel.load(Ordering::Relaxed) {
-                return ProcResult::Failed("用户取消".into());
+                return ProcResult::Cancelled;
             }
             // processing 阶段进度（处理是慢阶段，②b 写库在 processing 内部，不单独计阶段）
             let n = proc_done.fetch_add(1, Ordering::Relaxed) + 1;
@@ -562,16 +635,49 @@ pub fn import_paths<F: Fn(ImportProgress) + Sync>(
             );
             progress(pe);
             let hash = match &hashes[idx] {
-                None => return ProcResult::Failed(format!("{}: 读取文件失败", file.display())),
-                Some(h) => h.clone(),
+                HashOutcome::Ready(hash) => hash.clone(),
+                HashOutcome::Failed(error) => {
+                    tracing::warn!(
+                        operation = "import",
+                        task_id = %task_id,
+                        stage = "hash",
+                        file = %file.display(),
+                        error = %error,
+                        "导入文件哈希失败"
+                    );
+                    return ProcResult::Failed(error.clone());
+                }
+                HashOutcome::Cancelled => return ProcResult::Cancelled,
             };
             // precheck 用短锁（单次查询，微秒级）；TOCTOU 由 UNIQUE 约束兜底
             // 注意：precheck 返回 true=新文件，false=重复
             let is_new = {
                 let conn = db.lock().map_err(|_| AppError::msg("数据库锁中毒"));
                 match conn {
-                    Ok(c) => precheck(&c, file, &hash).unwrap_or(false),
-                    Err(_) => return ProcResult::Failed("数据库锁中毒".into()),
+                    Ok(c) => match precheck(&c, file, &hash) {
+                        Ok(is_new) => is_new,
+                        Err(e) => {
+                            tracing::warn!(
+                                operation = "import",
+                                task_id = %task_id,
+                                stage = "precheck",
+                                file = %file.display(),
+                                error = %e,
+                                "导入预检查失败"
+                            );
+                            return ProcResult::Failed(format!("{}: {e}", file.display()));
+                        }
+                    },
+                    Err(_) => {
+                        tracing::error!(
+                            operation = "import",
+                            task_id = %task_id,
+                            stage = "precheck",
+                            file = %file.display(),
+                            "导入预检查数据库锁中毒"
+                        );
+                        return ProcResult::Failed("数据库锁中毒".into());
+                    }
                 }
             };
             if !is_new {
@@ -580,7 +686,17 @@ pub fn import_paths<F: Fn(ImportProgress) + Sync>(
             // 锁外：托管复制
             let staged = match stage_file(file, opts, idx + 1) {
                 Ok(p) => p,
-                Err(e) => return ProcResult::Failed(format!("{}: {e}", file.display())),
+                Err(e) => {
+                    tracing::warn!(
+                        operation = "import",
+                        task_id = %task_id,
+                        stage = "stage",
+                        file = %file.display(),
+                        error = %e,
+                        "导入文件暂存失败"
+                    );
+                    return ProcResult::Failed(format!("{}: {e}", file.display()));
+                }
             };
             // 锁外：计算 DB 插入所需的路径/文件信息
             let ext = staged
@@ -623,10 +739,17 @@ pub fn import_paths<F: Fn(ImportProgress) + Sync>(
     for r in &processed {
         match r {
             ProcResult::Duplicate => result.duplicates += 1,
-            ProcResult::Failed(msg) if msg == "用户取消" => {}
+            ProcResult::Cancelled => {}
             ProcResult::Failed(msg) => {
                 result.failed += 1;
                 result.errors.push(msg.clone());
+                tracing::warn!(
+                    operation = "import",
+                    task_id = %task_id,
+                    stage = "process",
+                    error = %msg,
+                    "导入单文件处理失败"
+                );
             }
             ProcResult::New(_) => {}
         }
@@ -653,7 +776,7 @@ pub fn import_paths<F: Fn(ImportProgress) + Sync>(
                         result.duplicates += 1;
                         if managed {
                             // 罕见路径：单 syscall 级清理，不破坏「锁外慢 IO」纪律
-                            let _ = std::fs::remove_file(&p.staged);
+                            cleanup_staged_file(&p.staged, &task_id);
                         }
                         continue;
                     }
@@ -661,6 +784,14 @@ pub fn import_paths<F: Fn(ImportProgress) + Sync>(
                     Err(e) => {
                         result.failed += 1;
                         result.errors.push(format!("{}: {e}", p.staged.display()));
+                        tracing::warn!(
+                            operation = "import",
+                            task_id = %task_id,
+                            stage = "commit",
+                            file = %p.staged.display(),
+                            error = %e,
+                            "导入二次查重失败"
+                        );
                         continue;
                     }
                 }
@@ -673,11 +804,36 @@ pub fn import_paths<F: Fn(ImportProgress) + Sync>(
                     Err(e) => {
                         result.failed += 1;
                         result.errors.push(format!("{}: {e}", p.staged.display()));
+                        tracing::warn!(
+                            operation = "import",
+                            task_id = %task_id,
+                            stage = "commit",
+                            file = %p.staged.display(),
+                            error = %e,
+                            "导入写库失败"
+                        );
+                        if managed {
+                            cleanup_staged_file(&p.staged, &task_id);
+                        }
                     }
                 }
             }
         }
-        tx.commit()?;
+        if let Err(e) = tx.commit() {
+            if managed {
+                for (_, file, _) in &pending_thumbs {
+                    cleanup_staged_file(file, &task_id);
+                }
+            }
+            tracing::error!(
+                operation = "import",
+                task_id = %task_id,
+                stage = "commit",
+                error = %e,
+                "导入批次事务提交失败"
+            );
+            return Err(e.into());
+        }
     } // 释放库锁：占位图生成不阻塞素材库查询
 
     // B15：取消后已写库记录仍保留（部分导入语义）
@@ -686,6 +842,17 @@ pub fn import_paths<F: Fn(ImportProgress) + Sync>(
             "用户取消（已导入 {} 条，重复 {} 条）",
             result.imported, result.duplicates
         ));
+        tracing::info!(
+            operation = "import",
+            task_id = %task_id,
+            result = "cancelled",
+            imported = result.imported,
+            duplicates = result.duplicates,
+            failed = result.failed,
+            warnings = result.warnings.len(),
+            duration_ms = started_at.elapsed().as_millis() as u64,
+            "导入任务取消"
+        );
         emit_done(
             &task_id,
             &result,
@@ -744,6 +911,17 @@ pub fn import_paths<F: Fn(ImportProgress) + Sync>(
             "用户取消（已导入 {} 条，部分占位图待下次浏览时补生成）",
             result.imported
         ));
+        tracing::info!(
+            operation = "import",
+            task_id = %task_id,
+            result = "cancelled",
+            imported = result.imported,
+            duplicates = result.duplicates,
+            failed = result.failed,
+            warnings = result.warnings.len(),
+            duration_ms = started_at.elapsed().as_millis() as u64,
+            "导入任务取消：占位图未全部生成"
+        );
         emit_done(
             &task_id,
             &result,
@@ -753,6 +931,18 @@ pub fn import_paths<F: Fn(ImportProgress) + Sync>(
         return Ok(result);
     }
 
+    tracing::info!(
+        operation = "import",
+        task_id = %task_id,
+        result = if result.failed == 0 { "done" } else { "partial" },
+        total,
+        imported = result.imported,
+        duplicates = result.duplicates,
+        failed = result.failed,
+        warnings = result.warnings.len(),
+        duration_ms = started_at.elapsed().as_millis() as u64,
+        "导入任务完成"
+    );
     emit_done(&task_id, &result, Some("入库完成".into()), &progress);
     Ok(result)
 }
@@ -789,7 +979,15 @@ pub struct ImportPlan {
 
 /// 扫描路径展开为待入库清单（不落库，仅统计）
 pub fn inspect_paths(paths: &[String]) -> ImportPlan {
-    let files = collect_files(paths, |_| {});
+    let (files, warnings) = collect_files(paths, |_| {});
+    for warning in warnings {
+        tracing::warn!(
+            operation = "inspect_import",
+            stage = "scan",
+            error = %warning,
+            "待入库扫描警告"
+        );
+    }
     let mut plan = ImportPlan {
         items: Vec::new(),
         images: 0,
@@ -824,7 +1022,7 @@ pub fn preview_rename(template: &str, collection: &str, orig_stem: &str, seq: us
 
 #[cfg(test)]
 mod tests {
-    use super::render_name;
+    use super::{collect_files, precheck, render_name};
 
     // 2026-07-27 12:00:00 UTC
     const MTIME: i64 = 1_785_225_600_000;
@@ -878,5 +1076,27 @@ mod tests {
     #[test]
     fn empty_result_falls_back_to_original() {
         assert_eq!(render_name("", "", "orig", MTIME, 1), "orig");
+    }
+
+    #[test]
+    fn collect_files_reports_missing_paths_instead_of_silently_dropping() {
+        let missing = std::env::temp_dir()
+            .join(format!("bagertea_missing_{}", uuid::Uuid::new_v4()))
+            .to_string_lossy()
+            .into_owned();
+        let (files, warnings) = collect_files(&[missing], |_| {});
+        assert!(files.is_empty());
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("路径不存在或不受支持"));
+    }
+
+    #[test]
+    fn precheck_database_error_is_not_a_duplicate_result() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let result = precheck(&conn, std::path::Path::new("x.jpg"), "hash");
+        assert!(
+            result.is_err(),
+            "数据库结构错误必须向上返回，不能伪装为重复"
+        );
     }
 }

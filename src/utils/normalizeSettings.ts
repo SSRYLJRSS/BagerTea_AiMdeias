@@ -26,6 +26,10 @@ export const DEFAULT_BATCH_LIMIT = 30;
 /** FB3-07：云端每批处理数量运行时范围（与 ai_cloud.rs 执行层 clamp 一致） */
 export const BATCH_LIMIT_MIN = 10;
 export const BATCH_LIMIT_MAX = 50;
+/** 本机模型默认采用更小的处理轮次，降低小模型长时间连续执行的压力。 */
+export const DEFAULT_LOCAL_BATCH_LIMIT = 5;
+export const LOCAL_BATCH_LIMIT_MIN = 1;
+export const LOCAL_BATCH_LIMIT_MAX = 20;
 export const DEFAULT_CACHE_MB = 2048;
 export const DEFAULT_TRASH_RETENTION_DAYS = 30;
 // ── A4 置信度策略默认（与 Rust db/settings.rs 的 default_* 逐字对应）──
@@ -78,15 +82,16 @@ function normalizeAi(raw: unknown): AiSettings {
       const n = Math.round(asNum(r.batchLimit, DEFAULT_BATCH_LIMIT));
       return n >= BATCH_LIMIT_MIN && n <= BATCH_LIMIT_MAX ? n : DEFAULT_BATCH_LIMIT;
     })(),
+    localBatchLimit: (() => {
+      const n = Math.round(asNum(r.localBatchLimit, DEFAULT_LOCAL_BATCH_LIMIT));
+      return n >= LOCAL_BATCH_LIMIT_MIN && n <= LOCAL_BATCH_LIMIT_MAX ? n : DEFAULT_LOCAL_BATCH_LIMIT;
+    })(),
     ollamaSourceId: asStr(r.ollamaSourceId, "auto"),
     videoTaggingMode: asEnum(r.videoTaggingMode, ["cover", "frames"] as const, "cover"),
     videoFrameCount: clampInt(r.videoFrameCount, 2, 8, 3),
     systemPromptTagging: asStr(r.systemPromptTagging, ""),
     systemPromptSearch: asStr(r.systemPromptSearch, ""),
-    // A4 置信度策略：默认与指导书一致（精确命中自动接收开 / 自动建词关 / 阈值 0.30）——
-    // 必须保留这三项，否则 save_settings 整份 JSON 覆写会把后端已落库的策略刷回默认。
-    autoAcceptExactTerms: asBool(r.autoAcceptExactTerms, true),
-    autoAdoptNewTerms: asBool(r.autoAdoptNewTerms, false),
+    // 所有 AI 标签都进入人工确认；这里仅保留入库前的最低置信度阈值。
     confidenceMinSuggest: (() => {
       const n = asNum(r.confidenceMinSuggest, DEFAULT_CONF_MIN_SUGGEST);
       return Number.isFinite(n) && n >= 0 && n <= 1 ? n : DEFAULT_CONF_MIN_SUGGEST;
@@ -190,6 +195,7 @@ export function normalizeSettings(raw: unknown): Settings {
   return {
     ai,
     theme: theme === "light" || theme === "dark" ? theme : "system",
+    logLevel: asEnum(r.logLevel, ["info", "debug", "trace"] as const, "info"),
     thumbnailCacheMb: Math.max(0, Math.round(asNum(r.thumbnailCacheMb, DEFAULT_CACHE_MB))),
     tagCategories: Array.isArray(r.tagCategories) ? r.tagCategories.map(normalizeCategory) : [],
     libraryRoot: asStr(r.libraryRoot, ""),

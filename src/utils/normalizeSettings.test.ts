@@ -3,16 +3,18 @@
  */
 import { describe, expect, it } from "vitest";
 import { normalizeSettings } from "@/utils/normalizeSettings";
-import { DEFAULT_BATCH_LIMIT, DEFAULT_CACHE_MB, DEFAULT_MODEL } from "@/utils/normalizeSettings";
+import { DEFAULT_BATCH_LIMIT, DEFAULT_CACHE_MB, DEFAULT_LOCAL_BATCH_LIMIT, DEFAULT_MODEL } from "@/utils/normalizeSettings";
 import { CELL_STEPS } from "@/types/settings";
 
 describe("normalizeSettings", () => {
   it("对完全缺失的输入返回全默认值", () => {
     const s = normalizeSettings(undefined);
     expect(s.theme).toBe("system");
+    expect(s.logLevel).toBe("info");
     expect(s.ai.profiles).toEqual([]);
     expect(s.ai.videoTagging).toBe(false);
     expect(s.ai.batchLimit).toBe(DEFAULT_BATCH_LIMIT);
+    expect(s.ai.localBatchLimit).toBe(DEFAULT_LOCAL_BATCH_LIMIT);
     expect(s.ai.activeProfile).toBe("");
     expect(s.tagCategories).toEqual([]);
     expect(s.customDownloadSources).toEqual([]);
@@ -69,27 +71,38 @@ describe("normalizeSettings", () => {
     expect(s.tagCategories).toEqual([]);
   });
 
-  it("畸形数字/布尔字段兜底；batchLimit 越界归一到 [10,50] 默认 30（FB3-07）", () => {
+  it("在线与本机每轮处理数量分别校验并保留合法值", () => {
     const s = normalizeSettings({
       theme: "system",
       thumbnailCacheMb: -5,
       trashRetentionDays: -1,
-      ai: { batchLimit: 0 },
+      ai: { batchLimit: 0, localBatchLimit: 0 },
     });
     expect(s.thumbnailCacheMb).toBe(0);
     expect(s.trashRetentionDays).toBe(0);
     // FB3-07：0 越界 → 默认 30（旧语义 Math.max(1,·)→1 会写入运行时必被 clamp 的值）
     expect(s.ai.batchLimit).toBe(DEFAULT_BATCH_LIMIT);
+    expect(s.ai.localBatchLimit).toBe(DEFAULT_LOCAL_BATCH_LIMIT);
     // 历史 500（v2.5 遗留）→ 归一默认 30
     const s500 = normalizeSettings({ ai: { batchLimit: 500 } });
     expect(s500.ai.batchLimit).toBe(DEFAULT_BATCH_LIMIT);
     // 合法区间内保留
     const s20 = normalizeSettings({ ai: { batchLimit: 20 } });
     expect(s20.ai.batchLimit).toBe(20);
+    const local = normalizeSettings({ ai: { localBatchLimit: 3 } });
+    expect(local.ai.localBatchLimit).toBe(3);
+    const localTooLarge = normalizeSettings({ ai: { localBatchLimit: 21 } });
+    expect(localTooLarge.ai.localBatchLimit).toBe(DEFAULT_LOCAL_BATCH_LIMIT);
   });
 
   it("未知 theme 值回退 system", () => {
     expect(normalizeSettings({ theme: "blue" }).theme).toBe("system");
+  });
+
+  it("未知日志级别回退 info，debug/trace 保留", () => {
+    expect(normalizeSettings({ logLevel: "verbose" }).logLevel).toBe("info");
+    expect(normalizeSettings({ logLevel: "debug" }).logLevel).toBe("debug");
+    expect(normalizeSettings({ logLevel: "trace" }).logLevel).toBe("trace");
   });
 
   it("FB2-01：appearance 完全缺失 → 全默认（hoverEnabled 默认 true）", () => {

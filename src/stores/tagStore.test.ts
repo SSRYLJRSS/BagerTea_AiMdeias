@@ -1,8 +1,8 @@
 /** W3-2：tagStore 契约测试 —— 硬编码分面清单已删，
  *  buildWorkbenchFacets 按 inputMode 分组 + 消费 appliesTo；空 facets 返回空。 */
 import { describe, expect, it } from "vitest";
-import { buildWorkbenchFacets, normalizeTagKeys, keyForLegacyName } from "@/stores/tagStore";
-import type { TagFacet } from "@/types/tag";
+import { buildWorkbenchFacets, normalizeTagKeys, keyForLegacyName, useTagStore } from "@/stores/tagStore";
+import type { TagFacet, TagNode } from "@/types/tag";
 
 const mkFacet = (over: Partial<TagFacet> & Pick<TagFacet, "key">): TagFacet => ({
   displayName: over.key,
@@ -20,7 +20,7 @@ const mkFacet = (over: Partial<TagFacet> & Pick<TagFacet, "key">): TagFacet => (
 });
 
 const baseFacets: TagFacet[] = [
-  mkFacet({ key: "subject", displayName: "主体/对象", maxItems: 5 }),
+  mkFacet({ key: "subject", displayName: "主体对象", maxItems: 3 }),
   mkFacet({ key: "scene", displayName: "场景/地点", maxItems: 3 }),
   mkFacet({ key: "purpose", inputMode: "manual_only" }),
 ];
@@ -31,9 +31,9 @@ describe("W3-2 buildWorkbenchFacets", () => {
     expect(aiGroup.map((f) => f.key)).toEqual(["subject", "scene"]);
     expect(manualGroup.map((f) => f.key)).toEqual(["purpose"]);
     const subject = aiGroup[0];
-    expect(subject.displayName).toBe("主体/对象");
+    expect(subject.displayName).toBe("主体对象");
     expect(subject.selectionMode).toBe("multi");
-    expect(subject.maxItems).toBe(5);
+    expect(subject.maxItems).toBe(3);
   });
 
   it("_filters_by_applies_to：video-only 分面不进图片工作台", () => {
@@ -62,6 +62,16 @@ describe("W3-2 buildWorkbenchFacets", () => {
     expect(aiGroup).toHaveLength(0);
     expect(manualGroup).toHaveLength(0);
   });
+
+  it("custom 兜底桶不进工作台", () => {
+    const facets = [
+      mkFacet({ key: "custom", displayName: "自定义", isSystem: true }),
+      mkFacet({ key: "scene", displayName: "场景/地点" }),
+    ];
+    const { aiGroup, manualGroup } = buildWorkbenchFacets(facets);
+    expect(aiGroup.map((f) => f.key)).toEqual(["scene"]);
+    expect(manualGroup).toEqual([]);
+  });
 });
 
 describe("keyForLegacyName / normalizeTagKeys", () => {
@@ -89,5 +99,48 @@ describe("keyForLegacyName / normalizeTagKeys", () => {
     expect(out.scene).toEqual(expect.arrayContaining(["海边", "公园"]));
     expect(out.custom).toEqual(["某标签"]);
     expect(out.color).toEqual(["低饱和"]);
+  });
+});
+
+describe("useTagStore.clear", () => {
+  it("清空重置前的标签树、分面与展开状态", () => {
+    const node: TagNode = {
+      tag: {
+        id: 1,
+        name: "旧标签",
+        canonicalName: "旧标签",
+        normalizedName: "旧标签",
+        facetKey: "custom",
+        parentId: null,
+        status: "active",
+        isSystem: false,
+        isPreset: false,
+        sortOrder: 0,
+        assetCount: 0,
+        totalCount: 0,
+        aliases: [],
+        path: "旧标签",
+        facetEffective: true,
+      },
+      children: [],
+    };
+    useTagStore.setState({
+      tree: [node],
+      facets: baseFacets,
+      treesByFacet: { custom: [node] },
+      candidates: [node.tag],
+      expanded: new Set([1]),
+      loading: true,
+    });
+
+    useTagStore.getState().clear();
+
+    const state = useTagStore.getState();
+    expect(state.tree).toEqual([]);
+    expect(state.facets).toEqual([]);
+    expect(state.treesByFacet).toEqual({});
+    expect(state.candidates).toEqual([]);
+    expect(state.expanded.size).toBe(0);
+    expect(state.loading).toBe(false);
   });
 });

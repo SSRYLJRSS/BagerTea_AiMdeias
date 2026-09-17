@@ -17,7 +17,7 @@ import {
 
 const LABELS: Record<string, string> = {
   file_ext: "格式", mime_type: "MIME", width: "宽", height: "高",
-  resolution: "分辨率", aspect_ratio: "宽高比", file_size: "文件大小",
+  resolution: "像素总量", aspect_ratio: "宽高比", file_size: "文件大小",
   duration_ms: "视频时长", taken_at: "拍摄时间", created_at: "入库时间",
   modified_at: "修改时间", camera: "相机", lens: "镜头", iso: "ISO",
   aperture: "光圈", shutter: "快门", focal: "焦距", video_codec: "视频编码",
@@ -29,7 +29,7 @@ const LABELS: Record<string, string> = {
 /** W3：分面显示名优先读 tagStore.facets（自建分面自动显示中文名）；
  *  FACET_NAMES 只是系统分面在 store 未加载时的兜底。 */
 const FACET_NAMES: Record<string, string> = {
-  subject: "主体/对象", scene: "场景/地点", purpose: "用途", style: "风格/氛围",
+  subject: "主体对象", scene: "场景/地点", purpose: "用途",
   color: "色彩", composition: "构图/视角", lighting: "光线/时间", people: "人物属性",
   technical: "可用性/技术特征", custom: "自定义",
 };
@@ -191,7 +191,7 @@ export default function FilterChips() {
       {chips.map((chip) => (
         <span
           key={chip.key}
-          className="inline-flex h-7 shrink-0 items-center gap-1 rounded-full border border-[var(--color-border)] bg-[var(--color-surface)] pl-2.5 pr-1 text-xs text-[var(--color-text)]"
+          className="inline-flex h-7 shrink-0 items-center gap-1 rounded-full border border-[var(--color-border)] bg-transparent pl-2.5 pr-1 text-xs text-[var(--color-text)]"
         >
           {chip.group && (
             <span className="text-[10px] text-[var(--color-text-tertiary)]">{chip.group}</span>

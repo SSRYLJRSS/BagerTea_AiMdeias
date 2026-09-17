@@ -6,7 +6,7 @@
 use std::io::BufRead;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
@@ -157,16 +157,18 @@ pub fn probe_gpu() -> GpuInfo {
     }
 }
 
-/// 推荐档位（纯函数）——按显存给出「推荐 + 数个备选」的视觉模型候选，
-/// 打标场景需要视觉模型，故以 vlm 系为主；手动输入框可拉官方库任意模型
+/// 推荐档位（纯函数）——按显存给出「推荐 + 数个备选」的多模态模型候选，
+/// 打标场景需要视觉模型；手动输入框可拉官方库任意模型
 pub fn recommend(vram_gb: Option<f32>) -> Vec<ModelRec> {
-    const Q3: &str = "qwen2.5vl:3b";
-    const Q7: &str = "qwen2.5vl:7b";
-    const Q11: &str = "qwen2.5vl:11b";
-    const Q32: &str = "qwen2.5vl:32b";
+    // Qwen3.5 is the current small multimodal family in the Ollama registry.
+    // Keep the default below the detected VRAM ceiling because Ollama also
+    // needs room for the runtime and the model's KV cache.
+    const Q08: &str = "qwen3.5:0.8b";
+    const Q2: &str = "qwen3.5:2b";
+    const Q4: &str = "qwen3.5:4b";
+    const Q9: &str = "qwen3.5:9b";
     const MOON: &str = "moondream:2b";
     const MINI: &str = "minicpm-v:8b";
-    const GEMMA3: &str = "gemma3:4b";
     const GEMMA3_12: &str = "gemma3:12b";
     let rec = |name: &str, note: &str| ModelRec {
         name: name.into(),
@@ -179,31 +181,33 @@ pub fn recommend(vram_gb: Option<f32>) -> Vec<ModelRec> {
         note: note.into(),
     };
     match vram_gb {
-        // ≥12GB：7b 主推 + 更大/多选
+        // ≥12GB：9b 主推；更大的 Qwen3.5 变体不再作为本地小模型推荐，
+        // 避免把 20GB+ 的模型误导给单卡用户。
         Some(v) if v >= 12.0 => vec![
-            rec(Q7, "显存充足，中文效果更稳"),
-            alt(Q11, "更高精度"),
-            alt(Q32, "大显存可选，较重"),
+            rec(Q9, "显存充足，中文与视觉效果更稳"),
+            alt(Q4, "更轻量，适合批量打标"),
             alt(GEMMA3_12, "多模态新锐"),
         ],
-        // 4–12GB：3b 主推 + 小/中备选
-        Some(v) if v >= 4.0 => vec![
-            rec(Q3, "显存适中，稳妥之选"),
-            alt(Q7, "显存允许时可试"),
+        // 6–12GB：4b 主推；9b 需要给运行时和 KV cache 留足空间，放在备选。
+        Some(v) if v >= 6.0 => vec![
+            rec(Q4, "显存适中，最新小型多模态模型"),
+            alt(Q2, "更轻，速度更快"),
+            alt(Q9, "显存允许时可试，较慢"),
             alt(MINI, "多模态小模型"),
-            alt(GEMMA3, "轻量多模态"),
         ],
-        // <4GB：仅小模型
+        // <6GB：优先 2b，避免下载后因显存不足频繁回退到 CPU。
         Some(_) => vec![
-            rec(Q3, "显存偏紧，可能部分走 CPU"),
-            alt(MOON, "更轻，速度最快"),
+            rec(Q2, "显存偏紧，轻量且可运行"),
+            alt(Q08, "更轻，速度更快"),
+            alt(MOON, "纯 CPU 更友好"),
         ],
         // 未知显存：默认轻量档 + 诚实预期
         None => vec![
             rec(
-                Q3,
+                Q2,
                 "未探测到显存，默认轻量档；纯 CPU 可跑但慢，批量建议插电",
             ),
+            alt(Q08, "更轻，速度更快"),
             alt(MOON, "更轻，纯 CPU 更友好"),
         ],
     }
@@ -252,21 +256,56 @@ pub fn pull<F: Fn(PullProgress)>(
     progress: F,
 ) -> AppResult<()> {
     let root = api_root(base_url);
+    let started = Instant::now();
+    tracing::info!(
+        operation = "ollama_pull",
+        stage = "start",
+        model = %model,
+        "开始拉取 Ollama 模型"
+    );
     let client = reqwest::blocking::Client::builder()
         .connect_timeout(Duration::from_secs(10))
         // 连接后总超时兜底：网络挂起（连上但一直不发数据）时 lines() 会无限阻塞，
         // 设 120 分钟墙上限防永久卡死；正常情况下拉完即返回，不会触发
         .timeout(Duration::from_secs(120 * 60))
         .build()
-        .map_err(|e| AppError::msg(format!("HTTP 客户端初始化失败: {e}")))?;
+        .map_err(|e| {
+            tracing::error!(
+                operation = "ollama_pull",
+                stage = "client_init_failed",
+                error_code = "HTTP",
+                duration_ms = started.elapsed().as_millis() as u64,
+                "Ollama 拉取客户端初始化失败"
+            );
+            AppError::msg(format!("HTTP 客户端初始化失败: {e}"))
+        })?;
     let resp = client
         .post(format!("{root}/api/pull"))
         .json(&serde_json::json!({ "name": model, "stream": true }))
         .send()
-        .map_err(|e| AppError::msg(format!("连接本地服务失败（请确认 Ollama 已启动）: {e}")))?;
+        .map_err(|e| {
+            tracing::error!(
+                operation = "ollama_pull",
+                stage = "connect_failed",
+                model = %model,
+                error_code = "HTTP",
+                duration_ms = started.elapsed().as_millis() as u64,
+                "连接 Ollama 拉取接口失败"
+            );
+            AppError::msg(format!("连接本地服务失败（请确认 Ollama 已启动）: {e}"))
+        })?;
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().unwrap_or_default();
+        tracing::error!(
+            operation = "ollama_pull",
+            stage = "http_error",
+            model = %model,
+            status = %status,
+            error_code = "HTTP",
+            duration_ms = started.elapsed().as_millis() as u64,
+            "Ollama 拉取接口返回错误状态"
+        );
         return Err(AppError::msg(format!("拉取请求失败（{status}）: {body}")));
     }
 
@@ -274,15 +313,42 @@ pub fn pull<F: Fn(PullProgress)>(
     let mut succeeded = false;
     for line in reader.lines() {
         if cancel.load(Ordering::Relaxed) {
-            return Err(AppError::msg("拉取已取消"));
+            tracing::warn!(
+                operation = "ollama_pull",
+                stage = "cancelled",
+                model = %model,
+                error_code = "CANCELLED",
+                duration_ms = started.elapsed().as_millis() as u64,
+                "Ollama 模型拉取已取消"
+            );
+            return Err(AppError::cancelled("拉取已取消"));
         }
-        let line = line.map_err(|e| AppError::msg(format!("读取拉取进度失败: {e}")))?;
+        let line = line.map_err(|e| {
+            tracing::error!(
+                operation = "ollama_pull",
+                stage = "read_failed",
+                model = %model,
+                error_code = "IO",
+                duration_ms = started.elapsed().as_millis() as u64,
+                "读取 Ollama 拉取进度失败"
+            );
+            AppError::msg(format!("读取拉取进度失败: {e}"))
+        })?;
         if line.trim().is_empty() {
             continue;
         }
         let p = parse_pull_line(&line, model);
         if p.error.is_some() {
             let err = p.error.clone().unwrap_or_default();
+            tracing::warn!(
+                operation = "ollama_pull",
+                stage = "ollama_error",
+                model = %model,
+                error_code = "OLLAMA_PULL_ERROR",
+                error_chars = err.chars().count(),
+                duration_ms = started.elapsed().as_millis() as u64,
+                "Ollama 返回拉取错误"
+            );
             progress(p);
             return Err(AppError::msg(format!("Ollama 拉取失败: {err}")));
         }
@@ -293,8 +359,23 @@ pub fn pull<F: Fn(PullProgress)>(
         }
     }
     if !succeeded {
+        tracing::warn!(
+            operation = "ollama_pull",
+            stage = "incomplete_stream",
+            model = %model,
+            error_code = "OLLAMA_PULL_INCOMPLETE",
+            duration_ms = started.elapsed().as_millis() as u64,
+            "Ollama 拉取流提前结束"
+        );
         return Err(AppError::msg("拉取流提前结束，模型可能未完整下载，请重试"));
     }
+    tracing::info!(
+        operation = "ollama_pull",
+        stage = "done",
+        model = %model,
+        duration_ms = started.elapsed().as_millis() as u64,
+        "Ollama 模型拉取完成"
+    );
     Ok(())
 }
 
@@ -419,22 +500,22 @@ mod tests {
 
     #[test]
     fn recommend_tiers() {
-        // ≥12GB：7b 推荐 + 备选
+        // ≥12GB：9b 推荐 + 备选
         let r = recommend(Some(16.0));
-        assert!(r[0].recommended && r[0].name == "qwen2.5vl:7b");
+        assert!(r[0].recommended && r[0].name == "qwen3.5:9b");
         assert!(r.len() >= 3);
-        // 4–12GB：3b 推荐 + 数个备选
+        // 6–12GB：4b 推荐 + 数个备选
         let r = recommend(Some(8.0));
-        assert!(r[0].recommended && r[0].name == "qwen2.5vl:3b");
+        assert!(r[0].recommended && r[0].name == "qwen3.5:4b");
         assert_eq!(r.len(), 4);
-        // <4GB：3b 推荐 + 1 备选
+        // <6GB：2b 推荐 + 2 个轻量备选
         let r = recommend(Some(2.0));
-        assert_eq!(r.len(), 2);
-        assert!(r[0].name == "qwen2.5vl:3b" && r[0].recommended);
-        // 未知：默认 3b 诚实预期 + moondream 备选
+        assert_eq!(r.len(), 3);
+        assert!(r[0].name == "qwen3.5:2b" && r[0].recommended);
+        // 未知：默认 2b 诚实预期 + 轻量备选
         let r = recommend(None);
-        assert_eq!(r.len(), 2);
-        assert!(r[0].name == "qwen2.5vl:3b" && r[0].note.contains("CPU"));
+        assert_eq!(r.len(), 3);
+        assert!(r[0].name == "qwen3.5:2b" && r[0].note.contains("CPU"));
         assert!(r.iter().any(|m| m.name.starts_with("moondream")));
     }
 
@@ -442,7 +523,7 @@ mod tests {
     fn parse_pull_line_variants() {
         let p = parse_pull_line(
             r#"{"status":"downloading digest","total":1000,"completed":250}"#,
-            "qwen2.5vl:3b",
+            "qwen3.5:4b",
         );
         assert_eq!(p.completed, 250);
         assert_eq!(p.total, 1000);
@@ -462,12 +543,12 @@ mod tests {
     #[test]
     fn parse_tags_body_parses_name_and_size() {
         let body =
-            r#"{"models":[{"name":"llava:latest","size":1234567890},{"name":"qwen2.5vl:7b"}]}"#;
+            r#"{"models":[{"name":"llava:latest","size":1234567890},{"name":"qwen3.5:9b"}]}"#;
         let list = parse_tags_body(body);
         assert_eq!(list.len(), 2);
         assert_eq!(list[0].name, "llava:latest");
         assert_eq!(list[0].size, 1234567890);
-        assert_eq!(list[1].name, "qwen2.5vl:7b");
+        assert_eq!(list[1].name, "qwen3.5:9b");
         assert_eq!(list[1].size, 0, "缺 size 字段按 0 处理");
     }
 

@@ -1,5 +1,6 @@
 /** 标签树形导航：可折叠、父标签显示合计数、点击连带筛选子标签（PRD 5.4-3）
- *  FB6 需求四：顶部统一标题行——左「智能标签」、右「全部展开/全部收起」（不与文件属性共用状态）。 */
+ *  FB6 需求四：顶部统一标题行——左「智能标签」、右「全部展开/全部收起」（不与文件属性共用状态）。
+ *  首次进入默认收起全部分面，用户操作后再使用显式折叠状态。 */
 import { useEffect, useMemo, useState, type MouseEvent as ReactMouseEvent } from "react";
 import clsx from "clsx";
 import { useShallow } from "zustand/react/shallow";
@@ -31,7 +32,7 @@ export default function TagTree({ onManage }: TagTreeProps) {
     try {
       const ids = await fetchAllIds();
       if (ids.length === 0) return;
-      useAiStore.getState().setPendingAssets(ids, "auto");
+      useAiStore.getState().setPendingAssets(ids);
       window.dispatchEvent(new CustomEvent("app:navigate", { detail: "ai" }));
     } finally {
       setSending(false);
@@ -43,7 +44,7 @@ export default function TagTree({ onManage }: TagTreeProps) {
   }, [tree.length, refresh]);
 
   // 分面分组与文件属性保持相同的折叠模型：分组标题负责展开/收起，组内仍保留标签树层级。
-  const [collapsedFacets, setCollapsedFacets] = useState<ReadonlySet<string>>(new Set());
+  const [collapsedFacets, setCollapsedFacets] = useState<ReadonlySet<string> | null>(null);
   const [expandedNodes, setExpandedNodes] = useState<ReadonlySet<number>>(new Set());
   const groups = useMemo(
     () => (facets.length > 0
@@ -52,10 +53,15 @@ export default function TagTree({ onManage }: TagTreeProps) {
       .filter(({ roots }) => roots.length > 0),
     [facets, tree],
   );
-  const allCollapsed = groups.length > 0 && groups.every(({ facet }) => collapsedFacets.has(facet?.key ?? "legacy"));
+  const defaultCollapsedFacets = useMemo(
+    () => new Set(groups.map(({ facet }) => facet?.key ?? "legacy")),
+    [groups],
+  );
+  const collapsedFacetKeys = collapsedFacets ?? defaultCollapsedFacets;
+  const allCollapsed = groups.length > 0 && groups.every(({ facet }) => collapsedFacetKeys.has(facet?.key ?? "legacy"));
   const toggleFacet = (key: string) => {
     setCollapsedFacets((current) => {
-      const next = new Set(current);
+      const next = new Set(current ?? defaultCollapsedFacets);
       if (next.has(key)) next.delete(key);
       else next.add(key);
       return next;
@@ -137,7 +143,7 @@ export default function TagTree({ onManage }: TagTreeProps) {
 
       {groups.map(({ facet, roots }) => {
         const facetKey = facet?.key ?? "legacy";
-        const collapsed = collapsedFacets.has(facetKey);
+        const collapsed = collapsedFacetKeys.has(facetKey);
         const rows = flattenVisible(roots, expandedNodes);
         return (
         <section key={facetKey} className="pt-2">
@@ -261,7 +267,7 @@ function TreeRow({
       onClick={onClick}
       onContextMenu={onContextMenu}
       className={clsx(
-        "ui-nav-item flex min-h-8 flex-1 items-center justify-between px-2 py-1.5 text-left text-[var(--color-text-secondary)] transition-colors hover:bg-[var(--color-surface)] hover:text-[var(--color-text)]",
+        "ui-nav-item ui-nav-list-item flex min-h-8 flex-1 items-center justify-between px-2 py-1.5 text-left text-[var(--color-text-secondary)] transition-colors hover:bg-[var(--color-surface)] hover:text-[var(--color-text)]",
       )}
       data-active={active}
     >

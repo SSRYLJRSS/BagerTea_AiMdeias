@@ -48,14 +48,10 @@ export default function LibraryPage() {
   }
 
   // 顶栏与右键菜单共用同一组批量动作（v2.8）
-  // v2.10：打标（AI/手动）都跳转打标页，模式随选择带过去
+  // 打标统一跳转打标工作台；AI 建议和手工填写使用同一批次。
   const actions = {
-    onAiTag: () => {
-      useAiStore.getState().setPendingAssets(Array.from(selected), "auto");
-      window.dispatchEvent(new CustomEvent("app:navigate", { detail: "ai" }));
-    },
-    onAssignTags: () => {
-      useAiStore.getState().setPendingAssets(Array.from(selected), "manual");
+    onTag: () => {
+      useAiStore.getState().setPendingAssets(Array.from(selected));
       window.dispatchEvent(new CustomEvent("app:navigate", { detail: "ai" }));
     },
     onExport: () => {

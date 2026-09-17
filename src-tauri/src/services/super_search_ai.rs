@@ -1135,12 +1135,13 @@ pub fn collect_tag_dictionary(
     let mut per_facet: Vec<Vec<String>> = Vec::new();
     for f in facets {
         let mut stmt = conn.prepare(
-            "SELECT t.name,
+            "SELECT t.name, p.name,
                     (SELECT GROUP_CONCAT(ta.normalized_alias, ',') FROM (
                         SELECT ta.normalized_alias FROM tag_aliases ta
                          WHERE ta.tag_id = t.id AND ta.is_searchable = 1
                          ORDER BY ta.id LIMIT ?2) ta)
                FROM tags t
+               LEFT JOIN tags p ON p.id = t.parent_id
               WHERE t.facet_key = ?1 AND COALESCE(t.status,'active') = 'active'
               ORDER BY t.sort_order, t.id LIMIT ?3",
         )?;
@@ -1150,15 +1151,28 @@ pub fn collect_tag_dictionary(
                 DICT_MAX_ALIASES as i64,
                 DICT_MAX_PER_FACET as i64
             ],
-            |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                ))
+            },
         )?;
         let mut lines = Vec::new();
         for row in rows {
-            let (name, aliases) = row?;
+            let (name, parent, aliases) = row?;
             let name = sanitize_dict_text(&name);
             if name.is_empty() {
                 continue;
             }
+            let path = match parent
+                .map(|value| sanitize_dict_text(&value))
+                .filter(|value| !value.is_empty())
+            {
+                Some(parent) => format!("{parent} / {name}"),
+                None => name.clone(),
+            };
             let line = match aliases {
                 Some(a) => {
                     let list: Vec<String> = a
@@ -1167,12 +1181,12 @@ pub fn collect_tag_dictionary(
                         .filter(|s| !s.is_empty())
                         .collect();
                     if list.is_empty() {
-                        name
+                        format!("{path} | term: {name}")
                     } else {
-                        format!("{name} | aliases: {}", list.join(", "))
+                        format!("{path} | term: {name} | aliases: {}", list.join(", "))
                     }
                 }
-                None => name,
+                None => format!("{path} | term: {name}"),
             };
             lines.push(line);
         }
@@ -1483,7 +1497,10 @@ pub fn build_user_prompt(
     text: &str,
     capabilities: &str,
 ) -> String {
-    let mut user = String::from("标签词典（规范名 | aliases: 可搜索别名）\n");
+    let mut user = String::from(
+        "标签词典（父类 / 叶子 | term: 规范叶子名 | aliases: 可搜索别名）\n\
+         路径仅用于判断语义归类；输出 concept.text 时只写 term 对应的叶子名。\n",
+    );
     for t in dict {
         user.push_str(&format!("- {t}\n"));
     }
@@ -1521,12 +1538,20 @@ pub fn request_intent(
     dict: &[String],
     capabilities: &str,
 ) -> AppResult<(SearchIntentV3, Vec<String>)> {
+    let started = std::time::Instant::now();
     let profile = cfg
         .active()
         .ok_or_else(|| AppError::msg("请先在设置页添加 API 配置"))?;
     if profile.base_url.trim().is_empty() {
         return Err(AppError::msg("当前 API 配置缺少 base_url"));
     }
+    tracing::info!(
+        operation = "super_search_ai",
+        stage = "request_start",
+        model = %profile.model,
+        query_chars = text.chars().count(),
+        "AI 搜索解析开始"
+    );
 
     let schema = intent_schema(facets);
     // 用户可在设置页覆盖搜索 system prompt（非空优先；空 = 内置默认）
@@ -1547,15 +1572,49 @@ pub fn request_intent(
         TextJsonTier::Structured,
     ) {
         Ok(v) => v,
-        Err(e) if is_config_error(&e) => return Err(e),
-        Err(_) => return Ok(keyword_fallback_v3(text)),
+        Err(e) if is_config_error(&e) => {
+            tracing::warn!(
+                operation = "super_search_ai",
+                stage = "config_error",
+                error_code = e.code(),
+                error = %e,
+                duration_ms = started.elapsed().as_millis() as u64,
+                "AI 搜索解析配置错误"
+            );
+            return Err(e);
+        }
+        Err(e) => {
+            tracing::warn!(
+                operation = "super_search_ai",
+                stage = "keyword_fallback",
+                error_code = e.code(),
+                error = %e,
+                duration_ms = started.elapsed().as_millis() as u64,
+                "AI 搜索解析失败，已降级为关键词"
+            );
+            return Ok(keyword_fallback_v3(text));
+        }
     };
     if ai_cloud::is_degenerate_text(&raw) {
         // 持续乱码/复读：属模型能力问题而非配置问题 → 关键词兜底
+        tracing::warn!(
+            operation = "super_search_ai",
+            stage = "degenerate_fallback",
+            duration_ms = started.elapsed().as_millis() as u64,
+            "AI 搜索解析返回异常文本，已降级为关键词"
+        );
         return Ok(keyword_fallback_v3(text));
     }
     // ②/③/④：V3 解析（含 preferred evidence 守卫）+ lenient + 结构校验，全部失败落第 3 层
-    Ok(degrade_parse_v3(&raw, text, facets))
+    let (intent, warnings) = degrade_parse_v3(&raw, text, facets);
+    tracing::info!(
+        operation = "super_search_ai",
+        stage = "request_done",
+        warnings = warnings.len(),
+        duration_ms = started.elapsed().as_millis() as u64,
+        "AI 搜索解析完成"
+    );
+    Ok((intent, warnings))
 }
 
 fn keyword_fallback_v3(text: &str) -> (SearchIntentV3, Vec<String>) {
@@ -1906,6 +1965,9 @@ pub fn build_system_prompt(facets: &[FacetPromptContext]) -> String {
     p.push_str("每个 group 必填 assetType(all|image|video)/concepts/textTerms/metadata。\n");
     p.push_str(&format!("硬规则：\n1. 每个 concept 是原子化规范名词或短名词短语（中文 1-6 字），禁止「晚上拍的树」「画面中有很多人」这类句子片段。\n2. 连接/方位/语法词不作 concept。共享停用词：{stop}。\n"));
     p.push_str("3. 同义概念只输出一次：如「多人、人群」按词典二选一，不同时输出。\n");
+    p.push_str("3.1 人物统一走 people：男子/女子/老人/年轻人/男孩/女孩等人物词必须映射到 people 的原子属性；多人/单人/双人/人群/无人也属于 people。禁止把人物、人数、性别、年龄或穿着写成 subject。\n");
+    p.push_str("3.2 subject 中的人只写「人」；具体性别、年龄、穿着、人数和动作必须拆成 people 的多个 concept。例如「年轻女性」→ people:[青年,女性]，查询执行时二者同时命中。\n");
+    p.push_str("3.3 有树、看到建筑等视觉对象走 subject；在树林里、在城市街道等空间地点走 scene。不得把同一个物体词同时写入 subject 和 scene。\n");
     p.push_str("4. assetType 只有用户明确说 图片/照片/相片/图像（image）或 视频/录像/片段/短片（video）时才填；「拍的」不算。\n");
     p.push_str("5. 「晚上拍的」解析为「夜间」或「夜景」概念，不保留整句。\n");
     p.push_str("6. 同一个词只允许出现一次：凡是能映射为标签（concepts）或元数据（metadata）的词，绝不再写进 textTerms；禁止对同一概念既出标签又出全文（如「草地」已进 concepts，就不得再出 textTerms「草地」）。\n");
@@ -1951,12 +2013,12 @@ pub fn build_system_prompt(facets: &[FacetPromptContext]) -> String {
     p.push_str("元数据输出示例 D：输入「没打标签的视频」→ assetType video、untaggedOnly:true、concepts/textTerms/metadata 均为空。\n");
     // §9.2 回归基准：本轮截图用例
     p.push_str("示例 1：输入「晚上拍的然后有树还有多人」→ 期望：\n");
-    p.push_str("{\"groups\":[{\"assetType\":\"all\",\"concepts\":[{\"text\":\"夜间\",\"role\":\"lighting\",\"facetHint\":\"lighting\",\"confidence\":0.95},{\"text\":\"树\",\"role\":\"subject\",\"facetHint\":\"subject\",\"confidence\":0.95},{\"text\":\"多人\",\"role\":\"subject\",\"facetHint\":\"subject\",\"confidence\":0.9}],\"textTerms\":[],\"metadata\":[],\"untaggedOnly\":false,\"preferred\":[]}],\"exclusions\":[],\"sortBy\":null,\"sortDir\":null}\n");
+    p.push_str("{\"groups\":[{\"assetType\":\"all\",\"concepts\":[{\"text\":\"夜间\",\"role\":\"lighting\",\"facetHint\":\"lighting\",\"confidence\":0.95},{\"text\":\"树木\",\"role\":\"subject\",\"facetHint\":\"subject\",\"confidence\":0.95},{\"text\":\"多人\",\"role\":\"people\",\"facetHint\":\"people\",\"confidence\":0.9}],\"textTerms\":[],\"metadata\":[],\"untaggedOnly\":false,\"preferred\":[]}],\"exclusions\":[],\"sortBy\":null,\"sortDir\":null}\n");
     p.push_str(
         "示例 2：输入「晚上拍的树或者白天拍的建筑」→ 两个 group：(夜间∧树) OR (白天∧建筑)。\n",
     );
     p.push_str(
-        "示例 3：输入「不要夜景的人像」→ 一个含「人像」的 group + exclusions 含「夜景」。\n",
+        "示例 3：输入「不要夜景的人像」→ 一个含 subject「人」的 group + exclusions 含 lighting「夜景」。\n",
     );
     p.push_str("示例 4：输入「IMG_1097」→ groups 里 textTerms=[{\"text\":\"IMG_1097\",\"scope\":\"fileName\"}]。\n");
     // W6-4（§W6-4）：显式约束句 —— 分面 key 只能从这里选，不要发明新 key。
@@ -2727,6 +2789,59 @@ mod tests {
         assert!(line.contains("人群"), "可搜索别名应进词典：{line}");
         // 非可搜索别名不出现（未造，跳过）；控制字符被清除
         assert!(dict.iter().all(|l| !l.chars().any(|c| c.is_control())));
+    }
+
+    #[test]
+    fn core_taxonomy_paths_and_person_queries_resolve_to_people() {
+        let conn = init_memory().unwrap();
+        crate::db::ensure_default_taxonomy(&conn).unwrap();
+        let facets = crate::db::tag_facets::build_prompt_context(&conn, "all").unwrap();
+        let dict = collect_tag_dictionary(&conn, &facets).unwrap();
+        assert!(
+            dict.iter()
+                .any(|line| line.contains("性别 / 女性") && line.contains("term: 女性")),
+            "词典应包含父子路径与叶子名：{dict:?}"
+        );
+
+        match resolve_concept(&conn, &mk_concept("女性", Some("people"), 0.95), false).unwrap() {
+            ConceptOutcome::Tag(tag) => {
+                assert_eq!(tag.facet_key, "people");
+                assert_eq!(tag.path, "性别 / 女性");
+            }
+            _ => panic!("女性应解析为 people 标签"),
+        }
+        match resolve_concept(&conn, &mk_concept("人像", Some("subject"), 0.95), false).unwrap() {
+            ConceptOutcome::Tag(tag) => {
+                assert_eq!(tag.facet_key, "subject");
+                assert_eq!(tag.text, "人像");
+            }
+            _ => panic!("人像应通过别名解析为 subject「人」"),
+        }
+    }
+
+    #[test]
+    fn confirmed_new_word_enters_dictionary_without_restart() {
+        let conn = init_memory().unwrap();
+        crate::db::ensure_default_taxonomy(&conn).unwrap();
+        let tag_id = crate::db::tags::find_or_create_canonical(&conn, "subject", "蒲公英")
+            .expect("确认新词应写入「其他」");
+        let facets = crate::db::tag_facets::build_prompt_context(&conn, "all").unwrap();
+        let dict = collect_tag_dictionary(&conn, &facets).unwrap();
+
+        assert!(
+            dict.iter()
+                .any(|line| line.contains("其他 / 蒲公英") && line.contains("term: 蒲公英")),
+            "新词确认后应进入下一次搜索词典：{dict:?}"
+        );
+        match resolve_concept(&conn, &mk_concept("蒲公英", Some("subject"), 0.95), false).unwrap()
+        {
+            ConceptOutcome::Tag(tag) => {
+                assert_eq!(tag.tag_id, tag_id);
+                assert_eq!(tag.facet_key, "subject");
+                assert_eq!(tag.path, "其他 / 蒲公英");
+            }
+            _ => panic!("已确认新词应直接解析为标签"),
+        }
     }
 
     // ── 元数据能力清单 / schema 收窄 / 容错降级（第六轮反馈） ──

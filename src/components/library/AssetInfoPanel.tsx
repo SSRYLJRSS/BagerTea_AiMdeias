@@ -16,6 +16,7 @@ import {
 import { isVideoAsset } from "@/utils/assetKind";
 import { getAsset, rescanAssetMetadata, rescanAssetPalette } from "@/api/assets";
 import type { Asset } from "@/types/asset";
+import { useMetadataStore } from "@/stores/metadataStore";
 
 type Tab = "general" | "image" | "video";
 
@@ -56,6 +57,7 @@ export default function AssetInfoPanel({ asset, onRefreshed }: { asset: Asset; o
       // 这里的 catch 是有意的：用户要的状态（媒体属性）已拿到，色板缺失在 UI 上表现为
       // "没有色条"，是可见的；不该让"重新读取媒体属性"整体报错。
       await rescanAssetPalette([asset.id], "ids").catch(() => undefined);
+      await useMetadataStore.getState().refresh();
       const fresh = await getAsset(asset.id);
       onRefreshed?.(fresh);
       setRescanMsg("已重新读取媒体属性");

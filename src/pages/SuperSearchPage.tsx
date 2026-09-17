@@ -33,7 +33,7 @@ import { dominantFiltersFor } from "@/utils/dominantFilter";
 type DialogKey = "delete" | "export" | "tags" | null;
 
 export default function SuperSearchPage() {
-  const { refresh, error, total, loading, items, loadMore, fetchAllIds, patchLocal, applyAiSearch, query, setQuery, expr, plan, planRevision, executionWarnings, resolvedTags, clearConditions, removeAtZonePath, applyTermSuggestion } = useSuperSearchStore(
+  const { refresh, error, total, loading, items, loadMore, fetchAllIds, applyAiSearch, query, setQuery, expr, plan, planRevision, executionWarnings, resolvedTags, clearConditions, removeAtZonePath, applyTermSuggestion } = useSuperSearchStore(
     useShallow((s) => ({
       refresh: s.refresh,
       error: s.error,
@@ -42,7 +42,6 @@ export default function SuperSearchPage() {
       items: s.items,
       loadMore: s.loadMore,
       fetchAllIds: s.fetchAllIds,
-      patchLocal: s.patchLocal,
       applyAiSearch: s.applyAiSearch,
       query: s.query,
       setQuery: s.setQuery,
@@ -160,12 +159,8 @@ export default function SuperSearchPage() {
   }, [dialog, selected.size]);
 
   const actions = {
-    onAiTag: () => {
-      useAiStore.getState().setPendingAssets(Array.from(selected), "auto");
-      window.dispatchEvent(new CustomEvent("app:navigate", { detail: "ai" }));
-    },
-    onAssignTags: () => {
-      useAiStore.getState().setPendingAssets(Array.from(selected), "manual");
+    onTag: () => {
+      useAiStore.getState().setPendingAssets(Array.from(selected));
       window.dispatchEvent(new CustomEvent("app:navigate", { detail: "ai" }));
     },
     onExport: () => {
@@ -197,24 +192,12 @@ export default function SuperSearchPage() {
   // §3.9：展开详细条件并滚到对应区（区徽标点击）；折叠态只改 header 高度，滚动容器 scrollHeight 不变
   const expandToZone = (zone: "filter" | "should" | "mustNot") => {
     setChrome("expanded");
+    // 窄窗口的条件编辑器使用页签；先切换到目标区，再执行滚动定位。
+    document.getElementById(`qb-tab-${zone}`)?.click();
     window.setTimeout(() => {
       document.getElementById(ZONE_TARGET[zone])?.scrollIntoView?.({ block: "center", behavior: "smooth" } as ScrollIntoViewOptions);
     }, 220); // grid-template-rows 200ms 展开动画结束后再滚
   };
-  // §3.9：快速添加 —— 展开 + 点「必须满足」区的添加按钮 + 聚焦新行字段（折叠态唯一添加入口）
-  const quickAdd = () => {
-    setChrome("expanded");
-    window.setTimeout(() => {
-      const btn = document.getElementById("qb-must-add");
-      if (!btn) return;
-      btn.scrollIntoView?.({ block: "center" } as ScrollIntoViewOptions);
-      btn.click();
-      window.setTimeout(() => {
-        document.querySelector<HTMLElement>('#qb-zone-filter [aria-label="条件字段"]')?.focus();
-      }, 30);
-    }, 60);
-  };
-
   // §7.2 互斥（同素材库页）：Viewer 打开时整体替换超搜页（搜索头部/结果网格/弹窗全部卸载），
   // 让 ViewerPage 独占整页高度；关闭后由 store 恢复筛选/滚动/选中上下文。
   // 过片数据集显式传「当前搜索结果集」，避免胶片条/上下张错用素材库全量列表。
@@ -226,7 +209,6 @@ export default function SuperSearchPage() {
         listItems={items}
         listTotal={total}
         onListLoadMore={loadMore}
-        patchListItem={patchLocal}
       />
     );
   }
@@ -244,13 +226,13 @@ export default function SuperSearchPage() {
       >
         {/* 摘要条：搜索框 + chips + 计数（FB5-03 §3.5：文字披露按钮移出，改为中央 Chevron 披露行） */}
         <div className="bg-[var(--color-bg)] px-4 pt-3">
-          <div className="mx-auto max-w-5xl">
+          <div className="mx-auto w-full max-w-[1440px]">
             <AiSearchBar onSubmit={(text) => void applyAiSearch(text)} />
             <div className="mt-1.5 flex items-center gap-2">
               <FilterChips />
               <span className="ml-auto shrink-0 text-[11px] text-[var(--color-text-tertiary)]">{total} 项</span>
             </div>
-            {/* §3.9：折叠态保留四样之二 —— 三区摘要徽标 + 快速添加 ＋（点徽标展开并滚到对应区） */}
+            {/* §3.9：折叠态保留三区摘要徽标与排序说明；新增条件统一从对应区域进入。 */}
             {(zoneSummary.length > 0 || sortNote) && (
               <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1" data-testid="super-search-zone-summary">
                 {zoneSummary.map((z) => (
@@ -259,24 +241,13 @@ export default function SuperSearchPage() {
                     type="button"
                     onClick={() => expandToZone(z.zone)}
                     aria-label={`展开到${ZONE_FULL[z.zone]}区（${z.count} 条）`}
-                    className="inline-flex h-5 items-center gap-1 rounded-full border border-[var(--color-border)] bg-[var(--color-surface)] px-2 text-[11px] text-[var(--color-text-secondary)] hover:border-[var(--color-border-strong)] hover:text-[var(--color-text)]"
+                    className="inline-flex h-5 items-center gap-1 rounded-full border border-[var(--color-border)] bg-transparent px-2 text-[11px] text-[var(--color-text-secondary)] hover:border-[var(--color-border-strong)] hover:text-[var(--color-text)]"
                   >
                     <span className="font-medium text-[var(--color-text)]">{z.label}</span>
                     <span>{z.count}</span>
                   </button>
                 ))}
                 {sortNote && <span className="text-[11px] text-[var(--color-text-tertiary)]">{sortNote}</span>}
-                {zoneSummary.length > 0 && (
-                  <button
-                    type="button"
-                    onClick={quickAdd}
-                    aria-label="快速添加条件"
-                    title="快速添加条件（展开并聚焦到必须满足区新行）"
-                    className="ml-auto inline-flex size-5 items-center justify-center rounded-full border border-dashed border-[var(--color-border-strong)] text-[var(--color-text-secondary)] hover:bg-[var(--color-surface)] hover:text-[var(--color-text)]"
-                  >
-                    ＋
-                  </button>
-                )}
               </div>
             )}
             {/* §3.9/B7：执行 warning 黄字栏不随折叠隐藏（executionWarnings；AI 侧 warnings 在 AiSearchBar 常驻区） */}
@@ -333,7 +304,7 @@ export default function SuperSearchPage() {
             className="overflow-hidden"
             style={chrome !== "expanded" ? { pointerEvents: "none" } : undefined}
           >
-            <div className="mx-auto max-w-5xl px-4 pt-3 pb-2">
+            <div className="mx-auto w-full max-w-[1440px] px-4 pt-3 pb-2">
               <QueryBuilder />
             </div>
           </div>
@@ -341,7 +312,7 @@ export default function SuperSearchPage() {
 
         {/* 唯一的 Chevron 披露行（放在面板下方）：展开时位于三区条件最底部，一键收起看图片；
             收起后面板 0fr 不占位，它自然贴到摘要行下方，作为「展开详细条件」入口。 */}
-        <div className="mx-auto max-w-5xl px-4">
+        <div className="mx-auto w-full max-w-[1440px] px-4">
           <div className="relative flex h-6 items-center justify-center">
             <div className="absolute inset-x-0 top-1/2 h-px -translate-y-1/2 bg-[var(--color-border)]" aria-hidden="true" />
             <button
@@ -373,7 +344,6 @@ export default function SuperSearchPage() {
           scrollRestoreKey="superSearch"
           hasActiveFilter={hasActiveFilter}
           onClearFilter={clearConditions}
-          patchListItem={patchLocal}
           zeroingActions={zeroing.map((z) => ({ key: `${z.zone}:${z.path.join(".")}`, label: z.label, onRemove: () => removeAtZonePath(z.zone, z.path) }))}
           {...actions}
         />

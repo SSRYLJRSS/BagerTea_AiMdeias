@@ -23,19 +23,17 @@ interface AiState {
   error: string | null;
   /** 最近一次进度事件上报的当前素材 id（FB6 需求一：侧栏 LED 提示用它查当前素材名；无事件时为 null） */
   lastProgressAssetId: number | null;
-  /** 素材库「打标」带过来的选中素材与目标模式（跨页传递）；auto = 建批时按激活档案 kind 解析云端/本地（P3-01a） */
+  /** 素材库「打标」带过来的选中素材（跨页传递） */
   pendingAssetIds: number[];
-  pendingMode: "auto" | "manual";
-  setPendingAssets: (ids: number[], mode: "auto" | "manual") => void;
+  setPendingAssets: (ids: number[]) => void;
   refreshBatches: () => Promise<void>;
   openBatch: (batchId: number) => Promise<void>;
-  /** 只建批次不调 AI（v2.10）：跳转后图片立即上胶片条；manual 模式建完即就绪 */
-  createBatch: (mode: "auto" | "manual") => Promise<void>;
+  /** 只建批次不调 AI：跳转后图片立即上胶片条，AI 建议与手工填写共用工作台 */
+  createBatch: () => Promise<void>;
   /** 云端批次手动启动（左栏「开始打标」按钮） */
   startBatch: (limit?: number) => Promise<void>;
   /** 撤销拒绝（v2.11） */
   restore: (id: number) => Promise<void>;
-  createAndRun: (mode: "cloud" | "local" | "manual") => Promise<void>;
   cancel: () => Promise<void>;
   confirm: (id: number, tags: CategorizedTags, description?: string) => Promise<void>;
   reject: (id: number) => Promise<void>;
@@ -52,24 +50,18 @@ export const useAiStore = create<AiState>((set, get) => ({
   error: null,
   lastProgressAssetId: null,
   pendingAssetIds: [],
-  pendingMode: "auto" as const,
 
-  setPendingAssets: (ids, mode) => set({ pendingAssetIds: ids, pendingMode: mode }),
+  setPendingAssets: (ids) => set({ pendingAssetIds: ids }),
 
-  createBatch: async (mode) => {
+  createBatch: async () => {
     const ids = get().pendingAssetIds;
     if (ids.length === 0) return;
     // 阶段 5 §8.1/§8.3：所选素材完整进入逻辑批次，不做静默截断。
     // 「批量上限」已改名为「执行分块大小」，仅指执行层内存分块，不再限制总批次。
     set({ pendingAssetIds: [], error: null });
     try {
-      const batch = await aiCreateBatch(ids, mode);
+      const batch = await aiCreateBatch(ids);
       set((s) => ({ batches: [batch, ...s.batches], currentBatchId: batch.id }));
-      if (mode === "manual") {
-        // 手动模式：后端直接置 done，不调 AI；建议占位载入后即可人工编辑
-        const done = await aiStartBatch(batch.id);
-        set((s) => ({ batches: s.batches.map((b) => (b.id === done.id ? done : b)) }));
-      }
       await get().openBatch(batch.id);
     } catch (e) {
       set({ error: e instanceof Error ? e.message : String(e) });
@@ -116,26 +108,6 @@ export const useAiStore = create<AiState>((set, get) => ({
     }
   },
 
-  createAndRun: async (mode) => {
-    const ids = get().pendingAssetIds;
-    if (ids.length === 0) {
-      set({ error: "请先在素材库选中素材再发起打标" });
-      return;
-    }
-    // 阶段 5 §8.1/§8.3：所选素材完整进入逻辑批次，不做静默截断。
-    set({ running: true, error: null, cancelling: false, lastProgressAssetId: null });
-    try {
-      const batch = await aiCreateBatch(ids, mode);
-      set({ pendingAssetIds: [], currentBatchId: batch.id });
-      await aiStartBatch(batch.id); // 同步等跑完，进度走事件
-      await Promise.all([get().refreshBatches(), get().openBatch(batch.id)]);
-    } catch (e) {
-      set({ error: e instanceof Error ? e.message : String(e) });
-    } finally {
-      set({ running: false, cancelling: false });
-    }
-  },
-
   cancel: async () => {
     const id = get().currentBatchId;
     if (id == null) return;
@@ -167,8 +139,12 @@ export const useAiStore = create<AiState>((set, get) => ({
   confirmAll: async () => {
     const batchId = get().currentBatchId;
     if (batchId == null) return;
-    await aiConfirmAll(batchId);
-    await Promise.all([get().refreshBatches(), get().openBatch(batchId)]);
+    try {
+      await aiConfirmAll(batchId);
+    } finally {
+      // 分页确认可能在后续页失败；无论成功失败都回载，展示已经提交的部分。
+      await Promise.all([get().refreshBatches(), get().openBatch(batchId)]);
+    }
   },
 
   patchProgress: (processed, currentAssetId) => {

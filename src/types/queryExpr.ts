@@ -46,5 +46,5 @@ export type QueryExpr =
   | { op: "not"; child: QueryExpr }
   | { op: "leaf"; cond: LeafCond };
 
-/* 说明：QueryBuilder 的编辑视图已升级为递归「条件组/叶子」模型（组件内 VGroup/VLeaf，
- * 2026-09-06 改造），与 QueryExpr 双向递归互转；旧的扁平 BuilderRow 接口已删除（P-f 统一模型）。 */
+/* 说明：QueryBuilder 的手动编辑视图只提供必须、优先、排除三个平铺分区；
+ * QueryExpr 仍保留递归结构，用于承载 AI/历史查询并交给后端原样执行。 */

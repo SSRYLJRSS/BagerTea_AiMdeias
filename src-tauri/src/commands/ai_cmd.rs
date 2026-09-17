@@ -6,7 +6,7 @@ use std::sync::Arc;
 use tauri::{AppHandle, Emitter, State};
 
 use crate::db::ai::{AiBatch, AiSuggestion, AiSuggestionItem, CategorizedTags};
-use crate::db::{ai, settings};
+use crate::db::{ai, ai_connections, settings};
 use crate::error::{AppError, AppResult};
 use crate::services::ai_cloud::{self, AiProgress};
 use crate::state::AppState;
@@ -15,8 +15,28 @@ fn lock_db(state: &AppState) -> AppResult<std::sync::MutexGuard<'_, rusqlite::Co
     state.db.lock().map_err(|_| AppError::msg("数据库锁中毒"))
 }
 
+/// 打标只认 tagging 用途绑定；旧 settings 激活档案仅作为迁移输入，不再作为运行回退。
+fn require_tagging_binding(
+    conn: &rusqlite::Connection,
+    cfg: &mut settings::AiSettings,
+) -> AppResult<()> {
+    if ai_connections::apply_usage_binding(conn, "tagging", cfg)? {
+        return Ok(());
+    }
+    Err(AppError::msg(
+        "尚未绑定打标服务，请先在打标页选择在线或本地模型",
+    ))
+}
+
+fn mode_for_active_profile(cfg: &settings::AiSettings) -> &'static str {
+    match cfg.active().map(|profile| profile.is_local()) {
+        Some(true) => "local",
+        _ => "cloud",
+    }
+}
+
 /// 用选中素材创建批次（pending 建议占位）
-/// mode：cloud/local/manual/auto（auto = 按激活档案 kind 解析，P3-01a）
+/// mode 保留为旧客户端兼容参数；除历史 manual 外，实际部署类型一律按 tagging 用途绑定解析。
 /// retagMode（A3，可缺省 = append）：append / replaceAiOnly / reviewOnly
 #[tauri::command]
 pub fn ai_create_batch(
@@ -26,33 +46,25 @@ pub fn ai_create_batch(
     retag_mode: Option<String>,
 ) -> AppResult<AiBatch> {
     if asset_ids.is_empty() {
-        return Err(AppError::msg("未选择任何素材"));
+        return Err(AppError::invalid_arg("未选择任何素材"));
     }
     if !["cloud", "local", "manual", "auto"].contains(&mode.as_str()) {
-        return Err(AppError::msg("非法打标模式"));
+        return Err(AppError::invalid_arg("非法打标模式"));
     }
     let retag = match retag_mode.as_deref() {
         None | Some("append") => ai::RetagMode::Append,
         Some("replaceAiOnly") => ai::RetagMode::ReplaceAiOnly,
         Some("reviewOnly") => ai::RetagMode::ReviewOnly,
-        Some(other) => return Err(AppError::msg(format!("非法重跑模式: {other}"))),
+        Some(other) => return Err(AppError::invalid_arg(format!("非法重跑模式: {other}"))),
     };
     let conn = lock_db(&state)?;
     let mut s = settings::get_settings(&conn)?;
-    // §4.4：打标用途绑定优先（影响 auto/cloud 的本地/云端判定）
-    let _ =
-        crate::db::ai_connections::apply_usage_binding(&conn, "tagging", &mut s.ai).map_err(|e| {
-            tracing::warn!("打标读取用途绑定失败，回退默认档案: {e}");
-            e
-        });
-    // auto/cloud 统一按激活档案 kind 落实际模式：本地档案 → local，否则 cloud
+    // 新前端不再创建 manual 批次；保留历史协议兼容，存量 manual 批次仍可查看和手工编辑。
     let mode = if mode == "manual" {
         mode
     } else {
-        match s.ai.active().map(|p| p.is_local()).unwrap_or(false) {
-            true => "local".to_string(),
-            false => "cloud".to_string(),
-        }
+        require_tagging_binding(&conn, &mut s.ai)?;
+        mode_for_active_profile(&s.ai).to_string()
     };
     // 指导书阶段 5 §8.1/§8.3：用户选择的素材**完整**进入逻辑批次，不做静默截断。
     // 「批量上限」不再作为总批次截断——执行层按「分块大小」内存分块、限流、重试。
@@ -79,14 +91,9 @@ pub async fn ai_start_batch(
         let all = {
             let conn = db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
             let batch = ai::get_batch(&conn, batch_id)?;
-            // 手动模式（v2.10）：不请求 AI，批次直接就绪，pending 建议留待人工编辑
-            if batch.mode == "manual" {
-                ai::set_batch_status(&conn, batch_id, "done")?;
-                return ai::get_batch(&conn, batch_id);
-            }
             // v2.12：仅执行中拒绝；done/cancelled 允许续跑剩余 pending 建议
             if batch.status == "processing" {
-                return Err(AppError::msg("批次正在执行中"));
+                return Err(AppError::conflict("批次正在执行中"));
             }
             // F15a（2026-08-22）：待打标 = pending 且尚无候选（set_suggestion_tags 不改 status，
             // 只看 status 会把「已生成候选未确认」的条目误判为待处理 → 续跑重复请求）
@@ -94,24 +101,17 @@ pub async fn ai_start_batch(
                 .iter()
                 .any(|s| s.status == "pending" && s.suggested_tags.is_empty());
             if !has_pending {
-                return Err(AppError::msg("当前没有待打标的建议（已全部处理或确认）"));
-            }
-            let mut s = settings::get_settings(&conn)?;
-            // §4.4：打标按用途绑定读取连接档案（含 keyring 密钥解析）；无绑定时回退默认 active 档案。
-            //       绑定修改不写 settings JSON，复用现有 AI HTTP service（run_cloud_batch 只读 cfg）。
-            let _ = crate::db::ai_connections::apply_usage_binding(&conn, "tagging", &mut s.ai).map_err(
-                |e| {
-                    tracing::warn!("打标读取用途绑定失败，回退默认档案: {e}");
-                    e
-                },
-            );
-            // P3-01a：本地批次要求激活档案为本地端点（cloud/local 管线同构，只做一致性校验）
-            let profile_is_local = s.ai.active().map(|p| p.is_local()).unwrap_or(false);
-            if batch.mode == "local" && !profile_is_local {
-                return Err(AppError::msg(
-                    "该批次为本地打标：请在设置页把激活档案切换为本地端点（kind=本地，如 Ollama）后重试",
+                return Err(AppError::not_found(
+                    "当前没有待打标的建议（已全部处理或确认）",
                 ));
             }
+            let mut s = settings::get_settings(&conn)?;
+            // §4.4：打标按用途绑定读取连接档案（含 keyring 密钥解析）。
+            //       绑定修改不写 settings JSON，复用现有 AI HTTP service（run_cloud_batch 只读 cfg）。
+            require_tagging_binding(&conn, &mut s.ai)?;
+            let profile_is_local = mode_for_active_profile(&s.ai) == "local";
+            // 建批后允许切换服务；执行时按当前 tagging 绑定修正批次类型。
+            ai::set_batch_mode(&conn, batch_id, mode_for_active_profile(&s.ai))?;
             // FB-03 §9.3 视频批次预检（前后端一致；后端为最终校验，service 层兜底保留）：
             // 待打标条目是否含视频 → 开关/ffmpeg/本地视觉模型三项检查，启动前阻断而非逐条启动后失败。
             {
@@ -136,13 +136,15 @@ pub async fn ai_start_batch(
                 });
                 if has_video {
                     if !s.ai.video_tagging {
-                        return Err(AppError::msg(
+                        return Err(AppError::unsupported(
                             "视频 AI 打标未开启。请打开「设置 → AI 设置 → 自动打标 → 视频 AI 打标」，保存后重新开始批次。",
                         ));
                     }
-                    if !crate::services::video::ffmpeg_available() {
-                        return Err(AppError::msg(
-                            "本批次包含视频，但未检测到 ffmpeg：无法抽帧打标。请安装 ffmpeg 并加入 PATH，或在设置中关闭「视频 AI 打标」后重试。",
+                    if s.ai.video_tagging_mode == "frames"
+                        && !crate::services::video::ffmpeg_available()
+                    {
+                        return Err(AppError::unsupported(
+                            "视频打标模式为「抽帧打标」，但未检测到 ffmpeg。请安装 ffmpeg 并加入 PATH，或在设置中改为「封面打标」后重试。",
                         ));
                     }
                 }
@@ -151,8 +153,8 @@ pub async fn ai_start_batch(
                 if profile_is_local {
                     if let Some(active) = s.ai.active() {
                         if !crate::services::ai_cloud::model_supports_vision(&active.model) {
-                            return Err(AppError::msg(format!(
-                                "当前本地模型「{}」不支持视觉（图片/视频）输入，无法打标。请更换支持图片输入的视觉模型（如 qwen2.5vl、llava、moondream），保存后重新开始批次。",
+                            return Err(AppError::unsupported(format!(
+                                "当前本地模型「{}」不支持视觉（图片/视频）输入，无法打标。请更换支持图片输入的视觉模型（如 qwen3.5、llava、moondream），保存后重新开始批次。",
                                 active.model
                             )));
                         }
@@ -303,6 +305,94 @@ pub fn ai_apply_tags(
 
 #[tauri::command]
 pub fn ai_confirm_all(state: State<AppState>, batch_id: i64) -> AppResult<()> {
-    let conn = lock_db(&state)?;
-    ai::confirm_all_pending(&conn, batch_id)
+    const CHUNK: i64 = 100;
+    let mut after_id = 0;
+    loop {
+        let page = {
+            let conn = lock_db(&state)?;
+            ai::list_pending_confirmations(&conn, batch_id, after_id, CHUNK)?
+        };
+        let Some(last_id) = page.last_id else {
+            return Ok(());
+        };
+        {
+            let conn = lock_db(&state)?;
+            ai::confirm_pending_batch(&conn, &page.items)?;
+        }
+        after_id = last_id;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::{ai_connections, init_memory};
+
+    #[test]
+    fn tagging_binding_overrides_stale_active_profile() {
+        let conn = init_memory().unwrap();
+        ai_connections::upsert(
+            &conn,
+            "local-1",
+            "Local",
+            "local",
+            "openai_chat",
+            "http://localhost:11434/v1",
+            "qwen3.5:4b",
+            None,
+        )
+        .unwrap();
+        ai_connections::upsert(
+            &conn,
+            "cloud-1",
+            "Cloud",
+            "cloud",
+            "openai_chat",
+            "https://example.com/v1",
+            "vision-model",
+            None,
+        )
+        .unwrap();
+        ai_connections::bind_usage(&conn, "tagging", "cloud-1").unwrap();
+
+        let mut cfg = settings::get_settings(&conn).unwrap();
+        cfg.ai.profiles.push(settings::ApiProfile {
+            id: "stale-local".into(),
+            name: "Stale Local".into(),
+            api_mode: "openai".into(),
+            kind: "local".into(),
+            base_url: "http://localhost:11434/v1".into(),
+            api_key: String::new(),
+            model: "qwen3.5:4b".into(),
+        });
+        cfg.ai.active_profile = "stale-local".into();
+
+        require_tagging_binding(&conn, &mut cfg.ai).unwrap();
+        assert_eq!(cfg.ai.active().unwrap().id, "cloud-1");
+        assert_eq!(mode_for_active_profile(&cfg.ai), "cloud");
+
+        ai_connections::bind_usage(&conn, "tagging", "local-1").unwrap();
+        require_tagging_binding(&conn, &mut cfg.ai).unwrap();
+        assert_eq!(cfg.ai.active().unwrap().id, "local-1");
+        assert_eq!(mode_for_active_profile(&cfg.ai), "local");
+    }
+
+    #[test]
+    fn missing_tagging_binding_does_not_fall_back_to_legacy_profile() {
+        let conn = init_memory().unwrap();
+        let mut cfg = settings::get_settings(&conn).unwrap();
+        cfg.ai.profiles.push(settings::ApiProfile {
+            id: "legacy".into(),
+            name: "Legacy".into(),
+            api_mode: "openai".into(),
+            kind: "cloud".into(),
+            base_url: "https://example.com/v1".into(),
+            api_key: "secret".into(),
+            model: "vision-model".into(),
+        });
+        cfg.ai.active_profile = "legacy".into();
+
+        let err = require_tagging_binding(&conn, &mut cfg.ai).unwrap_err();
+        assert!(err.to_string().contains("尚未绑定打标服务"));
+    }
 }

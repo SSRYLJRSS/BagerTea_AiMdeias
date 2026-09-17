@@ -3,7 +3,7 @@
 //! 合成样本覆盖可编码格式（jpg/png/webp/bmp/tga/tif）在占位层（320）与
 //! 高清层（1024）的出图断言；垃圾/损坏样本验证各层优雅降级不 panic。
 //! 真实 RAW/HEIC 样本无法合成，走 perf_probe 手动探针 + 老板素材走查
-//! （fixtures 大文件 gitignore，见 PHASE2_FORMATS.md F06）。
+//! （fixtures 大文件 gitignore，见 docs/TEST_STRATEGY.md 与 docs/PERFORMANCE.md）。
 
 use std::path::PathBuf;
 

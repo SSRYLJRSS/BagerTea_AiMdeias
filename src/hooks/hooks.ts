@@ -1,6 +1,7 @@
 /** T04 通用 hooks：防抖 / Tauri 事件订阅 / Esc 键 / 元素尺寸 */
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { UnlistenFn } from "@tauri-apps/api/event";
+import { logger } from "@/utils/logger";
 
 /** 值防抖（搜索关键词等） */
 export function useDebouncedValue<T>(value: T, delayMs = 300): T {
@@ -25,7 +26,7 @@ export function useTauriEvent(subscribe: () => Promise<UnlistenFn>, deps: unknow
       // P2-02：订阅失败（如 Tauri API 暂不可用/测试环境）不能被 Promise.all 之外的空
       // then 链吞成 unhandled rejection；cleanup 由 cancelled 标志兜底，失败不阻断渲染
       .catch((e) => {
-        console.error("Tauri 事件订阅失败", e);
+        logger.error("Tauri 事件订阅失败", { error: e instanceof Error ? e.stack : String(e) });
       });
     return () => {
       cancelled = true;

@@ -35,7 +35,7 @@ describe("computeAiStats", () => {
 
   it("「全部确认」按钮应显示 awaitingConfirmation 数量", () => {
     const stats = computeAiStats([
-      { status: "pending", suggestedTags: { style: ["胶片"] } },
+      { status: "pending", suggestedTags: { lighting: ["逆光"] } },
       { status: "pending", suggestedTags: { subject: ["狗"] } },
     ]);
     expect(stats.awaitingConfirmation).toBe(2);

@@ -20,14 +20,14 @@ pub async fn export_local_files(
     layout: Option<String>,
 ) -> AppResult<ExportTask> {
     if mode != "copy" && mode != "move" {
-        return Err(AppError::msg("非法导出模式"));
+        return Err(AppError::invalid_arg("非法导出模式"));
     }
     let layout = layout.unwrap_or_else(|| "flat".to_string());
     if layout != "flat" && layout != "by_tag" && layout != "by_date" {
-        return Err(AppError::msg("非法目录组织"));
+        return Err(AppError::invalid_arg("非法目录组织"));
     }
     if asset_ids.is_empty() {
-        return Err(AppError::msg("未选择任何素材"));
+        return Err(AppError::invalid_arg("未选择任何素材"));
     }
     let db = std::sync::Arc::clone(&state.db);
     let registry = std::sync::Arc::clone(&state.export_cancel);
@@ -90,7 +90,7 @@ pub fn export_csv_manifest(
     dest_dir: String,
 ) -> AppResult<String> {
     if asset_ids.is_empty() {
-        return Err(AppError::msg("未选择任何素材"));
+        return Err(AppError::invalid_arg("未选择任何素材"));
     }
     let conn = state.db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
     let out = export_local::write_csv_manifest(&conn, &asset_ids, &dest_dir)?;

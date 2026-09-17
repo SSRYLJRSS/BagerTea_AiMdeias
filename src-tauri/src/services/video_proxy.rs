@@ -123,7 +123,7 @@ fn atomic_rename(tmp: &Path, out: &Path) -> AppResult<()> {
             }
         }
     }
-    Err(AppError::msg("代理 rename 失败（目标被占用）"))
+    Err(AppError::file_locked("代理 rename 失败（目标被占用）"))
 }
 
 /// 获取或生成代理。transcode(src, tmp, cancel) 由调用方注入：
@@ -142,6 +142,14 @@ pub fn get_or_create_proxy(
     {
         return Err(AppError::msg("非法代理变体"));
     }
+    let started = Instant::now();
+    tracing::debug!(
+        operation = "video_proxy",
+        asset_id,
+        variant = %variant,
+        stage = "start",
+        "开始获取视频代理"
+    );
     let key = format!("{asset_id}:{variant}");
     with_single_flight(&key, || {
         // ① 已 ready 且文件存在 → 复用
@@ -151,6 +159,14 @@ pub fn get_or_create_proxy(
                 if p.status == "ready" {
                     if let Some(path) = &p.path {
                         if Path::new(path).exists() {
+                            tracing::info!(
+                                operation = "video_proxy",
+                                asset_id,
+                                variant = %variant,
+                                stage = "cache_hit",
+                                duration_ms = started.elapsed().as_millis() as u64,
+                                "视频代理缓存命中"
+                            );
                             return Ok(p);
                         }
                     }
@@ -164,6 +180,15 @@ pub fn get_or_create_proxy(
             (a.mime_type, PathBuf::from(a.file_path))
         };
         if !mime.starts_with("video/") {
+            tracing::warn!(
+                operation = "video_proxy",
+                asset_id,
+                variant = %variant,
+                stage = "unsupported_asset",
+                error_code = "UNSUPPORTED",
+                duration_ms = started.elapsed().as_millis() as u64,
+                "素材不是视频，跳过代理生成"
+            );
             {
                 let conn = db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
                 video_proxy::upsert(
@@ -191,6 +216,14 @@ pub fn get_or_create_proxy(
                 Some(&out.to_string_lossy()),
                 None,
             )?;
+            tracing::info!(
+                operation = "video_proxy",
+                asset_id,
+                variant = %variant,
+                stage = "disk_reuse",
+                duration_ms = started.elapsed().as_millis() as u64,
+                "代理文件已存在，恢复数据库状态"
+            );
             return video_proxy::get(&conn, asset_id, variant)?
                 .ok_or_else(|| AppError::msg("代理记录写入失败"));
         }
@@ -201,6 +234,7 @@ pub fn get_or_create_proxy(
         }
         // ④ 全局转码并发闸：ffmpeg 启动前获取许可；等待可被取消；等待不持数据库锁
         //    （§8.1：默认并发 1，跨素材生效；超时 30s 与 ffmpeg 墙钟一致）
+        let license_started = Instant::now();
         let license = match TranscodeLicense::acquire(cancel, Duration::from_secs(30)) {
             Some(l) => l,
             None => {
@@ -211,12 +245,33 @@ pub fn get_or_create_proxy(
                 } else {
                     "等待转码许可超时"
                 };
+                let error_code = if canceled { "CANCELLED" } else { "TIMEOUT" };
+                tracing::warn!(
+                    operation = "video_proxy",
+                    asset_id,
+                    variant = %variant,
+                    stage = "license_unavailable",
+                    outcome = status,
+                    error_code,
+                    wait_ms = license_started.elapsed().as_millis() as u64,
+                    duration_ms = started.elapsed().as_millis() as u64,
+                    reason,
+                    "获取视频转码许可失败"
+                );
                 let conn = db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
                 video_proxy::upsert(&conn, asset_id, variant, status, None, Some(reason))?;
                 return video_proxy::get(&conn, asset_id, variant)?
                     .ok_or_else(|| AppError::msg("代理记录写入失败"));
             }
         };
+        tracing::debug!(
+            operation = "video_proxy",
+            asset_id,
+            variant = %variant,
+            stage = "license_acquired",
+            wait_ms = license_started.elapsed().as_millis() as u64,
+            "获取视频转码许可"
+        );
         // ⑤ 锁外转码到临时文件（许可持有时限 = 转码时长；结束后 drop 自动释放）
         let uid = uuid::Uuid::new_v4().to_string();
         let tmp = temp_path(&out, &uid);
@@ -234,9 +289,27 @@ pub fn get_or_create_proxy(
                         Some(&out.to_string_lossy()),
                         None,
                     )?;
+                    tracing::info!(
+                        operation = "video_proxy",
+                        asset_id,
+                        variant = %variant,
+                        stage = "done",
+                        duration_ms = started.elapsed().as_millis() as u64,
+                        "视频代理生成完成"
+                    );
                 }
                 Err(e) => {
                     let _ = fs::remove_file(&tmp);
+                    tracing::error!(
+                        operation = "video_proxy",
+                        asset_id,
+                        variant = %variant,
+                        stage = "rename_failed",
+                        error_code = e.code(),
+                        error = %e,
+                        duration_ms = started.elapsed().as_millis() as u64,
+                        "视频代理落盘失败"
+                    );
                     let conn = db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
                     video_proxy::upsert(
                         &conn,
@@ -257,6 +330,28 @@ pub fn get_or_create_proxy(
                     e.to_string()
                 };
                 let status = if canceled { "canceled" } else { "failed" };
+                if canceled {
+                    tracing::warn!(
+                        operation = "video_proxy",
+                        asset_id,
+                        variant = %variant,
+                        stage = "cancelled",
+                        error_code = "CANCELLED",
+                        duration_ms = started.elapsed().as_millis() as u64,
+                        "视频代理生成已取消"
+                    );
+                } else {
+                    tracing::error!(
+                        operation = "video_proxy",
+                        asset_id,
+                        variant = %variant,
+                        stage = "failed",
+                        error_code = e.code(),
+                        error = %e,
+                        duration_ms = started.elapsed().as_millis() as u64,
+                        "视频代理生成失败"
+                    );
+                }
                 let conn = db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
                 video_proxy::upsert(&conn, asset_id, variant, status, None, Some(&reason))?;
             }

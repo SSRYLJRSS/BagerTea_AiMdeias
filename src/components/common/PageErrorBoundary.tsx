@@ -2,10 +2,11 @@
  * 页面级 Error Boundary（指导书 A-1）：任何设置子组件/路由页的运行时异常都不得表现为无信息白屏。
  * - class Error Boundary，捕获 getDerivedStateFromError 与 componentDidCatch；
  * - 显示页面级错误状态（中文摘要），提供「重新加载」与「返回素材库」；
- * - 开发环境记录原始错误与 component stack；不吞错误（console.error）。
+ * - 统一记录原始错误与 component stack；不吞错误。
  * - 只包裹路由页，不把整个应用包成一个无法恢复的大边界。
  */
 import { Component, type ErrorInfo, type ReactNode } from "react";
+import { logger } from "@/utils/logger";
 
 interface PageErrorBoundaryProps {
   /** 重新加载：父层可提供重试动作（如重新加载设置） */
@@ -32,12 +33,10 @@ export default class PageErrorBoundary extends Component<PageErrorBoundaryProps,
 
   componentDidCatch(error: Error, info: ErrorInfo) {
     this.setState({ componentStack: info.componentStack ?? null });
-    // 不吞错误：至少记录到控制台（开发环境含 stack）
-    if (isDev) {
-      console.error("[PageErrorBoundary] 页面渲染异常:", error, info.componentStack);
-    } else {
-      console.error("[PageErrorBoundary] 页面渲染异常:", error);
-    }
+    logger.error("[PageErrorBoundary] 页面渲染异常", {
+      error: error.stack ?? error.message,
+      componentStack: isDev ? info.componentStack : undefined,
+    });
   }
 
   private reset = () => {

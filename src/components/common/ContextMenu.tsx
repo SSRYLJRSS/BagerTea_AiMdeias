@@ -1,7 +1,7 @@
 /** 通用右键菜单（PRD 5.4-4）：固定定位、点外/Esc 关闭、边缘防溢出、支持悬停二级菜单
  *  注意：点外关闭的捕获监听必须排除菜单内部，否则菜单项点击会被关闭抢先拦截
  */
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import clsx from "clsx";
 
 export type MenuEntry =
@@ -17,10 +17,14 @@ interface ContextMenuProps {
 }
 
 const MENU_W = 168;
+const SUBMENU_W = 96;
+const VIEWPORT_GAP = 8;
 
 export default function ContextMenu({ x, y, entries, onClose }: ContextMenuProps) {
   const ref = useRef<HTMLDivElement>(null);
+  const submenuRef = useRef<HTMLDivElement>(null);
   const [openSub, setOpenSub] = useState<number | null>(null);
+  const [submenuTop, setSubmenuTop] = useState(0);
 
   useEffect(() => {
     // 捕获阶段监听点外关闭，但菜单内部点击必须放行（否则菜单项 onClick 永远到不了）
@@ -40,8 +44,15 @@ export default function ContextMenu({ x, y, entries, onClose }: ContextMenuProps
 
   // 边缘防溢出
   const estH = entries.length * 30 + 8;
-  const left = Math.min(x, window.innerWidth - MENU_W - 8);
-  const top = Math.min(y, window.innerHeight - estH - 8);
+  const left = Math.max(VIEWPORT_GAP, Math.min(x, window.innerWidth - MENU_W - VIEWPORT_GAP));
+  const top = Math.max(VIEWPORT_GAP, Math.min(y, window.innerHeight - estH - VIEWPORT_GAP));
+
+  useLayoutEffect(() => {
+    if (openSub == null || !submenuRef.current) return;
+    const rect = submenuRef.current.getBoundingClientRect();
+    const overflow = rect.bottom - (window.innerHeight - VIEWPORT_GAP);
+    setSubmenuTop(overflow > 0 ? -overflow : 0);
+  }, [openSub]);
 
   return (
     <div
@@ -61,7 +72,15 @@ export default function ContextMenu({ x, y, entries, onClose }: ContextMenuProps
                 <span className="text-[10px] text-[var(--color-text-secondary)]">▸</span>
               </div>
               {openSub === i && (
-                <div className="absolute top-0 left-full z-50 ml-0.5 min-w-[96px] rounded-lg border border-[var(--color-border)] bg-[var(--color-bg)] py-1 shadow-lg">
+                <div
+                  ref={submenuRef}
+                  className="absolute left-full z-50 min-w-[96px] rounded-lg border border-[var(--color-border)] bg-[var(--color-bg)] py-1 shadow-lg"
+                  style={{
+                    top: submenuTop,
+                    marginLeft: -1,
+                    transform: left + MENU_W + SUBMENU_W > window.innerWidth - VIEWPORT_GAP ? `translateX(-${MENU_W + SUBMENU_W + 2}px)` : undefined,
+                  }}
+                >
                   {entry.children.map((c, j) =>
                     "divider" in c ? (
                       <div key={j} className="mx-2 my-1 border-t border-[var(--color-border)]" />

@@ -16,7 +16,7 @@ use crate::state::AppState;
 /// RAII guard（RefillGateGuard）与抢闸逻辑在 media_refill 内实现，供导入后置（FX-11）复用。
 fn acquire_refill_gate(gate: &Arc<AtomicBool>) -> AppResult<media_refill::RefillGateGuard> {
     media_refill::try_acquire_gate(gate).ok_or_else(|| {
-        AppError::msg("已有回填任务进行中（媒体元数据回填或色板回算），请等待完成或先取消")
+        AppError::conflict("已有回填任务进行中（媒体元数据回填或色板回算），请等待完成或先取消")
     })
 }
 
@@ -62,10 +62,10 @@ pub async fn rescan_asset_metadata(
 ) -> AppResult<RescanResult> {
     let scope = scope.unwrap_or_else(|| "missing".to_string());
     if scope != "all" && scope != "missing" && scope != "ids" {
-        return Err(AppError::msg("scope 只允许 all | missing | ids"));
+        return Err(AppError::invalid_arg("scope 只允许 all | missing | ids"));
     }
     if scope == "ids" && ids.as_ref().is_none_or(|v| v.is_empty()) {
-        return Err(AppError::msg("未选择任何素材"));
+        return Err(AppError::invalid_arg("未选择任何素材"));
     }
     let db = Arc::clone(&state.db);
     let cancel = Arc::clone(&state.media_refill_cancel);
@@ -110,10 +110,10 @@ pub async fn rescan_asset_palette(
 ) -> AppResult<PaletteRescanResult> {
     let scope = scope.unwrap_or_else(|| "missing".to_string());
     if scope != "all" && scope != "missing" && scope != "ids" {
-        return Err(AppError::msg("scope 只允许 all | missing | ids"));
+        return Err(AppError::invalid_arg("scope 只允许 all | missing | ids"));
     }
     if scope == "ids" && ids.as_ref().is_none_or(|v| v.is_empty()) {
-        return Err(AppError::msg("未选择任何素材"));
+        return Err(AppError::invalid_arg("未选择任何素材"));
     }
     let db = Arc::clone(&state.db);
     let cancel = Arc::clone(&state.media_refill_cancel);
@@ -172,10 +172,10 @@ pub async fn rescan_asset_geo_taken(
 ) -> AppResult<RescanResult> {
     let scope = scope.unwrap_or_else(|| "missing".to_string());
     if scope != "all" && scope != "missing" && scope != "ids" {
-        return Err(AppError::msg("scope 只允许 all | missing | ids"));
+        return Err(AppError::invalid_arg("scope 只允许 all | missing | ids"));
     }
     if scope == "ids" && ids.as_ref().is_none_or(|v| v.is_empty()) {
-        return Err(AppError::msg("未选择任何素材"));
+        return Err(AppError::invalid_arg("未选择任何素材"));
     }
     let db = Arc::clone(&state.db);
     let cancel = Arc::clone(&state.media_refill_cancel);
@@ -217,10 +217,10 @@ pub async fn rescan_image_dimensions(
 ) -> AppResult<RescanResult> {
     let scope = scope.unwrap_or_else(|| "missing".to_string());
     if scope != "all" && scope != "missing" && scope != "ids" {
-        return Err(AppError::msg("scope 只允许 all | missing | ids"));
+        return Err(AppError::invalid_arg("scope 只允许 all | missing | ids"));
     }
     if scope == "ids" && ids.as_ref().is_none_or(|v| v.is_empty()) {
-        return Err(AppError::msg("未选择任何素材"));
+        return Err(AppError::invalid_arg("未选择任何素材"));
     }
     let db = Arc::clone(&state.db);
     let cancel = Arc::clone(&state.media_refill_cancel);
@@ -271,10 +271,10 @@ pub async fn rescan_asset_phash(
 ) -> AppResult<RescanResult> {
     let scope = scope.unwrap_or_else(|| "missing".to_string());
     if scope != "all" && scope != "missing" && scope != "ids" {
-        return Err(AppError::msg("scope 只允许 all | missing | ids"));
+        return Err(AppError::invalid_arg("scope 只允许 all | missing | ids"));
     }
     if scope == "ids" && ids.as_ref().is_none_or(|v| v.is_empty()) {
-        return Err(AppError::msg("未选择任何素材"));
+        return Err(AppError::invalid_arg("未选择任何素材"));
     }
     let db = Arc::clone(&state.db);
     let cancel = Arc::clone(&state.media_refill_cancel);

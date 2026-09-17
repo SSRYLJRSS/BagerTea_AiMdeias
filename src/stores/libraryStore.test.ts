@@ -111,6 +111,29 @@ describe("libraryStore 数据装载", () => {
     expect(useLibraryStore.getState().filter.assetType).toBe("video");
   });
 
+  it("clearTagFilters：移除已删除标签的筛选且不会额外发起刷新", async () => {
+    useLibraryStore.setState((s) => ({
+      filter: {
+        ...s.filter,
+        untaggedOnly: true,
+        tagId: 7,
+        facetFilters: [{ facetKey: "scene", tagIds: [7], mode: "any", includeDescendants: true }],
+        excludeTagIds: [8],
+      },
+    }));
+    useSelectionStore.getState().toggle(1, 0, true);
+
+    useLibraryStore.getState().clearTagFilters();
+
+    const filter = useLibraryStore.getState().filter;
+    expect(filter.untaggedOnly).toBe(false);
+    expect(filter.tagId).toBeNull();
+    expect(filter.facetFilters).toEqual([]);
+    expect(filter.excludeTagIds).toEqual([]);
+    expect(useSelectionStore.getState().count()).toBe(0);
+    expect(listAssets).not.toHaveBeenCalled();
+  });
+
   it("BUG-E 回归：fetchAllIds 走 list_asset_ids 只取 id 数组（不拉完整对象/不带 limit）", async () => {
     vi.mocked(listAssetIds).mockResolvedValue([7, 8, 9]);
     const ids = await useLibraryStore.getState().fetchAllIds();

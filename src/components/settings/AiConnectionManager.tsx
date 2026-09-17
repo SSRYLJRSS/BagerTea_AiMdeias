@@ -152,16 +152,16 @@ export default function AiConnectionManager({ deployment, notify, fail, onChange
     <div className="flex flex-col gap-2">
       <div className="flex items-center justify-between">
         <p className="text-sm text-[var(--color-text)]">AI 服务</p>
-        <Button onClick={beginAdd} disabled={!!editingId}>{editingId ? "先完成当前编辑" : "+ 新增服务"}</Button>
+        <Button onClick={beginAdd} disabled={!!editingId}>{editingId ? "请先完成当前编辑" : "+ 新增服务"}</Button>
       </div>
       <p className="text-[11px] leading-4 text-[var(--color-text-secondary)]">
-        服务配置（地址、模型、密钥）只在这里维护。API 密钥会安全保存在系统凭据中，界面不会显示完整密钥。
+        服务地址、模型和密钥在此统一管理。API 密钥保存在系统凭据中，不会完整显示。
       </p>
 
       {error && <p className="text-xs text-[var(--color-danger)]">{error}</p>}
 
       {loading ? (
-        <p className="text-xs text-[var(--color-text-secondary)]">加载连接档案…</p>
+        <p className="text-xs text-[var(--color-text-secondary)]">正在加载服务…</p>
       ) : (
         <ul className="flex flex-col gap-1.5">
           {visible.map((c) =>
@@ -173,7 +173,7 @@ export default function AiConnectionManager({ deployment, notify, fail, onChange
                     {saving ? "保存中…" : "保存"}
                   </Button>
                   <Button disabled={saving} onClick={cancelEdit}>取消</Button>
-                  <span className="text-[10px] text-[var(--color-text-tertiary)]">API 密钥留空 = 保留原密钥</span>
+                  <span className="text-[10px] text-[var(--color-text-tertiary)]">API 密钥留空时保留原密钥</span>
                 </div>
               </li>
             ) : (
@@ -215,7 +215,7 @@ export default function AiConnectionManager({ deployment, notify, fail, onChange
                     onClick={() => void remove(c)}
                     className="rounded px-1.5 py-1 text-xs text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-hover)] hover:text-red-500"
                   >
-                    删
+                    删除
                   </button>
                 </div>
               </li>
@@ -224,8 +224,8 @@ export default function AiConnectionManager({ deployment, notify, fail, onChange
           {visible.length === 0 && !editingId && (
             <li className="rounded-md border border-dashed border-[var(--color-border)] px-2 py-3 text-center text-xs text-[var(--color-text-secondary)]">
               {deployment === "cloud"
-                ? "暂无在线服务，点击「+ 新增服务」创建（旧配置已自动迁入）。"
-                : "暂无本机服务，点击「+ 新增服务」创建（需本机 Ollama/LM Studio）。"}
+                ? "暂无在线服务，可点击「+ 新增服务」创建。"
+                : "暂无本机服务，可点击「+ 新增服务」创建（需本机 Ollama/LM Studio）。"}
             </li>
           )}
           {editingId === "__new__" && (

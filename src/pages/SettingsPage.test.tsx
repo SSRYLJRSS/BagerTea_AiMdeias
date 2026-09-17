@@ -1,16 +1,17 @@
 /**
  * SettingsPage 回归测试（指导书 §6.1/§12.5）：
- *  - 第一项是「入库与总库」；分组顺序为 入库与总库 → AI 设置 → 标签与分类 → 通用外观 → 数据与缓存 → 关于；
- *  - AI 设置内部可切换「超级搜索 AI / 打标 AI」子页，右侧显示在线/本地二选一；
+ *  - 第一项是「素材库与入库」；分组顺序为 素材库与入库 → AI 与模型 → 标签与分类 → 外观与浏览 → 存储与维护 → 诊断与支持 → 关于；
+ *  - AI 与模型内部可切换「超级搜索 / 自动打标」子页，右侧显示在线/本地二选一；
  *  - 网盘分组与「本地打标」顶层组不存在（§6.8 网盘移除）；
  *  - 加载失败后点击重试会再次调用 load，成功后进入表单。
  */
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { render, screen, waitFor, fireEvent } from "@testing-library/react";
 import { StrictMode as ReactStrictMode } from "react";
 import SettingsPage from "@/pages/SettingsPage";
 import { useSettingsStore } from "@/stores/settingsStore";
-import { getSettings, resetAppData, saveSettings } from "@/api/settings";
+import { useTagStore } from "@/stores/tagStore";
+import { exportDiagnostics, getSettings, resetAppData, saveSettings } from "@/api/settings";
 import { rescanAssetMetadata } from "@/api/assets";
 import type { Settings } from "@/types/settings";
 import type { TagFacet } from "@/types/tag";
@@ -26,10 +27,15 @@ const assetMocks = vi.hoisted(() => ({
 const libraryMocks = vi.hoisted(() => ({
   refreshPaletteFields: vi.fn(),
   refresh: vi.fn(),
+  clearTagFilters: vi.fn(),
 }));
 vi.mock("@/stores/libraryStore", () => ({
   useLibraryStore: {
-    getState: () => ({ refreshPaletteFields: libraryMocks.refreshPaletteFields, refresh: libraryMocks.refresh }),
+    getState: () => ({
+      refreshPaletteFields: libraryMocks.refreshPaletteFields,
+      refresh: libraryMocks.refresh,
+      clearTagFilters: libraryMocks.clearTagFilters,
+    }),
   },
 }));
 vi.mock("@/api/settings", () => ({
@@ -37,14 +43,21 @@ vi.mock("@/api/settings", () => ({
   saveSettings: vi.fn().mockResolvedValue(undefined),
   getDataDir: vi.fn().mockResolvedValue("D:/data"),
   openDataDir: vi.fn().mockResolvedValue(undefined),
+  openLogsDir: vi.fn().mockResolvedValue(undefined),
+  exportDiagnostics: vi.fn().mockResolvedValue({ path: "D:/diag.zip", logFiles: 2, bytes: 2048 }),
   clearThumbnailCache: vi.fn().mockResolvedValue(undefined),
   resetAppData: vi.fn().mockResolvedValue({
     assetsDeleted: 0,
+    assetFilesDeleted: 0,
+    assetFilesFailed: 0,
+    exportTasksDeleted: 0,
     tagsDeleted: 0,
     aiTasksDeleted: 0,
     connectionsDeleted: 0,
     preferencesReset: false,
+    searchStateReset: false,
     cacheFilesDeleted: 0,
+    logFilesDeleted: 0,
   }),
 }));
 vi.mock("@/api/ollama", () => ({
@@ -68,7 +81,6 @@ vi.mock("@/api/ollama", () => ({
 }));
 vi.mock("@/api/ai", () => ({
   // FB5-04：aiListModels 已删除（模型发现走 discoverAiModels / connections）
-  // F6-d：词表治理面板（VocabularyGovernancePanel）自动拉取
   aiListNewWordCandidates: vi.fn().mockResolvedValue([]),
   aiDecideSuggestionItem: vi.fn().mockResolvedValue(undefined),
 }));
@@ -79,18 +91,8 @@ vi.mock("@/api/tags", async (importOriginal) => ({
   ...(await importOriginal<Record<string, unknown>>()),
   listAllTagFacets: vi.fn().mockResolvedValue([]),
   listContentDescriptions: vi.fn().mockResolvedValue([]),
-  listTagConstraintFeatures: vi.fn().mockResolvedValue([]),
   scanDuplicateTags: vi.fn().mockResolvedValue([]),
   searchTagCandidates: vi.fn().mockResolvedValue([]),
-  detectTagConstraintsConflicts: vi.fn().mockResolvedValue({
-    termConflicts: [],
-    orphans: [],
-    crossFacetChildren: [],
-    cycleEdges: [],
-    overDeepSubtrees: [],
-    facetMismatches: [],
-  }),
-  applyTagConstraints: vi.fn().mockResolvedValue(undefined),
 }));
 vi.mock("@/api/assets", () => ({
   rescanAssetMetadata: assetMocks.rescanAssetMetadata,
@@ -119,6 +121,7 @@ vi.mock("@/api/connections", () => ({
 }));
 vi.mock("@tauri-apps/plugin-dialog", () => ({
   open: vi.fn().mockResolvedValue(null),
+  save: vi.fn().mockResolvedValue(null),
 }));
 
 /** 一份完整、可渲染的 Settings（normalizeSettings 之后的结构）。 */
@@ -130,15 +133,15 @@ function mkSettings(over: Partial<Settings> = {}): Settings {
       videoTagging: false,
       videoTaggingMode: "cover",
       videoFrameCount: 3,
-      batchLimit: 500,
+      batchLimit: 30,
+      localBatchLimit: 5,
       ollamaSourceId: "auto",
       systemPromptTagging: "",
       systemPromptSearch: "",
-      autoAcceptExactTerms: true,
-      autoAdoptNewTerms: false,
       confidenceMinSuggest: 0.3,
     },
     theme: "system",
+    logLevel: "info",
     thumbnailCacheMb: 2048,
     tagCategories: [],
     libraryRoot: "",
@@ -186,21 +189,21 @@ beforeEach(() => {
   libraryMocks.refreshPaletteFields.mockReset().mockResolvedValue(undefined);
 });
 
-/** 切到「通用外观」路由并等待色板状态行渲染（FB4-03 状态在进入该路由时读取） */
+/** 切到「外观与浏览」路由并等待色板状态行渲染（FB4-03 状态在进入该路由时读取） */
 async function openGeneral() {
   render(<SettingsPage />);
   await waitFor(() => expect(screen.getByText("保存设置")).toBeInTheDocument());
-  fireEvent.click(screen.getByText("通用外观"));
+  fireEvent.click(screen.getByText("外观与浏览"));
   await waitFor(() => expect(screen.getByText("素材框")).toBeInTheDocument());
 }
 
 describe("SettingsPage §6.1 信息架构", () => {
-  it("分组顺序：第一项是入库与总库；含 AI 设置/标签与分类/通用外观/数据与缓存/关于", async () => {
+  it("分组顺序：第一项是素材库与入库；含 AI 与模型/标签与分类/外观与浏览/存储与维护/诊断与支持/关于", async () => {
     useSettingsStore.setState({ settings: null, loaded: false, loading: false, loadError: null });
     render(<SettingsPage />);
     await waitFor(() => expect(screen.getByText("保存设置")).toBeInTheDocument());
 
-    for (const g of ["入库与总库", "AI 设置", "标签与分类", "通用外观", "数据与缓存", "关于"]) {
+    for (const g of ["素材库与入库", "AI 与模型", "标签与分类", "外观与浏览", "存储与维护", "诊断与支持", "关于"]) {
       expect(screen.getAllByText(g).length).toBeGreaterThan(0);
     }
   });
@@ -214,23 +217,25 @@ describe("SettingsPage §6.1 信息架构", () => {
     expect(screen.queryByText("本地打标")).not.toBeInTheDocument();
   });
 
-  it("点击「AI 设置」显示三个子页「超级搜索 / 自动打标 / 服务管理」，默认路由为入库与总库", async () => {
+  it("点击「AI 与模型」先进入服务管理，子页顺序为服务管理、超级搜索、自动打标", async () => {
     useSettingsStore.setState({ settings: mkSettings(), loaded: true, loading: false, loadError: null });
     render(<SettingsPage />);
-    await waitFor(() => expect(screen.getByText(/总库位置/)).toBeInTheDocument()); // 默认第一项
+    await waitFor(() => expect(screen.getByText("总库位置")).toBeInTheDocument()); // 默认第一项
 
-    fireEvent.click(screen.getByText("AI 设置"));
-    // 「超级搜索」同时出现在左侧子页与右侧面板标题，用 getAllByText 断言至少出现
-    await waitFor(() => expect(screen.getAllByText("超级搜索").length).toBeGreaterThan(0));
+    fireEvent.click(screen.getByText("AI 与模型"));
+    await waitFor(() => expect(screen.getAllByText("服务管理").length).toBeGreaterThan(0));
+    const aiSettings = screen.getByText("AI 与模型");
+    const childLabels = Array.from(aiSettings.parentElement?.querySelectorAll("button") ?? []).slice(1).map((node) => node.textContent);
+    expect(childLabels).toEqual(["服务管理", "超级搜索", "自动打标"]);
+    expect(screen.getAllByText("超级搜索").length).toBeGreaterThan(0);
     expect(screen.getAllByText("自动打标").length).toBeGreaterThan(0);
-    expect(screen.getByText("服务管理")).toBeInTheDocument();
   });
 
-  it("FB2-02 素材框：切到「通用外观」后存在「素材框」组与 7 项比例选项", async () => {
+  it("FB2-02 素材框：切到「外观与浏览」后存在「素材框」组与 7 项比例选项", async () => {
     useSettingsStore.setState({ settings: mkSettings(), loaded: true, loading: false, loadError: null });
     render(<SettingsPage />);
     await waitFor(() => expect(screen.getByText("保存设置")).toBeInTheDocument());
-    fireEvent.click(screen.getByText("通用外观"));
+    fireEvent.click(screen.getByText("外观与浏览"));
     await waitFor(() => expect(screen.getByText("素材框")).toBeInTheDocument());
     // 7 项比例选项（1:1 / 4:3 / 3:2 / 16:9 / 3:4 / 2:3 / 9:16）
     const ratioOpts = Array.from(screen.getAllByRole("option") as HTMLOptionElement[]).map((o) => o.value).filter((v) => v.includes(":"));
@@ -246,7 +251,7 @@ describe("SettingsPage §6.1 信息架构", () => {
     useSettingsStore.setState({ settings: mkSettings(), loaded: true, loading: false, loadError: null });
     render(<SettingsPage />);
     await waitFor(() => expect(screen.getByText("保存设置")).toBeInTheDocument());
-    fireEvent.click(screen.getByText("通用外观"));
+    fireEvent.click(screen.getByText("外观与浏览"));
     await waitFor(() => expect(screen.getByText("素材框")).toBeInTheDocument());
 
     // 默认 colorStrip.enabled=true → 细节折叠在（W4-5）；展开后位置/样式行都在
@@ -277,13 +282,16 @@ describe("SettingsPage §6.1 信息架构", () => {
     render(<SettingsPage />);
     await waitFor(() => expect(screen.getByText("保存设置")).toBeInTheDocument());
 
-    fireEvent.click(screen.getByText("AI 设置"));
+    fireEvent.click(screen.getByText("AI 与模型"));
     fireEvent.click(screen.getAllByText("自动打标")[0]);
     await waitFor(() => expect(screen.getByText("此功能使用的服务")).toBeInTheDocument());
     // 旧「部署方式」单选已移除（服务位置移到服务管理页）
     expect(screen.queryByText("部署方式")).not.toBeInTheDocument();
     // 不重复渲染服务管理列表（「+ 新增服务」不在用途页出现）
     expect(screen.queryByRole("button", { name: "+ 新增服务" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /管理 AI 服务/ })).not.toBeInTheDocument();
+    expect(screen.getByLabelText("在线服务每批处理数量")).toHaveValue("30");
+    expect(screen.getByLabelText("本机服务每批处理数量")).toHaveValue("5");
   });
 
   it("「服务管理」子页是唯一维护入口：服务位置二选一 + 服务列表", async () => {
@@ -291,8 +299,7 @@ describe("SettingsPage §6.1 信息架构", () => {
     render(<SettingsPage />);
     await waitFor(() => expect(screen.getByText("保存设置")).toBeInTheDocument());
 
-    fireEvent.click(screen.getByText("AI 设置"));
-    fireEvent.click(screen.getByText("服务管理"));
+    fireEvent.click(screen.getByText("AI 与模型"));
     await waitFor(() => expect(screen.getAllByText("服务位置").length).toBeGreaterThan(0));
     expect(screen.getByRole("tab", { name: "在线服务" })).toBeInTheDocument();
     expect(screen.getByRole("tab", { name: "本机服务" })).toBeInTheDocument();
@@ -305,51 +312,65 @@ describe("SettingsPage §6.1 信息架构", () => {
     render(<SettingsPage />);
     await waitFor(() => expect(screen.getByText("保存设置")).toBeInTheDocument());
 
-    fireEvent.click(screen.getByText("AI 设置"));
-    fireEvent.click(screen.getByText("服务管理"));
+    fireEvent.click(screen.getByText("AI 与模型"));
     await waitFor(() => expect(screen.getByRole("tab", { name: "本机服务" })).toBeInTheDocument());
     fireEvent.click(screen.getByRole("tab", { name: "本机服务" }));
     await waitFor(() => expect(screen.getByText(/仅在本机处理/)).toBeInTheDocument());
   });
 });
 
-// ── A4：AI 置信度策略三项随保存设置保留（save_settings 整份覆写不得刷回默认）──
-describe("SettingsPage A4 置信度策略", () => {
-  async function openTagging() {
+describe("SettingsPage AI 打标审核流程", () => {
+  it("不再展示自动写入、自动建词和置信度高级策略", async () => {
     useSettingsStore.setState({ settings: mkSettings(), loaded: true, loading: false, loadError: null, saving: false });
     render(<SettingsPage />);
     await waitFor(() => expect(screen.getByText("保存设置")).toBeInTheDocument());
-    fireEvent.click(screen.getByText("AI 设置"));
+    fireEvent.click(screen.getByText("AI 与模型"));
     fireEvent.click(screen.getAllByText("自动打标")[0]);
-    await waitFor(() => expect(screen.getByText("自动接收精确命中")).toBeInTheDocument());
-  }
 
-  it("三个 A4 控件渲染且初始值来自草稿（与后端默认一致：开 / 关 / 0.30）", async () => {
-    await openTagging();
-    const acceptSwitch = fieldSwitch("自动接收精确命中");
-    const adoptSwitch = fieldSwitch("AI 自动新建标签");
-    expect(acceptSwitch).toHaveAttribute("aria-checked", "true");
-    expect(adoptSwitch).toHaveAttribute("aria-checked", "false");
-    const conf = screen.getByLabelText("建议最低置信度") as HTMLInputElement;
-    expect(conf.value).toBe("0.3");
+    expect(screen.queryByText("已有标签自动打上")).not.toBeInTheDocument();
+    expect(screen.queryByText("新标签自动创建并打上")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("建议最低置信度")).not.toBeInTheDocument();
   });
 
-  it("修改三项后保存：saveSettings 收到的设置里三项策略被保留（不再被整份覆写刷回默认）", async () => {
-    await openTagging();
-    fireEvent.click(fieldSwitch("自动接收精确命中")); // 开 → 关
-    fireEvent.click(fieldSwitch("AI 自动新建标签")); // 关 → 开
-    fireEvent.change(screen.getByLabelText("建议最低置信度"), { target: { value: "0.5" } });
+  it("诊断与支持页切换日志级别后，保存请求携带 debug 级别", async () => {
+    useSettingsStore.setState({ settings: mkSettings(), loaded: true, loading: false, loadError: null });
+    render(<SettingsPage />);
+    await waitFor(() => expect(screen.getByText("保存设置")).toBeInTheDocument());
 
-    fireEvent.click(screen.getByRole("button", { name: "保存设置" }));
-    await waitFor(() => expect(saveSettings).toHaveBeenCalledTimes(1));
-    const payload = vi.mocked(saveSettings).mock.calls[0][0] as Settings;
-    expect(payload.ai.autoAcceptExactTerms).toBe(false);
-    expect(payload.ai.autoAdoptNewTerms).toBe(true);
-    expect(payload.ai.confidenceMinSuggest).toBe(0.5);
-    // 其余设置不受影响（仍是完整设置对象）
-    expect(payload.ai.batchLimit).toBe(500);
-    expect(payload.theme).toBe("system");
+    fireEvent.click(screen.getByText("诊断与支持"));
+    const level = await screen.findByLabelText("诊断日志级别");
+    fireEvent.change(level, { target: { value: "debug" } });
+    expect(level).toHaveValue("debug");
+
+    fireEvent.click(screen.getByText("保存设置"));
+    await waitFor(() =>
+      expect(vi.mocked(saveSettings)).toHaveBeenCalledWith(
+        expect.objectContaining({ logLevel: "debug" }),
+      ),
+    );
   });
+
+  it("诊断与支持页导出诊断包时把用户选择的目标路径传给后端", async () => {
+    const { save } = await import("@tauri-apps/plugin-dialog");
+    vi.mocked(save).mockResolvedValueOnce("D:/diagnostics.zip");
+    vi.mocked(exportDiagnostics).mockResolvedValueOnce({
+      path: "D:/diagnostics.zip",
+      logFiles: 2,
+      truncatedLogs: 0,
+      bytes: 2048,
+    });
+    useSettingsStore.setState({ settings: mkSettings(), loaded: true, loading: false, loadError: null });
+    render(<SettingsPage />);
+    await waitFor(() => expect(screen.getByText("保存设置")).toBeInTheDocument());
+
+    fireEvent.click(screen.getByText("诊断与支持"));
+    fireEvent.click(await screen.findByText("导出诊断包…"));
+    await waitFor(() => expect(vi.mocked(exportDiagnostics)).toHaveBeenCalledWith("D:/diagnostics.zip"));
+  });
+});
+
+afterEach(() => {
+  vi.restoreAllMocks();
 });
 
 describe("SettingsPage 加载与 Hook 安全", () => {
@@ -378,32 +399,32 @@ describe("SettingsPage 加载与 Hook 安全", () => {
     expect(useSettingsStore.getState().settings).not.toBeNull();
   });
 
-  it("「数据与缓存」分组可触发媒体元数据回填（只补缺失信息范围；FB3-11 新按钮名）", async () => {
+  it("「存储与维护」分组可触发媒体元数据回填（只补缺失信息范围；FB3-11 新按钮名）", async () => {
     useSettingsStore.setState({ settings: mkSettings(), loaded: true, loading: false, loadError: null });
     render(<SettingsPage />);
     await waitFor(() => expect(screen.getByText("保存设置")).toBeInTheDocument());
 
-    fireEvent.click(screen.getByText("数据与缓存"));
-    fireEvent.click(screen.getByRole("button", { name: "只补缺失信息" }));
+    fireEvent.click(screen.getByText("存储与维护"));
+    fireEvent.click(screen.getByRole("button", { name: "仅补充缺失信息" }));
 
     await waitFor(() => expect(rescanAssetMetadata).toHaveBeenCalledWith([], "missing"));
-    await waitFor(() => expect(screen.getByText(/回填完成：总数 2，成功 2/)).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(/媒体信息更新完成：总数 2，成功 2/)).toBeInTheDocument());
   });
 
-  it("R1-2 settingsPage_has_dimension_backfill_button：「数据与缓存」提供「图片宽高回填」入口，点「只补缺失宽高」调用 rescanImageDimensions", async () => {
+  it("R1-2 settingsPage_has_dimension_backfill_button：「存储与维护」提供「图片分辨率回填」入口，点「仅补充缺失项」调用 rescanImageDimensions", async () => {
     const { rescanImageDimensions } = await import("@/api/assets");
     vi.mocked(rescanImageDimensions).mockResolvedValue({ total: 3, success: 3, failed: 0, skipped: 0 });
     useSettingsStore.setState({ settings: mkSettings(), loaded: true, loading: false, loadError: null });
     render(<SettingsPage />);
     await waitFor(() => expect(screen.getByText("保存设置")).toBeInTheDocument());
 
-    fireEvent.click(screen.getByText("数据与缓存"));
-    const btn = screen.getByRole("button", { name: "只补缺失宽高" });
+    fireEvent.click(screen.getByText("存储与维护"));
+    const btn = screen.getByRole("button", { name: "补充缺失的图片分辨率" });
     expect(btn).toBeInTheDocument();
     fireEvent.click(btn);
 
     await waitFor(() => expect(rescanImageDimensions).toHaveBeenCalledWith([], "missing"));
-    await waitFor(() => expect(screen.getByText(/宽高回填完成：总数 3，成功 3/)).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText(/分辨率更新完成：总数 3，成功 3/)).toBeInTheDocument());
   });
 });
 
@@ -432,7 +453,7 @@ describe("SettingsPage §13（FB-07）宽屏布局", () => {
 });
 
 describe("SettingsPage 色条状态与生成（FB4-03 §10.6）", () => {
-  it("通用外观路由加载色板状态并显示（缺 259 时的真实文案）", async () => {
+  it("外观与浏览路由加载色板状态并显示（缺 259 时的真实文案）", async () => {
     useSettingsStore.setState({ settings: mkSettings(), loaded: true, loading: false, loadError: null });
     await openGeneral();
     expect(assetMocks.getPaletteStatus).toHaveBeenCalled();
@@ -534,23 +555,31 @@ describe("SettingsPage 色条状态与生成（FB4-03 §10.6）", () => {
     );
   });
 });
-describe("数据与缓存 · 重置数据", () => {
-  /** 切到「数据与缓存」路由并等待重置面板渲染 */
+describe("存储与维护 · 重置数据", () => {
+  /** 切到「存储与维护」路由并等待重置面板渲染 */
   async function openData() {
     render(<SettingsPage />);
     await waitFor(() => expect(screen.getByText("保存设置")).toBeInTheDocument());
-    fireEvent.click(screen.getByText("数据与缓存"));
+    fireEvent.click(screen.getByText("存储与维护"));
     await waitFor(() => expect(screen.getByText("重置所选数据")).toBeInTheDocument());
   }
 
   it("未勾选时重置按钮禁用；两步确认后才调用 resetAppData，且传入勾选项", async () => {
+    const tagRefreshSpy = vi
+      .spyOn(useTagStore.getState(), "refresh")
+      .mockResolvedValue(undefined);
     vi.mocked(resetAppData).mockResolvedValue({
       assetsDeleted: 259,
+      assetFilesDeleted: 0,
+      assetFilesFailed: 0,
+      exportTasksDeleted: 0,
       tagsDeleted: 40,
       aiTasksDeleted: 3,
       connectionsDeleted: 0,
       preferencesReset: false,
+      searchStateReset: false,
       cacheFilesDeleted: 512,
+      logFilesDeleted: 0,
     });
     useSettingsStore.setState({ settings: mkSettings(), loaded: true, loading: false, loadError: null });
     await openData();
@@ -572,9 +601,23 @@ describe("数据与缓存 · 重置数据", () => {
     // 第二步确认 → 调用后端并携带勾选项；成功后展示报告并刷新素材库
     fireEvent.click(screen.getByRole("button", { name: "确认重置" }));
     await waitFor(() => expect(resetAppData).toHaveBeenCalledTimes(1));
-    expect(resetAppData).toHaveBeenCalledWith({ ...{ assets: false, tags: false, aiTasks: false, aiConnections: false, preferences: false, caches: false }, assets: true, tags: true });
+    expect(resetAppData).toHaveBeenCalledWith({
+      assets: true,
+      assetFiles: false,
+      exportTasks: false,
+      tags: true,
+      aiTasks: false,
+      aiConnections: false,
+      preferences: false,
+      searchState: false,
+      caches: false,
+      logs: false,
+    });
     await waitFor(() => expect(screen.getAllByText(/重置完成：已清除素材 259 条/).length).toBeGreaterThan(0));
     expect(libraryMocks.refresh).toHaveBeenCalledTimes(1);
+    expect(libraryMocks.clearTagFilters).toHaveBeenCalledTimes(1);
+    expect(tagRefreshSpy).toHaveBeenCalledTimes(1);
+    expect(useTagStore.getState().tree).toEqual([]);
   });
 
   it("重置失败显示可读错误，不刷新素材库", async () => {
@@ -592,11 +635,16 @@ describe("数据与缓存 · 重置数据", () => {
   it("reset_clears_super_search_persist：重置成功后同步清除 localStorage 里的超级搜索条件", async () => {
     vi.mocked(resetAppData).mockResolvedValue({
       assetsDeleted: 259,
+      assetFilesDeleted: 0,
+      assetFilesFailed: 0,
+      exportTasksDeleted: 0,
       tagsDeleted: 40,
       aiTasksDeleted: 3,
       connectionsDeleted: 0,
       preferencesReset: false,
+      searchStateReset: false,
       cacheFilesDeleted: 512,
+      logFilesDeleted: 0,
     });
     // 预置陈旧条件（旧 epoch 日期格式的 expr 会让 hydrate 报错 —— 这正是要清掉的场景）
     localStorage.setItem("super-search-conditions", JSON.stringify({ expr: { op: "leaf", cond: { type: "metadata", filter: { key: "taken_at", op: "gte", value: 1722508800000 } } } }));
@@ -611,6 +659,76 @@ describe("数据与缓存 · 重置数据", () => {
 
     // 重置成功后键被移除（否则改完日期 P0 后这条陈旧条件仍会 hydrate 报错）
     await waitFor(() => expect(localStorage.getItem("super-search-conditions")).toBeNull());
+  });
+
+  it("原始素材文件是独立高风险项：必须输入确认短语，成功/失败数量如实展示", async () => {
+    vi.mocked(resetAppData).mockResolvedValue({
+      assetsDeleted: 2,
+      assetFilesDeleted: 2,
+      assetFilesFailed: 1,
+      exportTasksDeleted: 0,
+      tagsDeleted: 0,
+      aiTasksDeleted: 0,
+      connectionsDeleted: 0,
+      preferencesReset: false,
+      searchStateReset: false,
+      cacheFilesDeleted: 3,
+      logFilesDeleted: 0,
+    });
+    useSettingsStore.setState({ settings: mkSettings(), loaded: true, loading: false, loadError: null });
+    await openData();
+
+    fireEvent.click(screen.getByText("原始素材文件"));
+    fireEvent.click(screen.getByRole("button", { name: "重置所选数据" }));
+    const confirm = screen.getByRole("button", { name: "确认重置" });
+    expect(confirm).toBeDisabled();
+    expect(resetAppData).not.toHaveBeenCalled();
+
+    fireEvent.change(screen.getByLabelText("确认短语"), { target: { value: "删除原文件" } });
+    expect(confirm).toBeEnabled();
+    fireEvent.click(confirm);
+    await waitFor(() => expect(resetAppData).toHaveBeenCalledWith({
+      assets: false,
+      assetFiles: true,
+      exportTasks: false,
+      tags: false,
+      aiTasks: false,
+      aiConnections: false,
+      preferences: false,
+      searchState: false,
+      caches: false,
+      logs: false,
+    }));
+    await waitFor(() => expect(screen.getAllByText(/原始文件删除失败 1 个/).length).toBeGreaterThan(0));
+  });
+
+  it("全选明确标注恢复出厂设置，并要求输入恢复出厂设置", async () => {
+    vi.mocked(resetAppData).mockResolvedValue({
+      assetsDeleted: 0,
+      assetFilesDeleted: 0,
+      assetFilesFailed: 0,
+      exportTasksDeleted: 0,
+      tagsDeleted: 0,
+      aiTasksDeleted: 0,
+      connectionsDeleted: 0,
+      preferencesReset: true,
+      searchStateReset: true,
+      cacheFilesDeleted: 0,
+      logFilesDeleted: 0,
+    });
+    useSettingsStore.setState({ settings: mkSettings(), loaded: true, loading: false, loadError: null });
+    await openData();
+
+    fireEvent.click(screen.getByRole("button", { name: "全选（恢复出厂设置）" }));
+    fireEvent.click(screen.getByRole("button", { name: "重置所选数据" }));
+    expect(screen.getByText(/这是恢复出厂设置/)).toBeInTheDocument();
+    const confirm = screen.getByRole("button", { name: "确认重置" });
+    expect(confirm).toBeDisabled();
+    fireEvent.change(screen.getByLabelText("确认短语"), { target: { value: "恢复出厂设置" } });
+    fireEvent.click(confirm);
+    await waitFor(() => expect(resetAppData).toHaveBeenCalledTimes(1));
+    const sent = vi.mocked(resetAppData).mock.calls[0][0];
+    expect(Object.values(sent).every(Boolean)).toBe(true);
   });
 });
 
@@ -665,26 +783,26 @@ describe.skip("标签与分类 · 无配置条目分面的 AI 行为（回归：
   });
 });
 
-// ── W7 真机复现：切换到「数据与缓存」路由不抛 hooks 错误 ──
-describe("数据与缓存路由（W5c 备份恢复 + W5d phash 行）", () => {
-  it("点击「数据与缓存」渲染备份/恢复与感知哈希回填，不抛 more-hooks 错误", async () => {
+// ── W7 真机复现：切换到「存储与维护」路由不抛 hooks 错误 ──
+describe("存储与维护路由（W5c 备份恢复 + W5d phash 行）", () => {
+  it("点击「存储与维护」渲染备份/恢复与相似图识别数据，不抛 more-hooks 错误", async () => {
     useSettingsStore.setState({ settings: mkSettings(), loaded: true, loading: false, saving: false });
     render(<SettingsPage />);
-    fireEvent.click(screen.getByText("数据与缓存"));
+    fireEvent.click(screen.getByText("存储与维护"));
     await waitFor(() => {
       expect(screen.getByText("数据库备份与恢复")).toBeTruthy();
     });
-    expect(screen.getByText("感知哈希回填")).toBeTruthy();
+    expect(screen.getByText("相似图识别数据")).toBeTruthy();
   });
 
-  it("色板关系表重建按钮调用 rescanPaletteColors（色板索引表空时点一次补齐）", async () => {
+  it("颜色筛选索引重建按钮调用 rescanPaletteColors（颜色索引为空时重新生成）", async () => {
     useSettingsStore.setState({ settings: mkSettings(), loaded: true, loading: false, saving: false });
     render(<SettingsPage />);
-    fireEvent.click(screen.getByText("数据与缓存"));
-    await waitFor(() => expect(screen.getByText("色板关系表重建")).toBeInTheDocument());
+    fireEvent.click(screen.getByText("存储与维护"));
+    await waitFor(() => expect(screen.getByText("颜色筛选索引重建")).toBeInTheDocument());
 
     assetMocks.rescanPaletteColors.mockResolvedValue(410);
-    fireEvent.click(screen.getByRole("button", { name: "重建前三色索引" }));
+    fireEvent.click(screen.getByRole("button", { name: "重建颜色索引" }));
     await waitFor(() => expect(assetMocks.rescanPaletteColors).toHaveBeenCalledTimes(1));
     await waitFor(() => expect(screen.getByText(/色板关系表已重建：写入 410 条/)).toBeInTheDocument());
   });
@@ -697,7 +815,7 @@ describe("StrictMode 全路由遍历", () => {
     const { unmount } = render(
       <ReactStrictMode><SettingsPage /></ReactStrictMode>,
     );
-    const routes = ["AI 设置", "标签与分类", "通用外观", "数据与缓存", "关于", "入库与总库"];
+    const routes = ["AI 与模型", "标签与分类", "外观与浏览", "存储与维护", "诊断与支持", "关于", "素材库与入库"];
     for (const r of routes) {
       fireEvent.click(screen.getByText(r));
       await waitFor(() => expect(screen.queryByText("加载设置中…")).toBeNull());
@@ -706,72 +824,19 @@ describe("StrictMode 全路由遍历", () => {
   });
 });
 
-// ── F2-e：标签数据完整性区块 ──
-describe("SettingsPage F2-e 数据完整性", () => {
-  async function openTags() {
+// ── 标签数据保护由后端自动维护，不在设置页展示 ──
+describe("SettingsPage 标签数据保护", () => {
+  it("标签设置不展示内部数据保护控件", async () => {
     useSettingsStore.setState({ settings: mkSettings(), loaded: true, loading: false, loadError: null });
     render(<SettingsPage />);
     await waitFor(() => expect(screen.getByText("保存设置")).toBeInTheDocument());
     fireEvent.click(screen.getByText("标签与分类"));
-    await waitFor(() => expect(screen.getByText(/标签数据完整性/)).toBeInTheDocument());
-  }
 
-  it("标签路由展示数据完整性区块，四项能力状态加载自后端", async () => {
-    const { listTagConstraintFeatures } = await import("@/api/tags");
-    vi.mocked(listTagConstraintFeatures).mockResolvedValue([
-      { feature: "tag_cycle_guard", enabled: true, appliedAt: 1, blockedBy: null },
-      { feature: "tag_unique_terms", enabled: false, appliedAt: null, blockedBy: "pending" },
-      { feature: "tag_facet_fk", enabled: false, appliedAt: null, blockedBy: "pending" },
-      { feature: "tag_facet_restrict_delete", enabled: false, appliedAt: null, blockedBy: "pending" },
-    ]);
-    await openTags();
-    expect(screen.getByText("环检测与深度上限")).toBeInTheDocument();
-    // 能力状态摘要显示「1/4 项生效」
-    expect(screen.getByText(/标签数据完整性（1\/4 项生效）/)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "检查标签冲突" })).toBeInTheDocument();
-  });
-
-  it("点「检查标签冲突」调用预检；零冲突提示可启用约束", async () => {
-    const { detectTagConstraintsConflicts, applyTagConstraints } = await import("@/api/tags");
-    vi.mocked(detectTagConstraintsConflicts).mockResolvedValue({
-      termConflicts: [],
-      orphans: [],
-      crossFacetChildren: [],
-      cycleEdges: [],
-      overDeepSubtrees: [],
-      facetMismatches: [],
-    });
-    await openTags();
-    fireEvent.click(screen.getByRole("button", { name: "检查标签冲突" }));
-    await waitFor(() => expect(detectTagConstraintsConflicts).toHaveBeenCalledTimes(1));
-    await waitFor(() => expect(screen.getByText(/未发现标签数据冲突/)).toBeInTheDocument());
-    // 启用约束走命令
-    fireEvent.click(screen.getByRole("button", { name: "启用约束" }));
-    await waitFor(() => expect(applyTagConstraints).toHaveBeenCalledTimes(1));
-  });
-
-  it("预检发现重名冲突时展示冲突组并禁用提示", async () => {
-    const { detectTagConstraintsConflicts } = await import("@/api/tags");
-    vi.mocked(detectTagConstraintsConflicts).mockResolvedValue({
-      termConflicts: [
-        {
-          facetKey: "scene",
-          term: "海边",
-          entries: [
-            { tagId: 1, name: "海边", kind: "canonical", linkedAssets: 12 },
-            { tagId: 2, name: "海滨", kind: "canonical", linkedAssets: 3 },
-          ],
-        },
-      ],
-      orphans: [],
-      crossFacetChildren: [],
-      cycleEdges: [],
-      overDeepSubtrees: [],
-      facetMismatches: [],
-    });
-    await openTags();
-    fireEvent.click(screen.getByRole("button", { name: "检查标签冲突" }));
-    await waitFor(() => expect(screen.getByText(/「海边」在 scene 分面有 2 个条目/)).toBeInTheDocument());
-    expect(screen.getByText(/发现冲突：分面内重名 1 组/)).toBeInTheDocument();
+    await screen.findByText("AI 自动打标分类");
+    expect(screen.queryByText("分类设置")).toBeNull();
+    expect(screen.queryByText("分类标签")).toBeNull();
+    expect(screen.queryByText(/标签数据保护/)).toBeNull();
+    expect(screen.queryByRole("button", { name: "检查标签冲突" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "启用保护" })).toBeNull();
   });
 });

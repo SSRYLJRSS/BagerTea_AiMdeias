@@ -1,7 +1,6 @@
 /**
- * aiStore 测试：打标状态机核心迁移（v2.10/v2.12）
- * - createBatch 手动模式：建批即 done、无网络请求、建议载入
- * - createAndRun 空选中：报错不空跑
+ * aiStore 测试：统一打标状态机
+ * - createBatch 统一建批：不调 AI、建议占位载入
  * - confirm/reject 后重载建议（openBatch）
  * mock 掉 @/api/ai 的 invoke 封装。
  */
@@ -71,12 +70,11 @@ const mkSettings = (over: Partial<Settings["ai"]> = {}): Settings => ({
     ollamaSourceId: "auto",
     systemPromptTagging: "",
     systemPromptSearch: "",
-    autoAcceptExactTerms: true,
-    autoAdoptNewTerms: false,
     confidenceMinSuggest: 0.3,
     ...over,
   },
   theme: "system",
+  logLevel: "info",
   thumbnailCacheMb: 2048,
   tagCategories: [],
   libraryRoot: "",
@@ -101,39 +99,30 @@ beforeEach(() => {
     cancelling: false,
     error: null,
     pendingAssetIds: [],
-    pendingMode: "auto",
   });
   useSettingsStore.setState({ settings: mkSettings(), loaded: true, loadError: null, saving: false });
 });
 
 describe("aiStore 打标状态机", () => {
-  it("createBatch 手动模式：建批即 done（无网络请求）+ 建议载入 + 占位清空", async () => {
-    vi.mocked(aiCreateBatch).mockResolvedValue(mkBatch(1, { status: "pending", mode: "manual" }));
-    vi.mocked(aiStartBatch).mockResolvedValue(mkBatch(1, { status: "done", mode: "manual" }));
+  it("createBatch 统一建批：不调 AI、建议占位载入、带过来的选择清空", async () => {
+    vi.mocked(aiCreateBatch).mockResolvedValue(mkBatch(1, { status: "pending" }));
     vi.mocked(aiListSuggestions).mockResolvedValue([mkSuggestion(101), mkSuggestion(102)]);
 
-    useAiStore.setState({ pendingAssetIds: IDs, pendingMode: "manual" });
-    await useAiStore.getState().createBatch("manual");
+    useAiStore.setState({ pendingAssetIds: IDs });
+    await useAiStore.getState().createBatch();
 
     const s = useAiStore.getState();
     expect(s.currentBatchId).toBe(1);
     expect(s.pendingAssetIds).toEqual([]); // 带过去的选中清空
-    expect(s.batches[0].status).toBe("done"); // 手动模式后端直接 done
+    expect(s.batches[0].status).toBe("pending");
     expect(s.suggestions).toHaveLength(2);
-    expect(aiCreateBatch).toHaveBeenCalledWith(IDs, "manual");
+    expect(aiCreateBatch).toHaveBeenCalledWith(IDs);
+    expect(aiStartBatch).not.toHaveBeenCalled();
   });
 
   it("createBatch 空选中：直接返回，不调后端", async () => {
-    await useAiStore.getState().createBatch("auto");
+    await useAiStore.getState().createBatch();
     expect(aiCreateBatch).not.toHaveBeenCalled();
-  });
-
-  it("createAndRun 空选中：明确报错不空跑（v2.12 语义）", async () => {
-    await useAiStore.getState().createAndRun("cloud");
-    const s = useAiStore.getState();
-    expect(s.error).toContain("选中素材");
-    expect(aiCreateBatch).not.toHaveBeenCalled();
-    expect(aiStartBatch).not.toHaveBeenCalled();
   });
 
   it("startBatch 云端：置 running、写回批次状态、重载建议", async () => {
@@ -246,14 +235,14 @@ describe("aiStore 打标状态机", () => {
 
   it("阶段5 §8.1：所选素材完整进入逻辑批次，不做静默截断", async () => {
     useSettingsStore.setState({ settings: mkSettings({ batchLimit: 2 }) });
-    useAiStore.setState({ pendingAssetIds: [1, 2, 3, 4, 5], pendingMode: "auto" });
+    useAiStore.setState({ pendingAssetIds: [1, 2, 3, 4, 5] });
     vi.mocked(aiCreateBatch).mockResolvedValue(mkBatch(1));
     vi.mocked(aiListSuggestions).mockResolvedValue([]);
 
-    await useAiStore.getState().createBatch("auto");
+    await useAiStore.getState().createBatch();
 
     // 全部 id 进入批次（batchLimit 仅作执行分块大小，不再是总批次上限）
-    expect(aiCreateBatch).toHaveBeenCalledWith([1, 2, 3, 4, 5], "auto");
+    expect(aiCreateBatch).toHaveBeenCalledWith([1, 2, 3, 4, 5]);
     expect(useAiStore.getState().error).toBeNull();
   });
 

@@ -1,12 +1,12 @@
 /** W4 分面管理面板（整体重写）：两组列表 + 弹窗化编辑/新建/删除。
- *  - 两组列表：「AI 自动打标的分类」/「只手工填写的分类」+ 底部折叠「已停用的分类」（Q2：系统分面不可删，停用的折叠只给恢复）
+ *  - 两组列表：「AI 自动打标分类」/「手工填写分类」+ 底部折叠「已停用的分类」（Q2：系统分面不可删，停用的折叠只给恢复）
  *  - 拖拽手柄跨组拖动 = 改 input_mode；组内拖动 = reorder
  *  - 列表行只显示 4 项：名称 / key（小字）/ 规则摘要 / 操作按钮；详情进弹窗
  *  - 编辑弹窗 6 字段一个保存通道（update_tag_facet 单事务；替代旧的「基本规则即时写 + AI 行为进草稿」双通道）
- *  - 新建弹窗 2 个必填（名称 + 这类标签是什么）；key 自动 slugify，CJK 生成空串时明确提示
+ *  - 新建弹窗 2 个必填（名称 + 标签描述）；key 自动 slugify，CJK 生成空串时明确提示
  *  - 删除确认弹窗：精确影响数字 + 输入分类名确认 + 三按钮（取消 / 停用替代 / 确认删除）
- *  - 「一句话描述（AI 生成）」：与分面条目同形态的可点开条目——点开看已有描述，
- *    里面提供打标/搜索提示词编辑（draft 草稿，页面「保存设置」统一落库；空 = 用内置默认）
+ *  - 「画面摘要（一句话描述）」：属于 AI 自动打标组，但不参与精确筛选；
+ *    与分面条目同形态展示，点开可查看已有摘要并编辑提示词。
  */
 import { useCallback, useEffect, useMemo, useState } from "react";
 import clsx from "clsx";
@@ -21,13 +21,11 @@ import {
   getTagFacetImpact,
   setFacetKind,
   listAllTagFacets,
-  listContentDescriptions,
   reorderTagFacets,
   restoreTagFacet,
   updateTagFacet,
   type ConversionReport,
   type FacetDeleteReport,
-  type ContentDescription,
 } from "@/api/tags";
 import type { TagFacet, TagFacetImpact } from "@/types/tag";
 import type { Settings } from "@/types/settings";
@@ -37,6 +35,25 @@ const APP_TO_OPTIONS: { value: "all" | "image" | "video"; label: string }[] = [
   { value: "image", label: "只图片" },
   { value: "video", label: "只视频" },
 ];
+
+const TAG_ROW_CLASS =
+  "flex min-h-12 w-full items-center gap-3 px-4 py-2.5 transition-colors hover:bg-[var(--color-surface)]";
+
+const SUMMARY_FACET: TagFacet = {
+  key: "description",
+  displayName: "画面摘要（一句话描述）",
+  description: "AI 根据画面内容生成简短摘要，用于补充标签无法完整表达的信息，不参与精确筛选。",
+  inputMode: "ai_and_manual",
+  selectionMode: "single",
+  maxItems: 1,
+  sortOrder: -1,
+  isSystem: true,
+  status: "active",
+  appliesTo: "all",
+  createdAt: 0,
+  updatedAt: 0,
+  facetKind: "tag",
+};
 
 function slugify(s: string): string {
   return s
@@ -78,6 +95,7 @@ export default function FacetManagePanel({ draft, onPatchAi }: {
   const [showInactive, setShowInactive] = useState(false);
   /** W4 弹窗状态：编辑 / 新建（默认落哪组）/ 删除 / 分类词条 */
   const [editing, setEditing] = useState<TagFacet | null>(null);
+  const [editingSummaryMode, setEditingSummaryMode] = useState<"settings" | "terms" | null>(null);
   const [creatingGroup, setCreatingGroup] = useState<"ai" | "manual" | null>(null);
   const [deleting, setDeleting] = useState<TagFacet | null>(null);
   const [deleteImpact, setDeleteImpact] = useState<TagFacetImpact | null>(null);
@@ -86,11 +104,6 @@ export default function FacetManagePanel({ draft, onPatchAi }: {
   const [termsFacet, setTermsFacet] = useState<TagFacet | null>(null);
   /** 拖拽中：跨组 = 改 input_mode；组内 = reorder */
   const [dragKey, setDragKey] = useState<string | null>(null);
-  /** 一句话描述：可点开条目（像分面条目一样点开看内容），展开态 */
-  const [descOpen, setDescOpen] = useState(false);
-  /** 提示词编辑区是否已展开（与描述列表同在一个展开条目内） */
-  const [promptOpen, setPromptOpen] = useState(false);
-
   const refresh = useCallback(async () => {
     setLoading(true);
     setError(null);
@@ -101,24 +114,6 @@ export default function FacetManagePanel({ draft, onPatchAi }: {
     } finally {
       setLoading(false);
     }
-  }, []);
-
-  /** 一句话描述展示（AI 生成，走 FTS 模糊搜索；失败静默降级不阻塞面板） */
-  const [descriptions, setDescriptions] = useState<ContentDescription[]>([]);
-  const [descLoading, setDescLoading] = useState(true);
-  useEffect(() => {
-    let cancelled = false;
-    listContentDescriptions(200)
-      .then((d) => {
-        if (!cancelled) setDescriptions(d);
-      })
-      .catch(() => undefined)
-      .finally(() => {
-        if (!cancelled) setDescLoading(false);
-      });
-    return () => {
-      cancelled = true;
-    };
   }, []);
 
   useEffect(() => {
@@ -160,7 +155,7 @@ export default function FacetManagePanel({ draft, onPatchAi }: {
         maxItems: facet.maxItems,
         appliesTo: facet.appliesTo,
       }),
-      `「${facet.displayName}」已移到${group === "ai" ? " AI 自动打标" : "只手工填写"}组`,
+      `「${facet.displayName}」已移到${group === "ai" ? " AI 自动打标" : "手工填写"}分组`,
     );
   };
 
@@ -237,15 +232,17 @@ export default function FacetManagePanel({ draft, onPatchAi }: {
       onDragOver={(e) => e.preventDefault()}
       onDrop={() => onDropToGroup(group, f.key)}
       className={clsx(
-        "flex items-center gap-2 rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] px-2 py-1.5",
+        TAG_ROW_CLASS,
         dragKey === f.key && "opacity-50",
       )}
     >
-      <span className="cursor-grab select-none text-[var(--color-text-tertiary)]" title="拖动排序；拖到另一组 = 改归类">⠿</span>
-      <span className="min-w-0 flex-1 truncate text-xs font-medium text-[var(--color-text)]" title={f.description}>{f.displayName}</span>
-      <span className="shrink-0 rounded bg-[var(--color-surface-hover)] px-1 text-[10px] text-[var(--color-text-secondary)]" title={f.key}>{f.key}</span>
-      {f.isSystem && <span className="shrink-0 rounded bg-[var(--color-surface-hover)] px-1 text-[10px] text-[var(--color-text-secondary)]">系统</span>}
-      <span className="shrink-0 text-[10px] text-[var(--color-text-tertiary)]">{ruleSummary(f)}</span>
+      <span className="cursor-grab select-none text-[var(--color-text-tertiary)]" title="拖动可调整分组或顺序" aria-hidden="true">⠿</span>
+      <span className="min-w-0 flex-1" title={f.description}>
+        <span className="block truncate text-sm text-[var(--color-text)]">{f.displayName}</span>
+        <code className="mt-0.5 block truncate text-[11px] text-[var(--color-text-tertiary)]">{f.key}</code>
+      </span>
+      {f.isSystem && <span className="shrink-0 text-[11px] text-[var(--color-text-secondary)]">系统</span>}
+      <span className="shrink-0 text-[11px] text-[var(--color-text-secondary)]">{ruleSummary(f)}</span>
       <span className="flex shrink-0 items-center gap-1">
         <button type="button" onClick={() => setEditing(f)} className="rounded px-1.5 py-0.5 text-[11px] text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-hover)] hover:text-[var(--color-text)]">编辑</button>
         <button type="button" onClick={() => setTermsFacet(f)} className="rounded px-1.5 py-0.5 text-[11px] text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-hover)] hover:text-[var(--color-text)]">词条</button>
@@ -260,19 +257,52 @@ export default function FacetManagePanel({ draft, onPatchAi }: {
     <section
       onDragOver={(e) => e.preventDefault()}
       onDrop={() => onDropToGroup(group)}
-      className="flex flex-col gap-1.5"
+      className="border-t border-[var(--color-border)]"
     >
-      <div className="flex items-center justify-between">
-        <div>
-          <h5 className="text-[11px] font-semibold text-[var(--color-text)]">{title}</h5>
-          <p className="text-[10px] text-[var(--color-text-tertiary)]">{hint}</p>
+      <div className="flex items-center justify-between gap-6 px-4 py-3">
+        <div className="min-w-0">
+          <h2 className="text-sm text-[var(--color-text)]">{title}</h2>
+          <p className="mt-0.5 text-xs leading-5 text-[var(--color-text-secondary)]">{hint}</p>
         </div>
         <Button onClick={() => setCreatingGroup(group)}>+ 新增分类</Button>
       </div>
-      <ul className="flex flex-col gap-1.5">
+      <ul className="divide-y divide-[var(--color-border)] rounded-lg border border-[var(--color-border)]">
         {list.map((f) => renderRow(f, group))}
         {list.length === 0 && (
-          <li className="rounded-md border border-dashed border-[var(--color-border)] px-2 py-3 text-center text-[11px] text-[var(--color-text-tertiary)]">
+          <li className="px-4 py-4 text-center text-xs text-[var(--color-text-tertiary)]">
+            拖分类到这里，或点上方「+ 新增分类」
+          </li>
+        )}
+      </ul>
+    </section>
+  );
+
+  const renderAiGroup = () => (
+    <section onDragOver={(e) => e.preventDefault()} onDrop={() => onDropToGroup("ai")}>
+      <div className="mb-2 flex items-start justify-between gap-6">
+        <div className="min-w-0">
+          <h2 className="text-sm text-[var(--color-text)]">AI 自动打标分类</h2>
+          <p className="mt-0.5 text-xs leading-5 text-[var(--color-text-secondary)]">AI 根据画面内容生成分类标签和画面摘要。</p>
+        </div>
+        <Button onClick={() => setCreatingGroup("ai")}>+ 新增分类</Button>
+      </div>
+      <ul className="divide-y divide-[var(--color-border)] rounded-lg border border-[var(--color-border)]">
+        {aiGroup.map((f) => renderRow(f, "ai"))}
+        <li className={TAG_ROW_CLASS}>
+          <span className="cursor-default select-none text-[var(--color-text-tertiary)]" title="固定项目，不可拖动排序" aria-hidden="true">⠿</span>
+          <span className="min-w-0 flex-1">
+            <span className="block truncate text-sm text-[var(--color-text)]">画面摘要（一句话描述）</span>
+            <code className="mt-0.5 block text-[11px] text-[var(--color-text-tertiary)]">description</code>
+          </span>
+          <span className="shrink-0 text-[11px] text-[var(--color-text-secondary)]">系统</span>
+          <span className="shrink-0 text-[11px] text-[var(--color-text-secondary)]">最多 20 字</span>
+          <span className="flex shrink-0 items-center gap-1">
+            <button type="button" onClick={() => setEditingSummaryMode("settings")} className="rounded px-1.5 py-0.5 text-[11px] text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-hover)] hover:text-[var(--color-text)]">编辑</button>
+            <button type="button" onClick={() => setEditingSummaryMode("terms")} className="rounded px-1.5 py-0.5 text-[11px] text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-hover)] hover:text-[var(--color-text)]">词条</button>
+          </span>
+        </li>
+        {aiGroup.length === 0 && (
+          <li className="px-4 py-4 text-center text-xs text-[var(--color-text-tertiary)]">
             拖分类到这里，或点上方「+ 新增分类」
           </li>
         )}
@@ -281,39 +311,39 @@ export default function FacetManagePanel({ draft, onPatchAi }: {
   );
 
   return (
-    <div className="flex flex-col gap-3 rounded-md border border-[var(--color-border)] bg-[var(--color-surface)] p-3">
-      <h4 className="text-xs font-medium text-[var(--color-text)]">分类大类（分面）</h4>
-      <p className="text-[11px] leading-4 text-[var(--color-text-secondary)]">
-        拖动分类跨组 = 改归类（AI 自动打标 ↔ 只手工填写）；组内拖动 = 调整顺序。创建后英文标识锁定不可改。
-      </p>
-
-      {error && <p className="text-xs text-[var(--color-danger)]">{error}</p>}
-      {notice && <p className="text-xs text-[var(--color-text-secondary)]">{notice}</p>}
+    <div>
+      <div className="mb-3 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-[var(--color-text-secondary)]">
+        <span>拖动分类可调整分组或顺序；创建后英文标识不可修改。</span>
+        {error && <span className="text-[var(--color-danger)]">{error}</span>}
+        {notice && <span>{notice}</span>}
+      </div>
 
       {loading ? (
-        <p className="text-xs text-[var(--color-text-secondary)]">加载分类…</p>
+        <p className="border-t border-[var(--color-border)] px-4 py-3 text-xs text-[var(--color-text-secondary)]">加载分类…</p>
       ) : (
         <>
-          {renderGroup("AI 自动打标的分类", "AI 打标会产出这些分类的标签；也可手工填写", "ai", aiGroup)}
-          {renderGroup("只手工填写的分类", "AI 不会产出；只出现在打标工作台「需要你填」组", "manual", manualGroup)}
+          {renderAiGroup()}
+          {renderGroup("手工填写分类", "不由 AI 判断，需手动填写；填写后可用于搜索和筛选。", "manual", manualGroup)}
 
           {/* Q2：已停用分面折叠区（系统分面不可删，只给恢复） */}
           {inactive.length > 0 && (
-            <section className="mt-1">
+            <section className="border-t border-[var(--color-border)]">
               <button
                 type="button"
                 onClick={() => setShowInactive((v) => !v)}
-                className="flex items-center gap-1 text-[11px] text-[var(--color-text-tertiary)] hover:text-[var(--color-text-secondary)]"
+                className="flex w-full items-center gap-1 px-4 py-3 text-left text-xs text-[var(--color-text-secondary)] hover:bg-[var(--color-surface)] hover:text-[var(--color-text)]"
               >
                 已停用的分类（{inactive.length}）{showInactive ? "▾" : "▸"}
               </button>
               {showInactive && (
-                <ul className="mt-1.5 flex flex-col gap-1.5">
+                <ul className="divide-y divide-[var(--color-border)] rounded-lg border border-[var(--color-border)]">
                   {inactive.map((f) => (
-                    <li key={f.key} className="flex items-center gap-2 rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] px-2 py-1.5 opacity-75">
-                      <span className="min-w-0 flex-1 truncate text-xs text-[var(--color-text-secondary)] line-through">{f.displayName}</span>
-                      <span className="shrink-0 rounded bg-[var(--color-surface-hover)] px-1 text-[10px] text-[var(--color-text-secondary)]">{f.key}</span>
-                      <span className="shrink-0 text-[10px] text-[var(--color-text-tertiary)]">{ruleSummary(f)}</span>
+                    <li key={f.key} className="flex min-h-12 items-center gap-3 px-4 py-2.5 opacity-75 hover:bg-[var(--color-surface)]">
+                      <span className="min-w-0 flex-1">
+                        <span className="block truncate text-sm text-[var(--color-text-secondary)] line-through">{f.displayName}</span>
+                        <code className="mt-0.5 block truncate text-[11px] text-[var(--color-text-tertiary)]">{f.key}</code>
+                      </span>
+                      <span className="shrink-0 text-[11px] text-[var(--color-text-secondary)]">{ruleSummary(f)}</span>
                       <button type="button" onClick={() => run(() => restoreTagFacet(f.key), `已恢复「${f.displayName}」`)} className="rounded px-1.5 py-0.5 text-[11px] text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-hover)] hover:text-[var(--color-text)]">恢复</button>
                     </li>
                   ))}
@@ -322,91 +352,26 @@ export default function FacetManagePanel({ draft, onPatchAi }: {
             </section>
           )}
 
-          {/* 一句话描述（AI 生成）：与分面同形态的可点开条目——点开看具体描述，
-              里面提供打标/搜索提示词编辑（进 draft，「保存设置」统一落库；空 = 内置默认） */}
-          <section className="mt-1">
-            <button
-              type="button"
-              onClick={() => setDescOpen((v) => !v)}
-              className="flex w-full items-center gap-2 rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] px-2 py-1.5 text-left"
-            >
-              <span className="text-[var(--color-text-tertiary)]">{descOpen ? "▾" : "▸"}</span>
-              <span className="min-w-0 flex-1 truncate text-xs font-medium text-[var(--color-text)]">一句话描述（AI 生成）</span>
-              {!descLoading && <span className="shrink-0 rounded bg-[var(--color-surface-hover)] px-1 text-[10px] text-[var(--color-text-secondary)]">{descriptions.length} 条</span>}
-              {draft.ai.systemPromptTagging.trim() && <span className="shrink-0 rounded bg-[var(--color-surface-hover)] px-1 text-[10px] text-[var(--color-text-secondary)]">已改提示词</span>}
-            </button>
-            {descOpen && (
-              <div className="mt-1.5 flex flex-col gap-2 rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] p-2">
-                <p className="text-[11px] leading-4 text-[var(--color-text-secondary)]">
-                  打标时 AI 顺带生成的整句描述，属于自由文本不进分面（分面=精确筛选）；已加入全文索引，超级搜索可直接模糊搜到（如「夜晚树下多人」）。
-                </p>
-                {descLoading ? (
-                  <p className="text-[11px] text-[var(--color-text-tertiary)]">加载描述…</p>
-                ) : descriptions.length === 0 ? (
-                  <p className="text-[11px] text-[var(--color-text-tertiary)]">
-                    还没有一句话描述。AI 打标确认时会自动生成；生成后这里可查看、超级搜索可搜到。
-                  </p>
-                ) : (
-                  <ul className="flex max-h-40 flex-col gap-1 overflow-y-auto">
-                    {descriptions.map((d) => (
-                      <li key={d.assetId} className="flex items-baseline gap-2 rounded bg-[var(--color-surface)] px-2 py-1">
-                        <span className="max-w-28 shrink-0 truncate text-[10px] text-[var(--color-text-tertiary)]" title={d.fileName}>
-                          {d.fileName}
-                        </span>
-                        <span className="min-w-0 flex-1 text-[11px] leading-4 text-[var(--color-text-secondary)]" title={d.description}>
-                          {d.description}
-                        </span>
-                      </li>
-                    ))}
-                  </ul>
-                )}
-
-                {/* 提示词编辑：点开条目内部；空 = 用内置默认提示词 */}
-                <div className="border-t border-[var(--color-border)] pt-2">
-                  <button
-                    type="button"
-                    onClick={() => setPromptOpen((v) => !v)}
-                    className="flex items-center gap-1 text-[11px] text-[var(--color-text-secondary)] hover:text-[var(--color-text)]"
-                  >
-                    {promptOpen ? "▾" : "▸"} 提示词（可选，自行修改）
-                  </button>
-                  {promptOpen && (
-                    <div className="mt-1.5 flex flex-col gap-2">
-                      <label className="flex flex-col gap-1 text-[11px]">
-                        <span className="text-[var(--color-text-secondary)]">AI 打标提示词（控制标签与一句话描述的生成）</span>
-                        <textarea
-                          className="ui-control min-h-28 w-full px-2 py-1.5 text-xs"
-                          value={draft.ai.systemPromptTagging}
-                          onChange={(e) => onPatchAi({ systemPromptTagging: e.target.value })}
-                          placeholder="留空 = 使用内置默认提示词"
-                        />
-                      </label>
-                      <label className="flex flex-col gap-1 text-[11px]">
-                        <span className="text-[var(--color-text-secondary)]">超级搜索提示词（控制 AI 识别搜索意图）</span>
-                        <textarea
-                          className="ui-control min-h-28 w-full px-2 py-1.5 text-xs"
-                          value={draft.ai.systemPromptSearch}
-                          onChange={(e) => onPatchAi({ systemPromptSearch: e.target.value })}
-                          placeholder="留空 = 使用内置默认提示词"
-                        />
-                      </label>
-                      <p className="text-[10px] leading-3 text-[var(--color-text-tertiary)]">
-                        改动先进入草稿，点右上角「保存设置」才生效；清空恢复内置默认。
-                      </p>
-                    </div>
-                  )}
-                </div>
-              </div>
-            )}
-          </section>
         </>
       )}
 
       {/* W4-2 编辑弹窗（6 字段一个保存通道） */}
       <EditFacetDialog
-        facet={editing}
-        onClose={() => setEditing(null)}
-        onSaved={(msg) => { setNotice(msg); void refresh(); }}
+        facet={editingSummaryMode ? SUMMARY_FACET : editing}
+        summaryPrompt={editingSummaryMode === "terms" ? {
+          tagging: draft.ai.systemPromptTagging,
+          search: draft.ai.systemPromptSearch,
+          onPatch: onPatchAi,
+        } : undefined}
+        summarySettings={editingSummaryMode === "settings"}
+        onClose={() => {
+          setEditing(null);
+          setEditingSummaryMode(null);
+        }}
+        onSaved={(msg) => {
+          setNotice(msg);
+          if (!editingSummaryMode) void refresh();
+        }}
         onError={setError}
       />
 
@@ -429,7 +394,7 @@ export default function FacetManagePanel({ draft, onPatchAi }: {
               <Button
                 onClick={() => { const f = deleting; setDeleting(null); void run(() => deactivateTagFacet(f.key), `已停用「${f.displayName}」（历史标签保留）`); }}
               >
-                停用替代
+                停用分类
               </Button>
             )}
             <Button
@@ -479,8 +444,14 @@ export default function FacetManagePanel({ draft, onPatchAi }: {
 }
 
 /** W4-2 编辑弹窗：6 字段一个保存按钮一个事务（update_tag_facet） */
-function EditFacetDialog({ facet, onClose, onSaved, onError }: {
+function EditFacetDialog({ facet, summaryPrompt, summarySettings, onClose, onSaved, onError }: {
   facet: TagFacet | null;
+  summaryPrompt?: {
+    tagging: string;
+    search: string;
+    onPatch: (patch: Partial<Settings["ai"]>) => void;
+  };
+  summarySettings?: boolean;
   onClose: () => void;
   onSaved: (msg: string) => void;
   onError: (msg: string) => void;
@@ -499,6 +470,8 @@ function EditFacetDialog({ facet, onClose, onSaved, onError }: {
   const [numUnit, setNumUnit] = useState("");
   const [numStep, setNumStep] = useState("1");
   const [convertOpen, setConvertOpen] = useState(false);
+  const summaryTerms = summaryPrompt != null;
+  const isSummary = summaryTerms || summarySettings === true;
 
   useEffect(() => {
     if (facet) {
@@ -519,6 +492,11 @@ function EditFacetDialog({ facet, onClose, onSaved, onError }: {
 
   const submit = async () => {
     if (!facet) return;
+    if (isSummary) {
+      onSaved("已更新「画面摘要」设置");
+      onClose();
+      return;
+    }
     setSaving(true);
     try {
       await updateTagFacet({
@@ -556,7 +534,7 @@ function EditFacetDialog({ facet, onClose, onSaved, onError }: {
   return (
     <Modal
       open={facet != null}
-      title={facet ? `编辑分类：${facet.displayName}` : "编辑分类"}
+      title={facet ? `${summaryTerms ? "画面摘要词条" : summarySettings ? "编辑画面摘要" : "编辑分类"}：${facet.displayName}` : "编辑分类"}
       onClose={onClose}
       footer={
         <>
@@ -569,30 +547,31 @@ function EditFacetDialog({ facet, onClose, onSaved, onError }: {
     >
       {facet && (
         <div className="flex flex-col gap-3">
-          <label className="flex flex-col gap-1 text-xs">
+          <label hidden={summaryTerms} className="flex flex-col gap-1 text-xs">
             分类名称
-            <input className="ui-control px-2 py-1.5 text-sm" value={displayName} onChange={(e) => setDisplayName(e.target.value)} aria-label="分类名称" />
+            <input className="ui-control px-2 py-1.5 text-sm disabled:opacity-70" disabled={isSummary} value={displayName} onChange={(e) => setDisplayName(e.target.value)} aria-label="分类名称" />
           </label>
-          <label className="flex flex-col gap-1 text-xs">
-            这类标签是什么
+          <label hidden={summaryTerms} className="flex flex-col gap-1 text-xs">
+            标签描述
             <textarea
               className="ui-control min-h-20 px-2 py-1.5 text-sm"
+              disabled={isSummary}
               value={description}
               onChange={(e) => setDescription(e.target.value)}
-              aria-label="这类标签是什么"
-              placeholder="如「人物服装的主色调」（这段话会原样给 AI 看，写得越具体标得越准）"
+              aria-label="标签描述"
+              placeholder="如「人物服装的主色调」"
             />
-            <span className="text-[10px] text-[var(--color-text-tertiary)]">这段话会原样给 AI 看，写得越具体标得越准</span>
+            <span className="text-[10px] text-[var(--color-text-tertiary)]">用于 AI 打标提示词</span>
           </label>
-          <fieldset className="flex flex-col gap-1 text-xs">
-            <legend className="mb-0.5">归类</legend>
-            <label className="flex items-center gap-1.5"><input type="radio" checked={inputMode === "ai_and_manual"} onChange={() => setInputMode("ai_and_manual")} />AI 自动打标（也可手工填写）</label>
-            <label className="flex items-center gap-1.5"><input type="radio" checked={inputMode === "manual_only"} onChange={() => setInputMode("manual_only")} />只手工填写</label>
+          <fieldset hidden={summaryTerms} className="flex flex-col gap-1 text-xs">
+            <legend className="mb-0.5">打标方式</legend>
+            <label className="flex items-center gap-1.5"><input type="radio" disabled={isSummary} checked={inputMode === "ai_and_manual"} onChange={() => setInputMode("ai_and_manual")} />AI 自动打标（也可手工填写）</label>
+            <label className="flex items-center gap-1.5"><input type="radio" disabled={isSummary} checked={inputMode === "manual_only"} onChange={() => setInputMode("manual_only")} />只手工填写</label>
           </fieldset>
-          {facet.facetKind === "number" ? (
+          {facet.facetKind === "number" && !summaryTerms ? (
             // V24：数值分面 —— 规则区替换为数值配置（不可改回标签型，§6.6 规则 9）
-            <fieldset className="flex flex-col gap-1 text-xs">
-              <legend className="mb-0.5">数值配置 · 数值型不可改回标签型</legend>
+            <fieldset hidden={summaryTerms} className="flex flex-col gap-1 text-xs">
+              <legend className="mb-0.5">数值设置</legend>
               <div className="flex flex-wrap items-center gap-2">
                 <label className="flex items-center gap-1">下限
                   <input className="ui-control w-16 px-1 py-0.5" type="number" value={numMin} onChange={(e) => setNumMin(e.target.value)} placeholder="不限" aria-label="数值下限" />
@@ -607,20 +586,46 @@ function EditFacetDialog({ facet, onClose, onSaved, onError }: {
                   <input className="ui-control w-14 px-1 py-0.5" type="number" step="any" min="0" value={numStep} onChange={(e) => setNumStep(e.target.value)} aria-label="数值步进" />
                 </label>
               </div>
-              <span className="text-[10px] text-[var(--color-text-tertiary)]">范围会同时约束 AI 输出与手工输入；已确认的数值不受影响</span>
+              <span className="text-[10px] text-[var(--color-text-tertiary)]">数值类型创建后不可改回标签类型；已确认的数值不受影响</span>
             </fieldset>
           ) : (
-            <fieldset className="flex flex-col gap-1 text-xs">
-              <legend className="mb-0.5">可选几个</legend>
-              <label className="flex items-center gap-1.5"><input type="radio" checked={selectionMode === "single"} onChange={() => setSelectionMode("single")} />只能选 1 个</label>
+            <fieldset hidden={summaryTerms} className="flex flex-col gap-1 text-xs">
+              <legend className="mb-0.5">可选数量</legend>
+              <label className="flex items-center gap-1.5"><input type="radio" disabled={isSummary} checked={selectionMode === "single"} onChange={() => setSelectionMode("single")} />单选</label>
               <label className="flex items-center gap-1.5">
-                <input type="radio" checked={selectionMode === "multi"} onChange={() => setSelectionMode("multi")} />可多选，上限
+                <input type="radio" disabled={isSummary} checked={selectionMode === "multi"} onChange={() => setSelectionMode("multi")} />多选，最多
                 <input className="ui-control w-16 px-1 py-0.5" type="number" min={1} disabled={selectionMode === "single"} value={maxItems} onChange={(e) => setMaxItems(e.target.value)} placeholder="不限" aria-label="多选上限" />
-                （留空 = 不限）
+                个（留空表示不限）
               </label>
             </fieldset>
           )}
-          <div>
+          {summaryPrompt && (
+            <fieldset className="flex flex-col gap-2 text-xs">
+              <legend className="mb-0.5">提示词</legend>
+              <label className="flex flex-col gap-1">
+                AI 打标提示词（完整替换系统提示词；JSON 结构仍由接口约束）
+                <textarea
+                  className="ui-control min-h-24 px-2 py-1.5 text-xs"
+                  value={summaryPrompt.tagging}
+                  onChange={(e) => summaryPrompt.onPatch({ systemPromptTagging: e.target.value })}
+                  placeholder="留空时使用内置提示词；填写后完整接管标签与摘要的语义规则"
+                />
+              </label>
+              <label className="flex flex-col gap-1">
+                超级搜索提示词（控制 AI 识别搜索意图）
+                <textarea
+                  className="ui-control min-h-24 px-2 py-1.5 text-xs"
+                  value={summaryPrompt.search}
+                  onChange={(e) => summaryPrompt.onPatch({ systemPromptSearch: e.target.value })}
+                  placeholder="留空时使用内置提示词"
+                />
+              </label>
+              <p className="text-[10px] leading-3 text-[var(--color-text-tertiary)]">
+                修改后需保存设置才能生效。
+              </p>
+            </fieldset>
+          )}
+          <div hidden={summaryTerms}>
             <button type="button" onClick={() => setShowAdvanced((v) => !v)} className="text-[11px] text-[var(--color-text-secondary)] hover:text-[var(--color-text)]">
               ▸ 高级{showAdvanced ? "（收起）" : ""}
             </button>
@@ -628,15 +633,15 @@ function EditFacetDialog({ facet, onClose, onSaved, onError }: {
               <div className="mt-2 flex flex-col gap-2">
                 <label className="flex items-center gap-2 text-xs">
                   适用于
-                  <select className="ui-control rounded px-1 py-0.5 text-xs" value={appliesTo} onChange={(e) => setAppliesTo(e.target.value as typeof appliesTo)} aria-label="适用于">
+                  <select className="ui-control rounded px-1 py-0.5 text-xs disabled:opacity-70" disabled={isSummary} value={appliesTo} onChange={(e) => setAppliesTo(e.target.value as typeof appliesTo)} aria-label="适用于">
                     {APP_TO_OPTIONS.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
                   </select>
                 </label>
                 <label className="flex items-center gap-2 text-xs text-[var(--color-text-tertiary)]">
-                  英文标识（只读）：<code>{facet.key}</code>
+                  英文标识（不可修改）：<code>{facet.key}</code>
                 </label>
                 {/* V24（Phase 7-7）：tag → number 转换（先 dry-run 预览，不自动裁决） */}
-                <div className="flex flex-col gap-1">
+                {!isSummary && <div className="flex flex-col gap-1">
                   <button
                     type="button"
                     className="self-start rounded border border-[var(--color-border)] px-2 py-1 text-[11px] text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-hover)]"
@@ -645,9 +650,9 @@ function EditFacetDialog({ facet, onClose, onSaved, onError }: {
                     转换为数值型…
                   </button>
                   <span className="text-[10px] text-[var(--color-text-tertiary)]">
-                    按标签名解析出数值（如「5人」→ 5）；不可逆，先看预览报告
+                    从标签名称中识别数值，例如「5人」→ 5。此操作不可撤销，请先确认预览结果。
                   </span>
-                </div>
+                </div>}
               </div>
             )}
           </div>
@@ -715,7 +720,7 @@ function ConvertPreviewDialog({ facetKey, open, onClose, onDone, onError }: {
       }
     >
       {loading || !report ? (
-        <p className="text-xs text-[var(--color-text-tertiary)]">解析标签名中…</p>
+        <p className="text-xs text-[var(--color-text-tertiary)]">正在识别标签中的数值…</p>
       ) : (
         <div className="flex max-h-96 flex-col gap-2 overflow-y-auto text-xs">
           <p className="text-[var(--color-text-secondary)]">
@@ -729,19 +734,19 @@ function ConvertPreviewDialog({ facetKey, open, onClose, onDone, onError }: {
           )}
           {report.ambiguous.length > 0 && (
             <div className="text-[var(--color-status-warning,--color-text)]">
-              <p className="font-medium">歧义（不自动取值 —— 请逐条改名后重试，或手工填值）</p>
+              <p className="font-medium">含义不明确的标签（请先重命名或手动填写数值）</p>
               <ul className="ml-4 list-disc">{report.ambiguous.map((a) => <li key={a.tagId}>「{a.name}」：{a.reason}</li>)}</ul>
             </div>
           )}
           {report.unparseable.length > 0 && (
             <div>
-              <p className="font-medium">不可解析（这些标签会丢失，原标签置为弃用）</p>
+              <p className="font-medium">无法识别数值的标签（转换后将停用，不会删除）</p>
               <ul className="ml-4 list-disc">{report.unparseable.map((u) => <li key={u.tagId}>「{u.name}」（{u.assetCount} 张素材）</li>)}</ul>
             </div>
           )}
           {report.conflicts.length > 0 && (
             <div className="text-[var(--color-danger)]">
-              <p className="font-medium">同素材多个数值冲突（系统不代选，需先在标签侧合并/改名）</p>
+              <p className="font-medium">同一素材存在多个数值（需先在标签管理页合并或重命名）</p>
               <ul className="ml-4 list-disc">
                 {report.conflicts.slice(0, 20).map((c) => (
                   <li key={c.assetId}>素材 #{c.assetId}：{c.candidates.map(([, v, rs]) => `${v}（${rs}）`).join(" / ")}</li>
@@ -750,7 +755,7 @@ function ConvertPreviewDialog({ facetKey, open, onClose, onDone, onError }: {
             </div>
           )}
           <p className="text-[10px] text-[var(--color-text-tertiary)]">
-            层级丢失 {report.hierarchyLoss} 条 · 别名丢弃 {report.aliasLoss} 条 · pending 建议将拒绝 {report.pendingRejected} 条。转换在单事务内执行，原标签置为弃用（不物理删）。
+            层级丢失 {report.hierarchyLoss} 条 · 别名丢弃 {report.aliasLoss} 条 · 待确认的 AI 建议将拒绝 {report.pendingRejected} 条。原标签会保留为已停用状态，不会直接删除数据。
           </p>
         </div>
       )}
@@ -758,7 +763,7 @@ function ConvertPreviewDialog({ facetKey, open, onClose, onDone, onError }: {
   );
 }
 
-/** W4-3 新建弹窗：2 个必填（名称 + 这类标签是什么）；key 自动生成。
+/** W4-3 新建弹窗：2 个必填（名称 + 标签描述）；key 自动生成。
  *  P1-1：纯中文名 slugify 出空串不再硬报错 —— 自动补一个合法随机标识（facet_xxx），
  *  用户仍可改；只有显式清空了自己输入过的标识才报错。 */
 function CreateFacetDialog({ group, onClose, onCreated }: {
@@ -806,7 +811,7 @@ function CreateFacetDialog({ group, onClose, onCreated }: {
   const submit = async () => {
     setErr(null);
     if (!displayName.trim()) return setErr("请填写分类名称");
-    if (!description.trim()) return setErr("请填写「这类标签是什么」（它会成为给 AI 的提示词）");
+    if (!description.trim()) return setErr("请填写标签描述");
     if (keyEmpty) return setErr("英文标识不能为空");
     if (facetKind === "number" && numMin !== "" && numMax !== "" && Number(numMin) > Number(numMax)) {
       return setErr("数值下限不能大于上限");
@@ -854,7 +859,7 @@ function CreateFacetDialog({ group, onClose, onCreated }: {
   return (
     <Modal
       open={group != null}
-      title={`新增分类${group === "ai" ? "（AI 自动打标）" : group === "manual" ? "（只手工填写）" : ""}`}
+      title={`新增分类${group === "ai" ? "（AI 自动打标）" : group === "manual" ? "（手工填写）" : ""}`}
       onClose={onClose}
       footer={
         <>
@@ -869,7 +874,7 @@ function CreateFacetDialog({ group, onClose, onCreated }: {
           <legend className="mb-0.5">类型</legend>
           <label className="flex items-center gap-1.5"><input type="radio" checked={facetKind === "tag"} onChange={() => setFacetKindSel("tag")} />标签（从词表选词）</label>
           <label className="flex items-center gap-1.5">
-            <input type="radio" checked={facetKind === "number"} onChange={() => setFacetKindSel("number")} />数值（AI / 手工填一个数，如人数）
+            <input type="radio" checked={facetKind === "number"} onChange={() => setFacetKindSel("number")} />数值（如人数）
           </label>
           {facetKind === "number" && (
             <div className="mt-1 flex flex-wrap items-center gap-2 rounded-md border border-[var(--color-border)] bg-[var(--color-surface)] p-2">
@@ -885,7 +890,7 @@ function CreateFacetDialog({ group, onClose, onCreated }: {
               <label className="flex items-center gap-1 text-xs">步进
                 <input className="ui-control w-14 px-1 py-0.5" type="number" step="any" min="0" value={numStep} onChange={(e) => setNumStep(e.target.value)} aria-label="数值步进" />
               </label>
-              <span className="text-[10px] text-[var(--color-text-tertiary)]">范围会同时约束 AI 输出与手工输入</span>
+              <span className="text-[10px] text-[var(--color-text-tertiary)]">AI 和手动填写的数值都会限制在此范围内</span>
             </div>
           )}
         </fieldset>
@@ -894,8 +899,8 @@ function CreateFacetDialog({ group, onClose, onCreated }: {
           <input className="ui-control px-2 py-1.5 text-sm" placeholder={facetKind === "number" ? "如「人数」" : "如「人物服装颜色」"} value={displayName} onChange={(e) => setDisplayName(e.target.value)} aria-label="分类名称" />
         </label>
         <label className="flex flex-col gap-1 text-xs">
-          {facetKind === "number" ? "这个数值是什么（必填）" : "这类标签是什么（必填）"}
-          <textarea className="ui-control min-h-20 px-2 py-1.5 text-sm" placeholder={facetKind === "number" ? "如「画面中的人数」（这段话会原样给 AI 看）" : "如「人物服装的主色调」（这段话会原样给 AI 看）"} value={description} onChange={(e) => setDescription(e.target.value)} aria-label="这类标签是什么" />
+          标签描述（必填）
+          <textarea className="ui-control min-h-20 px-2 py-1.5 text-sm" placeholder={facetKind === "number" ? "如「画面中的人数」" : "如「人物服装的主色调」"} value={description} onChange={(e) => setDescription(e.target.value)} aria-label="标签描述" />
         </label>
         <label className="flex flex-col gap-1 text-xs">
           英文标识
@@ -908,10 +913,10 @@ function CreateFacetDialog({ group, onClose, onCreated }: {
           />
           {autoGenerated ? (
             <span className="text-[10px] text-[var(--color-text-tertiary)]">
-              {slugify(displayName) ? "自动从名称生成，可修改" : "中文名无法转英文，已自动生成随机标识，可修改"} · 创建后不可修改
+              {slugify(displayName) ? "根据名称自动生成，可修改" : "当前名称无法生成英文标识，已自动生成，可修改"} · 创建后不可修改
             </span>
           ) : (
-            <span className="text-[10px] text-[var(--color-text-tertiary)]">⚠ 创建后不可修改，只能删除</span>
+            <span className="text-[10px] text-[var(--color-text-tertiary)]">⚠ 创建后不可修改</span>
           )}
         </label>
         {err && <p className="text-xs text-[var(--color-danger)]">{err}</p>}

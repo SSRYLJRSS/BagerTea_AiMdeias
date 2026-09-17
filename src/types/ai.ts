@@ -1,6 +1,6 @@
 /** AI 打标（批次管理 + 确认流） */
 
-/** 打标模式；auto = 建批时按激活档案 kind 解析为 cloud/local（P3-01a） */
+/** 批次执行类型；auto 仅用于旧 IPC 兼容，实际云端/本地由 tagging 用途绑定解析。 */
 export type AiMode = "cloud" | "local" | "manual" | "auto";
 
 export interface AiBatch {

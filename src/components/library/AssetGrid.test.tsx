@@ -121,8 +121,7 @@ function renderGrid(preview: (asset: Asset) => void = vi.fn()) {
   return render(
     <AssetGrid
       onPreview={preview}
-      onAiTag={vi.fn()}
-      onAssignTags={vi.fn()}
+      onTag={vi.fn()}
       onExport={vi.fn()}
       onMove={vi.fn()}
       onDelete={vi.fn()}
@@ -236,6 +235,17 @@ describe("AssetGrid 单击选择语义", () => {
     expect(sel).toEqual([1, 2]); // 多选保留，未被反选/清空
   });
 
+  it("右键素材菜单不再提供评级功能", async () => {
+    const assets = [mkAsset(1)];
+    useLibraryStore.setState({ items: assets, viewItems: assets, total: 1 });
+    renderGrid();
+
+    fireEvent.contextMenu(cardByName("a1.jpg"));
+    await waitFor(() => expect(screen.getByText("导出")).toBeInTheDocument());
+    expect(screen.queryByText("评级")).not.toBeInTheDocument();
+    expect(screen.queryByText("清除评级")).not.toBeInTheDocument();
+  });
+
   it("右键菜单打开期间 Ctrl+A/Ctrl+I 不生效（防误触反选全选）", async () => {
     const assets = [mkAsset(1), mkAsset(2)];
     useLibraryStore.setState({ items: assets, viewItems: assets, total: 2 });
@@ -323,11 +333,10 @@ describe("AssetGrid FB2-01 档位缩放（Alt/Ctrl+滚轮）", () => {
         ollamaSourceId: "auto",
         systemPromptTagging: "",
         systemPromptSearch: "",
-        autoAcceptExactTerms: true,
-        autoAdoptNewTerms: false,
         confidenceMinSuggest: 0.3,
       },
       theme: "system",
+      logLevel: "info",
       thumbnailCacheMb: 2048,
       tagCategories: [],
       libraryRoot: "",
@@ -403,8 +412,7 @@ describe("AssetGrid §4.6 截断安全", () => {
     render(
       <AssetGrid
         onPreview={vi.fn()}
-        onAiTag={vi.fn()}
-        onAssignTags={vi.fn()}
+        onTag={vi.fn()}
         onExport={onExport}
         onMove={vi.fn()}
         onDelete={vi.fn()}
@@ -431,7 +439,7 @@ describe("AssetGrid §4.6 截断安全", () => {
       selectionTotal: 100_010,
     });
     render(
-      <GridToolbar onAiTag={vi.fn()} onAssignTags={vi.fn()} onExport={vi.fn()} onMove={vi.fn()} onDelete={vi.fn()} onPurge={vi.fn()} />,
+      <GridToolbar onTag={vi.fn()} onExport={vi.fn()} onMove={vi.fn()} onDelete={vi.fn()} onPurge={vi.fn()} />,
     );
     expect(screen.getByText(/已选中 100000 \/ 100010 项/)).toBeTruthy();
   });

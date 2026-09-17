@@ -1,6 +1,6 @@
 /** AI 打标命令封装（对应 commands/ai_cmd.rs，T05a） */
 import { invoke, on } from "./client";
-import type { AiBatch, AiMode, AiSuggestion, AiSuggestionItem, CategorizedTags } from "@/types/ai";
+import type { AiBatch, AiSuggestion, AiSuggestionItem, CategorizedTags } from "@/types/ai";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 
 export interface AiProgress {
@@ -10,8 +10,9 @@ export interface AiProgress {
   currentAssetId: number;
 }
 
-export function aiCreateBatch(assetIds: number[], mode: AiMode): Promise<AiBatch> {
-  return invoke<AiBatch>("ai_create_batch", { assetIds, mode });
+export function aiCreateBatch(assetIds: number[]): Promise<AiBatch> {
+  // mode 仅为兼容现有后端命令；实际云端/本地由 tagging 用途绑定决定。
+  return invoke<AiBatch>("ai_create_batch", { assetIds, mode: "auto" });
 }
 
 export function aiStartBatch(batchId: number, limit?: number): Promise<AiBatch> {

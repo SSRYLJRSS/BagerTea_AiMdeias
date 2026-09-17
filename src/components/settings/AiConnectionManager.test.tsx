@@ -95,7 +95,7 @@ describe("AiConnectionManager（§6.3）", () => {
     render(<AiConnectionManager deployment="cloud" notify={vi.fn()} fail={vi.fn()} />);
     await waitFor(() => expect(screen.getByText("通义")).toBeInTheDocument());
 
-    fireEvent.click(screen.getByRole("button", { name: "删" }));
+    fireEvent.click(screen.getByRole("button", { name: "删除" }));
     expect(confirmSpy).toHaveBeenCalled();
     await waitFor(() => expect(deleteAiConnection).toHaveBeenCalledWith("c1"));
   });

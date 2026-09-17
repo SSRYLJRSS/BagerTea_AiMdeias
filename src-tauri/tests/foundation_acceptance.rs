@@ -1567,9 +1567,9 @@ fn top_tags_quota_is_shared_fairly() {
             "小分面不得被大分面挤掉（实际 {keys:?}）"
         );
     }
-    // 均摊配额 = 1500 / 3 = 500 字符左右；大分面行不应失控（< 520，含分隔符余量）
+    // 均摊配额 = 5000 / 3 ≈ 1666 字符；大分面行不应失控（含分隔符余量）
     let big = out.iter().find(|(f, _)| f == "big_f").unwrap();
-    let cap_share = 1500usize / keys.len();
+    let cap_share = 5000usize / keys.len();
     assert!(
         big.1.chars().count() <= cap_share + 20,
         "大分面占用应接近均摊配额 {}（实际 {}）",
@@ -1589,6 +1589,10 @@ fn top_tags_quota_is_shared_fairly() {
 fn analysis_result_roundtrips() {
     let ar = ai::AnalysisResult {
         description: "黄昏海边".to_string(),
+        people_presence: ai::PeoplePresence {
+            status: ai::PeoplePresenceStatus::Unknown,
+            confidence: 0.5,
+        },
         proposals: vec![
             ai::TagProposal {
                 facet_key: "scene".into(),
@@ -1620,11 +1624,23 @@ fn analysis_result_roundtrips() {
 /// A1：对象形态（{"t","c"}）解析 → typed proposals → items 落库 confidence=0.9。
 #[test]
 fn confidence_object_form_reaches_db() {
+    use bagertea_ai_media_v2_lib::db::tag_facets::FacetPromptContext;
     use bagertea_ai_media_v2_lib::services::ai_cloud::parse_media_analysis;
     let c = mem();
     let sug = f6_one_suggestion(&c);
-    let ma =
-        parse_media_analysis(r#"{"scene":[{"t":"海边","c":0.9}]}"#, &["scene"], &[], &[]).unwrap();
+    let facets = [FacetPromptContext {
+        key: "scene".into(),
+        display_name: "场景".into(),
+        selection_mode: "multi".into(),
+        facet_kind: "tag".into(),
+        ..Default::default()
+    }];
+    let ma = parse_media_analysis(
+        r#"{"description":"黄昏海边风景","peoplePresence":{"status":"unknown","confidence":0.8},"tags":{"scene":[{"name":"海边","confidence":0.9}]},"numbers":{}}"#,
+        &facets,
+        0.30,
+    )
+    .unwrap();
     assert_eq!(
         ma.tags.get("scene").unwrap(),
         &vec!["海边".to_string()],
@@ -1642,50 +1658,38 @@ fn confidence_object_form_reaches_db() {
     assert!((dbc - 0.9).abs() < 1e-3, "item.confidence={dbc}");
 }
 
-/// A1：纯字符串形态仍是合法回退（confidence 落 NULL，不吞标签）。
-#[test]
-fn legacy_string_form_still_works() {
-    use bagertea_ai_media_v2_lib::services::ai_cloud::parse_media_analysis;
-    let c = mem();
-    let sug = f6_one_suggestion(&c);
-    let ma = parse_media_analysis(r#"{"scene":["海边","沙滩"]}"#, &["scene"], &[], &[]).unwrap();
-    assert_eq!(
-        ma.tags.get("scene").unwrap(),
-        &vec!["海边".to_string(), "沙滩".to_string()]
-    );
-    assert!(
-        ma.proposals.iter().all(|p| p.confidence.is_none()),
-        "纯字符串无置信度"
-    );
-    ai::set_suggestion_result_typed(&c, sug.id, &ma.tags, &ma.proposals, &ma.description).unwrap();
-    let items = ai::list_suggestion_items(&c, sug.id).unwrap();
-    assert_eq!(items.len(), 2);
-    assert!(items.iter().all(|i| i.confidence.is_none()));
-}
-
 // ═══════════════ A2：AI 溯源（F1-g 列接线） ═══════════════
 
 /// A2：raw_response 逐字落库（含围栏/首尾空白，一行不动）；
 /// analysis_json 存 AnalysisResult 序列化且可往返。
 #[test]
 fn raw_response_stored_verbatim() {
+    use bagertea_ai_media_v2_lib::db::tag_facets::FacetPromptContext;
     use bagertea_ai_media_v2_lib::services::ai_cloud::parse_media_analysis;
     let c = mem();
     let sug = f6_one_suggestion(&c);
-    // 模拟模型原样返回：围栏 + 内部 JSON + 尾部空行。逐字 = 存储不得清洗/裁剪。
-    let raw = "```json\n{\"scene\":[{\"t\":\"海边\",\"c\":0.9}]}\n```\n\n";
-    let ma = parse_media_analysis(raw, &["scene"], &[], &[]).unwrap();
+    let facets = [FacetPromptContext {
+        key: "scene".into(),
+        display_name: "场景".into(),
+        selection_mode: "multi".into(),
+        facet_kind: "tag".into(),
+        ..Default::default()
+    }];
+    // 围栏、前后空白必须逐字保留。
+    let raw = "```json\n{\"description\":\"黄昏海边风景\",\"peoplePresence\":{\"status\":\"unknown\",\"confidence\":0.8},\"tags\":{\"scene\":[{\"name\":\"海边\",\"confidence\":0.9}]},\"numbers\":{}}\n```\n\n";
+    let ma = parse_media_analysis(raw, &facets, 0.30).unwrap();
     assert_eq!(ma.tags.get("scene").unwrap(), &vec!["海边".to_string()]);
     // runner 顺序：先写 typed 结果，再补溯源
     ai::set_suggestion_result_typed(&c, sug.id, &ma.tags, &ma.proposals, &ma.description).unwrap();
     let analysis_json = serde_json::to_string(&ai::AnalysisResult {
         description: ma.description.clone(),
+        people_presence: ma.people_presence.clone(),
         proposals: ma.proposals.clone(),
         numbers: ma.numbers.clone(),
         warnings: ma.warnings.clone(),
     })
     .unwrap();
-    ai::set_suggestion_provenance(&c, sug.id, raw, &analysis_json).unwrap();
+    ai::set_suggestion_provenance(&c, sug.id, raw, &analysis_json, 2).unwrap();
     let (db_raw, db_analysis): (Option<String>, Option<String>) = c
         .query_row(
             "SELECT raw_response, analysis_json FROM ai_suggestions WHERE id = ?1",
@@ -1715,7 +1719,7 @@ fn raw_response_stored_verbatim() {
 fn request_config_hash_is_stable() {
     use bagertea_ai_media_v2_lib::db::tag_facets::FacetPromptContext;
     use bagertea_ai_media_v2_lib::services::ai_cloud::{
-        build_batch_request_config, stable_config_hash,
+        build_batch_request_config, stable_config_hash, TextJsonTier,
     };
     let facets = [FacetPromptContext {
         key: "scene".into(),
@@ -1728,7 +1732,15 @@ fn request_config_hash_is_stable() {
     let top = vec![("scene".to_string(), "海边/森林/室内".to_string())];
     let h = |sys: &str, model: &str, max_tokens: i64| {
         stable_config_hash(&build_batch_request_config(
-            sys, &facets, &top, model, "image", max_tokens, true,
+            sys,
+            &facets,
+            &top,
+            model,
+            "image",
+            max_tokens,
+            true,
+            TextJsonTier::Structured,
+            0.30,
         ))
     };
     let base = h("你是打标助手", "qwen2.5-vl", 1180);
@@ -1761,7 +1773,7 @@ fn request_config_hash_is_stable() {
 fn request_config_json_contains_all_inputs() {
     use bagertea_ai_media_v2_lib::db::tag_facets::FacetPromptContext;
     use bagertea_ai_media_v2_lib::services::ai_cloud::{
-        build_batch_request_config, PROMPT_VERSION,
+        build_batch_request_config, TextJsonTier, PROMPT_VERSION,
     };
     let facets = [FacetPromptContext {
         key: "scene".into(),
@@ -1780,6 +1792,8 @@ fn request_config_json_contains_all_inputs() {
         "image",
         1180,
         true,
+        TextJsonTier::Structured,
+        0.30,
     );
     let o = cfg.as_object().expect("配置应为对象");
     assert_eq!(
@@ -1816,12 +1830,12 @@ fn request_config_json_contains_all_inputs() {
         o["topTagsSnapshot"][0]["words"],
         serde_json::json!("海边/森林/室内")
     );
-    // modelParams：模型与 token 上限；本地档案记录 responseFormat/keepAlive
+    // modelParams：模型、token 上限与最终结构化等级；本地档案额外记录 keepAlive
     assert_eq!(o["modelParams"]["model"], serde_json::json!("qwen2.5-vl"));
     assert_eq!(o["modelParams"]["maxTokens"], serde_json::json!(1180));
     assert_eq!(
-        o["modelParams"]["responseFormat"],
-        serde_json::json!("json_object")
+        o["modelParams"]["jsonTier"],
+        serde_json::json!("structured")
     );
     // imagePreprocess 三字段
     let pre = &o["imagePreprocess"];
@@ -1830,13 +1844,13 @@ fn request_config_json_contains_all_inputs() {
     }
 }
 
-/// A2：旧行（溯源列 NULL / schema 默认 1）仍可被老读者正常读取 —— ALTER 加列不破坏兼容。
+/// A2：溯源列为空的既有行仍可读取；新写入路径记录 V2 schema 版本。
 #[test]
 fn schema_version_allows_old_data() {
     let c = mem();
     let sug = f6_one_suggestion(&c);
     // f6_one_suggestion 走 create_batch 的 INSERT —— 未列出溯源列，正是「旧版本写入形态」：
-    // ALTER 默认补 raw_response NULL / analysis_json NULL / analysis_schema_version 1。
+    // 旧行由既有列默认补 raw_response NULL / analysis_json NULL / analysis_schema_version 1。
     let ver: i64 = c
         .query_row(
             "SELECT analysis_schema_version FROM ai_suggestions WHERE id = ?1",
@@ -1844,7 +1858,7 @@ fn schema_version_allows_old_data() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(ver, 1, "旧行 analysis_schema_version 应为默认 1");
+    assert_eq!(ver, 1, "旧行 analysis_schema_version 保持默认 1");
     let nulls: i64 = c
         .query_row(
             "SELECT COUNT(*) FROM ai_suggestions WHERE id = ?1 AND raw_response IS NULL AND analysis_json IS NULL",
@@ -1855,8 +1869,8 @@ fn schema_version_allows_old_data() {
     assert_eq!(nulls, 1, "旧行溯源列为 NULL（未写不报错）");
     // 老读者（list_suggestions / suggestion_from_row）不受新列影响
     assert_eq!(ai::list_suggestions(&c, sug.batch_id).unwrap().len(), 1);
-    // 新路径写入后 schema 版本仍为 1（无跳版）
-    ai::set_suggestion_provenance(&c, sug.id, "{\"scene\":[]}", "{}").unwrap();
+    // 新路径写入后 schema 版本保持 2
+    ai::set_suggestion_provenance(&c, sug.id, "{\"scene\":[]}", "{}", 2).unwrap();
     let ver2: i64 = c
         .query_row(
             "SELECT analysis_schema_version FROM ai_suggestions WHERE id = ?1",
@@ -1864,7 +1878,7 @@ fn schema_version_allows_old_data() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(ver2, 1);
+    assert_eq!(ver2, 2);
 }
 
 // ═══════════════ A3：重跑策略与状态机（asset_tags.review_state 三态） ═══════════════
@@ -2036,10 +2050,9 @@ fn undo_batch_respects_review_state() {
 
 // ═══════════════ A4：置信度策略（按词表而非 confidence 高低决定自动化程度） ═══════════════
 
-/// A4：精确命中词表 canonical → auto_accept_exact_terms（默认开）自动接收：
-/// item decision='accepted' + 写 asset_tags（review_state='ai_unreviewed'，A3 状态机兜底）。
+/// 精确命中词表也只建立 pending 建议，必须人工确认后才写 asset_tags。
 #[test]
-fn exact_term_auto_accepted() {
+fn exact_term_stays_pending() {
     use bagertea_ai_media_v2_lib::db::ai::ConfidencePolicy;
     let c = mem();
     enable_terms(&c);
@@ -2063,22 +2076,16 @@ fn exact_term_auto_accepted() {
     .unwrap();
     let items = ai::list_suggestion_items(&c, sug.id).unwrap();
     assert_eq!(items.len(), 1);
-    assert_eq!(items[0].decision, "accepted", "精确命中应自动接收");
+    assert_eq!(items[0].decision, "pending", "精确命中仍须人工确认");
     assert_eq!(items[0].tag_id, Some(tag.id));
-    // 自动接收 → asset_tags ai_unreviewed（source = ai_cloud + 批次溯源）
-    let (rs, src, sb): (String, String, Option<i64>) = c
+    let count: i64 = c
         .query_row(
-            "SELECT review_state, source, source_batch_id FROM asset_tags WHERE asset_id=?1 AND tag_id=?2",
+            "SELECT COUNT(*) FROM asset_tags WHERE asset_id=?1 AND tag_id=?2",
             rusqlite::params![sug.asset_id, tag.id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(
-        rs, "ai_unreviewed",
-        "自动接收的行保持未审核态，等用户确认升级"
-    );
-    assert_eq!(src, "ai_cloud");
-    assert_eq!(sb, Some(sug.batch_id));
+    assert_eq!(count, 0, "未人工确认不得写 asset_tags");
 }
 
 /// A4：完全新词 → 只进 pending（不进 tags、不建词、不写 asset_tags）；自动建词默认关。
@@ -2143,7 +2150,7 @@ fn low_confidence_dropped_entirely() {
         &tags_map,
         &proposals,
         "",
-        &ConfidencePolicy::default(),
+        &ConfidencePolicy { min_suggest: 0.30 },
     )
     .unwrap();
     assert_eq!(
@@ -2172,19 +2179,14 @@ fn low_confidence_dropped_entirely() {
     assert_eq!(at, 0);
 }
 
-/// A4：显式开关 auto_adopt_new_terms 默认关（策略对象与设置对象同构缺省）。
+/// 当前版本固定人工审核：默认策略不自动写已有词、不自动建新词，也不静默过滤建议。
 #[test]
 fn auto_adopt_off_by_default() {
     use bagertea_ai_media_v2_lib::db::ai::ConfidencePolicy;
     use bagertea_ai_media_v2_lib::db::settings::AiSettings;
     let p = ConfidencePolicy::default();
-    assert!(!p.auto_adopt_new_terms, "AI 自动向词表建新词必须默认关");
-    assert!(p.auto_accept_exact_terms, "精确命中自动接收默认开");
-    assert!((p.min_suggest - 0.30).abs() < 1e-9, "min_suggest 默认 0.30");
-    // 设置对象缺省与默认策略一致（settings JSON 缺字段 → 同上默认）
+    assert_eq!(p.min_suggest, 0.30, "低置信度默认阈值");
     let s = AiSettings::default();
-    assert!(!s.auto_adopt_new_terms);
-    assert!(s.auto_accept_exact_terms);
     assert!((s.confidence_min_suggest - 0.30).abs() < 1e-9);
 }
 
@@ -2710,7 +2712,11 @@ fn palette_top3_ratio_min_filters() {
         max: None,
     };
     let compiled = compile_metadata(&f).unwrap().expect("带阈值可编译");
-    assert!(compiled.sql.contains("apc.ratio >= ?2"), "{}", compiled.sql);
+    assert!(
+        compiled.sql.contains("HAVING SUM(apc.ratio) >= ?2"),
+        "{}",
+        compiled.sql
+    );
     let filter = assets::AssetFilter {
         metadata_filters: vec![f],
         ..Default::default()

@@ -673,24 +673,20 @@ fn next_day_ms(s: &str) -> AppResult<i64> {
 /// C-1：palette_* 编译为对 asset_palette_colors 的 EXISTS（值 = 折叠色名 → 桶 id）。
 /// - palette_dominant → rank=0；palette_top3 → rank<3；palette_any → 不限 rank。
 ///   实测关系表覆盖索引（ix_apc_bucket）；like/字符串列是 SCAN，故不用。
-///   U-3：eq + 数字 min = 占比阈值（「前三色含红且红占 ≥50%」→ bucket=红 AND ratio>=0.5）。
+///   eq/in + 数字 min = 占比阈值；同色桶先合并 ratio，多色为 OR。
 ///   复用数值条件的 min 字段表达阈值，allowed_ops 仍只 eq/in —— AI schema 与校验面不变。
 fn compile_palette_meta(f: &MetadataFilter) -> AppResult<Option<CompiledMetadata>> {
     let rank_sql = match f.key.as_str() {
-        "palette_dominant" => Some(" AND apc.rank = 0"),
-        "palette_top3" => Some(" AND apc.rank < 3"),
-        "palette_any" => None,
+        "palette_dominant" => " AND apc.rank = 0",
+        "palette_top3" => " AND apc.rank < 3",
+        "palette_any" => "",
         _ => return Ok(None),
-    };
-    let rank_sql = match rank_sql {
-        Some(x) => x,
-        None => return Ok(None), // 非 palette key
     };
     let ratio_min = f.min.as_ref().and_then(json_f64);
     let names: Vec<String> = match f.op.as_str() {
         "eq" => {
             if ratio_min.is_some() {
-                // U-3：占比阈值 = 单色 eq + min（避免「多种颜色共享一个阈值」的歧义）
+                // eq + min 仍只接受单个色名；多色使用 in + values。
                 let Some(v) = f.value.as_ref() else {
                     return Err(AppError::msg("palette 等值条件缺少 value"));
                 };
@@ -713,9 +709,6 @@ fn compile_palette_meta(f: &MetadataFilter) -> AppResult<Option<CompiledMetadata
             }
         }
         "in" => {
-            if ratio_min.is_some() {
-                return Err(AppError::msg("带占比阈值的色板条件仅支持等于（eq）单色"));
-            }
             let mut out = Vec::new();
             if let Some(v) = f.value.as_ref() {
                 if let Some(x) = v.as_str() {
@@ -745,19 +738,25 @@ fn compile_palette_meta(f: &MetadataFilter) -> AppResult<Option<CompiledMetadata
         })?;
         ids.push(id);
     }
-    // U-3：单色 + 阈值 → ratio >= min（先绑定颜色再限定占比，覆盖索引依然可用）
+    // 同一颜色家族可能由多个前三色色块组成，先按素材和色桶合并占比再判断阈值。
     if let Some(r) = ratio_min {
-        if ids.len() != 1 {
-            return Err(AppError::msg("带占比阈值的色板条件一次只能选一种颜色"));
-        }
         if !(0.0..=1.0).contains(&r) {
             return Err(AppError::msg("色板占比阈值必须在 0..1 之间"));
         }
+        let ph = ids
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("?{}", i + 1))
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut params = ids.into_iter().map(Value::Integer).collect::<Vec<_>>();
+        params.push(Value::Real(r));
+        let ratio_param = params.len();
         return Ok(Some(CompiledMetadata {
             sql: format!(
-                "EXISTS (SELECT 1 FROM asset_palette_colors apc WHERE apc.asset_id = a.id AND apc.color_bucket = ?1 AND apc.ratio >= ?2{rank_sql})"
+                "EXISTS (SELECT 1 FROM asset_palette_colors apc WHERE apc.asset_id = a.id AND apc.color_bucket IN ({ph}){rank_sql} GROUP BY apc.color_bucket HAVING SUM(apc.ratio) >= ?{ratio_param})"
             ),
-            params: vec![Value::Integer(ids[0]), Value::Real(r)],
+            params,
         }));
     }
     let ph = ids
@@ -1311,7 +1310,7 @@ mod tests {
         assert!(compile_metadata(&gt).is_err());
     }
 
-    /// U-3：palette eq + 数字 min = 占比阈值编译（bucket=色 AND ratio>=min + rank 限定）。
+    /// palette eq/in + 数字 min：按同色桶合并占比，并保留 rank 限定。
     #[test]
     fn palette_eq_with_ratio_min_compiles() {
         let f = MetadataFilter {
@@ -1323,11 +1322,11 @@ mod tests {
             max: None,
         };
         let c = compile_metadata(&f).unwrap().unwrap();
-        assert!(c.sql.contains("apc.color_bucket = ?1"), "{}", c.sql);
-        assert!(c.sql.contains("apc.ratio >= ?2"), "{}", c.sql);
+        assert!(c.sql.contains("apc.color_bucket IN (?1)"), "{}", c.sql);
+        assert!(c.sql.contains("HAVING SUM(apc.ratio) >= ?2"), "{}", c.sql);
         assert!(c.sql.contains("rank < 3"), "{}", c.sql);
         assert_eq!(c.params.len(), 2);
-        // in + min 拒绝（阈值只配单色 eq）
+        // 侧栏多选：任一颜色达到阈值即可命中。
         let in_min = MetadataFilter {
             key: "palette_top3".into(),
             op: "in".into(),
@@ -1336,7 +1335,18 @@ mod tests {
             min: Some(serde_json::json!(0.5)),
             max: None,
         };
-        assert!(compile_metadata(&in_min).is_err());
+        let compiled = compile_metadata(&in_min).unwrap().unwrap();
+        assert!(
+            compiled.sql.contains("color_bucket IN (?1,?2)"),
+            "{}",
+            compiled.sql
+        );
+        assert!(
+            compiled.sql.contains("HAVING SUM(apc.ratio) >= ?3"),
+            "{}",
+            compiled.sql
+        );
+        assert_eq!(compiled.params.len(), 3);
         // 阈值越界拒绝
         let oob = MetadataFilter {
             key: "palette_top3".into(),

@@ -66,24 +66,30 @@ beforeEach(() => {
 });
 
 describe("TagTree 分面折叠（与文件属性统一）", () => {
-  it("默认展开分面，标题行可全部收起再全部展开", () => {
+  it("默认收起分面，标题行可全部展开再全部收起", () => {
     render(<TagTree />);
     expect(screen.getByText("智能标签")).toBeInTheDocument();
-    expect(screen.getByText("人像")).toBeVisible();
-    fireEvent.click(screen.getByRole("button", { name: "全部收起" }));
     expect(screen.queryByText("人像")).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "全部展开" }));
     expect(screen.getByText("人像")).toBeVisible();
-    expect(screen.getByRole("button", { name: "全部收起" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "全部收起" }));
+    expect(screen.queryByText("人像")).not.toBeInTheDocument();
   });
 
   it("分面标题可独立收起，且标签树节点仍可展开", () => {
     render(<TagTree />);
+    fireEvent.click(screen.getByRole("button", { name: "全部展开" }));
     fireEvent.click(screen.getByRole("button", { name: "标签" }));
     expect(screen.queryByText("人像")).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "标签" }));
     fireEvent.click(screen.getAllByRole("button", { name: "展开" })[0]);
     expect(screen.getByText("特写")).toBeVisible();
+  });
+
+  it("标签项使用无圆角的连续列表样式", () => {
+    render(<TagTree />);
+    fireEvent.click(screen.getByRole("button", { name: "全部展开" }));
+    expect(screen.getByText("人像").closest("button")).toHaveClass("ui-nav-list-item");
   });
 
   it("空树时展开控制按钮隐藏", () => {
@@ -96,7 +102,7 @@ describe("TagTree 分面折叠（与文件属性统一）", () => {
 
   it("点击全局按钮不改变选中筛选", () => {
     render(<TagTree />);
-    fireEvent.click(screen.getByRole("button", { name: "全部收起" }));
+    fireEvent.click(screen.getByRole("button", { name: "全部展开" }));
     const { filter } = useLibraryStore.getState();
     expect(filter.facetFilters).toEqual([]);
     expect(filter.untaggedOnly).toBe(false);

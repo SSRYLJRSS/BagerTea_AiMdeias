@@ -31,11 +31,36 @@ pub struct TagProposal {
     pub confidence: Option<f32>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum PeoplePresenceStatus {
+    Present,
+    Absent,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PeoplePresence {
+    pub status: PeoplePresenceStatus,
+    pub confidence: f32,
+}
+
+impl Default for PeoplePresence {
+    fn default() -> Self {
+        Self {
+            status: PeoplePresenceStatus::Unknown,
+            confidence: 0.0,
+        }
+    }
+}
+
 /// A1：单图分析结果（强类型）。warnings 回传前端（R2-1），不只进日志。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct AnalysisResult {
     pub description: String,
+    pub people_presence: PeoplePresence,
     pub proposals: Vec<TagProposal>,
     /// V24（§6.3④）：数值分面提议（平行字段，不改 CategorizedTags 形状）
     #[serde(default)]
@@ -330,7 +355,7 @@ pub enum RetagMode {
 pub struct AiBatch {
     pub id: i64,
     pub status: String, // pending|processing|done|cancelled
-    pub mode: String,   // cloud|local
+    pub mode: String,   // cloud|local；manual 仅用于读取历史批次
     pub total: i64,
     pub processed: i64,
     pub confirmed: i64,
@@ -361,6 +386,9 @@ pub struct AiSuggestion {
     pub confirmed_description: Option<String>,
     #[serde(default)]
     pub current_description: String,
+    /// 是否已有一次完整分析结果（用于续跑判定，不返回前端）。
+    #[serde(skip)]
+    pub has_analysis: bool,
 }
 
 fn batch_from_row(r: &rusqlite::Row) -> rusqlite::Result<AiBatch> {
@@ -498,6 +526,16 @@ pub fn set_batch_status(conn: &Connection, id: i64, status: &str) -> AppResult<(
     Ok(())
 }
 
+/// 批次执行时按当前 tagging 用途连接修正实际部署类型。
+/// 允许用户建批后切换在线/本地服务，下一次开始或续跑立即使用新连接。
+pub fn set_batch_mode(conn: &Connection, id: i64, mode: &str) -> AppResult<()> {
+    conn.execute(
+        "UPDATE ai_batches SET mode = ?1 WHERE id = ?2",
+        rusqlite::params![mode, id],
+    )?;
+    Ok(())
+}
+
 /// 应用启动/任务中断时：把遗留的 processing 批次置为 interrupted（指导书阶段 5 §8.2）。
 /// 允许一键续跑剩余 pending（避免僵尸 processing 态无法重试）。
 pub fn mark_interrupted_batches(conn: &Connection) -> AppResult<()> {
@@ -622,34 +660,24 @@ pub fn set_suggestion_result_typed(
     Ok(())
 }
 
-/// A4：AI 结果写入的自动化边界（「按词是否已在词表」而非 confidence 高低）。
+/// AI 结果进入人工审核前的唯一阈值策略。
 #[derive(Debug, Clone, PartialEq)]
 pub struct ConfidencePolicy {
     /// confidence < 此值不入库（连 pending 都不进）；默认 0.30
     pub min_suggest: f64,
-    /// 精确命中词表 canonical/synonym → 自动接收（写 asset_tags，review_state='ai_unreviewed'）
-    pub auto_accept_exact_terms: bool,
-    /// AI 直接向词表建新词（显式开关，默认关 —— 新词一律 pending/「新词待确认」）
-    pub auto_adopt_new_terms: bool,
 }
 
 impl Default for ConfidencePolicy {
     fn default() -> Self {
-        Self {
-            min_suggest: 0.30,
-            auto_accept_exact_terms: true,
-            auto_adopt_new_terms: false,
-        }
+        Self { min_suggest: 0.30 }
     }
 }
 
-/// A4：带策略的结果写入（runner 用，取代无策略的 set_suggestion_result_typed）。
+/// 带置信度策略的建议写入（runner 用，取代无策略的 set_suggestion_result_typed）。
 ///  - confidence < min_suggest → 不入库（连 pending 都不进，suggested_tags 同步剔除）
-///  - 精确命中 canonical/synonym：auto_accept_exact_terms → decision='accepted'
-///    并写 asset_tags（review_state='ai_unreviewed'，A3 状态机兜底）；否则 pending
+///  - 精确命中 canonical/synonym → 记录 tag_id，但仍保持 pending
 ///  - 近似命中 → pending + decision_reason（F6-b 只提示，绝不自动改写）
-///  - 完全新词 → pending；auto_adopt_new_terms 开启才 find_or_create + accepted + 写 asset_tags
-///    永不因 confidence 高就自动建词（LLM 自报置信度不具校准意义）。
+///  - 完全新词 → pending，等待用户在确认流程中处理
 pub fn set_suggestion_result_policy(
     conn: &Connection,
     id: i64,
@@ -657,20 +685,7 @@ pub fn set_suggestion_result_policy(
     proposals: &[TagProposal],
     description: &str,
     policy: &ConfidencePolicy,
-) -> AppResult<()> {
-    // 建议 → asset + 批次 mode（source 随批次：cloud → ai_cloud，local → ai_local）
-    let (asset_id, batch_id, mode): (i64, i64, String) = conn.query_row(
-        "SELECT s.asset_id, s.batch_id, b.mode FROM ai_suggestions s
-         JOIN ai_batches b ON b.id = s.batch_id WHERE s.id = ?1",
-        [id],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-    )?;
-    let source = match mode.as_str() {
-        "manual" => "manual",
-        "cloud" => "ai_cloud",
-        _ => "ai_local",
-    };
-
+) -> AppResult<usize> {
     // 先按阈值裁剪：低置信词既不入库也不留在 suggested_tags（确认全部不会复活它）
     let filtered_tags: CategorizedTags = {
         let mut out: CategorizedTags = CategorizedTags::new();
@@ -708,8 +723,7 @@ pub fn set_suggestion_result_policy(
     )?;
 
     let now = chrono::Utc::now().timestamp_millis();
-    // 自动接收（accepted）的词统一收口写 asset_tags（ai_unreviewed）；去重
-    let mut auto_apply: Vec<(String, String, i64)> = Vec::new(); // (facet, name, tag_id)
+    let mut blocked_low_confidence = 0usize;
     for p in proposals {
         let raw = p.raw_name.trim();
         if raw.is_empty() {
@@ -721,11 +735,12 @@ pub fn set_suggestion_result_policy(
             .map(|c| (c as f64) < policy.min_suggest)
             .unwrap_or(false);
         if low_conf {
+            blocked_low_confidence += 1;
             continue; // 低置信：不入库（连 pending 都不进）
         }
         let mut decision_reason: Option<String> = None;
         // F3-a：精确反查（canonical/synonym 命中 → tag_id Some）
-        let mut tag_id: Option<i64> =
+        let tag_id: Option<i64> =
             tags::find_by_term(conn, &p.facet_key, &normalized, tags::TermMatch::Alias)
                 .ok()
                 .and_then(|l| l.hits.into_iter().next())
@@ -742,52 +757,16 @@ pub fn set_suggestion_result_policy(
             }
         }
         let confidence = p.confidence.map(|c| c as f64);
-        // 决策：精确命中 → 自动接收开关；完全新词 → auto_adopt_new_terms 才真建词
-        let (decision, accepted): (String, bool) = match (tag_id, decision_reason.as_ref()) {
-            (Some(_), _) => {
-                if policy.auto_accept_exact_terms {
-                    ("accepted".to_string(), true)
-                } else {
-                    ("pending".to_string(), false)
-                }
-            }
-            // 近似命中（有 reason 无 tag_id）→ pending
-            (None, Some(_)) => ("pending".to_string(), false),
-            // 完全新词
-            (None, None) => {
-                if policy.auto_adopt_new_terms {
-                    tag_id = Some(tags::find_or_create_canonical(conn, &p.facet_key, raw)?);
-                    ("accepted".to_string(), true)
-                } else {
-                    ("pending".to_string(), false)
-                }
-            }
-        };
-        if accepted {
-            if let Some(tid) = tag_id {
-                auto_apply.push((p.facet_key.clone(), raw.to_string(), tid));
-            }
-        }
         conn.execute(
             "INSERT INTO ai_suggestion_items
              (suggestion_id, facet_key, raw_name, normalized_name, tag_id, confidence, decision, decision_reason, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, ?8)",
             rusqlite::params![
-                id, p.facet_key, raw, normalized, tag_id, confidence, decision, decision_reason, now
+                id, p.facet_key, raw, normalized, tag_id, confidence, decision_reason, now
             ],
         )?;
     }
-    // 自动接收 → asset_tags（ai_unreviewed；INSERT OR IGNORE + 不覆盖 manual，A3 语义兜底）
-    if !auto_apply.is_empty() {
-        let mut tag_ids: Vec<i64> = Vec::new();
-        for (_, _, tid) in &auto_apply {
-            if !tag_ids.contains(tid) {
-                tag_ids.push(*tid);
-            }
-        }
-        asset_tags::assign_inner(conn, &[asset_id], &tag_ids, source, Some(batch_id))?;
-    }
-    Ok(())
+    Ok(blocked_low_confidence)
 }
 
 /// A4 + V24：数值提议落库（§6.4）—— 建议项写入后追加 item_kind='number' 的条目。
@@ -804,19 +783,19 @@ pub fn record_number_proposals_for_suggestion(
     crate::db::facet_numbers::record_number_proposals(conn, id, &pairs)
 }
 
-/// A2：逐字写模型原始返回 + AnalysisResult 序列化（溯源；analysis_schema_version 恒 1，
-/// 旧行/旧版本默认 1，schema_version_allows_old_data 守护兼容）。
+/// 逐字写模型原始返回 + AnalysisResult 序列化及协议版本。
 pub fn set_suggestion_provenance(
     conn: &Connection,
     id: i64,
     raw_response: &str,
     analysis_json: &str,
+    analysis_schema_version: i64,
 ) -> AppResult<()> {
     conn.execute(
         "UPDATE ai_suggestions
-            SET raw_response = ?1, analysis_json = ?2, analysis_schema_version = 1
-          WHERE id = ?3",
-        rusqlite::params![raw_response, analysis_json, id],
+            SET raw_response = ?1, analysis_json = ?2, analysis_schema_version = ?3
+          WHERE id = ?4",
+        rusqlite::params![raw_response, analysis_json, analysis_schema_version, id],
     )?;
     Ok(())
 }
@@ -893,12 +872,14 @@ fn suggestion_from_row(r: &rusqlite::Row) -> rusqlite::Result<AiSuggestion> {
         suggested_description: r.get(10)?,
         confirmed_description: r.get(11)?,
         current_description: r.get(12)?,
+        has_analysis: r.get(13)?,
     })
 }
 
 const SUGG_COLS: &str = "s.id, s.batch_id, s.asset_id, a.file_path, s.suggested_tags, s.status, \
                          s.confirmed_tags, s.created_at, s.last_error, a.mime_type, \
-                         s.suggested_description, s.confirmed_description, a.content_description";
+                         s.suggested_description, s.confirmed_description, a.content_description, \
+                         (COALESCE(s.raw_response, '') != '' OR COALESCE(s.analysis_json, '') != '')";
 
 pub fn list_suggestions(conn: &Connection, batch_id: i64) -> AppResult<Vec<AiSuggestion>> {
     let mut stmt = conn.prepare(&format!(
@@ -1312,42 +1293,76 @@ pub fn reject_suggestion(conn: &Connection, id: i64) -> AppResult<()> {
 /// B-2：只处理解析后标签非空的建议——历史数据可能有 `{}`、空数组或空白 JSON，
 ///     不能只依赖 SQL 字符串比较；空建议不写入、不虚增批次 confirmed 计数。
 /// FB5-05（§7.6）：逐条应用各自描述（不得把第一张描述套给整批）；描述为空 → 保留素材已有描述。
-pub fn confirm_all_pending(conn: &Connection, batch_id: i64) -> AppResult<()> {
-    let pendings: Vec<(i64, CategorizedTags, Option<String>)> = {
-        let mut stmt = conn.prepare(
-            "SELECT id, suggested_tags, suggested_description
-               FROM ai_suggestions WHERE batch_id = ?1 AND status = 'pending'",
-        )?;
-        let rows = stmt
-            .query_map([batch_id], |r| {
-                let raw: String = r.get(1)?;
-                let desc: String = r.get(2)?;
-                let desc_opt = if desc.trim().is_empty() {
-                    None
-                } else {
-                    Some(desc)
-                };
-                Ok((r.get::<_, i64>(0)?, parse_tags_json(&raw), desc_opt))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        rows
-    };
-    // B-2：过滤解析后的空标签建议（不把无内容的建议误写成 confirmed）
-    let pendings: Vec<(i64, CategorizedTags, Option<String>)> = pendings
+/// 批量确认的一页。`last_id` 用于即使整页都是空建议也能继续向后扫描。
+#[derive(Debug, Clone)]
+pub struct PendingConfirmationPage {
+    pub items: Vec<(i64, CategorizedTags, Option<String>)>,
+    pub last_id: Option<i64>,
+}
+
+/// 按 id 分页读取可确认的 pending 建议。空标签且无描述的历史占位项跳过。
+pub fn list_pending_confirmations(
+    conn: &Connection,
+    batch_id: i64,
+    after_id: i64,
+    limit: i64,
+) -> AppResult<PendingConfirmationPage> {
+    let limit = limit.clamp(1, 500);
+    let mut stmt = conn.prepare(
+        "SELECT id, suggested_tags, suggested_description
+           FROM ai_suggestions
+          WHERE batch_id = ?1 AND status = 'pending' AND id > ?2
+          ORDER BY id LIMIT ?3",
+    )?;
+    let rows = stmt
+        .query_map(rusqlite::params![batch_id, after_id, limit], |r| {
+            let id: i64 = r.get(0)?;
+            let raw: String = r.get(1)?;
+            let desc: String = r.get(2)?;
+            let desc = desc.trim();
+            Ok((
+                id,
+                parse_tags_json(&raw),
+                (!desc.is_empty()).then(|| desc.to_string()),
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let last_id = rows.last().map(|(id, _, _)| *id);
+    let items = rows
         .into_iter()
-        .filter(|(_, tags, _)| !tags.is_empty())
+        .filter(|(_, tags, desc)| !tags.is_empty() || desc.is_some())
         .collect();
-    // B-2：没有可确认项目时返回成功空操作，不把批次错误计数
-    if pendings.is_empty() {
+    Ok(PendingConfirmationPage { items, last_id })
+}
+
+/// 确认一页建议。单页一个事务；页与页之间由命令层释放 DB 锁，避免整批大事务阻塞全应用。
+pub fn confirm_pending_batch(
+    conn: &Connection,
+    items: &[(i64, CategorizedTags, Option<String>)],
+) -> AppResult<()> {
+    if items.is_empty() {
         return Ok(());
     }
-    // B20：外层单事务，部分失败整批回滚
     let tx = conn.unchecked_transaction()?;
-    for (id, tags, desc) in pendings {
-        confirm_suggestion_inner(&tx, id, &tags, desc.as_deref())?;
+    for (id, tags, description) in items {
+        confirm_suggestion_inner(&tx, *id, tags, description.as_deref())?;
     }
     tx.commit()?;
     Ok(())
+}
+
+/// 兼容单连接调用方的整批确认；生产命令使用分页 API 在页间释放锁。
+pub fn confirm_all_pending(conn: &Connection, batch_id: i64) -> AppResult<()> {
+    const CHUNK: i64 = 100;
+    let mut after_id = 0;
+    loop {
+        let page = list_pending_confirmations(conn, batch_id, after_id, CHUNK)?;
+        let Some(last_id) = page.last_id else {
+            return Ok(());
+        };
+        confirm_pending_batch(conn, &page.items)?;
+        after_id = last_id;
+    }
 }
 
 #[cfg(test)]

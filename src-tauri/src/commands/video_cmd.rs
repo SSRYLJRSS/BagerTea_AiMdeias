@@ -26,7 +26,7 @@ pub async fn ensure_video_proxy(
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || c == '_')
     {
-        return Err(AppError::msg("非法代理变体"));
+        return Err(AppError::invalid_arg("非法代理变体"));
     }
     let db = Arc::clone(&state.db);
     let proxy_dir = state.data_dir.join("proxies");

@@ -7,7 +7,7 @@ import { useVirtualizer } from "@tanstack/react-virtual";
 import { useShallow } from "zustand/react/shallow";
 import AssetCard from "./AssetCard";
 import ContextMenu, { type MenuEntry } from "@/components/common/ContextMenu";
-import { getAssetUrls, revealInFolder, setRating } from "@/api/assets";
+import { getAssetUrls, revealInFolder } from "@/api/assets";
 import { openFileExternal } from "@/api/import";
 import { useElementSize, useEscape } from "@/hooks/hooks";
 import { useLibraryStore } from "@/stores/libraryStore";
@@ -44,16 +44,13 @@ export interface AssetGridViewProps extends LibraryGridActions {
   /** R0-5：清除筛选按钮的回调。素材库缺省清 useLibraryStore.filter；
    *  超级搜索传 clearConditions（否则按钮对超搜条件完全无效）。 */
   onClearFilter?: () => void;
-  /** 外部数据源（超级搜索）的局部更新；素材库未传时使用 libraryStore。 */
-  patchListItem?: (ids: number[], patch: Partial<Asset>) => void;
   /** U-7③：空结果时的归零条件列表（来自 C-2 诊断）—— 每条可单点移除 */
   zeroingActions?: { key: string; label: string; onRemove: () => void }[];
 }
 
 /** 批量操作入口（顶栏与右键菜单共用） */
 export interface LibraryGridActions {
-  onAiTag: () => void;
-  onAssignTags: () => void;
+  onTag: () => void;
   onExport: () => void;
   onMove: () => void;
   onDelete: () => void;
@@ -70,8 +67,7 @@ export default function AssetGridView({
   loadMore,
   fetchAllIds,
   onPreview,
-  onAiTag,
-  onAssignTags,
+  onTag,
   onExport,
   onMove,
   onDelete,
@@ -80,7 +76,6 @@ export default function AssetGridView({
   onSearchDominant,
   hasActiveFilter: hasActiveFilterProp,
   onClearFilter,
-  patchListItem,
   zeroingActions,
 }: AssetGridViewProps) {
   const { selected, truncated, selectionTotal, toggle, rangeTo, clear, setAll, invert } = useSelectionStore(
@@ -274,50 +269,11 @@ export default function AssetGridView({
     };
   }, [stepCell, scrollElementRef, ref]);
 
-  // W5b（§W5b）：评级 = 乐观更新 + 失败回滚（patchLocal 走刷新代际，不整页重载）。
-  const patchLocal = useCallback(
-    (ids: number[], patch: Partial<Asset>) =>
-      patchListItem ? patchListItem(ids, patch) : useLibraryStore.getState().patchLocal(ids, patch),
-    [patchListItem],
-  );
-
-  const applyRating = useCallback(
-    (rating: number) => {
-      const ids = Array.from(selected);
-      if (ids.length === 0) return;
-      const prev = new Map(
-        ids.map((id) => [
-          id,
-          useLibraryStore.getState().items.find((a) => a.id === id)?.rating,
-        ]),
-      );
-      patchLocal(ids, { rating });
-      void setRating(ids, rating).catch((e) => {
-        ids.forEach((id) => patchLocal([id], { rating: prev.get(id) }));
-        console.warn("评级更新失败，已回滚：", e);
-      });
-    },
-    [selected, patchLocal],
-  );
-
   // FB2-01：Ctrl/Cmd + = / - 增减一档（复用既有 keydown 效果，避开 INPUT 与菜单打开态）
-  // W5b（§W5b）：选片手不离键盘 —— 1–5 设评级、0 清除（无修饰键，选中的素材生效）
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (menu) return;
       if ((e.target as HTMLElement)?.tagName === "INPUT") return;
-      if (!e.ctrlKey && !e.metaKey && !e.altKey) {
-        if (e.key >= "1" && e.key <= "5") {
-          e.preventDefault();
-          applyRating(Number(e.key));
-          return;
-        }
-        if (e.key === "0") {
-          e.preventDefault();
-          applyRating(0);
-          return;
-        }
-      }
       if (!(e.ctrlKey || e.metaKey)) return;
       if (e.key === "a" || e.key === "A") {
         e.preventDefault();
@@ -335,7 +291,7 @@ export default function AssetGridView({
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [selectAll, invertAll, menu, stepCell, applyRating]);
+  }, [selectAll, invertAll, menu, stepCell]);
 
   const handleContextMenu = useCallback(
     (asset: Asset, _index: number, e: React.MouseEvent) => {
@@ -398,13 +354,7 @@ export default function AssetGridView({
     ];
     if (selected.size === 0) return common;
     return [
-      {
-        label: "打标",
-        children: [
-          { label: "AI", onClick: guardTruncated(onAiTag, "送 AI 批量打标") },
-          { label: "手动", onClick: guardTruncated(onAssignTags, "批量打标") },
-        ],
-      },
+      { label: "打标", onClick: guardTruncated(onTag, "批量打标") },
       { label: "导出", onClick: guardTruncated(onExport, "导出") },
       { label: "移动到…", onClick: guardTruncated(onMove, "移动") },
       // §4.6：删除（移入回收站）在截断集合上禁止 —— 不可逆 + 集合不完整 = 最坏组合
@@ -413,20 +363,6 @@ export default function AssetGridView({
         disabled: truncated,
         title: truncated ? "当前结果超过 100000 张，请先收窄条件再删除" : undefined,
         onClick: onDelete,
-      },
-      { divider: true },
-      // W5b（§W5b）：评级子菜单（对选中集批量生效）
-      {
-        label: "评级",
-        children: [
-          { label: "★★★★★", onClick: () => applyRating(5) },
-          { label: "★★★★", onClick: () => applyRating(4) },
-          { label: "★★★", onClick: () => applyRating(3) },
-          { label: "★★", onClick: () => applyRating(2) },
-          { label: "★", onClick: () => applyRating(1) },
-          { divider: true },
-          { label: "清除评级", onClick: () => applyRating(0) },
-        ],
       },
       { divider: true },
       { label: "复制路径", onClick: () => void copyPaths() },
@@ -441,7 +377,7 @@ export default function AssetGridView({
       ...common,
       { label: "取消选择", onClick: clear },
     ];
-  }, [selected.size, truncated, selectAll, invertAll, guardTruncated, onAiTag, onAssignTags, onExport, onMove, onDelete, copyPaths, revealFirst, openFirstExternal, clear, applyRating]);
+  }, [selected.size, truncated, selectAll, invertAll, guardTruncated, onTag, onExport, onMove, onDelete, copyPaths, revealFirst, openFirstExternal, clear]);
 
   if (items.length === 0) {
     return (

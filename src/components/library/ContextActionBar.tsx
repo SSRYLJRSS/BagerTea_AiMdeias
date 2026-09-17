@@ -1,19 +1,16 @@
-/** 选中操作条（PRD v2.8）：顶栏内联，统一文字按钮风格，无特殊色框
- *  「打标」悬停浮出 AI / 手动；全选/反选已收进右键菜单
- */
+/** 选中操作条（PRD v2.8）：顶栏内联，统一文字按钮风格，无特殊色框。 */
 import Button from "@/components/common/Button";
 import { useShallow } from "zustand/react/shallow";
 import { useSelectionStore } from "@/stores/selectionStore";
 
 interface Props {
-  onAiTag: () => void;
-  onAssignTags: () => void;
+  onTag: () => void;
   onExport: () => void;
   onMove: () => void;
   onDelete: () => void;
 }
 
-export default function ContextActionBar({ onAiTag, onAssignTags, onExport, onMove, onDelete }: Props) {
+export default function ContextActionBar({ onTag, onExport, onMove, onDelete }: Props) {
   const { selected, truncated, selectionTotal, clear } = useSelectionStore(
     useShallow((s) => ({ selected: s.selected, truncated: s.truncated, selectionTotal: s.selectionTotal, clear: s.clear })),
   );
@@ -36,24 +33,7 @@ export default function ContextActionBar({ onAiTag, onAssignTags, onExport, onMo
       </span>
       <span className="mx-1 h-4 w-px shrink-0 bg-[var(--color-border)]" />
 
-      {/* 打标：悬停浮出 AI / 手动 */}
-      <div className="group relative">
-        <Button className="font-medium">打标 ▾</Button>
-        <div className="invisible absolute top-full left-0 z-40 min-w-[96px] rounded-md border border-[var(--color-border)] bg-[var(--color-bg)] py-1 opacity-0 shadow-lg transition-opacity duration-150 group-hover:visible group-hover:opacity-100">
-          <button
-            onClick={guard(onAiTag, "送 AI 批量打标")}
-            className="flex w-full items-center px-3 py-1.5 text-left text-sm text-[var(--color-text)] transition-colors hover:bg-[var(--color-surface)]"
-          >
-            AI
-          </button>
-          <button
-            onClick={guard(onAssignTags, "批量打标")}
-            className="flex w-full items-center px-3 py-1.5 text-left text-sm text-[var(--color-text)] transition-colors hover:bg-[var(--color-surface)]"
-          >
-            手动
-          </button>
-        </div>
-      </div>
+      <Button onClick={guard(onTag, "批量打标")}>打标</Button>
 
       <Button onClick={guard(onExport, "导出")}>导出</Button>
       <Button onClick={guard(onMove, "移动")}>移动到…</Button>

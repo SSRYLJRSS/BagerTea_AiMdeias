@@ -1208,7 +1208,7 @@ fn b37_fresh_install_all_v2_columns() -> AppResult<()> {
     Ok(())
 }
 
-// ═══════════════ ⑳ B20：confirm_all_pending 原子性（单事务包裹） ═══════════════
+// ═══════════════ ⑳ B20：confirm_all_pending 分页确认 ═══════════════
 
 fn mk_categorized_tags() -> CategorizedTags {
     let mut m = std::collections::BTreeMap::new();
@@ -1217,7 +1217,7 @@ fn mk_categorized_tags() -> CategorizedTags {
 }
 
 #[test]
-fn b20_confirm_all_pending_atomic_success() -> AppResult<()> {
+fn b20_confirm_all_pending_success() -> AppResult<()> {
     let conn = setup();
     let a1 = add_asset(&conn, "d:/p/b20_1.jpg", "b20_1.jpg", "jpg", "image/jpeg");
     let a2 = add_asset(&conn, "d:/p/b20_2.jpg", "b20_2.jpg", "jpg", "image/jpeg");
@@ -1269,17 +1269,22 @@ fn b20_confirm_all_pending_no_pending_is_noop() -> AppResult<()> {
     Ok(())
 }
 
-// B-2：confirm_all_pending 只处理解析后标签非空的建议；空建议（{} / [] / 空白 JSON）不确认、不虚增计数。
+// B-2：确认标签或纯描述；完全空的历史占位项不确认、不虚增计数。
 #[test]
 fn b21_confirm_all_pending_skips_empty_tags() -> AppResult<()> {
     let conn = setup();
     let a1 = add_asset(&conn, "d:/p/b21_1.jpg", "b21_1.jpg", "jpg", "image/jpeg");
     let a2 = add_asset(&conn, "d:/p/b21_2.jpg", "b21_2.jpg", "jpg", "image/jpeg");
-    let batch = ai::create_batch(&conn, &[a1, a2], "cloud")?;
+    let a3 = add_asset(&conn, "d:/p/b21_3.jpg", "b21_3.jpg", "jpg", "image/jpeg");
+    let batch = ai::create_batch(&conn, &[a1, a2, a3], "cloud")?;
     let suggs = ai::list_suggestions(&conn, batch.id)?;
-    assert_eq!(suggs.len(), 2);
-    // 第 1 条设非空标签；第 2 条保持空（create_batch 写入 '[]'）
+    assert_eq!(suggs.len(), 3);
+    // 第 1 条设非空标签；第 2 条只有描述；第 3 条保持完全为空
     ai::set_suggestion_tags(&conn, suggs[0].id, &mk_categorized_tags())?;
+    conn.execute(
+        "UPDATE ai_suggestions SET suggested_description = ?1 WHERE id = ?2",
+        rusqlite::params!["纯描述建议也可人工确认", suggs[1].id],
+    )?;
 
     ai::confirm_all_pending(&conn, batch.id)?;
 
@@ -1289,11 +1294,17 @@ fn b21_confirm_all_pending_skips_empty_tags() -> AppResult<()> {
         .iter()
         .filter(|s| s.status == "pending" && s.suggested_tags.is_empty())
         .count();
-    assert_eq!(confirmed, 1, "只应确认非空建议");
-    assert_eq!(pending_empty, 1, "空建议应保持 pending 不被误确认");
+    assert_eq!(confirmed, 2, "标签建议和纯描述建议都应确认");
+    assert_eq!(pending_empty, 1, "完全空建议应保持 pending 不被误确认");
     let b = ai::get_batch(&conn, batch.id)?;
-    assert_eq!(b.confirmed, 1, "空建议不应虚增 confirmed 计数");
+    assert_eq!(b.confirmed, 2, "完全空建议不应虚增 confirmed 计数");
     assert_eq!(count(&conn, "SELECT COUNT(*) FROM asset_tags"), 1);
+    let desc: String = conn.query_row(
+        "SELECT content_description FROM assets WHERE id = ?1",
+        [a2],
+        |r| r.get(0),
+    )?;
+    assert_eq!(desc, "纯描述建议也可人工确认");
     Ok(())
 }
 

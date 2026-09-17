@@ -9,6 +9,7 @@ import { render, screen, waitFor } from "@testing-library/react";
 import App from "@/App";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { useLibraryStore } from "@/stores/libraryStore";
+import { useMetadataStore } from "@/stores/metadataStore";
 import type { Settings } from "@/types/settings";
 
 function mkSettings(): Settings {
@@ -23,11 +24,10 @@ function mkSettings(): Settings {
       ollamaSourceId: "auto",
       systemPromptTagging: "",
       systemPromptSearch: "",
-      autoAcceptExactTerms: true,
-      autoAdoptNewTerms: false,
       confidenceMinSuggest: 0.3,
     },
     theme: "system",
+    logLevel: "info",
     thumbnailCacheMb: 2048,
     tagCategories: [],
     libraryRoot: "",
@@ -68,7 +68,7 @@ vi.mock("@/api/thumbnail", () => ({
 }));
 vi.mock("@/api/settings", () => ({
   getSettings: vi.fn().mockResolvedValue({
-    ai: { profiles: [], activeProfile: "", videoTagging: false, batchLimit: 500, systemPromptTagging: "", systemPromptSearch: "", ollamaSourceId: "auto", autoAcceptExactTerms: true, autoAdoptNewTerms: false, confidenceMinSuggest: 0.3 },
+    ai: { profiles: [], activeProfile: "", videoTagging: false, batchLimit: 500, systemPromptTagging: "", systemPromptSearch: "", ollamaSourceId: "auto", confidenceMinSuggest: 0.3 },
     theme: "system",
     thumbnailCacheMb: 2048,
     tagCategories: [],
@@ -177,6 +177,14 @@ describe("App 启动骨架（§3.2）", () => {
     expect(screen.getByText("正在准备素材库")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "设置" })).toBeInTheDocument(); // TitleBar 保留
   });
+
+  it("全局阻止 WebView 原生右键菜单", () => {
+    useSettingsStore.setState({ ...emptySettingsStore, settings: mkSettings(), loaded: true });
+    render(<App />);
+    const event = new MouseEvent("contextmenu", { bubbles: true, cancelable: true });
+    document.body.dispatchEvent(event);
+    expect(event.defaultPrevented).toBe(true);
+  });
 });
 
 describe("App §7.3 方案 A（Viewer 打开隐藏 BottomBar）", () => {
@@ -218,7 +226,7 @@ describe("App palette://updated 全局监听（FB4-03 §6.5/§10.7）", () => {
     saving: false,
   };
 
-  it("收到导入色板事件后只调用 refreshPaletteFields(updatedIds)，不调用 refresh", async () => {
+  it("收到导入色板事件后定向同步色条并刷新颜色分面，不全量刷新素材库", async () => {
     useSettingsStore.setState(loadedStore);
     let handler: ((p: unknown) => void) | undefined;
     clientMocks.on.mockImplementation((_event: string, h: (p: unknown) => void) => {
@@ -234,6 +242,7 @@ describe("App palette://updated 全局监听（FB4-03 §6.5/§10.7）", () => {
     const st = useLibraryStore.getState();
     const refreshSpy = vi.spyOn(st, "refresh").mockResolvedValue(undefined);
     const fieldsSpy = vi.spyOn(st, "refreshPaletteFields").mockResolvedValue(undefined);
+    const metadataSpy = vi.spyOn(useMetadataStore.getState(), "refresh").mockResolvedValue(undefined);
     // 触发事件（source 固定 import）
     handler!({
       source: "import",
@@ -244,6 +253,7 @@ describe("App palette://updated 全局监听（FB4-03 §6.5/§10.7）", () => {
       updatedIds: [11, 22],
     });
     await waitFor(() => expect(fieldsSpy).toHaveBeenCalledWith([11, 22]));
+    expect(metadataSpy).toHaveBeenCalled();
     expect(refreshSpy).not.toHaveBeenCalled();
   });
 

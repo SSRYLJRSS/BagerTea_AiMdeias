@@ -23,7 +23,7 @@ interface WorkbenchProps {
   manualGroup: WorkbenchFacet[];
   tags: CategorizedTags;
   onTagsChange: (t: CategorizedTags) => void;
-  /** FB5-05（§7.6）：一句话描述（审核编辑区顶部；最多 20 字符） */
+  /** 一句话描述（审核编辑区顶部；AI 目标 12–30 字符，手工最多 30） */
   description: string;
   onDescriptionChange: (v: string) => void;
   index: number; // 0 基
@@ -215,6 +215,14 @@ export default function Workbench({
             {list.map((t) => (
               <TagChip key={t} label={t} onRemove={readOnly ? undefined : () => setFacetTags(f.key, list.filter((x) => x !== t))} />
             ))}
+            {list.length === 0 && f.key === "subject" && (
+              <span
+                data-testid="subject-unrecognized"
+                className="inline-flex h-6 items-center rounded-full border border-dashed border-[var(--color-border)] px-2 text-xs text-[var(--color-text-tertiary)]"
+              >
+                未识别
+              </span>
+            )}
             {!readOnly && (
               <FacetTagInput
                 facetKey={f.key}
@@ -301,90 +309,95 @@ export default function Workbench({
         </div>
       )}
 
-      {/* ③ 分类标签面板：一句话描述（顶部）+ 一排两个分类（v2.11） */}
-      <div className="max-h-64 shrink-0 overflow-y-auto bg-[var(--color-bg)] px-4 pt-3 pb-2">
-        <div className="mb-3 flex items-center justify-between">
-          <h3 className="ui-section-title">标签</h3>
-          <span className="text-[11px] text-[var(--color-text-tertiary)]">共 {totalTags} 个</span>
-        </div>
-        {/* V24（Phase 7-4）：数值建议 —— 确认建议时自动落库；歧义项保持待确认 */}
-        {numberItems && numberItems.length > 0 && (
-          <div className="mb-2 border-b border-[var(--color-border)]/70 pb-2">
-            <span className="text-xs font-medium text-[var(--color-text-secondary)]">数值建议</span>
-            <div className="mt-1 flex flex-col gap-1">
-              {numberItems.map((n) => (
-                <div key={n.id} className="flex min-h-6 flex-wrap items-center gap-2 text-xs" data-testid="workbench-number-item">
-                  <span className="font-medium text-[var(--color-text)]">{n.displayName}</span>
-                  {n.numValue != null ? (
-                    <>
-                      <span className="rounded bg-[var(--color-surface)] px-1.5 py-0.5 tabular-nums">{n.numValue}</span>
-                      {n.decision === "pending" && !readOnly && onDecideNumberItem ? (
-                        <>
-                          <button type="button" aria-label={`采纳数值建议 ${n.displayName}`} onClick={() => void onDecideNumberItem(n.id, "accepted")} className="text-[var(--color-status)] hover:underline">采纳</button>
-                          <button type="button" aria-label={`拒绝数值建议 ${n.displayName}`} onClick={() => void onDecideNumberItem(n.id, "rejected")} className="text-[var(--color-text-tertiary)] hover:underline">拒绝</button>
-                        </>
-                      ) : (
-                        <span className="text-[10px] text-[var(--color-text-tertiary)]">{n.decision === "accepted" ? "已采纳" : n.decision === "rejected" ? "已拒绝" : ""}</span>
-                      )}
-                    </>
-                  ) : (
-                    <span className="text-[10px] text-[var(--color-text-tertiary)]">
-                      需人工确认：{n.decisionReason ?? "表达有歧义"}（数值不自动取值；可在看片台手工赋值）
-                    </span>
-                  )}
+      {/* ③ 分类标签面板：标签优先保留操作高度，图片区只占剩余空间 */}
+      <div
+        data-testid="workbench-facet-panel"
+        className="flex h-[clamp(15rem,38vh,22rem)] shrink-0 flex-col overflow-hidden bg-[var(--color-bg)]"
+      >
+        <div data-testid="workbench-facet-scroll" className="min-h-0 overflow-y-auto px-4 pt-3 pb-2">
+          <div className="mb-3 flex items-center justify-between">
+            <h3 className="ui-section-title">标签</h3>
+            <span className="text-[11px] text-[var(--color-text-tertiary)]">共 {totalTags} 个</span>
+          </div>
+          {/* V24（Phase 7-4）：数值建议 —— 确认建议时自动落库；歧义项保持待确认 */}
+          {numberItems && numberItems.length > 0 && (
+            <div className="mb-2 border-b border-[var(--color-border)]/70 pb-2">
+              <span className="text-xs font-medium text-[var(--color-text-secondary)]">数值建议</span>
+              <div className="mt-1 flex flex-col gap-1">
+                {numberItems.map((n) => (
+                  <div key={n.id} className="flex min-h-6 flex-wrap items-center gap-2 text-xs" data-testid="workbench-number-item">
+                    <span className="font-medium text-[var(--color-text)]">{n.displayName}</span>
+                    {n.numValue != null ? (
+                      <>
+                        <span className="rounded bg-[var(--color-surface)] px-1.5 py-0.5 tabular-nums">{n.numValue}</span>
+                        {n.decision === "pending" && !readOnly && onDecideNumberItem ? (
+                          <>
+                            <button type="button" aria-label={`采纳数值建议 ${n.displayName}`} onClick={() => void onDecideNumberItem(n.id, "accepted")} className="text-[var(--color-status)] hover:underline">采纳</button>
+                            <button type="button" aria-label={`拒绝数值建议 ${n.displayName}`} onClick={() => void onDecideNumberItem(n.id, "rejected")} className="text-[var(--color-text-tertiary)] hover:underline">拒绝</button>
+                          </>
+                        ) : (
+                          <span className="text-[10px] text-[var(--color-text-tertiary)]">{n.decision === "accepted" ? "已采纳" : n.decision === "rejected" ? "已拒绝" : ""}</span>
+                        )}
+                      </>
+                    ) : (
+                      <span className="text-[10px] text-[var(--color-text-tertiary)]">
+                        需人工确认：{n.decisionReason ?? "表达有歧义"}（数值不自动取值；可在看片台手工赋值）
+                      </span>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+          {/* 一句话描述。AI 目标 12–30 字；手工单行 input、maxLength 30、字符计数用 JS 字符迭代；
+              位于标签分面滚动区顶部（分面滚动时描述保持在编辑区顶部）。 */}
+          <div className="mb-2 flex min-h-8 items-center gap-3 border-b border-[var(--color-border)]/70 pb-2">
+            <span className="w-16 shrink-0 text-xs font-medium text-[var(--color-text-secondary)]">一句话描述</span>
+            <div className="min-w-0 flex-1">
+              {readOnly ? (
+                <span className="block truncate text-sm text-[var(--color-text)]">
+                  {description.trim() || "未生成描述"}
+                </span>
+              ) : (
+                <div className="flex items-center gap-2">
+                  <input
+                    data-testid="suggestion-description"
+                    value={description}
+                    onChange={(e) => onDescriptionChange(e.target.value)}
+                    maxLength={30}
+                    placeholder="如「女子站在湖边树下回头张望」（12–30 字）"
+                    aria-label="一句话描述"
+                    className="ui-control h-7 min-w-0 flex-1 rounded-md px-2 text-sm outline-none focus:border-[var(--color-accent)]"
+                  />
+                  <span className="shrink-0 text-[11px] tabular-nums text-[var(--color-text-tertiary)]">
+                    {[...description].length}/30
+                  </span>
                 </div>
-              ))}
+              )}
             </div>
           </div>
-        )}
-        {/* FB5-05（§7.6）：一句话描述。单行 input、maxLength 20、字符计数用 JS 字符迭代；
-            位于标签分面滚动区顶部（分面滚动时描述保持在编辑区顶部）。 */}
-        <div className="mb-2 flex min-h-8 items-center gap-3 border-b border-[var(--color-border)]/70 pb-2">
-          <span className="w-16 shrink-0 text-xs font-medium text-[var(--color-text-secondary)]">一句话描述</span>
-          <div className="min-w-0 flex-1">
-            {readOnly ? (
-              <span className="block truncate text-sm text-[var(--color-text)]">
-                {description.trim() || "未生成描述"}
-              </span>
-            ) : (
-              <div className="flex items-center gap-2">
-                <input
-                  data-testid="suggestion-description"
-                  value={description}
-                  onChange={(e) => onDescriptionChange(e.target.value)}
-                  maxLength={20}
-                  placeholder="如「夜晚树下多人合影」（最多 20 字）"
-                  aria-label="一句话描述"
-                  className="ui-control h-7 min-w-0 flex-1 rounded-md px-2 text-sm outline-none focus:border-[var(--color-accent)]"
-                />
-                <span className="shrink-0 text-[11px] tabular-nums text-[var(--color-text-tertiary)]">
-                  {[...description].length}/20
-                </span>
-              </div>
-            )}
+          {/* W3-4：AI 识别组在前（含分隔标题），需要你填组在后（视觉分隔） */}
+          {aiGroup.length > 0 && (
+            <p className="mt-1 mb-1 text-[11px] font-semibold text-[var(--color-text-tertiary)]">AI 识别</p>
+          )}
+          <div className="grid grid-cols-1 gap-x-6 gap-y-2 xl:grid-cols-2">
+            {aiGroup.map((f) => renderFacetRow(f))}
           </div>
+          {manualGroup.length > 0 && (
+            <p className="mt-3 mb-1 border-t border-[var(--color-border)]/70 pt-2 text-[11px] font-semibold text-[var(--color-text-tertiary)]">
+              需要你填（不参与 AI 自动打标）
+            </p>
+          )}
+          <div className="grid grid-cols-1 gap-x-6 gap-y-2 xl:grid-cols-2">
+            {manualGroup.map((f) => renderFacetRow(f))}
+          </div>
+          {orphanKeys.length > 0 && (
+            <p className="mt-2 text-[11px] text-[var(--color-status)]">
+              有 {orphanKeys.length} 个标签属于已删除或未知的分类（{orphanKeys.join("、")}），确认后将归入 custom。
+            </p>
+          )}
         </div>
-        {/* W3-4：AI 识别组在前（含分隔标题），需要你填组在后（视觉分隔） */}
-        {aiGroup.length > 0 && (
-          <p className="mt-1 mb-1 text-[11px] font-semibold text-[var(--color-text-tertiary)]">AI 识别</p>
-        )}
-        <div className="grid grid-cols-1 gap-x-6 gap-y-2 xl:grid-cols-2">
-          {aiGroup.map((f) => renderFacetRow(f))}
-        </div>
-        {manualGroup.length > 0 && (
-          <p className="mt-3 mb-1 border-t border-[var(--color-border)]/70 pt-2 text-[11px] font-semibold text-[var(--color-text-tertiary)]">
-            需要你填（不参与 AI 自动打标）
-          </p>
-        )}
-        <div className="grid grid-cols-1 gap-x-6 gap-y-2 xl:grid-cols-2">
-          {manualGroup.map((f) => renderFacetRow(f))}
-        </div>
-        {orphanKeys.length > 0 && (
-          <p className="mt-2 text-[11px] text-[var(--color-status)]">
-            有 {orphanKeys.length} 个标签属于已删除或未知的分类（{orphanKeys.join("、")}），确认后将归入 custom。
-          </p>
-        )}
-        <div className="sticky bottom-0 mt-3 flex items-center gap-2 border-t border-[var(--color-border)] bg-[var(--color-bg)] py-3">
+        <div data-testid="workbench-confirm-bar" className="flex shrink-0 items-center gap-2 border-t border-[var(--color-border)] bg-[var(--color-bg)] px-4 py-3">
           <span className="text-xs text-[var(--color-text-secondary)]">{readOnly ? "当前结果为只读状态" : "Enter 添加标签，方向键切换图片"}</span>
           <div className="ml-auto flex gap-2">
             {isRejected ? (

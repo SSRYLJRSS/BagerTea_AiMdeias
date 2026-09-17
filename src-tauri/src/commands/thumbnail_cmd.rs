@@ -28,7 +28,7 @@ pub async fn get_thumbnail(
                 let p = thumbs.get_or_create_hd(&db, asset_id, size)?;
                 Ok(p.to_string_lossy().into_owned())
             }
-            _ => Err(AppError::msg("非法缩略图类型")),
+            _ => Err(AppError::invalid_arg("非法缩略图类型")),
         }
     })
     .await
@@ -41,13 +41,13 @@ pub async fn get_thumbnail(
 pub async fn get_preview(state: State<'_, AppState>, path: String) -> AppResult<Option<String>> {
     // B24：校验绝对路径
     if !crate::utils::path::ensure_absolute(&path) {
-        return Err(AppError::msg("路径无效"));
+        return Err(AppError::invalid_arg("路径无效"));
     }
     // B24：校验支持的文件类型
     let p = std::path::Path::new(&path);
     let ext = p.extension().and_then(|e| e.to_str()).unwrap_or_default();
     if crate::utils::mime::asset_type_from_ext(ext).is_none() {
-        return Err(AppError::msg("不支持的文件类型"));
+        return Err(AppError::unsupported("不支持的文件类型"));
     }
     let dir = state.data_dir.clone();
     tauri::async_runtime::spawn_blocking(move || {

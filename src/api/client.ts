@@ -6,23 +6,37 @@
  */
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 import { listen, type Event, type UnlistenFn } from "@tauri-apps/api/event";
+import { createLogCorrelationId, logger } from "@/utils/logger";
 
 export class AppError extends Error {
+  public readonly cause?: string;
+
   constructor(
     public code: string,
     message: string,
+    cause?: string,
   ) {
     super(message);
     this.name = "AppError";
+    this.cause = cause;
   }
 }
 
 export async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
+  const startedAt = performance.now();
+  const requestId = createLogCorrelationId(cmd);
   try {
     return await tauriInvoke<T>(cmd, args);
   } catch (e) {
-    const err = e as { code?: string; message?: string } | undefined;
-    throw new AppError(err?.code ?? "UNKNOWN", err?.message ?? String(e));
+    const err = e as { code?: string; message?: string; cause?: string } | undefined;
+    const appError = new AppError(err?.code ?? "UNKNOWN", err?.message ?? String(e), err?.cause);
+    logger.error(`invoke failed: ${cmd} [${appError.code}] ${appError.message}`, {
+      requestId,
+      command: cmd,
+      durationMs: Math.round(performance.now() - startedAt),
+      cause: appError.cause,
+    });
+    throw appError;
   }
 }
 

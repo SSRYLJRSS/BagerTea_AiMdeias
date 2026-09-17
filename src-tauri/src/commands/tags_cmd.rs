@@ -161,15 +161,15 @@ pub fn create_canonical_tag(
 ) -> AppResult<Tag> {
     let name = name.trim().to_string();
     if name.is_empty() || name.chars().count() > 64 || name.chars().any(|c| c.is_control()) {
-        return Err(AppError::msg("标签名称无效或超过 64 个字符"));
+        return Err(AppError::invalid_arg("标签名称无效或超过 64 个字符"));
     }
     let conn = lock_db(&state)?;
     crate::db::tag_facets::get(&conn, &facet_key)?;
     if let Some(pid) = parent_id {
         let parent_facet = tags::active_facet_key(&conn, pid)?
-            .ok_or_else(|| AppError::msg("父标签不存在或已停用"))?;
+            .ok_or_else(|| AppError::not_found("父标签不存在或已停用"))?;
         if parent_facet != facet_key {
-            return Err(AppError::msg("标签不能挂到其他分面下"));
+            return Err(AppError::conflict("标签不能挂到其他分面下"));
         }
     }
     if parent_id.is_none() {
@@ -202,11 +202,11 @@ pub fn create_tag(
 ) -> AppResult<Tag> {
     let name = name.trim().to_string();
     if name.is_empty() {
-        return Err(AppError::msg("标签名不能为空"));
+        return Err(AppError::invalid_arg("标签名不能为空"));
     }
     // B25：长度上限 64 字符 + 拒绝控制字符
     if name.chars().count() > 64 {
-        return Err(AppError::msg("标签名不能超过 64 字符"));
+        return Err(AppError::invalid_arg("标签名不能超过 64 字符"));
     }
     if name.chars().any(|c| c.is_control()) {
         return Err(AppError::msg("标签名不能包含控制字符"));
@@ -230,10 +230,10 @@ pub fn update_tag(
     let name = name.map(|n| n.trim().to_string());
     if let Some(n) = &name {
         if n.is_empty() {
-            return Err(AppError::msg("标签名不能为空"));
+            return Err(AppError::invalid_arg("标签名不能为空"));
         }
         if n.chars().count() > 64 {
-            return Err(AppError::msg("标签名不能超过 64 字符"));
+            return Err(AppError::invalid_arg("标签名不能超过 64 字符"));
         }
         if n.chars().any(|c| c.is_control()) {
             return Err(AppError::msg("标签名不能包含控制字符"));
@@ -254,7 +254,7 @@ pub fn deactivate_tag(state: State<AppState>, id: i64) -> AppResult<()> {
     let conn = lock_db(&state)?;
     let is_system = tags::is_system(&conn, id)?;
     if is_system {
-        return Err(AppError::msg("系统分面根标签不能停用"));
+        return Err(AppError::unsupported("系统分面根标签不能停用"));
     }
     tags::deactivate(&conn, id)
 }

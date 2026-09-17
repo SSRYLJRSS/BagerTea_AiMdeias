@@ -33,7 +33,7 @@ pub async fn ai_parse_search_query(
     tauri::async_runtime::spawn_blocking(move || {
         // 1. 校验文本长度
         if text.trim().is_empty() {
-            return Err(AppError::msg("请输入搜索描述"));
+            return Err(AppError::invalid_arg("请输入搜索描述"));
         }
         if text.chars().count() > super_search_ai::MAX_INPUT_LEN {
             return Err(AppError::msg(format!(
@@ -46,7 +46,7 @@ pub async fn ai_parse_search_query(
             let conn = lock_db(&db)?;
             let mut s = settings::get_settings(&conn)?;
             if s.ai.active().is_none() {
-                return Err(AppError::msg("请先在设置页添加 API 配置（中转站）"));
+                return Err(AppError::not_found("请先在设置页添加 API 配置（中转站）"));
             }
             // §4.4：超级搜索按用途绑定读取连接档案；无绑定时回退默认 active 档案。
             let _ =

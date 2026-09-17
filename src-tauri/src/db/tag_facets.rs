@@ -180,14 +180,31 @@ const FACET_COLS: &str =
 /// 系统分面种子清单（migrate_v8 与 reset 后重建共用；key 顺序即 sort_order）。
 /// color 已于 V16 停用（算法主色替代），补种时单独置 inactive。
 const SYSTEM_FACETS: &[(&str, &str, &str, i64, i64)] = &[
-    ("subject", "主体/对象", "画面中可观察到的主要对象", 5, 10),
-    ("scene", "场景/地点", "素材发生的环境或地点", 3, 20),
+    (
+        "subject",
+        "主体对象",
+        "画面中被重点呈现的人、动物、物体；人物统一标「人」，不写性别、年龄和穿着",
+        3,
+        10,
+    ),
+    (
+        "scene",
+        "场景/地点",
+        "画面发生的空间、环境和地点；多值如实输出，不写主体物品",
+        3,
+        20,
+    ),
     ("purpose", "用途", "稳定的发布或设计用途", 3, 30),
-    ("style", "风格/氛围", "视觉风格与整体情绪", 4, 40),
     ("color", "色彩", "主色、色调与色彩关系", 3, 50),
     ("composition", "构图/视角", "景别、视角和构图关系", 4, 60),
     ("lighting", "光线/时间", "光线方向、质感和时间氛围", 3, 70),
-    ("people", "人物属性", "人物数量、年龄段和可观察动作", 4, 80),
+    (
+        "people",
+        "人物属性",
+        "人物状态、人数档位、性别、年龄段、穿着和动作；多人时分别输出可观察属性",
+        8,
+        80,
+    ),
     (
         "technical",
         "可用性/技术特征",
@@ -204,6 +221,44 @@ const SYSTEM_FACETS: &[(&str, &str, &str, i64, i64)] = &[
     ),
 ];
 
+/// 旧系统分面若仍保持出厂文案和上限，则平滑升级为新默认值；
+/// 用户已经修改过的显示名、说明或数量上限不做覆盖。
+pub fn refresh_system_facet_defaults(conn: &Connection, now: i64) -> AppResult<()> {
+    conn.execute(
+        "UPDATE tag_facets
+            SET display_name = '主体对象',
+                description = '画面中被重点呈现的人、动物、物体；人物统一标「人」，不写性别、年龄和穿着',
+                max_items = 3,
+                updated_at = ?1
+          WHERE key = 'subject'
+            AND display_name = '主体/对象'
+            AND description = '画面中可观察到的主要对象'
+            AND max_items = 5",
+        [now],
+    )?;
+    conn.execute(
+        "UPDATE tag_facets
+            SET description = '画面发生的空间、环境和地点；多值如实输出，不写主体物品',
+                max_items = 3,
+                updated_at = ?1
+          WHERE key = 'scene'
+            AND description = '素材发生的环境或地点'
+            AND max_items = 3",
+        [now],
+    )?;
+    conn.execute(
+        "UPDATE tag_facets
+            SET description = '人物状态、人数档位、性别、年龄段、穿着和动作；多人时分别输出可观察属性',
+                max_items = 8,
+                updated_at = ?1
+          WHERE key = 'people'
+            AND description = '人物数量、年龄段和可观察动作'
+            AND max_items = 4",
+        [now],
+    )?;
+    Ok(())
+}
+
 /// 幂等补种系统分面（INSERT OR IGNORE：已存在行不动，包括用户改过的 display_name 与停用态）。
 /// 使用场景：① V8 迁移建库；② 重置标签数据后重建系统分面；③ 启动自愈兜底。
 pub fn seed_system_facets(conn: &Connection) -> AppResult<()> {
@@ -219,6 +274,17 @@ pub fn seed_system_facets(conn: &Connection) -> AppResult<()> {
     Ok(())
 }
 
+/// 新库/重置后的产品默认：主观用途与可用性判断交给用户填写。
+pub(crate) fn set_human_judgment_facets_manual_only(conn: &Connection) -> AppResult<()> {
+    conn.execute(
+        "UPDATE tag_facets
+            SET cfg_ai_assignable = 0, input_mode = 'manual_only'
+          WHERE is_system = 1 AND key IN ('purpose', 'technical')",
+        [],
+    )?;
+    Ok(())
+}
+
 /// 空表自愈：tag_facets 一行都没有（历史重置标签路径清空后未补种）时重建系统分面。
 /// color 补种后立即置回 inactive（V16 语义：颜色由算法主色呈现，AI 侧已摘除）。
 /// 只在完全空表时触发，不影响任何已有分面（含用户自建）。
@@ -228,6 +294,7 @@ pub fn seed_system_facets_if_empty(conn: &Connection) -> AppResult<()> {
         return Ok(());
     }
     seed_system_facets(conn)?;
+    set_human_judgment_facets_manual_only(conn)?;
     let now = chrono::Utc::now().timestamp_millis();
     conn.execute(
         "UPDATE tag_facets SET status = 'inactive', updated_at = ?1 WHERE key = 'color'",
@@ -429,6 +496,11 @@ pub fn delete_facet(conn: &Connection, key: &str) -> AppResult<FacetDeleteReport
     if f.is_system {
         return Err(AppError::msg("系统分面不能删除（只允许停用）"));
     }
+    delete_facet_cascade(conn, key)
+}
+
+/// 供一次性产品迁移删除已下线的系统分面；普通命令仍必须经过 [`delete_facet`] 的系统保护。
+pub(crate) fn delete_facet_cascade(conn: &Connection, key: &str) -> AppResult<FacetDeleteReport> {
     let tx = conn.unchecked_transaction()?;
     // V24（§6.5）：数值级联 —— 必须在同一事务内先删 asset_facet_numbers（铁律 6：先删引用再删主体）
     let numbers_deleted = crate::db::facet_numbers::delete_facet_numbers(&tx, key)?;
@@ -576,17 +648,15 @@ pub fn key_for_legacy_name(name: &str) -> &'static str {
         "subject" => "subject",
         "scene" => "scene",
         "purpose" => "purpose",
-        "style" => "style",
         "color" => "color",
         "composition" => "composition",
         "lighting" => "lighting",
         "people" => "people",
         "technical" => "technical",
         "custom" => "custom",
-        "主体" | "主体/对象" | "物体" => "subject",
+        "主体" | "主体/对象" | "主体对象" | "物体" => "subject",
         "场景" | "场景/地点" => "scene",
         "用途" | "用途/项目类型" => "purpose",
-        "风格" | "风格/氛围" | "色彩风格" | "氛围情绪" => "style",
         "色彩" | "色调" => "color",
         "构图" | "构图视角" | "构图/视角" => "composition",
         "光线" | "时间" | "光线/时间" | "光线/时间氛围" => "lighting",
@@ -731,7 +801,16 @@ mod tests {
             !keys.contains(&"color".to_string()),
             "color 应补种为 inactive，不出现在 active 列表"
         );
+        assert!(
+            !keys.contains(&"style".to_string()),
+            "style 已下线，不得重新补种"
+        );
         assert_eq!(get(&c, "color").unwrap().status, "inactive");
+        for key in ["purpose", "technical"] {
+            let facet = get(&c, key).unwrap();
+            assert!(!facet.cfg_ai_assignable, "{key} 默认只允许人工填写");
+            assert_eq!(facet.input_mode, "manual_only");
+        }
         // 非空表不触发（用户自建分面不被打扰）
         seed_system_facets_if_empty(&c).unwrap();
         assert_eq!(

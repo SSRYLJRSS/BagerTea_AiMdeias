@@ -15,6 +15,39 @@ fn add_asset(conn: &rusqlite::Connection, path: &str, name: &str, ext: &str, mim
     assets::insert(conn, path, name, ext, 1024, mime, 1700000000000).expect("插入素材失败")
 }
 
+#[test]
+fn core_taxonomy_seed_is_idempotent_and_uses_other_for_new_words() -> AppResult<()> {
+    let conn = setup();
+    db::ensure_default_taxonomy(&conn)?;
+    let first_count: i64 = conn.query_row("SELECT COUNT(*) FROM tags", [], |r| r.get(0))?;
+    tags::seed_core_taxonomy(&conn)?;
+    let second_count: i64 = conn.query_row("SELECT COUNT(*) FROM tags", [], |r| r.get(0))?;
+    assert_eq!(first_count, second_count, "重复播种不得新增重复标签");
+
+    let parent: String = conn.query_row(
+        "SELECT p.name FROM tags t JOIN tags p ON p.id = t.parent_id
+          WHERE t.facet_key = 'people' AND t.name = '女性'",
+        [],
+        |r| r.get(0),
+    )?;
+    assert_eq!(parent, "性别");
+    assert!(tags::search_candidates(&conn, Some("subject"), "人像")?
+        .iter()
+        .any(|tag| tag.name == "人"));
+
+    let new_tag_id = tags::find_or_create_canonical(&conn, "people", "赛博朋克少女")?;
+    let new_parent: String = conn.query_row(
+        "SELECT p.name FROM tags t JOIN tags p ON p.id = t.parent_id WHERE t.id = ?1",
+        [new_tag_id],
+        |r| r.get(0),
+    )?;
+    assert_eq!(new_parent, "其他");
+
+    assert_eq!(tag_facets::get(&conn, "subject")?.max_items, Some(3));
+    assert_eq!(tag_facets::get(&conn, "people")?.max_items, Some(8));
+    Ok(())
+}
+
 // ① 迁移 + 触发器：插入素材即可被 FTS 检索（文件名逐字切分）
 #[test]
 fn fts_index_on_insert() -> AppResult<()> {
@@ -842,7 +875,7 @@ fn tag_facets_aliases_and_canonical_search() -> AppResult<()> {
     assert!(facets.iter().any(|f| f.key == "subject"));
     assert!(facets.iter().any(|f| f.key == "scene"));
 
-    let root = tags::find_or_create_facet_root(&conn, "subject", "主体/对象")?;
+    let root = tags::find_or_create_facet_root(&conn, "subject", "主体对象")?;
     let tea = tags::create_in_facet(&conn, "茶", Some(root), Some("subject"))?;
     tags::add_alias(&conn, tea.id, "茶叶", Some("zh-CN"), "synonym")?;
     let id = add_asset(&conn, "d:/p/tea.jpg", "tea.jpg", "jpg", "image/jpeg");
@@ -862,7 +895,7 @@ fn tag_facets_aliases_and_canonical_search() -> AppResult<()> {
 #[test]
 fn facet_filter_any_all_and_exclude() -> AppResult<()> {
     let conn = setup();
-    let subject = tags::find_or_create_facet_root(&conn, "subject", "主体/对象")?;
+    let subject = tags::find_or_create_facet_root(&conn, "subject", "主体对象")?;
     let scene = tags::find_or_create_facet_root(&conn, "scene", "场景/地点")?;
     let tea = tags::create_in_facet(&conn, "茶", Some(subject), Some("subject"))?;
     let coffee = tags::create_in_facet(&conn, "咖啡", Some(subject), Some("subject"))?;
@@ -1460,6 +1493,13 @@ fn prompt_context_reflects_facet_config_overrides() -> AppResult<()> {
 #[test]
 fn prompt_context_excludes_manual_only_and_includes_description() -> AppResult<()> {
     let conn = setup();
+    let defaults = db::tag_facets::build_prompt_context(&conn, "all")?;
+    for key in ["purpose", "technical"] {
+        assert!(
+            !defaults.iter().any(|c| c.key == key),
+            "{key} 是人工判断项，不得进入 AI 提示词"
+        );
+    }
     tag_facets::create(
         &conn,
         "manual_field",
@@ -1839,12 +1879,10 @@ fn user_created_facet_full_pipeline() -> AppResult<()> {
         [batch.id],
         |r| r.get(0),
     )?;
-    let valid_keys: Vec<&str> = ctx.iter().map(|f| f.key.as_str()).collect();
     let analysis = bagertea_ai_media_v2_lib::services::ai_cloud::parse_media_analysis(
-        r#"{"description":"红裙","tags":{"clothing_color":["红色"]}}"#,
-        &valid_keys,
+        r#"{"description":"人物穿着红色裙子","peoplePresence":{"status":"present","confidence":0.9},"tags":{"clothing_color":[{"name":"红色","confidence":0.95}]}}"#,
         &ctx,
-        &[],
+        0.30,
     )?;
     assert!(
         analysis.tags.contains_key("clothing_color"),
@@ -2244,17 +2282,17 @@ fn top_tags_orders_by_usage() -> AppResult<()> {
 fn top_tags_respects_char_cap() -> AppResult<()> {
     let conn = setup();
     let a1 = add_asset(&conn, "d:/p/c1.jpg", "c1.jpg", "jpg", "image/jpeg");
-    // 造 60 个长名标签（每个 12 字 = 720 字符 + 分隔），足够触发 1500 上限
-    for i in 0..60 {
+    // 造 500 个长名标签（每个截断为 12 字），足够触发 5000 上限
+    for i in 0..500 {
         let name = format!("超长标签名称第{:03}号占位", i);
         let t = tags::create_in_facet(&conn, &name, None, Some("scene"))?;
         asset_tags::assign(&conn, &[a1], &[t.id], "manual")?;
     }
-    let top = tags::top_tags_per_facet(&conn, 100)?;
+    let top = tags::top_tags_per_facet(&conn, 600)?;
     let words_total: usize = top.iter().map(|(_, w)| w.chars().count()).sum();
     assert!(
-        words_total <= 1500,
-        "候选词总字符应受 1500 上限约束，实际 {words_total}"
+        words_total <= 5000,
+        "候选词总字符应受 5000 上限约束，实际 {words_total}"
     );
     // 每个分面至少保留 1 个词（大分面不得把词丢光）
     assert!(

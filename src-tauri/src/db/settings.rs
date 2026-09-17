@@ -89,6 +89,9 @@ pub struct AiSettings {
     pub local_model_tier: String,
     #[serde(default = "default_batch_limit")]
     pub batch_limit: i64,
+    /// 本机服务每轮处理数量；独立于在线服务，适合能力较小的本地模型。
+    #[serde(default = "default_local_batch_limit")]
+    pub local_batch_limit: i64,
     /// 一键安装的下载源偏好（"auto" = 测速选最快；旧数据缺省视为 auto）
     #[serde(default = "default_ollama_source_id")]
     pub ollama_source_id: String,
@@ -98,13 +101,6 @@ pub struct AiSettings {
     /// 超级搜索提示词覆盖（用户可自行修改；空 = 用内置默认）
     #[serde(default)]
     pub system_prompt_search: String,
-    // ── A4 置信度策略（默认与指导书一致；U 波次补设置页 UI 与风险措辞）──
-    /// 精确命中词表 canonical/synonym → 自动接收（写 asset_tags，review_state='ai_unreviewed'）
-    #[serde(default = "default_true")]
-    pub auto_accept_exact_terms: bool,
-    /// AI 直接向词表添加新标签（显式开关，默认关 —— 新词走「新词待确认」逐个采纳）
-    #[serde(default)]
-    pub auto_adopt_new_terms: bool,
     /// AI 建议最低置信度阈值：confidence < 此值不入库（连 pending 都不进）；默认 0.30
     #[serde(default = "default_conf_min_suggest")]
     pub confidence_min_suggest: f64,
@@ -139,6 +135,9 @@ impl AiSettings {
         // 读取时归一到 30（新默认），避免「显示 500 实际 50」的假象。
         if self.batch_limit > 50 || self.batch_limit < 10 {
             self.batch_limit = default_batch_limit();
+        }
+        if self.local_batch_limit > 20 || self.local_batch_limit < 1 {
+            self.local_batch_limit = default_local_batch_limit();
         }
     }
 
@@ -190,6 +189,9 @@ fn default_video_frame_count() -> i64 {
 fn default_batch_limit() -> i64 {
     30 // FB3-07：云端每轮处理数量；运行时 clamp [10,50]，默认 30（旧 500 永不生效已归一）
 }
+fn default_local_batch_limit() -> i64 {
+    5
+}
 
 /// 标签分类（PRD 5.5）：分类=父标签；hint 参与 AI 提示词，single 控制单/多选
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -213,10 +215,8 @@ pub fn default_tag_categories() -> Vec<TagCategory> {
     [
         ("场景", "如公园/街道/室内，选最主要的一个", true),
         ("色彩", "主色、色调与色彩关系，如青橙/暗调/冷调", false),
-        ("色彩风格", "如胶片感/低饱和/高对比/清新", false),
         ("人物", "人物数量、年龄段、动作姿态，无人物则留空", false),
         ("物体", "画面中的关键物体", false),
-        ("氛围情绪", "如宁静/热烈/孤独/治愈", false),
         ("构图视角", "如特写/全景/俯拍/对称", true),
         ("光线", "只描述光线方向与质感，如逆光/柔光/黄昏金调", false),
     ]
@@ -245,11 +245,10 @@ impl Default for AiSettings {
             video_frame_count: default_video_frame_count(),
             local_model_tier: default_tier(),
             batch_limit: default_batch_limit(),
+            local_batch_limit: default_local_batch_limit(),
             ollama_source_id: default_ollama_source_id(),
             system_prompt_tagging: String::new(),
             system_prompt_search: String::new(),
-            auto_accept_exact_terms: true,
-            auto_adopt_new_terms: false,
             confidence_min_suggest: 0.30,
         }
     }
@@ -454,6 +453,9 @@ pub struct Settings {
     pub ai: AiSettings,
     #[serde(default = "default_theme")]
     pub theme: String, // system|light|dark
+    /// 用户可调整的文件日志级别：info|debug|trace
+    #[serde(default = "default_log_level")]
+    pub log_level: String,
     #[serde(default = "default_cache_mb")]
     pub thumbnail_cache_mb: i64,
     /// 标签分类（PRD 5.5，设置页可管理）
@@ -485,6 +487,9 @@ pub struct Settings {
 fn default_theme() -> String {
     "system".into()
 }
+fn default_log_level() -> String {
+    "info".into()
+}
 fn default_cache_mb() -> i64 {
     2048
 }
@@ -497,6 +502,7 @@ impl Default for Settings {
         Self {
             ai: AiSettings::default(),
             theme: default_theme(),
+            log_level: default_log_level(),
             thumbnail_cache_mb: default_cache_mb(),
             tag_categories: Vec::new(),
             ai_facet_configs: Vec::new(),
@@ -506,6 +512,13 @@ impl Default for Settings {
             model_download_proxy: String::new(),
             appearance: Appearance::default(),
         }
+    }
+}
+
+/// 读取侧：日志级别只接受三个可选值，非法旧值回退 info。
+pub fn normalize_log_level(s: &mut Settings) {
+    if !matches!(s.log_level.as_str(), "info" | "debug" | "trace") {
+        s.log_level = default_log_level();
     }
 }
 
@@ -619,6 +632,7 @@ pub fn get_settings(conn: &Connection) -> AppResult<Settings> {
         normalize_ai_facet_defaults(&mut s);
         s.ai.normalize();
         normalize_appearance(&mut s);
+        normalize_log_level(&mut s);
         return Ok(s);
     }
     let mut d = Settings::default();
@@ -711,8 +725,30 @@ mod tests {
         let s: Settings =
             serde_json::from_str(r#"{"ai":{"profiles":[]},"theme":"system"}"#).unwrap();
         assert_eq!(s.ai.ollama_source_id, "auto");
+        assert_eq!(s.log_level, "info");
         assert!(s.custom_download_sources.is_empty());
         assert_eq!(s.model_download_proxy, "");
+    }
+
+    #[test]
+    fn invalid_saved_log_level_falls_back_to_info() {
+        let mut s: Settings = serde_json::from_str(r#"{"logLevel":"verbose"}"#).unwrap();
+        normalize_log_level(&mut s);
+        assert_eq!(s.log_level, "info");
+    }
+
+    #[test]
+    fn get_settings_normalizes_persisted_log_level() {
+        let conn = crate::db::init_memory().unwrap();
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            rusqlite::params![KEY, r#"{"logLevel":"verbose"}"#],
+        )
+        .unwrap();
+
+        let s = get_settings(&conn).unwrap();
+        assert_eq!(s.log_level, "info");
     }
 
     #[test]

@@ -20,9 +20,24 @@ use image::{DynamicImage, GenericImageView};
 
 /// 读取常规图片或 RAW 文件的尺寸。RAW 由 rawler 兜底，调用方应在数据库锁外调用。
 pub fn probe_dimensions(src: &Path) -> Option<(u32, u32)> {
-    image::image_dimensions(src)
+    if let Ok(dims) = image::image_dimensions(src) {
+        return Some(dims);
+    }
+    if is_heic_like(src) {
+        let _permit = acquire();
+        return super::heic_decode::probe_dimensions(src);
+    }
+    super::raw_decode::probe_dimensions(src).or_else(|| guessed_dimensions(src))
+}
+
+/// 非标准扩展名的 TIFF 容器（如 3FR/IIQ）按内容识别，只读头拿预览尺寸。
+fn guessed_dimensions(src: &Path) -> Option<(u32, u32)> {
+    image::ImageReader::open(src)
+        .ok()?
+        .with_guessed_format()
+        .ok()?
+        .into_dimensions()
         .ok()
-        .or_else(|| super::raw_decode::probe_dimensions(src))
 }
 
 // ---------------------------------------------------------------------------
@@ -383,7 +398,7 @@ pub fn embedded_preview(src: &Path) -> Option<Vec<u8>> {
     tiff_embedded_jpeg(src)
         .or_else(|| cr3_embedded_jpeg(src))
         .or_else(|| {
-            if is_jpeg_like(src) {
+            if is_jpeg_like(src) || has_native_decoder(src) {
                 None
             } else {
                 marker_scan_jpeg(src)
@@ -402,39 +417,89 @@ fn is_jpeg_like(src: &Path) -> bool {
         .unwrap_or(false)
 }
 
+fn is_heic_like(src: &Path) -> bool {
+    src.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| matches!(e.to_ascii_lowercase().as_str(), "heic" | "heif"))
+        .unwrap_or(false)
+}
+
+/// 这些格式由 image crate 原生解码，不应再扫描最多 64MB 的 JPEG marker。
+fn has_native_decoder(src: &Path) -> bool {
+    src.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| {
+            matches!(
+                e.to_ascii_lowercase().as_str(),
+                "png" | "webp" | "gif" | "bmp" | "tga" | "tif" | "tiff"
+            )
+        })
+        .unwrap_or(false)
+}
+
 /// 统一解码入口：目标最长边 max_px
 /// 内嵌图达标（≥max_px）直接用；不达标再按格式选最快的解码路
 /// **内部已取全局并发闸**，调用方不要再 `acquire()`（同线程双持会把 4 并发压成 2，FX-08）。
 pub fn decode_thumb(src: &Path, max_px: u32) -> Option<DynamicImage> {
     let _permit = acquire();
 
-    // 1. 内嵌预览（微秒~毫秒级）
-    if let Some(jpeg) = embedded_preview(src) {
-        if let Ok(img) = image::load_from_memory(&jpeg) {
-            if img.dimensions().0.max(img.dimensions().1) >= max_px {
-                return Some(img.thumbnail(max_px, max_px));
-            }
-            // 内嵌太小（如 160px 的 IFD1 缩略图）：小目标直接够用
-            if max_px <= 320 {
-                return Some(img);
-            }
+    // 1. 内嵌预览（微秒~毫秒级）。即使尺寸小于目标，也保留为可靠兜底；
+    //    部分 RAW 的全解码会返回纯黑，不能让黑图覆盖真实预览。
+    let embedded = embedded_preview(src).and_then(|jpeg| image::load_from_memory(&jpeg).ok());
+    if let Some(img) = &embedded {
+        if img.dimensions().0.max(img.dimensions().1) >= max_px {
+            return Some(img.thumbnail(max_px, max_px));
         }
     }
 
     // 2. 全解码 + 缩放（image 0.24 默认 zune-jpeg；dev 下已配 O3 override，
     //    24MP 全解码 ~370ms——实测比 jpeg-decoder 的 DCT 缩放路径还快，故精简掉后者）
-    image::open(src)
+    let raw_like = is_raw_like(src);
+    let decoded = image::open(src)
         .ok()
+        .filter(|img| !(raw_like && is_effectively_black(img)))
+        .or_else(|| {
+            if max_px > 320 {
+                guessed_decode(src)
+            } else {
+                None
+            }
+        })
         .or_else(|| {
             // 3. 真解码兜底（Phase 2 F02/F04）：仅高清按需层；占位层（≤320px）禁用，
-            //    避免 HEVC/RAW 全解码拖垮入库速度（PHASE2_FORMATS.md 红线）
+            //    避免 HEVC/RAW 全解码拖垮入库速度（docs/ARCHITECTURE.md 红线）
             if max_px > 320 {
                 special_decode(src)
             } else {
                 None
             }
-        })
-        .map(|img| img.thumbnail(max_px, max_px))
+        });
+    if let Some(img) = decoded {
+        if raw_like && is_effectively_black(&img) {
+            tracing::warn!("RAW 解码结果近似纯黑，降级到内嵌预览或占位图: {src:?}");
+            return embedded;
+        }
+        return Some(img.thumbnail(max_px, max_px));
+    }
+    embedded
+}
+
+/// `image::open` 依赖扩展名；3FR/IIQ 等 TIFF 容器按文件头识别后解码其预览。
+fn guessed_decode(src: &Path) -> Option<DynamicImage> {
+    let reader = image::ImageReader::open(src)
+        .ok()?
+        .with_guessed_format()
+        .ok()?;
+    if reader.format() != Some(image::ImageFormat::Tiff) {
+        return None;
+    }
+    let mut reader = reader;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(20_000);
+    limits.max_image_height = Some(20_000);
+    limits.max_alloc = Some(256 * 1024 * 1024);
+    reader.limits(limits);
+    reader.decode().ok()
 }
 
 /// 特殊格式真解码分派：HEIC/HEIF → libheif；RAW 系 → rawler
@@ -444,10 +509,39 @@ fn special_decode(src: &Path) -> Option<DynamicImage> {
         .and_then(|e| e.to_str())
         .map(|e| e.to_ascii_lowercase())
         .unwrap_or_default();
-    match ext.as_str() {
+    let img = match ext.as_str() {
         "heic" | "heif" => super::heic_decode::decode_heic(src),
         _ => super::raw_decode::decode_raw(src),
+    }?;
+    if is_raw_like(src) && is_effectively_black(&img) {
+        tracing::warn!("RAW 全解码结果近似纯黑，降级到内嵌预览或占位图: {src:?}");
+        return None;
     }
+    Some(img)
+}
+
+fn is_raw_like(src: &Path) -> bool {
+    src.extension()
+        .and_then(|e| e.to_str())
+        .map(crate::utils::mime::is_raw_ext)
+        .unwrap_or(false)
+}
+
+/// RAW 全解码偶发返回黑帧（上游黑电平/裁剪处理缺陷）。只拦截接近纯黑且无动态范围的
+/// 结果，避免让可靠的内嵌预览或通用占位图被黑卡覆盖。
+fn is_effectively_black(img: &DynamicImage) -> bool {
+    let sample = img.thumbnail(64, 64).to_luma8();
+    let mut min = u8::MAX;
+    let mut max = u8::MIN;
+    let mut sum = 0u64;
+    for px in sample.pixels() {
+        let v = px.0[0];
+        min = min.min(v);
+        max = max.max(v);
+        sum += u64::from(v);
+    }
+    let mean = sum as f64 / sample.pixels().len().max(1) as f64;
+    max <= 8 && max.saturating_sub(min) <= 4 && mean <= 4.0
 }
 
 /// 解码并写 webp 缩略图到 out
@@ -611,5 +705,95 @@ mod tests {
         std::fs::write(&f2, &jpeg).unwrap();
         assert!(cr3_embedded_jpeg(&f2).is_none());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn native_formats_skip_marker_scan() {
+        let dir = std::env::temp_dir().join(format!("bagertea_native_skip_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let png = dir.join("fake.png");
+        let raw = dir.join("fake.raw");
+        let mut data = vec![0x89, b'P', b'N', b'G'];
+        data.extend_from_slice(&[0u8; 100]);
+        data.extend_from_slice(&[0xFF, 0xD8]);
+        data.extend_from_slice(&vec![7u8; 5000]);
+        data.extend_from_slice(&[0xFF, 0xD9]);
+        std::fs::write(&png, &data).unwrap();
+        std::fs::write(&raw, &data).unwrap();
+
+        assert!(
+            embedded_preview(&png).is_none(),
+            "PNG 由原生解码器处理，不应扫描伪 JPEG"
+        );
+        assert!(
+            embedded_preview(&raw).is_some(),
+            "未知/RAW 容器仍应保留 marker 兜底"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn guessed_tiff_preview_supports_3fr() {
+        let sample = std::path::Path::new(
+            r"F:\testdata\S2_formats\raw\Hasselblad - CFV-50c - 16bit (4_3).3FR",
+        );
+        if !sample.exists() {
+            eprintln!("跳过：3FR 真机样本不存在（{}）", sample.display());
+            return;
+        }
+        assert!(
+            probe_dimensions(sample).is_some(),
+            "3FR 应能从 TIFF 内容识别宽高"
+        );
+        assert!(
+            decode_thumb(sample, 512).is_some(),
+            "3FR 应能从 TIFF 内容解出预览"
+        );
+    }
+
+    #[test]
+    fn effectively_black_detects_empty_raw_output() {
+        let black = DynamicImage::new_luma8(64, 64);
+        assert!(is_effectively_black(&black));
+
+        let mut visible = DynamicImage::new_luma8(64, 64).to_luma8();
+        visible.put_pixel(32, 32, image::Luma([80]));
+        assert!(!is_effectively_black(&DynamicImage::ImageLuma8(visible)));
+    }
+
+    #[test]
+    fn black_raw_decode_falls_back_to_real_embedded_preview() {
+        let sample = std::path::Path::new(r"F:\all\test4\test4_20260915_333.ARW");
+        if !sample.exists() {
+            eprintln!("跳过：ARW 真机样本不存在（{}）", sample.display());
+            return;
+        }
+        let img = decode_thumb(sample, 1024).expect("应回退到可用的内嵌预览");
+        let rgb = img.to_rgb8();
+        let max = rgb.pixels().flat_map(|p| p.0).max().unwrap_or(0);
+        assert!(max > 16, "回退结果不应是纯黑占位");
+    }
+
+    #[test]
+    fn known_black_raw_samples_never_emit_black_thumbnails() {
+        let samples = [
+            r"F:\all\test4\test4_20260915_305.DCR",
+            r"F:\all\test4\test4_20260915_312.NRW",
+            r"F:\all\test4\test4_20260915_317.ORF",
+        ];
+        for sample in samples {
+            let path = std::path::Path::new(sample);
+            if !path.exists() {
+                eprintln!("跳过：RAW 真机样本不存在（{}）", path.display());
+                continue;
+            }
+            if let Some(img) = decode_thumb(path, 1024) {
+                assert!(
+                    !is_effectively_black(&img),
+                    "已知黑帧样本不应输出全黑缩略图: {}",
+                    path.display()
+                );
+            }
+        }
     }
 }

@@ -11,6 +11,7 @@ import PageErrorBoundary from "@/components/common/PageErrorBoundary";
 import { startGlobalTaskWatch } from "@/stores/taskStore";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { useLibraryStore } from "@/stores/libraryStore";
+import { useMetadataStore } from "@/stores/metadataStore";
 import { markStartup } from "@/utils/startupMarks";
 import { useTauriEvent } from "@/hooks/hooks";
 import { on } from "@/api/client";
@@ -40,6 +41,13 @@ export default function App() {
   useEffect(() => {
     pageRef.current = page;
   }, [page]);
+
+  // 桌面应用只使用自定义右键菜单，阻止 WebView 在其余区域弹出浏览器原生菜单。
+  useEffect(() => {
+    const preventNativeContextMenu = (event: MouseEvent) => event.preventDefault();
+    window.addEventListener("contextmenu", preventNativeContextMenu);
+    return () => window.removeEventListener("contextmenu", preventNativeContextMenu);
+  }, []);
 
   // 库页操作区/上下文条的跨页导航（导入、AI 打标、设置）
   useEffect(() => {
@@ -91,6 +99,7 @@ export default function App() {
     () =>
       on<PaletteUpdatedEvent>("palette://updated", (payload) => {
         void useLibraryStore.getState().refreshPaletteFields(payload.updatedIds);
+        void useMetadataStore.getState().refresh();
       }),
     [],
   );

@@ -112,15 +112,15 @@ export default function ViewerPage({ asset: initial, onClose, listItems, listTot
   // 其他元素进入全屏不改变 ViewerShell 模式（§4.1）。
   useEffect(() => {
     const onFsChange = () => {
-      if (isViewerNativeFullscreen(viewerRootRef.current)) {
-        setImmersiveMode("native");
-      } else if (immersiveMode === "native") {
-        setImmersiveMode("off");
-      }
+      const nativeActive = isViewerNativeFullscreen(viewerRootRef.current);
+      setImmersiveMode((mode) => {
+        if (nativeActive) return "native";
+        return mode === "native" ? "off" : mode;
+      });
     };
     document.addEventListener("fullscreenchange", onFsChange);
     return () => document.removeEventListener("fullscreenchange", onFsChange);
-  }, [immersiveMode]);
+  }, []);
 
   // fallback 沉浸：焦点移入沉浸画布，应用根节点（不含 portal）inert；退出/卸载清理 inert（§4.1）。
   useEffect(() => {

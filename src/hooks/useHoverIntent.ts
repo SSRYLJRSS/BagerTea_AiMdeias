@@ -8,6 +8,8 @@ interface HoverIntentOptions {
   /** 离开后延迟 ms 才关闭（默认 350） */
   leave?: number;
   disabled?: boolean;
+  /** 运行时护栏（例如滚动抑制）。每次准备激活时读取，避免捕获过期状态。 */
+  canActivate?: () => boolean;
 }
 
 export interface HoverIntentResult {
@@ -27,13 +29,15 @@ export interface HoverIntentResult {
 }
 
 export function useHoverIntent(options: HoverIntentOptions = {}): HoverIntentResult {
-  const { enter = 300, leave = 350, disabled = false } = options;
+  const { enter = 300, leave = 350, disabled = false, canActivate } = options;
   const [active, setActive] = useState(false);
   const [inside, setInside] = useState(false);
   const enterTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const leaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const disabledRef = useRef(disabled);
+  const canActivateRef = useRef(canActivate);
   disabledRef.current = disabled;
+  canActivateRef.current = canActivate;
 
   const clearTimers = useCallback(() => {
     if (enterTimer.current) clearTimeout(enterTimer.current);
@@ -48,18 +52,46 @@ export function useHoverIntent(options: HoverIntentOptions = {}): HoverIntentRes
     setInside(false);
   }, [clearTimers]);
 
+  const allowedNow = useCallback(() => {
+    try {
+      return canActivateRef.current?.() ?? true;
+    } catch {
+      // 运行时护栏失败时宁可不启动预览，也不让一次 hover 破坏卡片交互。
+      return false;
+    }
+  }, []);
+
   const onEnter = useCallback(() => {
     if (disabledRef.current) return;
-    if (!disabledRef.current) setInside(true);
+    setInside(true);
+    if (enterTimer.current) clearTimeout(enterTimer.current);
     if (leaveTimer.current) clearTimeout(leaveTimer.current);
-    enterTimer.current = setTimeout(() => setActive(true), enter);
-  }, [enter]);
+    const tryActivate = () => {
+      enterTimer.current = null;
+      if (disabledRef.current) return;
+      if (!allowedNow()) {
+        // 滚动停止是 ref 状态，不一定触发 React 重渲染；短暂重试可让
+        // 指针停在卡片上时自然恢复预览，而不要求用户移开再移入。
+        enterTimer.current = setTimeout(tryActivate, 100);
+        return;
+      }
+      setActive(true);
+    };
+    enterTimer.current = setTimeout(tryActivate, enter);
+  }, [allowedNow, enter]);
 
   const onLeave = useCallback(() => {
     setInside(false);
-    if (enterTimer.current) clearTimeout(enterTimer.current);
+    if (enterTimer.current) {
+      clearTimeout(enterTimer.current);
+      enterTimer.current = null;
+    }
     leaveTimer.current = setTimeout(() => setActive(false), leave);
   }, [leave]);
+
+  useEffect(() => {
+    if (disabled) cancel();
+  }, [cancel, disabled]);
 
   useEffect(() => clearTimers, [clearTimers]);
 

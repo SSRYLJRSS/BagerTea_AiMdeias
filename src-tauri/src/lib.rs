@@ -6,74 +6,29 @@
 pub mod commands;
 pub mod db;
 pub mod error;
+pub mod observability;
 pub mod services;
 pub mod state;
 pub mod utils;
 
 use crate::db::settings;
 use crate::error::AppError;
+use crate::observability::LoggingGuard;
 use crate::services::thumbnail::ThumbnailService;
 use state::AppState;
 use tauri::Manager;
 
-/// W0-9：日志目录（stdout + 滚动文件双出口）。初始化失败降级纯 stdout，不阻断启动。
-fn init_logging(data_dir: &std::path::Path) -> Option<tracing_appender::non_blocking::WorkerGuard> {
-    use tracing_appender::non_blocking;
-    use tracing_appender::rolling;
-    use tracing_subscriber::layer::SubscriberExt;
-    use tracing_subscriber::util::SubscriberInitExt;
-    use tracing_subscriber::{fmt, layer::Layer as _, EnvFilter};
-
-    let logs_dir = data_dir.join("logs");
-    // 滚动 appender 自带保留策略：max_log_files(7)，超期自动清理
-    let file_appender = match rolling::Builder::new()
-        .max_log_files(7)
-        .filename_prefix("app.log")
-        .rotation(rolling::Rotation::DAILY)
-        .build(logs_dir.clone())
-    {
-        Ok(a) => a,
-        Err(e) => {
-            // 降级：纯 stdout，不阻断启动
-            let _ = fmt::Subscriber::builder()
-                .with_ansi(false)
-                .with_env_filter(
-                    EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-                )
-                .try_init();
-            eprintln!("日志文件初始化失败（降级为 stdout）: {e}");
-            return None;
-        }
-    };
-    let (file_writer, guard) = non_blocking(file_appender);
-    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let stdout_layer = fmt::layer().with_ansi(false);
-    let file_layer = fmt::layer()
-        .with_writer(file_writer)
-        .with_ansi(false)
-        .with_filter(env_filter);
-    let result = tracing_subscriber::registry()
-        .with(stdout_layer)
-        .with(file_layer)
-        .try_init();
-    if result.is_err() {
-        // 已有全局 subscriber（如测试环境）：文件层装不上，只能降级
-        eprintln!("tracing subscriber 已初始化，文件日志未接入");
-        return Some(guard);
-    }
-    tracing::info!(?logs_dir, "文件日志已启用（保留 7 天）");
-    Some(guard)
-}
-
 /// W0-10：迁移/初始化失败给用户可见出路（发布版无控制台，panic 等于静默崩溃）。
 /// 先在 tauri app 启动前用 rfd 弹原生 dialog（plugin dialog 需要 AppHandle，此时还没有），
-/// 弹失败（无桌面环境）时退回 eprintln + panic。
+/// 弹失败（无桌面环境）时退回同步日志 + eprintln。
 fn fatal_db_error(db_path: &std::path::Path, logs_dir: &std::path::Path, e: &AppError) -> ! {
     let msg = format!(
         "数据库升级失败：{e}。\n\n请把日志目录打包发给支持：\n{}",
         logs_dir.display()
     );
     tracing::error!(?db_path, "数据库初始化失败: {e}");
+    // 非阻塞 writer 可能尚未刷盘；退出前同步补一份事实，避免关键启动错误丢失。
+    observability::write_sync_diagnostic(logs_dir, &format!("database_init_failed: {e}"));
     // tauri-plugin-dialog 2.7 依赖 rfd 0.15：直接用它做无 AppHandle 的阻塞弹窗
     let _shown = rfd::MessageDialog::new()
         .set_level(rfd::MessageLevel::Error)
@@ -107,7 +62,7 @@ pub fn run() {
         .unwrap_or_else(|| std::path::PathBuf::from("."))
         .join("bagertea_ai_media_v2");
     // WorkerGuard 必须绑定 run() 栈生命周期：绑到局部会立即 drop → 文件日志一条不写
-    let _log_guard = init_logging(&data_dir);
+    let _log_guard: LoggingGuard = observability::init_logging(&data_dir);
 
     // 应用数据目录：$APP_DATA_DIR/bagertea_ai_media_v2/library.db
     let db_path = data_dir.join("library.db");
@@ -118,6 +73,15 @@ pub fn run() {
         Ok(c) => c,
         Err(e) => fatal_db_error(&db_path, &data_dir.join("logs"), &e),
     };
+    // 用户保存的日志级别在数据库可用后应用；初始化阶段仍使用环境变量或 info。
+    if let Ok(saved) = settings::get_settings(&conn) {
+        if let Err(e) = observability::set_log_level(&saved.log_level) {
+            tracing::warn!("应用已保存的日志级别失败: {e}");
+        }
+    }
+    if let Err(e) = db::ensure_default_taxonomy(&conn) {
+        tracing::warn!("核心标签词表补齐失败（不影响启动，可在设置页重置标签后重试）: {e}");
+    }
 
     // asset 协议放行用（data_dir 稍后会 move 进 AppState）
     let scope_dir = data_dir.clone();
@@ -209,6 +173,27 @@ pub fn run() {
                     if let Ok(thumbs) = ThumbnailService::new(&lru_dir) {
                         let _ = thumbs.cleanup_lru(max_mb);
                     }
+                }
+            });
+
+            // 日志按文件数滚动，这里再按总字节数和 30 天期限兜底；
+            // 文件 IO 放后台线程，避免大日志目录拖慢启动。
+            let log_dir = scope_dir.join("logs");
+            spawn_maintenance("log-retention", move || {
+                match observability::prune_log_files(&log_dir) {
+                    Ok(report) if report.removed_files > 0 => tracing::info!(
+                        operation = "log_retention",
+                        removed_files = report.removed_files,
+                        removed_bytes = report.removed_bytes,
+                        kept_files = report.kept_files,
+                        "日志保留清理完成"
+                    ),
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(
+                        operation = "log_retention",
+                        error = %e,
+                        "日志保留清理失败，不影响应用启动"
+                    ),
                 }
             });
 
@@ -398,6 +383,9 @@ pub fn run() {
             commands::open_data_dir,
             // W0-9：设置页「关于」打开日志目录（tracing-appender 滚动文件）
             commands::open_logs_dir,
+            // 前端异常与关键事件回传统一 tracing 文件
+            commands::log_frontend,
+            commands::export_diagnostics,
             commands::reset_app_data,
             // W5c：数据库备份/恢复
             commands::backup_db,

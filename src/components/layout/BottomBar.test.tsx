@@ -61,4 +61,40 @@ describe("BottomBar 超级搜索入口提示", () => {
     fireEvent.blur(library);
     expect(screen.queryByRole("tooltip")).not.toBeInTheDocument();
   });
+
+  it("入库页隐藏重复的入库任务，其他页面保留全局进度", () => {
+    useTaskStore.setState({
+      tasks: [{
+        id: "t1",
+        kind: "import",
+        label: "入库",
+        overall: 0.5,
+        detail: "正在入库",
+      }],
+    });
+
+    const { rerender } = render(
+      <BottomBar current="import" onNavigate={() => undefined} />,
+    );
+    expect(screen.queryByRole("progressbar")).not.toBeInTheDocument();
+
+    rerender(<BottomBar current="library" onNavigate={() => undefined} />);
+    expect(screen.getByRole("progressbar")).toHaveAttribute("aria-valuenow", "50");
+  });
+
+  it("离开入库页后只兜底展示运行中任务，完成态留在入库侧栏", () => {
+    useTaskStore.setState({
+      tasks: [{
+        id: "t-done",
+        kind: "import",
+        label: "入库",
+        overall: 1,
+        detail: "已完成",
+        done: true,
+      }],
+    });
+
+    render(<BottomBar current="library" onNavigate={() => undefined} />);
+    expect(screen.queryByRole("progressbar")).not.toBeInTheDocument();
+  });
 });

@@ -4,6 +4,7 @@ import { getSettings, saveSettings } from "@/api/settings";
 import { normalizeSettings } from "@/utils/normalizeSettings";
 import { markStartup } from "@/utils/startupMarks";
 import type { Appearance, Settings } from "@/types/settings";
+import { logger } from "@/utils/logger";
 
 /** R-24：主题写入 <html> 的 data-theme（system 时 media query 接管，light/dark 显式生效） */
 export function applyTheme(theme: Settings["theme"]) {
@@ -137,5 +138,5 @@ export const useSettingsStore = create<SettingsState>((set, get) => ({
 
 /** 回读失败仅告警（不把后端异常升级为保存失败） */
 function tracingWarn(msg: string) {
-  if (import.meta.env?.DEV) console.warn(`[settingsStore] ${msg}`);
+  logger.warn(`[settingsStore] ${msg}`);
 }

@@ -39,7 +39,7 @@ describe("FilterChips（FB5-05 §9.6.1 expr 驱动）", () => {
       ],
     );
     render(<FilterChips />);
-    expect(screen.getByText("主体/对象：建筑")).toBeInTheDocument();
+    expect(screen.getByText("主体对象：建筑")).toBeInTheDocument();
     expect(screen.getByText("色彩：红色")).toBeInTheDocument();
   });
 

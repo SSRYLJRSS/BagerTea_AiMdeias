@@ -5,9 +5,9 @@
 //! HEVC 全解码比内嵌 JPEG 提取慢一到两个量级，绝不能进入库占位路径。
 //!
 //! 依赖链：heif-rs（Apache-2.0）静态链接 libheif（LGPL-3.0）+ libde265（LGPL-3.0）；
-//! 闭源分发合规要求见 PROGRESS.md 决策日志。
+//! 闭源分发合规要求见 docs/ARCHITECTURE.md。
 
-use image::DynamicImage;
+use image::{DynamicImage, ImageDecoder};
 
 /// 超过该文件大小的 HEIC 拒绝解码（内存保护：heif::decode 需整文件读入）
 const MAX_HEIC_BYTES: u64 = 128 * 1024 * 1024;
@@ -29,6 +29,17 @@ pub fn decode_heic(src: &std::path::Path) -> Option<DynamicImage> {
     }
 }
 
+/// 只解析 HEIF 容器头和主图属性，不解 HEVC 像素。
+pub fn probe_dimensions(src: &std::path::Path) -> Option<(u32, u32)> {
+    let meta = std::fs::metadata(src).ok()?;
+    if !meta.is_file() || meta.len() == 0 || meta.len() > MAX_HEIC_BYTES {
+        return None;
+    }
+    let file = std::fs::File::open(src).ok()?;
+    let decoder = heif::HeifDecoder::new(file).ok()?;
+    Some(decoder.dimensions())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -46,5 +57,26 @@ mod tests {
         std::fs::write(&f, b"this is not a heic file at all").unwrap();
         assert!(decode_heic(&f).is_none());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn probe_real_heic_reads_dimensions() {
+        let sample = std::path::Path::new(r"F:\testdata\S2_formats\common\heic");
+        let Ok(entries) = std::fs::read_dir(sample) else {
+            eprintln!("跳过：HEIC 真机样本目录不存在（{}）", sample.display());
+            return;
+        };
+        let file = entries.filter_map(Result::ok).map(|e| e.path()).find(|p| {
+            p.extension()
+                .and_then(|e| e.to_str())
+                .map(|e| matches!(e.to_ascii_lowercase().as_str(), "heic" | "heif"))
+                .unwrap_or(false)
+        });
+        let Some(file) = file else {
+            eprintln!("跳过：HEIC 真机样本为空");
+            return;
+        };
+        let dims = probe_dimensions(&file).expect("HEIC 容器头应能读出宽高");
+        assert!(dims.0 > 0 && dims.1 > 0);
     }
 }

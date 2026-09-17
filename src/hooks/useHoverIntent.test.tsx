@@ -55,4 +55,17 @@ describe("useHoverIntent", () => {
     act(() => vi.advanceTimersByTime(1000));
     expect(result.current.active).toBe(false);
   });
+
+  it("运行时护栏解除后，停留在目标内也能恢复激活", () => {
+    let allowed = false;
+    const { result } = renderHook(() => useHoverIntent({ enter: 300, canActivate: () => allowed }));
+
+    result.current.triggerProps.onMouseEnter();
+    act(() => vi.advanceTimersByTime(300));
+    expect(result.current.active).toBe(false);
+
+    allowed = true;
+    act(() => vi.advanceTimersByTime(100));
+    expect(result.current.active).toBe(true);
+  });
 });

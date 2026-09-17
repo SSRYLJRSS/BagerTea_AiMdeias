@@ -144,6 +144,8 @@ describe("SuperSearchPage", () => {
     expect(screen.getByRole("region", { name: "条件公式" })).toBeInTheDocument();
     // 结果计数保留在摘要行（U-5 之后「加分项」区标题也含「项」字，计数须为「数字 + 项」形态）
     expect(screen.getByText(/^\d+ 项$/)).toBeInTheDocument();
+    // 新增条件统一从三个区域进入，摘要行不再重复放一个快速添加加号。
+    expect(screen.queryByRole("button", { name: "快速添加条件" })).not.toBeInTheDocument();
   });
 
   function scrollTo(top: number) {
@@ -218,9 +220,9 @@ describe("SuperSearchPage", () => {
       // 中央披露按钮：仅图标（aria-label 驱动查询）
       expect(screen.getByRole("button", { name: "收起详细条件" })).toBeInTheDocument();
       expect(screen.queryByRole("button", { name: "展开详细条件" })).not.toBeInTheDocument();
-      // 按钮位于 max-w-5xl 容器内的独立行（祖先含 mx-auto max-w-5xl）
+      // 按钮位于宽屏内容容器内的独立行
       const btn = screen.getByRole("button", { name: "收起详细条件" });
-      expect(btn.closest(".mx-auto.max-w-5xl")).not.toBeNull();
+      expect(btn.closest(".mx-auto.w-full.max-w-\\[1440px\\]")).not.toBeNull();
       // 行高 24px
       const row = btn.closest(".h-6") as HTMLElement;
       expect(row).not.toBeNull();

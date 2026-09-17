@@ -1,11 +1,11 @@
-/** 入库页（PRD v2.6 编排层；阶段 1 改造）：左侧任务栏 + 右侧拖拽区/清单。
- *  页面只保留结果摘要（当前文件/成功/重复/失败/阶段），不再绘制第二条进度条——
- *  统一进度条由底栏上方任务层（taskStore 驱动）承担。 */
+/** 入库页（PRD v2.6 编排层）：左侧任务栏承载入库进度与操作，右侧为拖拽区/清单。
+ *  进度统一消费 taskStore；同一页的底栏不再重复绘制入库任务。 */
 import { useCallback, useEffect, useState } from "react";
 import clsx from "clsx";
 import { open as pickFiles, open as pickDir } from "@tauri-apps/plugin-dialog";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import Button from "@/components/common/Button";
+import ProgressBar from "@/components/common/ProgressBar";
 import PendingList, { formatSize } from "@/components/import/PendingList";
 import RenameBuilder from "@/components/import/RenameBuilder";
 import { openFileExternal } from "@/api/import";
@@ -13,14 +13,19 @@ import {
   cancelImport,
   importFiles,
   inspectImport,
-  onImportProgress,
   type ImportPlan,
-  type ImportProgress,
 } from "@/api/import";
 import { useLibraryStore } from "@/stores/libraryStore";
 import { useMetadataStore } from "@/stores/metadataStore";
 import { useSettingsStore } from "@/stores/settingsStore";
-import { markImportCancelling } from "@/stores/taskStore";
+import {
+  clearActiveImportTask,
+  importPhaseLabel,
+  latestImportTask,
+  markImportCancelling,
+  useTaskStore,
+  type TaskItem,
+} from "@/stores/taskStore";
 import type { ImportResult } from "@/types/asset";
 
 // 与后端 utils/mime.rs asset_type_from_ext 白名单同步（选择器过滤，拖拽入口由后端扫描过滤）
@@ -49,10 +54,12 @@ export default function ImportPage() {
   const [collection, setCollection] = useState("");
   const [renamePattern, setRenamePattern] = useState("");
   const [dragOver, setDragOver] = useState(false);
-  const [progress, setProgress] = useState<ImportProgress | null>(null);
   const [result, setResult] = useState<ImportResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [running, setRunning] = useState(false);
+  const importTask = useTaskStore((s) => latestImportTask(s.tasks));
+  const activeImportTask = importTask && !importTask.done ? importTask : undefined;
+  const importBusy = running || Boolean(activeImportTask);
 
   useEffect(() => {
     if (!settingsLoaded) void loadSettings();
@@ -61,7 +68,7 @@ export default function ImportPage() {
   /** 选文件/拖文件 → 只生成清单，不入库（PRD v2.4 手动确认）；追加期间保留旧清单 */
   const stage = useCallback(
     async (paths: string[]) => {
-      if (paths.length === 0 || running) return;
+      if (paths.length === 0 || importBusy) return;
       setError(null);
       setResult(null);
       try {
@@ -87,23 +94,8 @@ export default function ImportPage() {
         setError(e instanceof Error ? e.message : String(e));
       }
     },
-    [running],
+    [importBusy],
   );
-
-  // 阶段 1：页面只保留结果摘要（当前文件/计数/阶段），不绘制进度条。
-  // 进度事件仍订阅用于汇总文本；统一进度条由 taskStore/底栏任务层承担。
-  useEffect(() => {
-    let un: (() => void) | undefined;
-    let cancelled = false;
-    onImportProgress(setProgress).then((fn) => {
-      if (cancelled) fn();
-      else un = fn;
-    });
-    return () => {
-      cancelled = true;
-      un?.();
-    };
-  }, []);
 
   // Tauri 原生拖拽（获取真实文件路径）
   useEffect(() => {
@@ -129,7 +121,7 @@ export default function ImportPage() {
   }, [stage]);
 
   const choose = async () => {
-    if (running) return;
+    if (importBusy) return;
     const picked = await pickFiles({ multiple: true, filters: FILE_FILTERS });
     if (Array.isArray(picked)) void stage(picked);
     else if (typeof picked === "string") void stage([picked]);
@@ -137,7 +129,7 @@ export default function ImportPage() {
 
   /** 添加文件夹：目录选择器，同样走 stage(paths) */
   const chooseFolder = async () => {
-    if (running) return;
+    if (importBusy) return;
     const picked = await pickDir({ directory: true, multiple: true });
     if (picked && Array.isArray(picked)) void stage(picked);
     else if (typeof picked === "string") void stage([picked]);
@@ -156,13 +148,13 @@ export default function ImportPage() {
     });
 
   const clearPlan = () => {
-    if (running) return;
+    if (importBusy) return;
     setPlan(null);
   };
 
   /** 手动确认入库 */
   const run = async () => {
-    if (!plan || plan.items.length === 0 || running) return;
+    if (!plan || plan.items.length === 0 || importBusy) return;
     setRunning(true);
     setError(null);
     setResult(null);
@@ -176,10 +168,10 @@ export default function ImportPage() {
       void refreshLibrary();
       void useMetadataStore.getState().refresh();
     } catch (e) {
+      clearActiveImportTask();
       setError(e instanceof Error ? e.message : String(e));
     } finally {
       setRunning(false);
-      setProgress(null);
     }
   };
 
@@ -223,54 +215,40 @@ export default function ImportPage() {
           />
         </div>
 
-        {plan && plan.items.length > 0 && (
-          <div className="mt-auto p-3">
-            {running ? (
-              <Button
-                className="w-full"
-                onClick={() => {
-                  markImportCancelling();
-                  void cancelImport();
-                }}
-              >
-                取消入库
-              </Button>
-            ) : (
-              <>
-                <Button variant="primary" className="w-full" onClick={() => void run()}>
-                  开始入库（{plan.items.length}）
+        <div className="mt-auto border-t border-[var(--color-border)] p-3">
+          {plan && plan.items.length > 0 && (
+            <div className="mb-3">
+              {importBusy ? (
+                <Button
+                  className="w-full"
+                  onClick={() => {
+                    markImportCancelling();
+                    void cancelImport();
+                  }}
+                >
+                  取消入库
                 </Button>
-                <Button className="mt-1 w-full" onClick={clearPlan}>
-                  清空清单
-                </Button>
-              </>
-            )}
-          </div>
-        )}
+              ) : (
+                <>
+                  <Button variant="primary" className="w-full" onClick={() => void run()}>
+                    开始入库（{plan.items.length}）
+                  </Button>
+                  <Button className="mt-1 w-full" onClick={clearPlan}>
+                    清空清单
+                  </Button>
+                </>
+              )}
+            </div>
+          )}
+          <ImportProgressPanel
+            task={running && !activeImportTask ? undefined : importTask}
+            starting={running && !activeImportTask}
+          />
+        </div>
       </aside>
 
-      {/* 右侧：拖拽区 / 清单 + 结果摘要（不绘制进度条） */}
+      {/* 右侧：拖拽区 / 清单 + 失败明细（完成计数只在左侧进度面板展示） */}
       <div className="flex min-w-0 flex-1 flex-col p-6">
-        {/* 结果摘要：当前文件 + 成功/重复/失败 + 阶段（不是进度条） */}
-        {(progress || result) && (
-          <div className="mb-3 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-[var(--color-text-secondary)]">
-            {progress && progress.file && (
-              <span className="truncate text-[var(--color-text)]" title={progress.file}>
-                当前文件：{progress.file}
-              </span>
-            )}
-            {result ? (
-              <span>
-                成功 {result.imported} · 重复 {result.duplicates} · 失败 {result.failed}
-              </span>
-            ) : (
-              <span>
-                成功 {progress?.imported ?? 0} · 重复 {progress?.duplicates ?? 0} · 失败 {progress?.failed ?? 0}
-              </span>
-            )}
-            {progress && progress.message && <span>阶段：{progress.message}</span>}
-          </div>
-        )}
         {/* W5f-f2：导入失败明细 —— 首行摘要 + 可展开全量清单 */}
         {result && result.errors.length > 0 && (
           <div className="mb-3 max-w-lg text-xs text-[var(--color-danger)]">
@@ -279,7 +257,7 @@ export default function ImportPage() {
               onClick={() => setShowImportErrors((v) => !v)}
               className="text-left"
             >
-              失败 {result.errors.length} 个{showImportErrors ? "（收起明细）" : "（展开明细）"}
+              {showImportErrors ? "收起失败明细" : "查看失败明细"}
             </button>
             {showImportErrors && (
               <ul className="mt-1 max-h-40 space-y-0.5 overflow-y-auto rounded-md bg-[var(--color-surface)] p-2">
@@ -290,12 +268,30 @@ export default function ImportPage() {
             )}
           </div>
         )}
+        {result && result.warnings.length > 0 && (
+          <div className="mb-3 max-w-lg text-xs text-[var(--color-status)]">
+            <button
+              type="button"
+              onClick={() => setShowImportErrors((v) => !v)}
+              className="text-left"
+            >
+              {showImportErrors ? "收起扫描警告" : `查看扫描警告（${result.warnings.length}）`}
+            </button>
+            {showImportErrors && (
+              <ul className="mt-1 max-h-40 space-y-0.5 overflow-y-auto rounded-md bg-[var(--color-surface)] p-2">
+                {result.warnings.map((warning, i) => (
+                  <li key={i} className="break-all">{warning}</li>
+                ))}
+              </ul>
+            )}
+          </div>
+        )}
         {error && !running && <p className="mb-3 text-xs text-[var(--color-danger)]">{error}</p>}
 
         {plan && plan.items.length > 0 ? (
           <PendingList
             items={plan.items}
-            running={running}
+            running={importBusy}
             onRemove={removeItem}
             onAddFiles={choose}
             onAddFolder={chooseFolder}
@@ -313,7 +309,7 @@ export default function ImportPage() {
             <p className="text-sm text-[var(--color-text-secondary)]">
               支持文件夹递归，重复文件自动识别；选中后先入清单，手动确认才入库
             </p>
-            {!running && (
+            {!importBusy && (
               <div className="flex gap-2">
                 <Button variant="primary" onClick={choose}>
                   选择文件…
@@ -325,5 +321,57 @@ export default function ImportPage() {
         )}
       </div>
     </div>
+  );
+}
+
+/** 左侧入库进度：阶段、总体百分比、当前文件与真实结果计数都在同一处展示。 */
+function ImportProgressPanel({ task, starting }: { task?: TaskItem; starting: boolean }) {
+  const detail = task?.importProgress;
+  const idle = !task && !starting;
+  const indeterminate = starting || Boolean(task && task.overall == null && !task.done);
+  const percent = task?.overall == null ? null : Math.round(task.overall * 100);
+  const phase = detail ? importPhaseLabel(detail.phase) : "正在准备入库";
+  const phaseText = task?.detail?.startsWith("取消中") ? task.detail : phase;
+  const showResults = detail?.phase === "previewing" || detail?.phase === "done";
+  const phaseProgress =
+    detail?.phase === "scanning"
+      ? `已发现 ${detail.phaseCurrent} 项`
+      : detail?.phaseTotal != null && detail.phaseTotal > 0
+        ? `当前阶段 ${detail.phaseCurrent}/${detail.phaseTotal}`
+        : null;
+  const hasErrors = Boolean(detail && detail.failed > 0);
+  const taskError = task?.error && !hasErrors ? task.error : null;
+
+  return (
+    <section aria-label="入库进度" className="min-w-0" data-state={idle ? "idle" : task?.done ? "done" : "running"}>
+      <div className="flex items-center justify-between gap-2">
+        <h3 className="text-xs font-medium text-[var(--color-text)]">入库进度</h3>
+        <span className={clsx("shrink-0 text-[11px]", hasErrors ? "text-[var(--color-status)]" : "text-[var(--color-text-secondary)]")}>
+          {idle ? "等待入库" : indeterminate || percent == null ? "准备中" : `${percent}%`}
+        </span>
+      </div>
+      <ProgressBar value={task?.overall ?? 0} indeterminate={indeterminate} className="mt-2" />
+      {!idle && (
+        <p className={clsx("mt-2 text-xs", hasErrors ? "text-[var(--color-status)]" : "text-[var(--color-text)]")} aria-live="polite">
+          {phaseText}
+        </p>
+      )}
+      {detail?.file && (
+        <p className="mt-1 truncate text-[11px] text-[var(--color-text-secondary)]" title={detail.file}>
+          {detail.file}
+        </p>
+      )}
+      {phaseProgress && <p className="mt-1 text-[11px] text-[var(--color-text-tertiary)]">{phaseProgress}</p>}
+      {showResults && detail && (
+        <div className="mt-2 flex flex-wrap gap-x-2 gap-y-1 text-[11px] text-[var(--color-text-secondary)]">
+          <span>成功 {detail.imported}</span>
+          <span>重复 {detail.duplicates}</span>
+          <span className={detail.failed > 0 ? "text-[var(--color-danger)]" : undefined}>
+            失败 {detail.failed}
+          </span>
+        </div>
+      )}
+      {taskError && <p className="mt-1 text-[11px] text-[var(--color-status)]">{taskError}</p>}
+    </section>
   );
 }

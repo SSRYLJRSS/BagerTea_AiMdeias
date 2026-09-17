@@ -65,7 +65,7 @@ pub struct Asset {
     pub dominant_hue: Option<i64>,
     pub dominant_sat: Option<i64>,
     pub dominant_lum: Option<i64>,
-    // FB5-05（§7.3）：一句话描述（最多 20 字符；素材字段，不进标签树/统计）。
+    // FB5-05（§7.3）：一句话描述（目标 12–30 字符；素材字段，不进标签树/统计）。
     // 固定追加在 palette 字段之后，避免已有固定列索引错位。
     #[serde(default)]
     pub content_description: String,
@@ -168,6 +168,38 @@ pub fn rescan_palette_colors(conn: &Connection) -> AppResult<i64> {
     Ok(written)
 }
 
+const PRIMARY_COLOR_MIN_RATIO: f64 = 0.10;
+
+fn primary_color_items(conn: &Connection) -> AppResult<Vec<MetadataFacetItem>> {
+    let mut stmt = conn.prepare(
+        "SELECT color_bucket, COUNT(*) AS count
+           FROM (
+             SELECT asset_id, color_bucket
+               FROM asset_palette_colors
+              WHERE rank < 3
+              GROUP BY asset_id, color_bucket
+             HAVING SUM(ratio) >= ?1
+           )
+          GROUP BY color_bucket
+          ORDER BY count DESC, color_bucket",
+    )?;
+    let rows = stmt.query_map([PRIMARY_COLOR_MIN_RATIO], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+    })?;
+    let mut items = Vec::new();
+    for row in rows {
+        let (bucket, count) = row?;
+        if let Some(name) = crate::db::palette_bucket::bucket_name(bucket) {
+            items.push(MetadataFacetItem {
+                value: name.to_string(),
+                label: name.to_string(),
+                count,
+            });
+        }
+    }
+    Ok(items)
+}
+
 /// FB4-03（§5.5）：轻量色板补丁 —— 只同步色板相关字段，不返回文件路径/标签/缩略图等无关字段。
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -186,6 +218,9 @@ pub struct ImportResult {
     pub failed: i64,
     pub duplicates: i64,
     pub errors: Vec<String>,
+    /// 扫描阶段无法读取的路径等非致命警告；不得混入 errors 冒充单文件失败。
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -878,17 +913,10 @@ pub fn list_metadata_facets(
             items: metadata_items(conn, "lower(a.audio_codec)", "upper(a.audio_codec)", "a.audio_codec IS NOT NULL AND trim(a.audio_codec) != ''")?,
         },
         MetadataFacet {
-            key: "hue".into(),
-            display_name: "色调".into(),
-            description: "主导色相分桶（低饱和度判为灰度）".into(),
-            // 红色跨 0°：>=345 或 <15；灰度优先判（sat<=10 时色相无意义）。
-            // 前端点击桶 → bucketToFilter 翻译为 dominant_hue between / dominant_sat lte 条件。
-            items: metadata_items(
-                conn,
-                "CASE WHEN a.dominant_sat <= 10 THEN 'gray' WHEN a.dominant_hue >= 345 OR a.dominant_hue < 15 THEN 'red' WHEN a.dominant_hue < 45 THEN 'orange' WHEN a.dominant_hue < 70 THEN 'yellow' WHEN a.dominant_hue < 155 THEN 'green' WHEN a.dominant_hue < 225 THEN 'cyan' WHEN a.dominant_hue < 295 THEN 'blue' ELSE 'purple' END",
-                "CASE WHEN a.dominant_sat <= 10 THEN '灰度' WHEN a.dominant_hue >= 345 OR a.dominant_hue < 15 THEN '红' WHEN a.dominant_hue < 45 THEN '橙' WHEN a.dominant_hue < 70 THEN '黄' WHEN a.dominant_hue < 155 THEN '绿' WHEN a.dominant_hue < 225 THEN '青' WHEN a.dominant_hue < 295 THEN '蓝' ELSE '紫' END",
-                "a.dominant_hue IS NOT NULL AND a.dominant_sat IS NOT NULL",
-            )?,
+            key: "palette_top3".into(),
+            display_name: "主要颜色".into(),
+            description: "画面前三色中占比至少 10% 的颜色".into(),
+            items: primary_color_items(conn)?,
         },
         MetadataFacet {
             key: "has_location".into(),
@@ -1354,7 +1382,7 @@ pub fn set_phash(conn: &Connection, id: i64, phash: u64) -> AppResult<()> {
     Ok(())
 }
 
-/// FB2-08：写算法色板 + 主导三维度索引列（「按颜色筛选」走这三列，palette_json 只用于渲染色条）。
+/// 写算法色板、主导三维度和多颜色关系索引；同一事务保证色条与颜色筛选同步。
 pub fn set_palette(
     conn: &Connection,
     id: i64,
@@ -1365,11 +1393,31 @@ pub fn set_palette(
     lum: i64,
 ) -> AppResult<()> {
     let now = chrono::Utc::now().timestamp_millis();
-    conn.execute(
+    let segments = parse_palette_json(Some(palette_json.to_string()));
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
         "UPDATE assets SET palette_json=?1, palette_version=?2, palette_scanned_at=?3,
             dominant_hue=?4, dominant_sat=?5, dominant_lum=?6 WHERE id=?7",
         rusqlite::params![palette_json, version, now, hue, sat, lum, id],
     )?;
+    tx.execute("DELETE FROM asset_palette_colors WHERE asset_id=?1", [id])?;
+    if let Some(segments) = segments {
+        let mut stmt = tx.prepare(
+            "INSERT INTO asset_palette_colors (asset_id, rank, color_bucket, ratio)
+             VALUES (?1, ?2, ?3, ?4)",
+        )?;
+        for (rank, segment) in segments.into_iter().enumerate() {
+            let (bucket, _) =
+                crate::db::palette_bucket::bucket_of_rgb(segment.r, segment.g, segment.b);
+            stmt.execute(rusqlite::params![
+                id,
+                rank as i64,
+                bucket,
+                segment.ratio as f64
+            ])?;
+        }
+    }
+    tx.commit()?;
     Ok(())
 }
 
@@ -1638,6 +1686,33 @@ mod tests {
         assert!(v.get("paletteJson").is_none(), "palette_json 不得直接暴露");
     }
 
+    #[test]
+    fn set_palette_keeps_color_index_in_sync() {
+        let c = mem();
+        let id = ins(&c, "/indexed.jpg", "image/jpeg");
+        let json = r##"[{"hex":"#e02020","r":224,"g":32,"b":32,"ratio":0.7},{"hex":"#2030a0","r":32,"g":48,"b":160,"ratio":0.2}]"##;
+        set_palette(&c, id, json, 1, 0, 0, 0).unwrap();
+        let rows: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM asset_palette_colors WHERE asset_id=?1",
+                [id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 2);
+
+        let replacement = r##"[{"hex":"#20c040","r":32,"g":192,"b":64,"ratio":0.8}]"##;
+        set_palette(&c, id, replacement, 1, 0, 0, 0).unwrap();
+        let rows: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM asset_palette_colors WHERE asset_id=?1",
+                [id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 1, "重算后旧色板索引必须被替换");
+    }
+
     /// FX-05：损坏 JSON 不得让查询失败，只降级为 None。
     #[test]
     fn broken_palette_json_degrades_to_none() {
@@ -1858,25 +1933,38 @@ mod tests {
         assert_eq!(a.taken_at, Some(1_710_484_200_000), "空 taken_at 应被补上");
     }
 
-    /// 分面：色相分桶（红色跨 0° 合并 350 与 10；低饱和度判灰度）+ 定位有无计数。
+    /// 分面：前三色按色系合并并应用 10% 门槛；同一素材可进入多个颜色 + 定位计数。
     #[test]
-    fn metadata_facets_include_hue_buckets_and_location() {
+    fn metadata_facets_include_primary_colors_and_location() {
         let c = mem();
         let red_a = ins(&c, "/r1.jpg", "image/jpeg");
         let red_b = ins(&c, "/r2.jpg", "image/jpeg");
         let green = ins(&c, "/g.jpg", "image/jpeg");
-        let gray = ins(&c, "/w.jpg", "image/jpeg");
-        set_palette(&c, red_a, "{}", 1, 350, 80, 50).unwrap();
-        set_palette(&c, red_b, "{}", 1, 10, 80, 50).unwrap(); // 跨 0° 也应归入红色桶
-        set_palette(&c, green, "{}", 1, 120, 80, 50).unwrap();
-        set_palette(&c, gray, "{}", 1, 120, 5, 50).unwrap(); // sat<=10 → 灰度（色相不参与）
+        set_palette(
+            &c,
+            red_a,
+            r##"[{"hex":"#e02020","r":224,"g":32,"b":32,"ratio":0.5},{"hex":"#2030a0","r":32,"g":48,"b":160,"ratio":0.3}]"##,
+            1, 0, 0, 0,
+        ).unwrap();
+        set_palette(
+            &c,
+            red_b,
+            r##"[{"hex":"#e02020","r":224,"g":32,"b":32,"ratio":0.06},{"hex":"#d82828","r":216,"g":40,"b":40,"ratio":0.05}]"##,
+            1, 0, 0, 0,
+        ).unwrap();
+        set_palette(
+            &c,
+            green,
+            r##"[{"hex":"#20c040","r":32,"g":192,"b":64,"ratio":0.09},{"hex":"#e02020","r":224,"g":32,"b":32,"ratio":0.08}]"##,
+            1, 0, 0, 0,
+        ).unwrap();
         set_geo_taken(&c, red_a, Some(30.25), Some(120.16), None).unwrap();
 
         let facets = list_metadata_facets(&c, None).unwrap();
         let hue = facets
             .iter()
-            .find(|f| f.key == "hue")
-            .expect("应有色调分面");
+            .find(|f| f.key == "palette_top3")
+            .expect("应有主要颜色分面");
         let get_count = |v: &str| {
             hue.items
                 .iter()
@@ -1884,9 +1972,9 @@ mod tests {
                 .map(|i| i.count)
                 .unwrap_or(0)
         };
-        assert_eq!(get_count("red"), 2, "350° 与 10° 都应进红色桶");
-        assert_eq!(get_count("green"), 1);
-        assert_eq!(get_count("gray"), 1, "低饱和度应判灰度而非绿色");
+        assert_eq!(get_count("红"), 2, "同色系 6%+5% 合并后应达到门槛");
+        assert_eq!(get_count("天蓝"), 1, "同一素材可以同时进入红、天蓝");
+        assert_eq!(get_count("绿"), 0, "低于 10% 的颜色不应进入分面");
 
         let loc = facets
             .iter()
@@ -1900,7 +1988,7 @@ mod tests {
                 .unwrap_or(0)
         };
         assert_eq!(loc_count("yes"), 1);
-        assert_eq!(loc_count("no"), 3);
+        assert_eq!(loc_count("no"), 2);
     }
 
     /// W1-1（V19）：新列经 INSERT/SELECT 往返不丢值（COLUMNS 位置映射 + from_row 索引 49–52 对齐）。

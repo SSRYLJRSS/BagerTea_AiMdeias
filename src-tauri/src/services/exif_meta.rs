@@ -150,10 +150,12 @@ fn extract_container(path: &Path) -> ExifData {
 /// rawler 轻量识别兜底：get_decoder + raw_metadata 只做容器解析与相机识别，
 /// 不解码像素，成本远低于全解码；失败返回 None 不阻塞入库
 fn raw_fallback(path: &Path) -> Option<ExifData> {
-    let src = rawler::rawsource::RawSource::new(path).ok()?;
-    let decoder = rawler::get_decoder(&src).ok()?;
-    let params = rawler::decoders::RawDecodeParams::default();
-    let meta = decoder.raw_metadata(&src, &params).ok()?;
+    let meta = catch_raw_panics(path, || {
+        let src = rawler::rawsource::RawSource::new(path).ok()?;
+        let decoder = rawler::get_decoder(&src).ok()?;
+        let params = rawler::decoders::RawDecodeParams::default();
+        decoder.raw_metadata(&src, &params).ok()
+    })?;
     let ex = &meta.exif;
     // 镜头名优先取 EXIF 原文（含厂商前缀），其次 rawler 库内描述
     let lens = ex
@@ -200,6 +202,18 @@ fn raw_fallback(path: &Path) -> Option<ExifData> {
         latitude: None,
         longitude: None,
     })
+}
+
+/// rawler 0.7.2 的少数解码器把未实现的分支写成 todo!()，而 raw_metadata()
+/// 不在上游 decode_file 的 panic 边界内。元数据是增强信息，不能让整次入库退出。
+fn catch_raw_panics<T>(path: &Path, f: impl FnOnce() -> Option<T>) -> Option<T> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(value) => value,
+        Err(_) => {
+            tracing::warn!("RAW 元数据兜底解析 panic，已跳过: {}", path.display());
+            None
+        }
+    }
 }
 
 /// 兜底数据只填补空缺字段，不覆盖 kamadak 已读到的值
@@ -312,6 +326,24 @@ mod tests {
         std::fs::write(&f, b"not a real raw file at all").unwrap();
         assert!(raw_fallback(&f).is_none());
         std::fs::remove_file(&f).ok();
+    }
+
+    #[test]
+    fn raw_fallback_panic_is_contained() {
+        let result = catch_raw_panics(std::path::Path::new("panic.x3f"), || -> Option<()> {
+            panic!("not yet implemented")
+        });
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn extract_x3f_no_longer_panics() {
+        let sample = std::path::Path::new(r"F:\testdata\S2_formats\raw\Sigma - DP1 - 3_2.X3F");
+        if !sample.exists() {
+            eprintln!("跳过：X3F 真机样本不存在（{}）", sample.display());
+            return;
+        }
+        let _ = extract(sample);
     }
 
     #[test]

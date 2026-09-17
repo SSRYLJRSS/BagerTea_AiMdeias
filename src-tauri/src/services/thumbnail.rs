@@ -19,6 +19,15 @@ use crate::error::{AppError, AppResult};
 
 pub const PLACEHOLDER_SIZE: u32 = 256;
 pub const HD_SIZE: u32 = 512;
+/// 缩略图解码修复后提升缓存代次，避免继续命中历史纯黑 RAW WebP。
+const IMAGE_HD_CACHE_VERSION: &str = "v2";
+
+/// 判断数据库中的图片高清缓存是否属于当前解码代次。
+pub(crate) fn is_current_image_hd_cache_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with(&format!("_{IMAGE_HD_CACHE_VERSION}.webp")))
+}
 
 /// 通用占位图的三个颜色（`write_generic`）。暖灰底 + 中央色块（视频强调色 / 图片灰）。
 /// 公开是给 FX-13 的取材校验用：色板回算必须能认出"这张图是 UI 占位图而不是素材"。
@@ -112,6 +121,11 @@ impl ThumbnailService {
         self.placeholder_dir.join(format!("{asset_id}.webp"))
     }
 
+    fn image_hd_path(&self, asset_id: i64, size: u32) -> PathBuf {
+        self.hd_dir
+            .join(format!("{asset_id}_{size}_{IMAGE_HD_CACHE_VERSION}.webp"))
+    }
+
     // ── 占位层 ──
 
     /// 提取/生成占位图（永不失败：全链路失败 → 通用类型占位图）。
@@ -144,10 +158,28 @@ impl ThumbnailService {
             false
         };
         if !ok {
-            atomic_generate(&out, |tmp| {
+            tracing::warn!(
+                operation = "thumbnail",
+                asset_id,
+                variant = "placeholder",
+                source = %src.display(),
+                mime_type,
+                reason = "decode_or_write_failed",
+                "缩略图生成失败，降级为通用占位图"
+            );
+            let fallback_ok = atomic_generate(&out, |tmp| {
                 Self::write_generic(tmp, is_video);
                 true
             });
+            if !fallback_ok {
+                tracing::error!(
+                    operation = "thumbnail",
+                    asset_id,
+                    variant = "placeholder",
+                    source = %src.display(),
+                    "通用占位图写入失败"
+                );
+            }
             return (out, None);
         }
         (out, phash_out)
@@ -173,7 +205,7 @@ impl ThumbnailService {
             let out = if asset.mime_type.starts_with("video/") {
                 self.hd_dir.join(format!("{asset_id}_cover.jpg"))
             } else {
-                self.hd_dir.join(format!("{asset_id}_{size}.webp"))
+                self.image_hd_path(asset_id, size)
             };
             (asset, out)
         }; // 此处释放 DB 锁
@@ -219,6 +251,14 @@ impl ThumbnailService {
                 }
                 Ok(out)
             } else {
+                tracing::warn!(
+                    operation = "thumbnail",
+                    asset_id,
+                    variant = "hd",
+                    source = %src.display(),
+                    size,
+                    "高清缩略图生成失败，降级返回占位图"
+                );
                 // 高清生成失败降级返回占位图，保证前端有图可显
                 Ok(self.placeholder_path(asset_id))
             }
@@ -231,11 +271,50 @@ impl ThumbnailService {
     pub fn cleanup_lru(&self, max_mb: i64) -> AppResult<()> {
         let mut entries: Vec<(PathBuf, u64, std::time::SystemTime)> = Vec::new();
         let mut total: u64 = 0;
-        for e in fs::read_dir(&self.hd_dir)?.flatten() {
-            let md = e.metadata()?;
+        let mut skipped = 0u64;
+        for entry in fs::read_dir(&self.hd_dir)? {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(e) => {
+                    skipped += 1;
+                    tracing::warn!(
+                        operation = "thumbnail_cache",
+                        stage = "lru_scan",
+                        error = %e,
+                        "缩略图缓存目录项读取失败"
+                    );
+                    continue;
+                }
+            };
+            let md = match entry.metadata() {
+                Ok(md) => md,
+                Err(e) => {
+                    skipped += 1;
+                    tracing::warn!(
+                        operation = "thumbnail_cache",
+                        stage = "lru_metadata",
+                        path = %entry.path().display(),
+                        error = %e,
+                        "缩略图缓存元数据读取失败"
+                    );
+                    continue;
+                }
+            };
             if md.is_file() {
                 total += md.len();
-                entries.push((e.path(), md.len(), md.modified()?));
+                match md.modified() {
+                    Ok(modified) => entries.push((entry.path(), md.len(), modified)),
+                    Err(e) => {
+                        skipped += 1;
+                        tracing::warn!(
+                            operation = "thumbnail_cache",
+                            stage = "lru_mtime",
+                            path = %entry.path().display(),
+                            error = %e,
+                            "缩略图缓存修改时间读取失败"
+                        );
+                    }
+                }
             }
         }
         let budget = (max_mb.max(0) as u64) * 1024 * 1024;
@@ -243,14 +322,29 @@ impl ThumbnailService {
             return Ok(());
         }
         entries.sort_by_key(|(_, _, mtime)| *mtime);
+        let mut removed = 0u64;
+        let mut remove_failed = 0u64;
         for (path, len, _) in entries {
             if total <= budget {
                 break;
             }
             if fs::remove_file(&path).is_ok() {
                 total -= len;
+                removed += 1;
+            } else {
+                remove_failed += 1;
             }
         }
+        tracing::info!(
+            operation = "thumbnail_cache",
+            stage = "lru_cleanup",
+            removed,
+            remove_failed,
+            skipped,
+            remaining_bytes = total,
+            budget_bytes = budget,
+            "缩略图 LRU 清理完成"
+        );
         Ok(())
     }
 
@@ -396,6 +490,20 @@ mod tests {
         assert!(tmp.extension().is_some());
         assert!(tmp.to_string_lossy().contains("abc123"));
         assert_ne!(tmp, out);
+    }
+
+    #[test]
+    fn image_hd_cache_uses_new_generation_path() {
+        let dir = std::env::temp_dir().join(format!("bg_hd_version_{}", std::process::id()));
+        let svc = ThumbnailService::new(&dir).unwrap();
+        let path = svc.image_hd_path(7, 1024);
+
+        assert_eq!(path.file_name().unwrap(), "7_1024_v2.webp");
+        assert!(is_current_image_hd_cache_path(&path));
+        assert!(!is_current_image_hd_cache_path(Path::new(
+            "thumbnails/hd/7_1024.webp"
+        )));
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

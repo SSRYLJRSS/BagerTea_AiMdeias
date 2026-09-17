@@ -3,9 +3,11 @@ import ReactDOM from "react-dom/client";
 import App from "./App";
 import "./styles/index.css";
 import { markStartup } from "./utils/startupMarks";
+import { installGlobalErrorLogging } from "./utils/logger";
 
 // 启动埋点（指导书 §4.1）：DOM 就绪（脚本为 deferred，模块执行即在 DOMContentLoaded 后）
 markStartup("html_dom_content_loaded");
+installGlobalErrorLogging();
 const root = ReactDOM.createRoot(document.getElementById("root")!);
 root.render(
   <React.StrictMode>

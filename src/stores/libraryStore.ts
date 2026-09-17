@@ -116,6 +116,8 @@ interface LibraryState {
   error: string | null;
   filter: LibraryFilter;
   setFilter: (patch: Partial<LibraryFilter>) => void;
+  /** 删除标签后移除已失效的标签筛选，不主动刷新（调用方可与数据刷新合并） */
+  clearTagFilters: () => void;
   refresh: () => Promise<void>;
   loadMore: () => Promise<void>;
   /** 删除/打标后局部摘除，避免整页重载 */
@@ -184,6 +186,26 @@ export const useLibraryStore = create<LibraryState>((set, get) => ({
     set({ filter: next });
     useSelectionStore.getState().clear(); // B09：筛选变更清空选中，避免跨筛选残留不可见 id
     void get().refresh();
+  },
+
+  clearTagFilters: () => {
+    const prev = get().filter;
+    const unchanged =
+      prev.untaggedOnly === false &&
+      prev.tagId === null &&
+      (prev.facetFilters?.length ?? 0) === 0 &&
+      (prev.excludeTagIds?.length ?? 0) === 0;
+    if (unchanged) return;
+    set({
+      filter: {
+        ...prev,
+        untaggedOnly: false,
+        tagId: null,
+        facetFilters: [],
+        excludeTagIds: [],
+      },
+    });
+    useSelectionStore.getState().clear();
   },
 
   refresh: async () => {

@@ -4,7 +4,7 @@
 //! 关键事实：OllamaSetup.exe 是 Inno Setup 包（免管理员、装到用户目录、装完自动后台运行）；
 //! 静默参数 /VERYSILENT /SUPPRESSMSGBOXES /NORESTART；官方未公布稳定 sha256，用体积+功能复检兜底。
 //!
-//! 改造点（对照 docs/改造方案.md）：
+//! 运行时说明见 docs/OPERATIONS.md：
 //!  - DownloadSource 源注册表（内置 3 源 + 自定义源），替代旧的裸 URL 列表 resolve_sources
 //!  - probe_source：Range 拉真实 1MB 实测 TTFB + 带宽（不是 HEAD）
 //!  - resolve_sources_ordered：preferred 置顶、其余按测速降序作降级兜底、无效 id 回落 auto
@@ -520,6 +520,13 @@ pub fn download<F: Fn(InstallProgress)>(
     if sources.is_empty() {
         return Err(AppError::msg("无可用下载源"));
     }
+    let started = Instant::now();
+    tracing::info!(
+        operation = "ollama_install",
+        stage = "download_start",
+        source_count = sources.len(),
+        "开始下载 Ollama 安装包"
+    );
     log(&format!(
         "开始下载安装包：共 {} 个候选源，按顺序降级尝试",
         sources.len()
@@ -542,7 +549,11 @@ pub fn download<F: Fn(InstallProgress)>(
                         "检测到 .part 由源「{origin_id}」创建、本次首选「{target_id}」，源已切换 → 清空重新下载"
                     ));
                     tracing::info!(
-                        "检测到 .part 由源 {origin_id} 创建、本次首选为 {target_id}，源已切换，清空重下"
+                        operation = "ollama_install",
+                        stage = "resume_source_changed",
+                        origin_source_id = %origin_id,
+                        target_source_id = %target_id,
+                        "检测到续传分片来源变化，清空后重新下载"
                     );
                     let _ = std::fs::remove_file(&part);
                     let _ = std::fs::remove_file(&meta);
@@ -554,8 +565,24 @@ pub fn download<F: Fn(InstallProgress)>(
     let mut last_err = String::new();
     for (idx, src) in sources.iter().enumerate() {
         if cancel.load(Ordering::Relaxed) {
-            return Err(AppError::msg("下载已取消"));
+            tracing::warn!(
+                operation = "ollama_install",
+                stage = "download_cancelled",
+                source_idx = idx,
+                error_code = "CANCELLED",
+                duration_ms = started.elapsed().as_millis() as u64,
+                "Ollama 安装包下载已取消"
+            );
+            return Err(AppError::cancelled("下载已取消"));
         }
+        tracing::debug!(
+            operation = "ollama_install",
+            stage = "source_attempt",
+            source_idx = idx,
+            attempt = idx + 1,
+            source_id = %src.id,
+            "尝试下载源"
+        );
         log(&format!(
             "→ [{}/{}] 尝试源：{}（{}）",
             idx + 1,
@@ -589,6 +616,16 @@ pub fn download<F: Fn(InstallProgress)>(
                     let _ = std::fs::remove_file(&part);
                     let _ = std::fs::remove_file(&meta);
                     last_err = format!("下载不完整（{size}/{total} 字节）");
+                    tracing::warn!(
+                        operation = "ollama_install",
+                        stage = "size_mismatch",
+                        source_idx = idx,
+                        source_id = %src.id,
+                        downloaded_bytes = size,
+                        expected_bytes = total,
+                        error_code = "DOWNLOAD_INCOMPLETE",
+                        "安装包大小校验失败，切换下载源"
+                    );
                     continue;
                 }
                 if size < 50 * 1024 * 1024 {
@@ -603,10 +640,30 @@ pub fn download<F: Fn(InstallProgress)>(
                     let _ = std::fs::remove_file(&part);
                     let _ = std::fs::remove_file(&meta);
                     last_err = format!("安装包异常偏小（{size} 字节），疑似无效响应");
+                    tracing::warn!(
+                        operation = "ollama_install",
+                        stage = "package_too_small",
+                        source_idx = idx,
+                        source_id = %src.id,
+                        downloaded_bytes = size,
+                        minimum_bytes = 50 * 1024 * 1024,
+                        error_code = "INVALID_PACKAGE",
+                        "安装包体积异常，切换下载源"
+                    );
                     continue;
                 }
-                std::fs::rename(&part, dest)
-                    .map_err(|e| AppError::msg(format!("安装包落盘失败: {e}")))?;
+                std::fs::rename(&part, dest).map_err(|e| {
+                    tracing::error!(
+                        operation = "ollama_install",
+                        stage = "persist_failed",
+                        source_idx = idx,
+                        source_id = %src.id,
+                        error_code = "IO",
+                        duration_ms = started.elapsed().as_millis() as u64,
+                        "安装包落盘失败"
+                    );
+                    AppError::msg(format!("安装包落盘失败: {e}"))
+                })?;
                 let _ = std::fs::remove_file(&meta);
                 log(&format!(
                     "✓ [{}/{}] {}：下载完成（{}MB，校验通过），已落盘",
@@ -615,9 +672,30 @@ pub fn download<F: Fn(InstallProgress)>(
                     src.label,
                     size / 1024 / 1024
                 ));
+                tracing::info!(
+                    operation = "ollama_install",
+                    stage = "download_done",
+                    source_idx = idx,
+                    source_id = %src.id,
+                    bytes = size,
+                    duration_ms = started.elapsed().as_millis() as u64,
+                    "Ollama 安装包下载完成"
+                );
                 return Ok(());
             }
             Err(e) => {
+                if e.code() == "CANCELLED" {
+                    tracing::warn!(
+                        operation = "ollama_install",
+                        stage = "download_cancelled",
+                        source_idx = idx,
+                        source_id = %src.id,
+                        error_code = "CANCELLED",
+                        duration_ms = started.elapsed().as_millis() as u64,
+                        "Ollama 安装包下载已取消"
+                    );
+                    return Err(e);
+                }
                 last_err = e.to_string();
                 log(&format!(
                     "✗ [{}/{}] {}：失败（{}），切换下一源",
@@ -626,11 +704,26 @@ pub fn download<F: Fn(InstallProgress)>(
                     src.label,
                     last_err
                 ));
-                tracing::warn!("下载源 {} 失败，尝试下一源: {last_err}", idx);
+                tracing::warn!(
+                    operation = "ollama_install",
+                    stage = "source_failed",
+                    source_idx = idx,
+                    source_id = %src.id,
+                    error_code = e.code(),
+                    "下载源失败，尝试下一源"
+                );
             }
         }
     }
     log(&format!("✗ 所有下载源均失败：{last_err}"));
+    tracing::error!(
+        operation = "ollama_install",
+        stage = "download_failed",
+        source_count = sources.len(),
+        error_code = "DOWNLOAD_FAILED",
+        duration_ms = started.elapsed().as_millis() as u64,
+        "所有 Ollama 下载源均失败"
+    );
     Err(AppError::msg(format!("所有下载源均失败：{last_err}")))
 }
 
@@ -701,7 +794,7 @@ fn download_one<F: Fn(InstallProgress)>(
     let mut buf = [0u8; 64 * 1024];
     loop {
         if cancel.load(Ordering::Relaxed) {
-            return Err(AppError::msg("下载已取消"));
+            return Err(AppError::cancelled("下载已取消"));
         }
         let n = resp
             .read(&mut buf)

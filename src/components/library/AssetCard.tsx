@@ -2,7 +2,7 @@
  *  FB2-01/02（§9）：卡格比例由 appearance.grid.cellAspect 决定（决策 4：一个设置管素材库与入库两页），
  *  缩略图填充方式由 appearance.grid.cellFit 经 resolveFit 解析（cover/contain/smart，绝不拉伸）。
  *  FB3-01（§3.2）：色条恒定槽位——开关打开时卡片永远预留色条高度（与 rowHeight 同用 HEIGHT_PX），
- *  palette 未到达渲染空槽；hover 只允许边框/文件名透明度变化（§3.3）；双击进入 Viewer。 */
+ *  palette 未到达渲染空槽；视频 hover 仅在卡片内受控播放短片段；双击进入 Viewer。 */
 import { memo, useCallback, useContext, useMemo } from "react";
 import clsx from "clsx";
 import Thumbnail from "./Thumbnail";
@@ -81,10 +81,13 @@ export default memo(function AssetCard({ asset, index, selected, thumbSize, onSe
   const containerAspect = cw / ch;
   const fit = resolveFit(grid.cellFit, contentAspect, containerAspect);
 
-  // FB2-03：视频 hover 原位预览。滚动抑制窗内不激活（用函数而非布尔传 context，
-  // 避免 re-render；只在 hover 触发那一刻读一次）。设置可关。
-  const previewEnabled = isVideo && hoverPreview.enabled && hoverPreview.inLibraryGrid && !isScrolling();
-  const { active: hoverActive, triggerProps } = useHoverIntent({ disabled: !previewEnabled });
+  // FB2-03：视频 hover 原位预览。滚动抑制通过动态护栏读取，不能把 ref
+  // 在 render 时快照成过期布尔值，否则滚动结束后指针停在卡片上也不会恢复。
+  const previewEnabled = isVideo && hoverPreview.enabled && hoverPreview.inLibraryGrid;
+  const { active: hoverActive, triggerProps } = useHoverIntent({
+    disabled: !previewEnabled,
+    canActivate: () => !isScrolling(),
+  });
   // 只在 intent 激活（enter 300ms 后）出现
   const showVideoLayer = isVideo && previewEnabled && hoverActive;
 

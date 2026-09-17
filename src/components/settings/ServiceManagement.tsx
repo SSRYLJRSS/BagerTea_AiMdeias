@@ -53,7 +53,7 @@ export default function ServiceManagement({ draft, onPatchAi, onPatchSettings, n
         <p className="text-[11px] leading-4 text-[var(--color-text-secondary)]">
           {deployment === "cloud"
             ? "通过在线服务分析素材；素材会按所选服务发送。服务配置只在这里维护。"
-            : "仅在本机处理，不会上传素材。可一键安装引擎、拉取模型，并管理本机服务。"}
+            : "仅在本机处理，不会上传素材。可安装引擎、下载模型，并管理本机服务。"}
         </p>
       </div>
 

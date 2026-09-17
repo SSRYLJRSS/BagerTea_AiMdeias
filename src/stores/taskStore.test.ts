@@ -1,9 +1,18 @@
-import { beforeEach, describe, expect, it } from "vitest";
-import { useTaskStore, importOverall, upsertImport } from "@/stores/taskStore";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  useTaskStore,
+  importOverall,
+  upsertImport,
+  clearActiveImportTask,
+} from "@/stores/taskStore";
 import type { ImportProgress } from "@/api/import";
 
 beforeEach(() => {
   useTaskStore.setState({ tasks: [] });
+});
+
+afterEach(() => {
+  vi.useRealTimers();
 });
 
 function ev(partial: Partial<ImportProgress>): ImportProgress {
@@ -59,6 +68,15 @@ describe("全局任务条（taskStore）", () => {
     expect(tasks).toHaveLength(1);
     expect(tasks[0].id).toBe("t1");
     expect(tasks[0].overall).toBeCloseTo(0.05 + 0.25 * 0.1, 5);
+    expect(tasks[0].importProgress).toEqual({
+      phase: "hashing",
+      phaseCurrent: 10,
+      phaseTotal: 100,
+      file: undefined,
+      imported: 0,
+      duplicates: 0,
+      failed: 0,
+    });
   });
 
   it("旧 taskId 事件不会污染新任务", () => {
@@ -77,6 +95,30 @@ describe("全局任务条（taskStore）", () => {
     const task = useTaskStore.getState().tasks.find((t) => t.id === "t1")!;
     expect(task.error).toContain("失败 2");
     expect(task.done).toBe(true);
+  });
+
+  it("命令级失败时清理未完成入库任务，不留占位任务", () => {
+    upsertImport(ev({ phase: "processing", phaseCurrent: 80, phaseTotal: 100 }));
+    expect(useTaskStore.getState().tasks).toHaveLength(1);
+
+    clearActiveImportTask();
+
+    expect(useTaskStore.getState().tasks).toHaveLength(0);
+  });
+
+  it("完成入库保留最终进度，下一次新任务开始才替换", () => {
+    vi.useFakeTimers();
+    upsertImport(ev({ phase: "done", phaseCurrent: 100, phaseTotal: 100, imported: 96, duplicates: 3, failed: 1 }));
+    vi.advanceTimersByTime(10_000);
+
+    expect(useTaskStore.getState().tasks).toHaveLength(1);
+    expect(useTaskStore.getState().tasks[0].done).toBe(true);
+
+    upsertImport(ev({ taskId: "t2", phase: "queued", phaseCurrent: 0, phaseTotal: null }));
+    const tasks = useTaskStore.getState().tasks;
+    expect(tasks).toHaveLength(1);
+    expect(tasks[0].id).toBe("t2");
+    expect(tasks[0].done).toBe(false);
   });
 
   it("阶段切换不倒退（任务条整体进度单调不减）", () => {

@@ -28,18 +28,16 @@ export interface AiSettings {
   videoTaggingMode: "cover" | "frames";
   /** FB2-07：frames 模式抽帧数（2~8） */
   videoFrameCount: number;
+  /** 在线服务每轮处理数量（10~50） */
   batchLimit: number;
+  /** 本机服务每轮处理数量（1~20） */
+  localBatchLimit?: number;
   /** AI 打标提示词覆盖（空 = 用内置默认） */
   systemPromptTagging: string;
   /** 超级搜索提示词覆盖（空 = 用内置默认） */
   systemPromptSearch: string;
   /** 一键安装的下载源偏好（"auto" = 测速选最快；旧数据缺省视为 auto） */
   ollamaSourceId: string;
-  // ── A4 置信度策略（与 Rust AiSettings 逐字对应；缺省 = 指导书默认）──
-  /** 精确命中词表 canonical/synonym → 自动接收（写 asset_tags，review_state='ai_unreviewed'） */
-  autoAcceptExactTerms: boolean;
-  /** AI 直接向词表添加新标签（显式开关，默认关 —— 新词走「新词待确认」逐个采纳） */
-  autoAdoptNewTerms: boolean;
   /** AI 建议最低置信度阈值：confidence < 此值不入库（连 pending 都不进）；默认 0.30 */
   confidenceMinSuggest: number;
 }
@@ -64,6 +62,8 @@ export interface CustomSource {
 export interface Settings {
   ai: AiSettings;
   theme: "system" | "light" | "dark";
+  /** 文件日志级别；默认 info，排障时可临时切到 debug/trace */
+  logLevel: "info" | "debug" | "trace";
   thumbnailCacheMb: number;
   /** 标签分类（已弃用）：仅作迁移输入，后端不再序列化 */
   tagCategories: TagCategory[];

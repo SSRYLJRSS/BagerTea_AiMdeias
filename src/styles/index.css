@@ -96,6 +96,11 @@ button:disabled {
   background: var(--color-status);
 }
 
+/* 标签与文件属性的连续列表使用整行高亮，避免相邻条目堆叠成一串圆角胶囊。 */
+.ui-nav-list-item {
+  border-radius: 0;
+}
+
 .ui-control {
   border: 1px solid var(--color-border);
   border-radius: var(--radius-control);

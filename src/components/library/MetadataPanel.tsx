@@ -45,7 +45,11 @@ function selectedToFilters(selected: Map<string, string[]>): MetadataFilter[] {
     // 数值型离散分面（iso/aperture/focal/resolution）：后端已支持 `in` 且接受数字（P0-2），
     // 把多个选中值合并为一条 `in`，值为数字。W0-1：resolution 的展示值是 "1920x1080"，
     // 必须经 bucketToFilter 换算成像素乘积，直接 Number(label) 会得到 NaN → 整次查询被拒。
-    if (isDiscreteEq && ["iso", "aperture", "focal", "resolution"].includes(first.key)) {
+    if (key === "palette_top3") {
+      out.push(values.length === 1
+        ? { key: "palette_top3", op: "eq", value: values[0], min: 0.1 }
+        : { key: "palette_top3", op: "in", values: [...values], min: 0.1 });
+    } else if (isDiscreteEq && ["iso", "aperture", "focal", "resolution"].includes(first.key)) {
       const nums = values
         .map((v) => bucketToFilter(key, v))
         .filter((f): f is NonNullable<typeof f> => f !== null && f.op === "eq")
@@ -70,7 +74,8 @@ export default function MetadataPanel() {
   const { filter, setFilter } = useLibraryStore(
     useShallow((s) => ({ filter: s.filter, setFilter: s.setFilter })),
   );
-  const [collapsed, setCollapsed] = useState<ReadonlySet<string>>(new Set());
+  // null 表示尚无用户操作：当前加载出的全部分组默认收起。
+  const [collapsed, setCollapsed] = useState<ReadonlySet<string> | null>(null);
 
   useEffect(() => {
     if (!loaded && !loading) void refresh();
@@ -107,10 +112,15 @@ export default function MetadataPanel() {
   };
 
   const visibleFacets = useMemo(() => facets.filter((facet) => facet.items.length > 0), [facets]);
-  const allCollapsed = visibleFacets.length > 0 && visibleFacets.every((facet) => collapsed.has(facet.key));
+  const defaultCollapsed = useMemo(
+    () => new Set(visibleFacets.map((facet) => facet.key)),
+    [visibleFacets],
+  );
+  const collapsedKeys = collapsed ?? defaultCollapsed;
+  const allCollapsed = visibleFacets.length > 0 && visibleFacets.every((facet) => collapsedKeys.has(facet.key));
   const toggleGroup = (key: string) => {
     setCollapsed((current) => {
-      const next = new Set(current);
+      const next = new Set(current ?? defaultCollapsed);
       if (next.has(key)) next.delete(key);
       else next.add(key);
       return next;
@@ -133,10 +143,10 @@ export default function MetadataPanel() {
   }
 
   return (
-    <div className="flex flex-col pb-3 text-sm">
+    <div className="flex flex-col py-1 text-sm">
       {/* FB6 需求四：统一标题行——左「文件属性」标题、右「全部展开/全部收起」。
           折叠状态由本面板自持，不与智能标签（tagStore.expanded）共用。 */}
-      <div className="flex min-h-8 items-center justify-between px-2 pt-1">
+      <div className="flex min-h-8 items-center justify-between px-2">
         <h4 className="text-[11px] font-semibold text-[var(--color-text)]">文件属性</h4>
         <button
           type="button"
@@ -149,29 +159,26 @@ export default function MetadataPanel() {
         </button>
       </div>
       {visibleFacets.map((facet) => {
-        const isRange = ["file_size", "duration", "resolution", "taken_month", "hue"].includes(facet.key);
+        const isRange = ["file_size", "duration", "resolution", "taken_month"].includes(facet.key);
         return (
         <section key={facet.key} className="pt-2">
           <button
             type="button"
             onClick={() => toggleGroup(facet.key)}
             className="flex w-full items-center justify-between px-2 pb-1 text-left"
-            aria-expanded={!collapsed.has(facet.key)}
+            aria-expanded={!collapsedKeys.has(facet.key)}
           >
-            <span>
-              <span className="block text-[11px] font-semibold text-[var(--color-text)]">{facet.displayName}</span>
-              <span className="mt-0.5 block text-[10px] text-[var(--color-text-tertiary)]">{facet.description}</span>
-            </span>
+            <span className="block text-[11px] font-semibold text-[var(--color-text)]">{facet.displayName}</span>
             <span className="ml-2 flex items-center gap-1.5 text-xs text-[var(--color-text-tertiary)]">
               {(selected.get(facet.key) ?? []).length ? (
                 <span className="rounded-full bg-[var(--color-status-soft)] px-1.5 py-0.5 text-[9px] text-[var(--color-status)]">
                   {(selected.get(facet.key) ?? []).length}
                 </span>
               ) : null}
-              {collapsed.has(facet.key) ? "▸" : "▾"}
+              {collapsedKeys.has(facet.key) ? "▸" : "▾"}
             </span>
           </button>
-          {!collapsed.has(facet.key) && <div className="flex flex-col gap-0.5">
+          {!collapsedKeys.has(facet.key) && <div className="flex flex-col gap-0.5">
             {facet.items.map((item) => {
               const active = (selected.get(facet.key) ?? []).includes(item.value);
               return (
@@ -181,7 +188,7 @@ export default function MetadataPanel() {
                   data-active={active}
                   title={item.label}
                   className={clsx(
-                    "ui-nav-item flex min-h-8 items-center justify-between px-2 py-1.5 text-left text-[var(--color-text-secondary)] transition-colors",
+                    "ui-nav-item ui-nav-list-item flex min-h-8 items-center justify-between px-2 py-1.5 text-left text-[var(--color-text-secondary)] transition-colors",
                     "hover:bg-[var(--color-surface)] hover:text-[var(--color-text)]",
                   )}
                 >

@@ -3,6 +3,7 @@
  *  代理未就绪期间静默保持封面（hover 预览不值得弹 loading，§12.5）。
  *  回归护栏：只渲染 absolute inset-0 <video>，不制造 fixed 浮层，不新增 requestThumbnail（§12.3）。 */
 import { memo, useCallback, useEffect, useRef, useState } from "react";
+import clsx from "clsx";
 import { toFileUrl } from "@/api/thumbnail";
 import { ensureVideoProxy, toProxyFileUrl } from "@/api/video";
 import { useHoverPreviewPlayback } from "@/hooks/useHoverPreviewPlayback";
@@ -18,7 +19,14 @@ export default memo(function AssetCardVideoLayer({ asset, previewSeconds }: Asse
   const videoRef = useRef<HTMLVideoElement | null>(null);
   // 初始用原文件 URL；播放失败（常见 HEVC/不兼容编码）→ 换 H.264 代理（每张只尝试一次）
   const [src, setSrc] = useState<string>(() => toFileUrl(asset.filePath));
+  const [failed, setFailed] = useState(false);
   const proxyAttempted = useRef(false);
+
+  useEffect(() => {
+    proxyAttempted.current = false;
+    setFailed(false);
+    setSrc(toFileUrl(asset.filePath));
+  }, [asset.id, asset.filePath]);
 
   // 挂载即抢占全局唯一位；卸载让出
   useEffect(() => {
@@ -26,12 +34,16 @@ export default memo(function AssetCardVideoLayer({ asset, previewSeconds }: Asse
   }, [asset.id]);
 
   const onFail = useCallback(() => {
+    setFailed(true);
     if (proxyAttempted.current) return;
     proxyAttempted.current = true;
     void ensureVideoProxy(asset.id, "h264_mp4").then((p) => {
-      if (p.status === "ready" && p.path) setSrc(toProxyFileUrl(p.path));
+      if (p.status === "ready" && p.path) {
+        setSrc(toProxyFileUrl(p.path));
+        setFailed(false);
+      }
       // 未就绪：静默保持封面（不弹加载态，见 §12.5）
-    });
+    }).catch(() => undefined);
   }, [asset.id]);
 
   useHoverPreviewPlayback(videoRef, { previewSeconds, onFailed: onFail });
@@ -40,10 +52,17 @@ export default memo(function AssetCardVideoLayer({ asset, previewSeconds }: Asse
     <video
       ref={videoRef}
       src={src}
+      autoPlay
       muted
       playsInline
       preload="metadata"
-      className="absolute inset-0 h-full w-full object-cover"
+      aria-hidden="true"
+      onError={() => setFailed(true)}
+      onCanPlay={() => setFailed(false)}
+      className={clsx(
+        "absolute inset-0 h-full w-full object-cover transition-opacity duration-100",
+        failed && "pointer-events-none opacity-0",
+      )}
     />
   );
 });

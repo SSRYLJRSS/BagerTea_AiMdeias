@@ -1,7 +1,7 @@
 /** 批量改名构造器（PRD v2.6）：占位符按钮点选拼装，替代手输模板
  *  逻辑：点击 token 追加到末尾并高亮；再点取消；顺序 = 点击顺序，以 "_" 拼接
  */
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import clsx from "clsx";
 import { renderNamePreview } from "@/api/import";
 
@@ -44,8 +44,8 @@ interface RenameBuilderProps {
 }
 
 export default function RenameBuilder({ value, onChange, disabled, collection, sampleStem, sampleExt }: RenameBuilderProps) {
-  const [selected, setSelected] = useState<string[]>(() => parsePattern(value)[0]);
-  const [seqDigits, setSeqDigits] = useState<string>(() => parsePattern(value)[1]);
+  // 完全受控：父级重置或替换模板时，按钮态、位数和预览必须同帧跟随。
+  const [selected, seqDigits] = useMemo(() => parsePattern(value), [value]);
   const [preview, setPreview] = useState("");
 
   /** SEQ 占位符按位数展开为真实 token */
@@ -53,12 +53,6 @@ export default function RenameBuilder({ value, onChange, disabled, collection, s
     sel.map((id) => (id === "SEQ" ? (digits.trim() ? `{序号:${digits.trim()}}` : "{序号}") : id));
 
   const emit = (sel: string[], digits: string) => onChange(expand(sel, digits).join("_"));
-
-  // 外部清空（如切换场景）时同步按钮态；仅初始化/外部清空时触发
-  useEffect(() => {
-    if (!value.trim() && selected.length > 0) setSelected([]);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [value]);
 
   // 实时预览：后端 preview_rename 单一事实源（异步，cancelled 防竞态）
   useEffect(() => {
@@ -73,23 +67,19 @@ export default function RenameBuilder({ value, onChange, disabled, collection, s
     return () => {
       cancelled = true;
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selected, seqDigits, collection, sampleStem]);
 
   const toggle = (id: string) => {
     const next = selected.includes(id) ? selected.filter((t) => t !== id) : [...selected, id];
-    setSelected(next);
     emit(next, seqDigits);
   };
 
   const changeDigits = (v: string) => {
     const digits = v.replace(/[^1-9]/g, "").slice(0, 1); // 1-9 一位
-    setSeqDigits(digits);
     if (selected.includes("SEQ")) emit(selected, digits);
   };
 
   const clear = () => {
-    setSelected([]);
     onChange("");
   };
 

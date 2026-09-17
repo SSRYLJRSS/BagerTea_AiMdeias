@@ -16,8 +16,7 @@ import { useSettingsStore } from "@/stores/settingsStore";
 import { trashRestore } from "@/api/assets";
 
 interface GridToolbarProps {
-  onAiTag: () => void;
-  onAssignTags: () => void;
+  onTag: () => void;
   onExport: () => void;
   onMove: () => void;
   onDelete: () => void;
@@ -45,7 +44,7 @@ const SIZE_STEPS = [
   { step: 5, label: "大", Icon: Square, title: "格子大" },
 ];
 
-export default function GridToolbar({ onAiTag, onAssignTags, onExport, onMove, onDelete, onDedup, onPurge }: GridToolbarProps) {
+export default function GridToolbar({ onTag, onExport, onMove, onDelete, onDedup, onPurge }: GridToolbarProps) {
   const { setFilter, total, sortBy, sortDir, trashOnly, removeLocal } = useLibraryStore(
     useShallow((s) => ({
       setFilter: s.setFilter,
@@ -86,10 +85,9 @@ export default function GridToolbar({ onAiTag, onAssignTags, onExport, onMove, o
   };
 
   return (
-    <div className="flex h-11 shrink-0 items-center gap-3 border-b border-[var(--color-border)] px-3">
+    <div data-testid="grid-toolbar" className="flex h-11 shrink-0 items-center gap-3 border-b border-[var(--color-border)] px-3">
       {/* 设置入口已移至顶部标题栏（指导书 §10.1），此处移除避免重复入口与导航状态分叉 */}
       <SearchInput onSearch={(kw) => setFilter({ search: kw })} />
-      <SelectedFilterTags />
 
       {trashOnly ? (
         /* R-22 回收站操作条：恢复 / 彻底删除 */
@@ -112,10 +110,17 @@ export default function GridToolbar({ onAiTag, onAssignTags, onExport, onMove, o
           </span>
         )
       ) : (
-        <>
-          <ContextActionBar onAiTag={onAiTag} onAssignTags={onAssignTags} onExport={onExport} onMove={onMove} onDelete={onDelete} />
-          {/* W0-7：恢复去重入口（dedup_scan + DupDialog 已交付但此前不可达）。hash 重复组为 0 时显示「没有重复」是正确结果 */}
-          {onDedup && (
+        <ContextActionBar onTag={onTag} onExport={onExport} onMove={onMove} onDelete={onDelete} />
+      )}
+
+      <div data-testid="toolbar-filters" className="min-w-0 flex-1 overflow-hidden">
+        <SelectedFilterTags />
+      </div>
+
+      <div data-testid="toolbar-actions" className="flex shrink-0 items-center gap-3">
+        {!trashOnly && (
+          /* W0-7：恢复去重入口（dedup_scan + DupDialog 已交付但此前不可达）。hash 重复组为 0 时显示「没有重复」是正确结果 */
+          onDedup && (
             <button
               type="button"
               onClick={onDedup}
@@ -124,9 +129,10 @@ export default function GridToolbar({ onAiTag, onAssignTags, onExport, onMove, o
             >
               查找重复
             </button>
-          )}
-          {/* R-21 排序下拉 + 方向切换 */}
-          <div className="flex shrink-0 items-center gap-0.5">
+          )
+        )}
+        {!trashOnly && (
+          <div className="flex items-center gap-0.5">
             <select
               value={sortBy}
               onChange={(e) => setFilter({ sortBy: e.target.value as typeof sortBy })}
@@ -145,33 +151,33 @@ export default function GridToolbar({ onAiTag, onAssignTags, onExport, onMove, o
               {sortDir === "desc" ? "↓" : "↑"}
             </button>
           </div>
-        </>
-      )}
+        )}
 
-      {/* FB2-01 可发现入口：三态大小（小/中/大） */}
-      <div className="flex shrink-0 items-center overflow-hidden rounded-md border border-[var(--color-border)]">
-        {SIZE_STEPS.map(({ step, label, Icon, title }) => (
-          <button
-            key={step}
-            type="button"
-            onClick={() => setSizeStep(step)}
-            aria-label={label}
-            aria-pressed={grid.libraryCellStep === step}
-            title={title}
-            data-active={grid.libraryCellStep === step}
-            className={clsx(
-              "flex h-6 w-7 items-center justify-center text-[var(--color-text-secondary)] transition-colors",
-              grid.libraryCellStep === step
-                ? "bg-[var(--color-accent)] text-[var(--color-accent-text)]"
-                : "hover:bg-[var(--color-surface-hover)] hover:text-[var(--color-text)]",
-            )}
-          >
-            <Icon className="h-3.5 w-3.5" aria-hidden />
-          </button>
-        ))}
+        <span className="shrink-0 text-xs text-[var(--color-text-secondary)]">{total} 项</span>
+
+        {/* FB2-01 可发现入口：三态大小（小/中/大） */}
+        <div className="flex shrink-0 items-center overflow-hidden rounded-md border border-[var(--color-border)]">
+          {SIZE_STEPS.map(({ step, label, Icon, title }) => (
+            <button
+              key={step}
+              type="button"
+              onClick={() => setSizeStep(step)}
+              aria-label={label}
+              aria-pressed={grid.libraryCellStep === step}
+              title={title}
+              data-active={grid.libraryCellStep === step}
+              className={clsx(
+                "flex h-6 w-7 items-center justify-center text-[var(--color-text-secondary)] transition-colors",
+                grid.libraryCellStep === step
+                  ? "bg-[var(--color-accent)] text-[var(--color-accent-text)]"
+                  : "hover:bg-[var(--color-surface-hover)] hover:text-[var(--color-text)]",
+              )}
+            >
+              <Icon className="h-3.5 w-3.5" aria-hidden />
+            </button>
+          ))}
+        </div>
       </div>
-
-      <span className="ml-auto shrink-0 text-xs text-[var(--color-text-secondary)]">{total} 项</span>
     </div>
   );
 }

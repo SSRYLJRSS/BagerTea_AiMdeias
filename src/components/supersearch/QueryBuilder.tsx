@@ -1,10 +1,9 @@
-/** 飞书式条件公式构建器：三区竖排，每区 = 一个根「条件组」，组内可嵌套子条件组。
- *  2026-09-06 改造（docs/review/超级搜索条件组前端UI改造方案）：
- *  - 视图模型 = 递归组/叶子（VGroup/VLeaf），与 QueryExpr 树递归互转，
- *    任何 AI 产出或历史持久化的树都能 100% 还原成可编辑结构（不再有「复杂条件只读」降级）。
+/** 搜索条件构建器：三区共用同一套编辑行；宽屏并列、窄屏通过页签切换。
+ *  当前契约见 docs/contracts/search-plan-v3.md：
+ *  - 页面只提供三个平铺条件区。QueryExpr 仍是后端执行事实源，AI/历史产生的嵌套树
+ *    保留在本地模型中，前端按叶子路径编辑，避免 UI 简化时改变搜索语义。
  *  - 连接词分段控件：必须区三态（全部满足 / 满足任一 / 至少N项），排除区两态。
  *  - 「至少N项」编译为 minMatch 语义：N=1 → OR、N=全部 → AND、中间 → 组合展开（上限内）。
- *  - NOT(组) 无组级取反开关，渲染为「整组取反」角标卡片（组内仍可编辑）。
  *  - FB5-05（§9.8）：已有非空 tagId 优先 tagStore options，找不到再从 resolvedTags 注入
  *    synthetic option，两边都找不到时显示「标签 #id」，绝不退回「选择标签」。 */
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -30,20 +29,19 @@ import {
 } from "@/utils/dateShortcuts";
 
 type FieldKey = "search" | "tag" | "excludeTag" | "assetType" | "untagged" | "facetHasAny" | "facetMissing" | MetadataFilterKey | `facet:${string}`;
+type SearchZone = "filter" | "should" | "mustNot";
 /** V24（Phase 7-8）：数值分面字段 key 前缀（domain key = facet:<facet_key>） */
 const FACET_FIELD_PREFIX = "facet:";
 type FlatTag = { id: number; name: string; facet: string; aliases: string[] };
 type TagCondData = { facetKey: string; tagIds: number[]; mode: "any" | "all"; includeDescendants: boolean; termQuery: string | null; termMatch: TermMatchKey };
-type FieldOption = { key: FieldKey; label: string; group: "关键词" | "标签" | "素材" | "颜色" | "定位" | "时间" | "拍摄设备" | "视频" | "数值分面"; kind?: "number" | "text" | "date" | "size" | "duration" | "resolution"; ops?: MetadataOp[] };
+type FieldOption = { key: FieldKey; label: string; group: "关键词" | "标签" | "素材" | "颜色" | "定位" | "时间" | "拍摄设备" | "视频" | "数值分面"; kind?: "number" | "text" | "date" | "size" | "duration"; ops?: MetadataOp[]; visible?: boolean };
 
-// ═════════ 递归条件组视图模型（区 = 根条件组；expr 树仍是唯一持久化事实源）═════════
-/** 组连接词：全部满足（且）/ 满足任一（或）/ 至少 N 项（minMatch，编译时展开）。 */
+// ═════════ 三栏平铺视图模型（QueryExpr 仍是唯一持久化/执行事实源）═════════
+/** 根区连接词：全部满足（且）/ 满足任一（或）/ 至少 N 项（minMatch，编译时展开）。 */
 type VGroupOp = "and" | "or" | "minMatch";
 type VLeaf = { kind: "leaf"; id: string; negated: boolean; cond: LeafCond };
-type VGroup = { kind: "group"; id: string; op: VGroupOp; min: number; /** NOT(组)：无组级取反开关，渲染「整组取反」角标 */ groupNegated?: boolean; /** P3：子组折叠收起（仅视图状态，expr 不存） */ collapsed?: boolean; items: VNode[] };
+type VGroup = { kind: "group"; id: string; op: VGroupOp; min: number; /** 兼容 AI/历史 AST 的组级取反标记，不提供手动入口 */ groupNegated?: boolean; items: VNode[] };
 type VNode = VLeaf | VGroup;
-/** 嵌套深度软上限（根组 = 1 层）：后端不限制，仅 UI 收敛。 */
-const MAX_GROUP_DEPTH = 3;
 /** minMatch 组合展开上限：C(n,k) 超过则禁用该 N 档（UI 收敛，避免组合爆炸）。 */
 const MAX_MIN_COMBOS = 128;
 
@@ -54,23 +52,30 @@ const DATE_OPS: MetadataOp[] = ["gte", "lte", "between"];
 const FIELD_OPTIONS: FieldOption[] = [
   { key: "search", label: "关键词", group: "关键词" },
   { key: "tag", label: "包含标签", group: "标签" }, { key: "excludeTag", label: "排除标签", group: "标签" }, { key: "untagged", label: "未打标", group: "标签" },
-  // W3-3d：分面有任意/没有标签（W2-7 对应；「有主体没有场景」类补漏筛选）
-  { key: "facetHasAny", label: "分类有任意标签", group: "标签" }, { key: "facetMissing", label: "分类没有标签", group: "标签" },
-  { key: "assetType", label: "素材类型", group: "素材" }, { key: "file_ext", label: "文件格式", group: "素材", kind: "text", ops: ENUM_OPS }, { key: "mime_type", label: "MIME 类型", group: "素材", kind: "text", ops: ENUM_OPS }, { key: "file_size", label: "文件大小", group: "素材", kind: "size", ops: NUMERIC_OPS }, { key: "width", label: "宽度", group: "素材", kind: "number", ops: NUMERIC_OPS }, { key: "height", label: "高度", group: "素材", kind: "number", ops: NUMERIC_OPS }, { key: "resolution", label: "分辨率", group: "素材", kind: "resolution", ops: NUMERIC_OPS }, { key: "aspect_ratio", label: "宽高比", group: "素材", kind: "number", ops: NUMERIC_OPS },
+  // W3-3d：保留协议和历史/AI 执行能力，但不把抽象的分面存在性条件放进普通字段入口。
+  { key: "facetHasAny", label: "分类有任意标签", group: "标签", visible: false }, { key: "facetMissing", label: "分类没有标签", group: "标签", visible: false },
+  { key: "assetType", label: "素材类型", group: "素材" }, { key: "file_ext", label: "文件格式", group: "素材", kind: "text", ops: ENUM_OPS },
+  // MIME 是内部文件识别属性，不是普通用户的筛选语言；保留隐藏项以兼容旧计划和 AI 生成的条件。
+  { key: "mime_type", label: "MIME 类型", group: "素材", kind: "text", ops: ENUM_OPS, visible: false }, { key: "file_size", label: "文件大小", group: "素材", kind: "size", ops: NUMERIC_OPS }, { key: "width", label: "宽度", group: "素材", kind: "number", ops: NUMERIC_OPS }, { key: "height", label: "高度", group: "素材", kind: "number", ops: NUMERIC_OPS },
+  // 后端仍保留 resolution（总像素数）供历史/AI 条件执行，但不在手动字段列表中展示，避免把“像素总量”误认为宽×高输入。
+  { key: "resolution", label: "像素总量", group: "素材", kind: "number", ops: NUMERIC_OPS, visible: false }, { key: "aspect_ratio", label: "宽高比", group: "素材", kind: "number", ops: NUMERIC_OPS },
   { key: "taken_at", label: "拍摄时间", group: "时间", kind: "date", ops: DATE_OPS }, { key: "created_at", label: "入库时间", group: "时间", kind: "date", ops: DATE_OPS }, { key: "modified_at", label: "修改时间", group: "时间", kind: "date", ops: DATE_OPS },
-  { key: "camera", label: "相机", group: "拍摄设备", kind: "text", ops: TEXT_OPS }, { key: "lens", label: "镜头", group: "拍摄设备", kind: "text", ops: TEXT_OPS }, { key: "iso", label: "ISO", group: "拍摄设备", kind: "number", ops: NUMERIC_OPS }, { key: "aperture", label: "光圈", group: "拍摄设备", kind: "number", ops: NUMERIC_OPS }, { key: "shutter", label: "快门", group: "拍摄设备", kind: "text", ops: TEXT_OPS }, { key: "focal", label: "焦距", group: "拍摄设备", kind: "number", ops: NUMERIC_OPS },
-  { key: "duration_ms", label: "视频时长", group: "视频", kind: "duration", ops: NUMERIC_OPS }, { key: "video_codec", label: "视频编码", group: "视频", kind: "text", ops: TEXT_OPS }, { key: "audio_codec", label: "音频编码", group: "视频", kind: "text", ops: TEXT_OPS },
+  { key: "camera", label: "相机", group: "拍摄设备", kind: "text", ops: TEXT_OPS }, { key: "lens", label: "镜头", group: "拍摄设备", kind: "text", ops: TEXT_OPS },
+  // ISO/光圈/快门/焦距和编解码器对后台查询仍有效，但属于专业/技术元数据，先从日常字段选择器收敛掉。
+  { key: "iso", label: "ISO", group: "拍摄设备", kind: "number", ops: NUMERIC_OPS, visible: false }, { key: "aperture", label: "光圈", group: "拍摄设备", kind: "number", ops: NUMERIC_OPS, visible: false }, { key: "shutter", label: "快门", group: "拍摄设备", kind: "text", ops: TEXT_OPS, visible: false }, { key: "focal", label: "焦距", group: "拍摄设备", kind: "number", ops: NUMERIC_OPS, visible: false },
+  { key: "duration_ms", label: "视频时长", group: "视频", kind: "duration", ops: NUMERIC_OPS }, { key: "video_codec", label: "视频编码", group: "视频", kind: "text", ops: TEXT_OPS, visible: false }, { key: "audio_codec", label: "音频编码", group: "视频", kind: "text", ops: TEXT_OPS, visible: false },
   // U-3：色板关系表 UI —— 只暴露 palette_top3（C-1 的 UI 范围决策：前三色）。
   // 值 = 折叠色名（12 hue + 黑/灰/白），eq 单选 + 占比阈值（min 0..1）；多选走 in。
   { key: "palette_top3", label: "前三色包含", group: "颜色", ops: ENUM_OPS },
   // FB2-08（§14.9）：算法主色检索维度。色相是环形量：介于 345 至 15 表示跨过 0° 的红色区间
   // （后端编译为双区间 OR，search_query.rs 对 dominant_hue 的 min>max 特判），其他字段的区间倒置仍是错误。
-  { key: "dominant_hue", label: "主色色相（0-359，可跨 0°）", group: "颜色", kind: "number", ops: NUMERIC_OPS },
-  { key: "dominant_sat", label: "主色饱和度（0-100）", group: "颜色", kind: "number", ops: NUMERIC_OPS },
-  { key: "dominant_lum", label: "主色明度（0-100）", group: "颜色", kind: "number", ops: NUMERIC_OPS },
+  { key: "dominant_hue", label: "主色色相（0-359，可跨 0°）", group: "颜色", kind: "number", ops: NUMERIC_OPS, visible: false },
+  { key: "dominant_sat", label: "主色饱和度（0-100）", group: "颜色", kind: "number", ops: NUMERIC_OPS, visible: false },
+  { key: "dominant_lum", label: "主色明度（0-100）", group: "颜色", kind: "number", ops: NUMERIC_OPS, visible: false },
   // W3-3a：定位字段组（Q4 裁决：地图砍了，筛选留着；后端白名单 V18 已就绪）
-  { key: "latitude", label: "纬度", group: "定位", kind: "number", ops: NUMERIC_OPS },
-  { key: "longitude", label: "经度", group: "定位", kind: "number", ops: NUMERIC_OPS },
+  // 普通筛选只表达“有无定位”；原始经纬度输入容易把用户带进不必要的坐标查询。
+  { key: "latitude", label: "纬度", group: "定位", kind: "number", ops: NUMERIC_OPS, visible: false },
+  { key: "longitude", label: "经度", group: "定位", kind: "number", ops: NUMERIC_OPS, visible: false },
   { key: "has_location", label: "有无定位", group: "定位", kind: "text", ops: ENUM_OPS },
   // Phase 4（§5.1 / 4-5）：rating / folder 从后端白名单补进条件行。
   // rating 是 Stars domain（ValueInput eq → 星选）；folder 走枚举（命中数下拉/`属于任一` chip）。
@@ -79,22 +84,28 @@ const FIELD_OPTIONS: FieldOption[] = [
 ];
 const FIELD_GROUPS = ["关键词", "标签", "素材", "颜色", "定位", "时间", "拍摄设备", "视频", "数值分面"] as const;
 const RECENT_FIELDS_KEY = "qb:recent-fields";
-const MAX_RECENT_FIELDS = 5;
-/** U-1：最近使用字段持久化（localStorage 最多 5 个，最新在前）；读取容错返回 [] */
+const MAX_RECENT_FIELDS = 3;
+/** 手动字段入口的可见范围；隐藏的 legacy 字段仍允许历史/AI 条件执行，但不应污染最近使用。 */
+function isRecentFieldKey(key: string): key is FieldKey {
+  return (key.startsWith(FACET_FIELD_PREFIX) && key.length > FACET_FIELD_PREFIX.length) || FIELD_OPTIONS.some((o) => o.key === key && o.visible !== false && o.key !== "excludeTag");
+}
+/** U-1：最近使用字段持久化（localStorage 最多 3 个，最新在前）；读取容错、去重并剔除隐藏旧字段。 */
 function readRecentFields(): FieldKey[] {
   try {
     const raw = localStorage.getItem(RECENT_FIELDS_KEY);
     if (!raw) return [];
     const arr: unknown = JSON.parse(raw);
     if (!Array.isArray(arr)) return [];
-    return arr.filter((k): k is FieldKey => typeof k === "string" && (FIELD_OPTIONS.some((o) => o.key === k) || k.startsWith(FACET_FIELD_PREFIX))).slice(0, MAX_RECENT_FIELDS);
+    const valid = arr.filter((k): k is FieldKey => typeof k === "string" && isRecentFieldKey(k));
+    return [...new Set(valid)].slice(0, MAX_RECENT_FIELDS);
   } catch {
     return [];
   }
 }
 function writeRecentFields(list: FieldKey[]) {
   try {
-    localStorage.setItem(RECENT_FIELDS_KEY, JSON.stringify(list.slice(0, MAX_RECENT_FIELDS)));
+    const valid = list.filter(isRecentFieldKey);
+    localStorage.setItem(RECENT_FIELDS_KEY, JSON.stringify([...new Set(valid)].slice(0, MAX_RECENT_FIELDS)));
   } catch {
     /* localStorage 不可用时最近使用静默降级 */
   }
@@ -103,6 +114,7 @@ const OP_LABELS: Record<MetadataOp, string> = { eq: "等于", in: "属于任一"
 let rowSeq = 0;
 const uid = () => `query-row-${++rowSeq}`;
 const controlClass = "ui-control h-8 min-w-0 px-2 text-xs";
+const zonePanelClass = "flex min-w-0 flex-col rounded-md border border-[var(--color-border)] bg-[var(--color-surface-raised)] p-3";
 
 // U-2：标签面板搜索的匹配模式（默认别名）。模式只影响面板「过滤显示哪些标签」，不改后端条件语义。
 type TermMatchKey = "exact" | "alias" | "prefix" | "contains" | "fuzzy";
@@ -130,9 +142,9 @@ function tagMatch(opt: FlatTag, qRaw: string, match: TermMatchKey): boolean {
 }
 
 export default function QueryBuilder() {
-  const { expr, setExpr, clearConditions, resolvedTags, plan, planRevision, setPlanShould, setPlanMustNot, moveConditionBetweenZones } = useSuperSearchStore(
+  const { expr, setExpr, resolvedTags, plan, planRevision, setPlanShould, setPlanMustNot, moveConditionBetweenZones } = useSuperSearchStore(
     useShallow((s) => ({
-      expr: s.expr, setExpr: s.setExpr, clearConditions: s.clearConditions,
+      expr: s.expr, setExpr: s.setExpr,
       resolvedTags: s.resolvedTags, plan: s.plan, planRevision: s.planRevision,
       setPlanShould: s.setPlanShould, setPlanMustNot: s.setPlanMustNot,
       moveConditionBetweenZones: s.moveConditionBetweenZones,
@@ -182,14 +194,14 @@ export default function QueryBuilder() {
   const allTagOptions = useMemo(() => [...flatTags, ...syntheticTags], [flatTags, syntheticTags]);
   // Phase 4（§5.3）：允许 between 倒置的 key 集合（= domain.circular，如 dominant_hue）
   const circularKeys = useMemo(() => new Set(numericDomains.filter((d) => d.circular).map((d) => d.key)), [numericDomains]);
-  // ═══ 必须满足区：递归条件组视图（根组连接词三态，组内可嵌套子组）═══
+  // ═══ 必须满足区：平铺条件视图（根组连接词三态）═══
   const [root, setRoot] = useState<VGroup>(emptyGroup);
   const [focusLeafId, setFocusLeafId] = useState<string | null>(null);
   const lastLocalSignature = useRef<string | null>(null);
   const exprSignature = expr ? serializeExpr(expr) : "";
   useEffect(() => {
-    // 沿用签名比对防回跳：本组件提交的 expr 不回灌视图（保留本地草稿行/空组）；
-    // 外部变更（AI/换源/chips 删除/持久化恢复）→ 从 expr 递归还原整棵可编辑组树。
+    // 沿用签名比对防回跳：本组件提交的 expr 不回灌视图（保留本地草稿行）；
+    // 外部变更（AI/换源/chips 删除/持久化恢复）→ 重新生成平铺叶子视图，底层树仍保留。
     if (lastLocalSignature.current === exprSignature) {
       lastLocalSignature.current = null;
       return;
@@ -204,7 +216,7 @@ export default function QueryBuilder() {
     setExpr(normalized);
   };
   const editFilter = useCallback((fn: (r: VGroup) => VGroup) => commitFilter(fn(root)), [root, circularKeys, setExpr]);
-  // ═══ 排除区：递归条件组视图（根组连接词两态：命中任一 / 全部命中；行内禁取反，避免双重否定）═══
+  // ═══ 排除区：平铺条件视图（根组连接词两态：命中任一 / 全部命中）═══
   const mustNotRoot = plan?.mustNot ?? null;
   const mustNotSig = mustNotRoot ? serializeExpr(mustNotRoot) : "";
   const [exRoot, setExRoot] = useState<VGroup>(emptyMustNotGroup);
@@ -229,13 +241,6 @@ export default function QueryBuilder() {
   // 视图叶子按 DFS 序与 expr 叶子一一配对；未完成叶子不进 expr，配对时跳过保持对齐。
   const filterLeafPathById = useMemo(() => leafPathMap(root, collectLeafPaths(expr), circularKeys), [root, exprSignature, circularKeys]);
   const mustNotLeafPathById = useMemo(() => leafPathMap(exRoot, collectLeafPaths(mustNotRoot ?? undefined), circularKeys), [exRoot, mustNotSig, circularKeys]);
-  const clearAll = () => { lastLocalSignature.current = ""; lastExSignature.current = ""; setRoot(emptyGroup()); setExRoot(emptyMustNotGroup()); clearConditions(); };
-  // P3：拖拽调层级（行/子组 → 组内重排或搬入其他组）
-  const [dndId, setDndId] = useState<string | null>(null);
-  const [dropAt, setDropAt] = useState<{ groupId: string; index: number } | null>(null);
-  const drag: DragState = { dndId, dropAt, setDndId, setDropAt };
-  const [shouldDragIndex, setShouldDragIndex] = useState<number | null>(null);
-  const [shouldDropAt, setShouldDropAt] = useState<number | null>(null);
   // U-6/§4.5：四指标诊断（diagnose_search_plan_cmd → PlanDiagnostics）——
   // 叶子带 zone（filter/mustNot），加分项带 index，warnings 与列表同批。
   const [diag, setDiag] = useState<PlanDiagnostics | null>(null);
@@ -281,201 +286,153 @@ export default function QueryBuilder() {
     if (nextIndex < 0 || nextIndex >= shouldList.length) return;
     setShould(reorderShould(shouldList, index, nextIndex));
   };
-  const clearShouldDrag = () => {
-    setShouldDragIndex(null);
-    setShouldDropAt(null);
-  };
-  const dropShouldAt = (index: number) => {
-    if (shouldDragIndex != null) {
-      // DropLine index is a final insertion slot; when moving down, deletion shifts it left.
-      const target = shouldDragIndex < index ? index - 1 : index;
-      setShould(reorderShould(shouldList, shouldDragIndex, target));
-    }
-    clearShouldDrag();
-  };
   const patchShould = (index: number, next: ShouldClause) => setShould(shouldList.map((x, i) => (i === index ? next : x)));
 
-  const hasAnyConditions = root.items.length > 0 || exRoot.items.length > 0 || shouldList.length > 0;
-  // P1：底部实时人话预览（必须 / 排除 / 优先），随编辑即时更新；无任何完成条件时不显示。
-  const previewSentence = useMemo(() => {
-    const segs: string[] = [];
-    const fb = groupBrief(root, allTagOptions, circularKeys);
-    if (fb) {
-      const lead = root.op === "and" ? "同时满足" : root.op === "or" ? "满足以下任一" : "满足";
-      segs.push(`显示${lead}：${fb}`);
-    }
-    const eb = groupBrief(exRoot, allTagOptions, circularKeys);
-    if (eb) segs.push(`排除：${eb}`);
-    const sb = shouldList.map((s) => (isComplete(s.cond, circularKeys) ? leafBrief(s.cond, allTagOptions) : "")).filter(Boolean);
-    if (sb.length > 0) segs.push(`优先依次：${sb.join("、")}`);
-    return segs.join("；");
-  }, [root, exRoot, shouldList, allTagOptions, circularKeys]);
-  const rootOpSentence = root.op === "and" ? "全部满足才显示" : root.op === "or" ? "满足任一即显示" : "满足至少 N 项才显示";
-  const exOpSentence = exRoot.op === "and" ? "全部命中才不显示" : "命中任一条就不显示";
+  const [activeZone, setActiveZone] = useState<SearchZone>("filter");
+  const rootOpSentence = root.op === "and" ? "所有条件都满足" : root.op === "or" ? "满足任一条件" : `至少满足 ${root.min} 条`;
+  const exOpSentence = exRoot.op === "and" ? "全部命中才排除" : "命中任一条即排除";
   return (
     <section className="overflow-hidden rounded-md border border-[var(--color-border)] bg-[var(--color-surface-raised)]" aria-label="条件公式">
-      <div className="flex min-h-10 items-center gap-2 border-b border-[var(--color-border)] px-3 py-2"><span className="text-xs font-semibold text-[var(--color-text)]">筛选条件</span><span className="text-[11px] text-[var(--color-text-tertiary)]">AI 生成后可继续修改</span>{hasAnyConditions && <button type="button" onClick={clearAll} className="ml-auto text-xs text-[var(--color-text-secondary)] hover:text-[var(--color-text)]">清除全部</button>}</div>
-      {/* 三区并排三个框（每框内部条件竖排）；窄屏回落为单列 */}
-      <div className="grid grid-cols-1 items-start gap-2 px-3 py-2.5 md:grid-cols-3">
+      <div className="flex min-h-10 items-center gap-2 border-b border-[var(--color-border)] px-3 py-2"><span className="text-xs font-semibold text-[var(--color-text)]">筛选条件</span><span className="text-[11px] text-[var(--color-text-tertiary)]">AI 生成后可继续修改</span></div>
+      <div className="px-3 pt-2.5 min-[1180px]:hidden">
+        <div role="tablist" aria-label="搜索条件分区" className="grid grid-cols-3 gap-1 rounded-md border border-[var(--color-border)] p-1">
+          {([
+            ["filter", "必须", countViewLeaves(root)],
+            ["should", "优先", shouldList.length],
+            ["mustNot", "排除", countViewLeaves(exRoot)],
+          ] as [SearchZone, string, number][]).map(([zone, label, count]) => (
+            <button
+              key={zone}
+              type="button"
+              role="tab"
+              id={`qb-tab-${zone}`}
+              aria-selected={activeZone === zone}
+              aria-controls={`qb-zone-${zone === "mustNot" ? "mustnot" : zone}`}
+              onClick={() => setActiveZone(zone)}
+              className={`min-w-0 rounded px-2 py-1.5 text-xs ${activeZone === zone ? "bg-[var(--color-accent)] font-medium text-[var(--color-accent-text)]" : "text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-hover)] hover:text-[var(--color-text)]"}`}
+            >
+              <span>{label}</span>
+              <span className="ml-1 text-[10px] opacity-75">{count}</span>
+            </button>
+          ))}
+        </div>
+      </div>
+      {/* 三区并排三个框（每框内部条件竖排）；窄屏使用分区页签，避免把完整条件行硬塞进窄列。 */}
+      <div data-testid="super-search-zones" className="grid grid-cols-1 items-stretch gap-2 px-3 py-2.5 min-[1180px]:grid-cols-3">
         {/* ═══ 框一：必须满足（plan.filter）═══ */}
-        <section id="qb-zone-filter" data-zone="filter" className="flex min-w-0 flex-col rounded-md border border-[var(--color-border)] bg-[var(--color-surface)] p-2">
-          <div className="flex flex-wrap items-center gap-x-1.5 gap-y-1">
-            <span className="text-xs font-semibold text-[var(--color-text)]">必须满足</span>
-            <span className="ml-auto">
+        <section id="qb-zone-filter" role="tabpanel" aria-labelledby="qb-tab-filter" data-zone="filter" className={`${zonePanelClass} ${activeZone !== "filter" ? "max-[1179px]:hidden" : ""}`}>
+          <div className="flex flex-wrap items-start justify-between gap-2">
+            <div className="min-w-0">
+              <div className="flex flex-wrap items-center gap-x-1.5 gap-y-1">
+                <span className="text-xs font-semibold text-[var(--color-text)]">必须满足</span>
+              </div>
+              <p className="mt-0.5 text-[10px] leading-4 text-[var(--color-text-tertiary)]">{rootOpSentence}{root.op === "minMatch" && "（按条件数量）"}</p>
+            </div>
+            <div className="flex max-w-full flex-wrap items-center justify-end gap-1.5">
               <OpSegmented
                 ariaLabel="条件连接方式"
                 value={root.op}
                 options={FILTER_OP_OPTIONS}
                 onChange={(op) => editFilter((r) => patchGroupById(r, root.id, { op: op as VGroupOp, ...(op === "minMatch" ? { min: defaultMinFor(root.items.length) } : {}) }))}
               />
-            </span>
+            </div>
           </div>
-          <p className="mt-0.5 flex flex-wrap items-center gap-x-1.5 text-[10px] leading-4 text-[var(--color-text-tertiary)]">
-            {rootOpSentence}
-            {root.op === "minMatch" && <MinSelect count={root.items.length} value={root.min} onChange={(n) => editFilter((r) => patchGroupById(r, root.id, { min: n }))} />}
-          </p>
-          <div className="mt-1.5">
-            <GroupEditor
+          {root.op === "minMatch" && <div className="mt-1 flex items-center gap-1 text-[11px] text-[var(--color-text-secondary)]"><span>至少</span><MinSelect count={root.items.length} value={root.min} onChange={(n) => editFilter((r) => patchGroupById(r, root.id, { min: n }))} /></div>}
+          <div className="mt-3 flex-1">
+            <ConditionList
               node={root}
-              depth={1}
               zone="filter"
-              allowGroups
-              allowMin
               allTagOptions={allTagOptions}
-              circularKeys={circularKeys}
               diag={diag}
               leafPaths={filterLeafPathById}
               focusLeafId={focusLeafId}
               setFocusLeafId={setFocusLeafId}
-              drag={drag}
               edit={editFilter}
               onMoveCondition={(to, path) => moveConditionBetweenZones("filter", to, path)}
             />
           </div>
         </section>
-        {/* ═══ 框二：优先满足（plan.should，软排序：中了靠前、不中也显示；P1 单行、无权重/无连接词）═══ */}
-        <section id="qb-zone-should" data-zone="should" className="flex min-w-0 flex-col rounded-md border border-dashed border-[var(--color-border)] bg-[var(--color-surface)] p-2">
-          <div className="flex items-center gap-1.5">
-            <span className="text-xs font-semibold text-[var(--color-text)]">优先满足</span>
-            <span className="ml-auto rounded bg-[var(--color-surface-hover)] px-1.5 py-0.5 text-[10px] text-[var(--color-text-tertiary)]">软排序</span>
+        {/* ═══ 框二：优先满足（plan.should，顺序就是优先级；不中也不筛掉素材）═══ */}
+        <section id="qb-zone-should" role="tabpanel" aria-labelledby="qb-tab-should" data-zone="should" className={`${zonePanelClass} ${activeZone !== "should" ? "max-[1179px]:hidden" : ""}`}>
+          <div className="flex flex-wrap items-start justify-between gap-2">
+            <div>
+              <span className="text-xs font-semibold text-[var(--color-text)]">优先满足</span>
+              <p className="mt-0.5 text-[10px] leading-4 text-[var(--color-text-tertiary)]">越靠上越优先 · 一条不中也照样显示</p>
+            </div>
+            <span className="text-[10px] text-[var(--color-text-tertiary)]">只调整顺序</span>
           </div>
-          <p className="mt-0.5 text-[10px] leading-4 text-[var(--color-text-tertiary)]">越靠上越优先 · 一条不中也照样显示，只是排后面</p>
-          <div className="mt-1.5 flex flex-col gap-1.5">
-            {shouldList.map((sc, i) => {
-              const field = fieldFromCond(sc.cond);
-              const needsOperator = leafNeedsOperator(sc.cond);
-              return (
-                <div key={`should-${i}`}>
-                  <div
-                    data-testid="should-drop-line"
-                    onDragOver={(event) => {
-                      event.preventDefault();
-                      event.dataTransfer.dropEffect = "move";
-                      setShouldDropAt(i);
-                    }}
-                    onDrop={(event) => {
-                      event.preventDefault();
-                      dropShouldAt(i);
-                    }}
-                    className={`-my-0.5 rounded-full transition-all ${shouldDragIndex != null && shouldDropAt === i ? "h-2 bg-[var(--color-accent)]/50" : "h-1"}`}
-                  />
-                  <div className="flex items-center gap-1 rounded-md border border-[var(--color-border)] bg-[var(--color-surface-raised)] p-1.5">
-                    <span className="w-5 shrink-0 text-center text-[10px] font-medium text-[var(--color-accent)]">{i + 1}</span>
-                    <button
-                      type="button"
-                      draggable
-                      aria-label={`拖动优先条件 ${i + 1}`}
-                      title="拖动调整优先顺序"
-                      onDragStart={(event) => {
-                        event.dataTransfer.effectAllowed = "move";
-                        event.dataTransfer.setData("text/plain", `should-${i}`);
-                        setShouldDragIndex(i);
-                      }}
-                      onDragEnd={clearShouldDrag}
-                      className={`flex size-6 shrink-0 cursor-grab items-center justify-center rounded text-xs text-[var(--color-text-tertiary)] hover:bg-[var(--color-surface-hover)] ${shouldDragIndex === i ? "opacity-40" : ""}`}
-                    >
-                      ⠿
-                    </button>
-                    <button type="button" aria-label="上移优先条件" disabled={i === 0} onClick={() => moveShould(i, -1)} className="flex size-6 shrink-0 items-center justify-center rounded text-xs text-[var(--color-text-tertiary)] hover:bg-[var(--color-surface-hover)] disabled:cursor-not-allowed disabled:opacity-30">↑</button>
-                    <button type="button" aria-label="下移优先条件" disabled={i === shouldList.length - 1} onClick={() => moveShould(i, 1)} className="flex size-6 shrink-0 items-center justify-center rounded text-xs text-[var(--color-text-tertiary)] hover:bg-[var(--color-surface-hover)] disabled:cursor-not-allowed disabled:opacity-30">↓</button>
-                    <div className="w-[104px] shrink-0"><FieldSelect value={field} onChange={(next) => patchShould(i, { ...sc, cond: makeCond(next, allTagOptions) })} /></div>
-                    {needsOperator && <div className="w-[76px] shrink-0"><ConditionOperator cond={sc.cond} negated={false} onChange={(p) => { if (p.cond) patchShould(i, { ...sc, cond: p.cond }); }} /></div>}
-                    <div className="min-w-0 flex-1"><ConditionValue cond={sc.cond} allTagOptions={allTagOptions} onChange={(cond) => patchShould(i, { ...sc, cond })} /></div>
-                    <MoveMenu zone="should" onMove={(t) => moveConditionBetweenZones("should", t, i)} />
-                    <button type="button" aria-label={`移除优先条件 ${i + 1}`} onClick={() => setShould(shouldList.filter((_, j) => j !== i))} className="flex size-7 shrink-0 items-center justify-center rounded text-base text-[var(--color-text-tertiary)] hover:bg-[var(--color-surface-hover)] hover:text-[var(--color-danger)]">×</button>
+          <div className="mt-3 flex flex-1 flex-col gap-1.5">
+            {shouldList.length === 0 ? (
+              <FirstConditionButton ariaLabel="+ 添加第一个优先条件" onClick={() => setShould([...shouldList, { cond: makeCond("tag", allTagOptions), weight: 0.5, label: "" }])} />
+            ) : (
+              <>
+                {shouldList.map((sc, i) => (
+                  <div key={`should-${i}`}>
+                    <ConditionRow
+                      row={{ kind: "leaf", id: `should-${i}`, negated: false, cond: sc.cond }}
+                      allTagOptions={allTagOptions}
+                      zone="should"
+                      rank={i + 1}
+                      extraActions={(
+                        <>
+                          <button type="button" aria-label="上移优先条件" disabled={i === 0} onClick={() => moveShould(i, -1)} className="flex size-7 shrink-0 items-center justify-center rounded text-xs text-[var(--color-text-tertiary)] hover:bg-[var(--color-surface-hover)] disabled:cursor-not-allowed disabled:opacity-30">↑</button>
+                          <button type="button" aria-label="下移优先条件" disabled={i === shouldList.length - 1} onClick={() => moveShould(i, 1)} className="flex size-7 shrink-0 items-center justify-center rounded text-xs text-[var(--color-text-tertiary)] hover:bg-[var(--color-surface-hover)] disabled:cursor-not-allowed disabled:opacity-30">↓</button>
+                        </>
+                      )}
+                      removeLabel={`移除优先条件 ${i + 1}`}
+                      onMove={(to) => moveConditionBetweenZones("should", to, i)}
+                      onChange={(patch) => { if (patch.cond) patchShould(i, { ...sc, cond: patch.cond }); }}
+                      onRemove={() => setShould(shouldList.filter((_, j) => j !== i))}
+                    />
+                    {/* §3.5：evidence 原文回显（AI 判断可逐条改判的草稿），不占主行 */}
+                    {sc.evidence ? (
+                      <div className="pr-1 pt-0.5 text-right text-[10px] text-[var(--color-text-tertiary)]">「{sc.evidence}」</div>
+                    ) : null}
                   </div>
-                  {/* §3.5：evidence 原文回显（AI 判断可逐条改判的草稿），不占主行 */}
-                  {sc.evidence ? (
-                    <div className="pr-1 pt-0.5 text-right text-[10px] text-[var(--color-text-tertiary)]">「{sc.evidence}」</div>
-                  ) : null}
-                </div>
-              );
-            })}
-            <div
-              data-testid="should-drop-line"
-              onDragOver={(event) => {
-                event.preventDefault();
-                event.dataTransfer.dropEffect = "move";
-                setShouldDropAt(shouldList.length);
-              }}
-              onDrop={(event) => {
-                event.preventDefault();
-                dropShouldAt(shouldList.length);
-              }}
-              className={`-my-0.5 rounded-full transition-all ${shouldDragIndex != null && shouldDropAt === shouldList.length ? "h-2 bg-[var(--color-accent)]/50" : "h-1"}`}
-            />
-            {shouldList.length === 0 && <p className="text-[11px] leading-4 text-[var(--color-text-tertiary)]">把「最好有」的倾向加在这里：只影响排序先后，不会筛掉任何素材。</p>}
+                ))}
+              </>
+            )}
           </div>
-          <button type="button" onClick={() => setShould([...shouldList, { cond: makeCond("tag", allTagOptions), weight: 0.5, label: "" }])} className="mt-1.5 h-7 px-1 text-left text-xs font-medium text-[var(--color-status)] hover:opacity-80">＋ 添加优先条件</button>
+          {shouldList.length > 0 && <button type="button" onClick={() => setShould([...shouldList, { cond: makeCond("tag", allTagOptions), weight: 0.5, label: "" }])} className="mt-1.5 h-7 px-1 text-left text-xs font-medium text-[var(--color-status)] hover:opacity-80">+ 添加条件</button>}
         </section>
         {/* ═══ 框三：排除（plan.mustNot）：根组连接词两态（命中任一 / 全部命中），行内禁取反 ═══ */}
-        <section id="qb-zone-mustnot" data-zone="mustNot" className="flex min-w-0 flex-col rounded-md border border-[var(--color-border)] bg-[var(--color-surface)] p-2">
-          <div className="flex flex-wrap items-center gap-x-1.5 gap-y-1">
-            <span className="text-xs font-semibold text-[var(--color-text)]">排除</span>
-            <span className="ml-auto">
+        <section id="qb-zone-mustnot" role="tabpanel" aria-labelledby="qb-tab-mustNot" data-zone="mustNot" className={`${zonePanelClass} ${activeZone !== "mustNot" ? "max-[1179px]:hidden" : ""}`}>
+          <div className="flex flex-wrap items-start justify-between gap-2">
+            <div>
+              <span className="text-xs font-semibold text-[var(--color-text)]">排除</span>
+              <p className="mt-0.5 text-[10px] leading-4 text-[var(--color-text-tertiary)]">{exOpSentence}</p>
+            </div>
+            <div className="flex max-w-full flex-wrap items-center justify-end gap-1.5">
               <OpSegmented
                 ariaLabel="排除连接方式"
                 value={exRoot.op === "and" ? "and" : "or"}
                 options={MUSTNOT_OP_OPTIONS}
                 onChange={(op) => editMustNot((r) => patchGroupById(r, exRoot.id, { op: op as VGroupOp }))}
               />
-            </span>
+            </div>
           </div>
-          <p className="mt-0.5 text-[10px] leading-4 text-[var(--color-text-tertiary)]">{exOpSentence}</p>
-          <div className="mt-1.5">
-            <GroupEditor
+          <div className="mt-3 flex-1">
+            <ConditionList
               node={exRoot}
-              depth={1}
               zone="mustNot"
-              allowGroups
-              allowMin={false}
               allTagOptions={allTagOptions}
-              circularKeys={circularKeys}
               diag={diag}
               leafPaths={mustNotLeafPathById}
               focusLeafId={focusLeafId}
               setFocusLeafId={setFocusLeafId}
-              drag={drag}
               edit={editMustNot}
               onMoveCondition={(to, path) => moveConditionBetweenZones("mustNot", to, path)}
             />
           </div>
         </section>
       </div>
-      {/* P1：实时人话预览 —— 读这句话即可判断条件配得对不对，无需理解布尔树 */}
-      {previewSentence && (
-        <div className="border-t border-[var(--color-border)] bg-[var(--color-surface)] px-3 py-1.5 text-[11px] leading-5 text-[var(--color-text-secondary)]">
-          <span className="text-[var(--color-text-tertiary)]">预览：</span>{previewSentence}
-        </div>
-      )}
     </section>
   );
 }
 
-// ═════════ 递归组模型 ⇄ QueryExpr 互转（and/or/not/leaf 四种节点全覆盖，无 unsupported 分支）═════════
+// ═════════ QueryExpr ⇄ 平铺视图模型（保留后端 AST，界面只编辑三栏叶子）═════════
 
-/** expr → 视图节点。leaf → 叶子；not(leaf) → 行内取反叶子；not(组) → 「整组取反」角标组；
- *  and/or → 组（子节点递归）。任何 AI 产出或历史持久化的树都能完整还原成可编辑结构。 */
+/** expr → 内部视图节点。嵌套节点只用于保存 AI/历史 AST，界面不会创建或展示子组控件。 */
 function exprToNode(e: QueryExpr): VNode {
   if (e.op === "leaf") return { kind: "leaf", id: uid(), negated: false, cond: e.cond };
   if (e.op === "not") {
@@ -486,7 +443,7 @@ function exprToNode(e: QueryExpr): VNode {
   return { kind: "group", id: uid(), op: e.op, min: 1, items: e.children.map(exprToNode) };
 }
 
-/** 根节点必须是组：单叶子 expr 包一层平铺根组（不画卡片，视觉与旧版一致）。 */
+/** 根节点统一包成内部组，便于三栏平铺视图维护草稿行。 */
 function asRootGroup(n: VNode): VGroup {
   return n.kind === "group" ? n : { kind: "group", id: uid(), op: "and", min: 1, items: [n] };
 }
@@ -504,8 +461,7 @@ function defaultMinFor(itemCount: number): number {
   return itemCount >= 2 ? 2 : 1;
 }
 
-/** 视图节点 → expr。未完成叶子按旧规则剔除；空组剔除；单子项组折叠（normalizeExpr 再兜底）。
- *  allowNegated=false（排除区）：取反叶子/取反组直接剔除（后端禁止 must_not 树内 NOT）。 */
+/** 视图节点 → expr。未完成叶子和空节点剔除；嵌套历史/AI 节点保持原有结构。 */
 function nodeToExpr(n: VNode, circularKeys: ReadonlySet<string>, allowNegated = true): QueryExpr | undefined {
   if (n.kind === "leaf") {
     if (!isComplete(n.cond, circularKeys)) return undefined;
@@ -519,8 +475,7 @@ function nodeToExpr(n: VNode, circularKeys: ReadonlySet<string>, allowNegated = 
   return n.groupNegated ? { op: "not", child: inner } : inner;
 }
 
-/** 组连接词 → expr：minMatch 编译为 minMatch 语义 —— N=1 → OR、N=全部 → AND、
- *  中间 N → C(n,k) 个 AND 组的 OR（组合数超上限退回 OR，UI 侧已禁用该档）。 */
+/** 根连接词 → expr：minMatch 编译为 QueryExpr。 */
 function groupExpr(op: VGroupOp, min: number, children: QueryExpr[]): QueryExpr {
   if (op === "and") return { op: "and", children };
   if (op === "or") return { op: "or", children };
@@ -547,7 +502,7 @@ function combosCount(n: number, k: number): number {
   return Math.round(c);
 }
 
-// ═════════ 视图树编辑（全部按节点 id 定位，天然免受 expr 单子项折叠/拍平影响）═════════
+// ═════════ 视图叶子编辑（按节点 id 定位，避免归一化时丢失草稿行）═════════
 
 function patchGroupById(rootNode: VGroup, id: string, patch: Partial<VGroup>): VGroup {
   if (rootNode.id === id) return { ...rootNode, ...patch };
@@ -565,78 +520,6 @@ function removeNodeById(rootNode: VGroup, id: string): VGroup {
 function addToGroupById(rootNode: VGroup, groupId: string, item: VNode): VGroup {
   if (rootNode.id === groupId) return { ...rootNode, items: [...rootNode.items, item] };
   return { ...rootNode, items: rootNode.items.map((it) => (it.kind === "group" ? addToGroupById(it, groupId, item) : it)) };
-}
-
-/** P3 拖拽调层级：把 id 节点搬到 toGroupId 组的 index 位置（同组内重排或跨组搬移）。
- *  守卫：组不能搬进自己/自己的后代；搬入后总深度超过软上限（MAX_GROUP_DEPTH）不搬；
- *  越界 index 收敛到 [0, len]。 */
-function moveNodeById(rootNode: VGroup, id: string, toGroupId: string, index: number): VGroup {
-  const moving = findNodeById(rootNode, id);
-  if (!moving) return rootNode;
-  if (moving.kind === "group" && (moving.id === toGroupId || findNodeById(moving, toGroupId))) return rootNode;
-  const targetDepth = depthOfGroup(rootNode, toGroupId);
-  if (targetDepth == null || targetDepth + subtreeHeight(moving) > MAX_GROUP_DEPTH) return rootNode;
-  const from = findParentOf(rootNode, id);
-  const without = removeNodeById(rootNode, id);
-  // 同组内搬移：删除节点后原下标左侧的项左移，目标 index 相应 -1
-  let at = Math.max(0, index);
-  if (from && from.parent.id === toGroupId && from.index < index) at -= 1;
-  return insertNodeById(without, toGroupId, at, moving);
-}
-
-/** 组节点在树中的深度（根组 = 1；找不到返回 undefined）。 */
-function depthOfGroup(rootNode: VGroup, id: string, depth = 1): number | undefined {
-  if (rootNode.id === id) return depth;
-  for (const it of rootNode.items) {
-    if (it.kind === "group") {
-      const hit = depthOfGroup(it, id, depth + 1);
-      if (hit != null) return hit;
-    }
-  }
-  return undefined;
-}
-
-/** 子树高度（叶子 = 1）。 */
-function subtreeHeight(n: VNode): number {
-  if (n.kind === "leaf") return 1;
-  return 1 + n.items.reduce((max, it) => Math.max(max, subtreeHeight(it)), 0);
-}
-
-function findNodeById(rootNode: VNode, id: string): VNode | undefined {
-  if (rootNode.id === id) return rootNode;
-  if (rootNode.kind !== "group") return undefined;
-  for (const it of rootNode.items) {
-    const hit = findNodeById(it, id);
-    if (hit) return hit;
-  }
-  return undefined;
-}
-
-function findParentOf(rootNode: VGroup, id: string): { parent: VGroup; index: number } | undefined {
-  for (let i = 0; i < rootNode.items.length; i += 1) {
-    const it = rootNode.items[i];
-    if (it.id === id) return { parent: rootNode, index: i };
-    if (it.kind === "group") {
-      const hit = findParentOf(it, id);
-      if (hit) return hit;
-    }
-  }
-  return undefined;
-}
-
-function insertNodeById(rootNode: VGroup, groupId: string, index: number, item: VNode): VGroup {
-  if (rootNode.id === groupId) {
-    const items = [...rootNode.items];
-    items.splice(Math.max(0, Math.min(index, items.length)), 0, item);
-    return { ...rootNode, items };
-  }
-  return { ...rootNode, items: rootNode.items.map((it) => (it.kind === "group" ? insertNodeById(it, groupId, index, item) : it)) };
-}
-
-/** P3 折叠摘要：组内叶子数（递归）。 */
-function countNodeLeaves(n: VNode): number {
-  if (n.kind === "leaf") return 1;
-  return n.items.reduce((sum, it) => sum + countNodeLeaves(it), 0);
 }
 
 /** 诊断叶子的下标链（根→子组→行）。NOT 子树按下标 0 展开 —— 与后端 collect_leaves 严格对齐。 */
@@ -672,7 +555,7 @@ function leafPathMap(viewRoot: VGroup, exprPaths: ExprPath[], circularKeys: Read
 /** 连接词分段控件（替代旧的窄下拉，P-e）：radiogroup 语义。 */
 function OpSegmented({ value, options, onChange, ariaLabel }: { value: string; options: { value: string; label: string; title: string }[]; onChange: (value: string) => void; ariaLabel: string }) {
   return (
-    <span role="radiogroup" aria-label={ariaLabel} className="inline-flex overflow-hidden rounded-md border border-[var(--color-border)]">
+    <span role="radiogroup" aria-label={ariaLabel} className="inline-flex max-w-full shrink-0 overflow-x-auto rounded-md border border-[var(--color-border)]">
       {options.map((o) => {
         const active = o.value === value;
         return (
@@ -683,7 +566,7 @@ function OpSegmented({ value, options, onChange, ariaLabel }: { value: string; o
             aria-checked={active}
             title={o.title}
             onClick={() => onChange(o.value)}
-            className={`h-7 px-2 text-[11px] transition-colors ${active ? "bg-[var(--color-accent)]/15 font-medium text-[var(--color-accent)]" : "text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-hover)] hover:text-[var(--color-text)]"}`}
+            className={`h-7 shrink-0 px-2 text-[11px] transition-colors ${active ? "bg-[var(--color-accent)] font-medium text-[var(--color-accent-text)]" : "text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-hover)] hover:text-[var(--color-text)]"}`}
           >
             {o.label}
           </button>
@@ -712,7 +595,7 @@ function MinSelect({ count, value, onChange, ariaLabel = "至少满足项数" }:
       <select aria-label={ariaLabel} value={clamped} onChange={(e) => onChange(Number(e.target.value))} className={`${controlClass} w-14`}>
         {Array.from({ length: total }, (_, i) => i + 1).map((k) => {
           const overCap = k > 1 && k < count && combosCount(count, k) > MAX_MIN_COMBOS;
-          return <option key={k} value={k} disabled={overCap} title={overCap ? "组合数过多，请拆分条件组" : undefined}>{k === count ? `${k}（全部）` : k}</option>;
+          return <option key={k} value={k} disabled={overCap} title={overCap ? "条件组合数过多，当前档位不可用" : undefined}>{k === count ? `${k}（全部）` : k}</option>;
         })}
       </select>
       <span>项</span>
@@ -741,234 +624,96 @@ function LeafDiagNote({ diag }: { diag: PlanDiagnostics["leaves"][number] }) {
   );
 }
 
-/** 递归条件组编辑器：根组直接铺行（不画卡片），子组画浅底圆角卡片并向右缩进一级。
- *  每组底部两个添加入口：+ 条件（加叶子）、+ 条件组（加空子组，默认 AND 并聚焦首行字段）。
- *  行首连接词随组联动：组内第一项「当」，其后按该组 op 显示「并且 / 或者」。 */
-/** 拖拽状态：正在被拖的节点 id + 当前悬停的落点（组 id + 组内下标）。 */
-type DragState = {
-  dndId: string | null;
-  dropAt: { groupId: string; index: number } | null;
-  setDndId: (id: string | null) => void;
-  setDropAt: (at: { groupId: string; index: number } | null) => void;
-};
-
-/** 组内下标 i 的落点线（拖拽调层级用；平时零高度不占布局）。 */
-function DropLine({ node, index, drag, edit }: { node: VGroup; index: number; drag: DragState; edit: (fn: (root: VGroup) => VGroup) => void }) {
-  const active = drag.dndId != null && drag.dropAt?.groupId === node.id && drag.dropAt.index === index;
-  if (drag.dndId == null) return <div aria-hidden="true" className="h-0" />;
+function ConditionRelation({ text }: { text: string }) {
   return (
-    <div
-      data-testid="drop-line"
-      onDragOver={(e) => {
-        e.preventDefault();
-        e.stopPropagation();
-        e.dataTransfer.dropEffect = "move";
-        drag.setDropAt({ groupId: node.id, index });
-      }}
-      onDrop={(e) => {
-        e.preventDefault();
-        e.stopPropagation();
-        if (drag.dndId) edit((r) => moveNodeById(r, drag.dndId!, node.id, index));
-        drag.setDndId(null);
-        drag.setDropAt(null);
-      }}
-      className={`-my-0.5 rounded-full transition-all ${active ? "h-2 bg-[var(--color-accent)]/50" : "h-1.5"}`}
-    />
+    <div className="flex items-center gap-2 px-1 py-1 text-[10px] text-[var(--color-text-tertiary)]">
+      <span className="h-px w-3 bg-[var(--color-border)]" aria-hidden="true" />
+      <span className="font-medium text-[var(--color-text-secondary)]">{text}</span>
+      <span>{text === "并且" ? "同时满足下一项" : text === "或者" ? "下一项满足即可" : "计入至少项数"}</span>
+    </div>
   );
 }
 
-/** 行首/组头拖拽手柄（P3：行/子组拖拽调层级；整卡不可拖避免干扰输入框选词）。 */
-function DragHandle({ item, drag }: { item: VNode; drag: DragState }) {
-  const isGroup = item.kind === "group";
+function FirstConditionButton({ id, label = "+ 添加第一个条件", ariaLabel, onClick }: { id?: string; label?: string; ariaLabel?: string; onClick: () => void }) {
   return (
-    <span
-      draggable
-      title={isGroup ? "拖动调整本组位置 / 移入其他组" : "拖动调整顺序 / 移入其他组"}
-      onDragStart={(e) => {
-        e.dataTransfer.effectAllowed = "move";
-        e.dataTransfer.setData("text/plain", item.id);
-        drag.setDndId(item.id);
-      }}
-      onDragEnd={() => {
-        drag.setDndId(null);
-        drag.setDropAt(null);
-      }}
-      className={`shrink-0 cursor-grab select-none text-[10px] leading-none text-[var(--color-text-tertiary)] hover:text-[var(--color-text)] ${drag.dndId === item.id ? "opacity-40" : ""}`}
+    <button
+      id={id}
+      type="button"
+      aria-label={ariaLabel ?? label}
+      onClick={onClick}
+      className="flex h-10 w-full items-center justify-center rounded-md border border-[var(--color-border)] text-xs text-[var(--color-text-secondary)] hover:border-[var(--color-border-strong)] hover:text-[var(--color-text)]"
     >
-      ⠿
-    </span>
+      {label}
+    </button>
   );
 }
 
-function GroupEditor({ node, depth, zone, allowGroups, allowMin, allTagOptions, circularKeys, diag, leafPaths, focusLeafId, setFocusLeafId, drag, edit, onMoveCondition }: {
+function flattenViewLeaves(node: VGroup): VLeaf[] {
+  const leaves: VLeaf[] = [];
+  const walk = (item: VNode) => {
+    if (item.kind === "leaf") leaves.push(item);
+    else item.items.forEach(walk);
+  };
+  node.items.forEach(walk);
+  return leaves;
+}
+
+function countViewLeaves(node: VGroup): number {
+  return flattenViewLeaves(node).length;
+}
+
+/** 三栏共用的平铺条件列表。嵌套 AST 只展开叶子显示，增删改仍按节点 id 回写原树。 */
+function ConditionList({ node, zone, allTagOptions, diag, leafPaths, focusLeafId, setFocusLeafId, edit, onMoveCondition }: {
   node: VGroup;
-  /** 1 = 区根组（不画卡片） */
-  depth: number;
   zone: "filter" | "mustNot";
-  allowGroups: boolean;
-  allowMin: boolean;
   allTagOptions: FlatTag[];
-  circularKeys: ReadonlySet<string>;
   diag: PlanDiagnostics | null;
   leafPaths: Map<string, ExprPath>;
   focusLeafId: string | null;
   setFocusLeafId: (id: string) => void;
-  drag: DragState;
   edit: (fn: (root: VGroup) => VGroup) => void;
   onMoveCondition: (to: "filter" | "should" | "mustNot", path: ExprPath) => void;
 }) {
-  const isCard = depth > 1 || Boolean(node.groupNegated);
-  const opValue = node.op === "minMatch" && !allowMin ? "or" : node.op;
-  const opOptions = allowMin ? FILTER_OP_OPTIONS : MUSTNOT_OP_OPTIONS;
-  const connectorText = node.op === "and" ? "并且" : "或者";
-  const dragState: DragState = { dndId: drag.dndId, dropAt: drag.dropAt, setDndId: drag.setDndId, setDropAt: drag.setDropAt };
-  const addLeaf = (groupId: string) => {
+  const leaves = flattenViewLeaves(node);
+  const connectorText = node.op === "and" ? "并且" : node.op === "or" ? "或者" : "计入";
+  const addLeaf = () => {
     const leaf: VLeaf = { kind: "leaf", id: uid(), negated: false, cond: makeCond("tag", allTagOptions) };
     setFocusLeafId(leaf.id);
-    edit((r) => addToGroupById(r, groupId, leaf));
+    edit((r) => addToGroupById(r, r.id, leaf));
   };
-  const addGroup = (groupId: string) => {
-    // 新子组默认 AND 并自带一条草稿行（自动聚焦其字段），避免空组死胡同（方案 §3.3/§4）
-    const leaf: VLeaf = { kind: "leaf", id: uid(), negated: false, cond: makeCond("tag", allTagOptions) };
-    setFocusLeafId(leaf.id);
-    edit((r) => addToGroupById(r, groupId, { ...emptyGroup(), items: [leaf] }));
-  };
+  if (leaves.length === 0) {
+    return <FirstConditionButton id={zone === "filter" ? "qb-must-add" : undefined} label={zone === "filter" ? "+ 添加第一个条件" : "+ 添加第一个排除条件"} onClick={addLeaf} />;
+  }
   return (
-    <div className={isCard ? "rounded-md border border-[var(--color-border)] bg-[var(--color-surface)] p-2" : undefined}>
-      {isCard && (
-        <div className="mb-1.5 flex flex-wrap items-center gap-x-2 gap-y-1">
-          <DragHandle item={node} drag={dragState} />
-          <button
-            type="button"
-            aria-expanded={!node.collapsed}
-            aria-label={node.collapsed ? "展开本组" : "收起本组"}
-            title={node.collapsed ? "展开本组" : "收起本组"}
-            onClick={() => edit((r) => patchGroupById(r, node.id, { collapsed: !node.collapsed }))}
-            className="text-[10px] leading-none text-[var(--color-text-secondary)] hover:text-[var(--color-text)]"
-          >
-            {node.collapsed ? "▸" : "▾"}
-          </button>
-          {node.groupNegated && (
-            <span
-              title="该组整体取反（NOT）：组内条件可继续编辑，取反本身不提供开关"
-              className="rounded bg-[var(--color-danger)]/10 px-1.5 py-0.5 text-[10px] font-medium text-[var(--color-danger)]"
-            >
-              整组取反
-            </span>
-          )}
-          <OpSegmented
-            ariaLabel="子组连接方式"
-            value={opValue}
-            options={opOptions}
-            onChange={(op) => edit((r) => patchGroupById(r, node.id, { op: op as VGroupOp, ...(op === "minMatch" ? { min: defaultMinFor(node.items.length) } : {}) }))}
-          />
-          {allowMin && opValue === "minMatch" && <MinSelect count={node.items.length} value={node.min} onChange={(n) => edit((r) => patchGroupById(r, node.id, { min: n }))} />}
-          <button
-            type="button"
-            aria-label="删除本组"
-            title="删除本组（组内条件一并移除）"
-            onClick={() => edit((r) => removeNodeById(r, node.id))}
-            className="ml-auto text-[11px] text-[var(--color-text-secondary)] hover:text-[var(--color-danger)]"
-          >
-            删除本组
-          </button>
-        </div>
-      )}
-      {node.collapsed ? (
-        <p className="px-1 py-1 text-[11px] text-[var(--color-text-tertiary)]">已收起：{countNodeLeaves(node)} 项条件</p>
-      ) : node.items.length === 0 ? (
-        depth === 1 ? (
-          <div className="flex gap-2">
-            <button
-              id={zone === "filter" ? "qb-must-add" : undefined}
-              type="button"
-              onClick={() => addLeaf(node.id)}
-              className="flex h-10 flex-1 items-center justify-center border border-dashed border-[var(--color-border)] text-xs text-[var(--color-text-secondary)] hover:border-[var(--color-border-strong)] hover:bg-[var(--color-surface-raised)] hover:text-[var(--color-text)]"
-            >
-              {zone === "filter" ? "+ 添加第一个条件" : "+ 添加第一个排除条件"}
-            </button>
-            {allowGroups && depth < MAX_GROUP_DEPTH && (
-              <button
-                type="button"
-                onClick={() => addGroup(node.id)}
-                className="flex h-10 items-center justify-center border border-dashed border-[var(--color-border)] px-3 text-xs text-[var(--color-text-secondary)] hover:border-[var(--color-border-strong)] hover:bg-[var(--color-surface-raised)] hover:text-[var(--color-text)]"
-              >
-                + 条件组
-              </button>
-            )}
-          </div>
-        ) : (
-          <p className="px-1 py-1 text-[11px] text-[var(--color-text-tertiary)]">空条件组：点下方「+ 条件」添加第一项</p>
-        )
-      ) : (
-        <div className="flex flex-col">
-          <DropLine node={node} index={0} drag={dragState} edit={edit} />
-          {node.items.map((item, index) => (
-            <Fragment key={item.id}>
-              {item.kind === "leaf" ? (
-                <div>
-                  <ConditionRow
-                    row={item}
-                    dragHandle={<DragHandle item={item} drag={dragState} />}
-                    autoFocus={item.id === focusLeafId}
-                    prefix={index === 0 ? "当" : connectorText}
-                    allTagOptions={allTagOptions}
-                    zone={zone}
-                    onMove={(t) => onMoveCondition(t, leafPaths.get(item.id) ?? [])}
-                    onChange={(patch) => edit((r) => replaceNodeById(r, item.id, { ...item, ...patch }))}
-                    onRemove={() => edit((r) => removeNodeById(r, item.id))}
-                  />
-                  <LeafDiagNoteByPath diag={diag} zone={zone} path={leafPaths.get(item.id)} />
-                </div>
-              ) : (
-                <div>
-                  {index > 0 && (
-                    <div className="mb-1 pl-1">
-                      <span className="rounded-full bg-[var(--color-surface-hover)] px-2 py-0.5 text-[10px] text-[var(--color-text-secondary)]">{connectorText}</span>
-                    </div>
-                  )}
-                  <div className="pl-2">
-                    <GroupEditor
-                      node={item}
-                      depth={depth + 1}
-                      zone={zone}
-                      allowGroups={allowGroups}
-                      allowMin={allowMin}
-                      allTagOptions={allTagOptions}
-                      circularKeys={circularKeys}
-                      diag={diag}
-                      leafPaths={leafPaths}
-                      focusLeafId={focusLeafId}
-                      setFocusLeafId={setFocusLeafId}
-                      drag={dragState}
-                      edit={edit}
-                      onMoveCondition={onMoveCondition}
-                    />
-                  </div>
-                </div>
-              )}
-              <DropLine node={node} index={index + 1} drag={dragState} edit={edit} />
-            </Fragment>
-          ))}
-        </div>
-      )}
-      {/* 底部添加入口：空子组也能加第一项（否则空组成死胡同）；折叠时不显示 */}
-      {!node.collapsed && (node.items.length > 0 || depth > 1) && (
-        <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1">
-          <button
-            id={depth === 1 && zone === "filter" ? "qb-must-add" : undefined}
-            type="button"
-            onClick={() => addLeaf(node.id)}
-            className="h-8 px-1 text-xs font-medium text-[var(--color-status)] hover:opacity-80"
-          >
-            {zone === "filter" ? "+ 添加条件" : "＋ 添加排除条件"}
-          </button>
-          {allowGroups && depth < MAX_GROUP_DEPTH && (
-            <button type="button" onClick={() => addGroup(node.id)} className="h-8 px-1 text-xs font-medium text-[var(--color-text-secondary)] hover:text-[var(--color-text)]">+ 条件组</button>
-          )}
-          {allowGroups && depth >= MAX_GROUP_DEPTH && <span className="text-[11px] text-[var(--color-text-tertiary)]">层级已足够，可拆分搜索</span>}
-        </div>
-      )}
+    <div>
+      <div className="flex flex-col gap-1.5">
+        {leaves.map((item, index) => (
+          <Fragment key={item.id}>
+            {index > 0 && <ConditionRelation text={connectorText} />}
+            <ConditionRow
+              row={item}
+              autoFocus={item.id === focusLeafId}
+              allTagOptions={allTagOptions}
+              zone={zone}
+              onMove={(to) => {
+                const path = leafPaths.get(item.id);
+                if (path) onMoveCondition(to, path);
+              }}
+              onChange={(patch) => edit((r) => replaceNodeById(r, item.id, { ...item, ...patch }))}
+              onRemove={() => edit((r) => removeNodeById(r, item.id))}
+            />
+            <LeafDiagNoteByPath diag={diag} zone={zone} path={leafPaths.get(item.id)} />
+          </Fragment>
+        ))}
+      </div>
+      <button
+        id={zone === "filter" ? "qb-must-add" : undefined}
+        type="button"
+        onClick={addLeaf}
+        className="mt-2 h-8 px-1 text-xs font-medium text-[var(--color-status)] hover:opacity-80"
+      >
+        {zone === "filter" ? "+ 添加条件" : "+ 添加排除条件"}
+      </button>
     </div>
   );
 }
@@ -1002,20 +747,34 @@ function MoveMenu({ zone, onMove }: { zone: "filter" | "should" | "mustNot"; onM
   );
 }
 
-function ConditionRow({ row, prefix, allTagOptions, zone, autoFocus = false, dragHandle, onMove, onChange, onRemove }: { row: VLeaf; prefix: string; allTagOptions: FlatTag[]; zone: "filter" | "mustNot"; autoFocus?: boolean; dragHandle?: React.ReactNode; onMove: (to: "filter" | "should" | "mustNot") => void; onChange: (patch: Partial<VLeaf>) => void; onRemove: () => void }) {
+function ConditionRow({ row, allTagOptions, zone, autoFocus = false, extraActions, rank, removeLabel = "删除条件", onMove, onChange, onRemove }: { row: VLeaf; allTagOptions: FlatTag[]; zone: SearchZone; autoFocus?: boolean; extraActions?: React.ReactNode; rank?: number; removeLabel?: string; onMove: (to: SearchZone) => void; onChange: (patch: Partial<VLeaf>) => void; onRemove: () => void }) {
   const field = fieldFromCond(row.cond);
-  // P1 硬规则：一条条件严格只占一行 —— 连接词｜字段｜（数值类才有的）运算符｜值｜移动｜删除，同一水平线。
+  // 条件行采用「字段与操作 / 运算符与值」两层布局，窄列中也不再把值和操作按钮挤在同一条水平线上。
   const needsOperator = leafNeedsOperator(row.cond);
   return (
-    <div className="flex items-center gap-1 rounded-md border border-[var(--color-border)] bg-[var(--color-surface-raised)] p-1.5">
-      {dragHandle}
-      <span className="w-6 shrink-0 text-[11px] text-[var(--color-text-tertiary)]">{prefix}</span>
-      <div className="w-[104px] shrink-0"><FieldSelect value={field} autoFocus={autoFocus} onChange={(next) => onChange({ cond: makeCond(next, allTagOptions), negated: false })} /></div>
-      {needsOperator && <div className="w-[76px] shrink-0"><ConditionOperator cond={row.cond} negated={row.negated} onChange={onChange} /></div>}
-      {row.negated && <span title="该条件取反（NOT）" className="shrink-0 rounded bg-[var(--color-danger)]/10 px-1 text-[11px] text-[var(--color-danger)]">非</span>}
-      <div className="min-w-0 flex-1"><ConditionValue cond={row.cond} allTagOptions={allTagOptions} onChange={(cond) => onChange({ cond })} /></div>
-      <MoveMenu zone={zone} onMove={onMove} />
-      <button type="button" onClick={onRemove} className="flex size-7 shrink-0 items-center justify-center rounded text-base text-[var(--color-text-tertiary)] hover:bg-[var(--color-surface-hover)] hover:text-[var(--color-danger)]" aria-label="删除条件" title="删除条件">×</button>
+    <div data-testid="condition-row" className="rounded-md border border-[var(--color-border)] bg-[var(--color-surface-raised)] p-2">
+      <div className="flex min-w-0 items-start gap-1.5">
+        <div className="flex shrink-0 items-center gap-1 pt-1">
+          {rank != null && <span className="w-4 text-center text-[10px] font-medium text-[var(--color-accent)]">{rank}</span>}
+        </div>
+        <div className="min-w-0 flex-1">
+          <div className="flex min-w-0 items-center gap-1.5">
+            <div className="min-w-0 flex-1">
+              <FieldSelect value={field} autoFocus={autoFocus} onChange={(next) => onChange({ cond: makeCond(next, allTagOptions), negated: false })} />
+            </div>
+            <div className="flex shrink-0 items-center gap-0.5">
+              {extraActions}
+              <MoveMenu zone={zone} onMove={onMove} />
+              <button type="button" onClick={onRemove} className="flex size-7 shrink-0 items-center justify-center rounded text-base text-[var(--color-text-tertiary)] hover:bg-[var(--color-surface-hover)] hover:text-[var(--color-danger)]" aria-label={removeLabel} title={removeLabel}>×</button>
+            </div>
+          </div>
+          <div className="mt-1.5 flex min-w-0 flex-wrap items-start gap-1.5">
+            {needsOperator && <div className="min-w-0 flex-[0_1_7.5rem]"><ConditionOperator cond={row.cond} negated={row.negated} onChange={onChange} /></div>}
+            {row.negated && <span title="该条件取反（NOT）" className="shrink-0 rounded px-1 text-[11px] text-[var(--color-danger)]">非</span>}
+            <div className="min-w-0 flex-[1_1_10rem]"><ConditionValue cond={row.cond} allTagOptions={allTagOptions} onChange={(cond) => onChange({ cond })} /></div>
+          </div>
+        </div>
+      </div>
     </div>
   );
 }
@@ -1046,7 +805,7 @@ function FieldSelect({ value, onChange, hideKeys = [], autoFocus = false }: { va
     return () => { host.remove(); };
   }, []);
 
-  // 「+ 条件 / + 条件组」新行自动聚焦字段下拉（方案 §3.3）
+  // 「+ 添加条件」新行自动聚焦字段下拉
   useEffect(() => {
     if (autoFocus) inputRef.current?.focus();
   }, [autoFocus]);
@@ -1087,7 +846,11 @@ function FieldSelect({ value, onChange, hideKeys = [], autoFocus = false }: { va
     window.addEventListener("scroll", measure, true);
     window.addEventListener("resize", measure);
     const onDown = (e: MouseEvent) => {
-      if (rootRef.current && !rootRef.current.contains(e.target as Node)) setOpen(false);
+      const target = e.target as Node;
+      // 字段列表通过 portal 挂到 body；点击选项时不能被“点击外部”逻辑
+      // 抢先关闭，否则下拉会在 option 的 click 事件触发前卸载，字段就不会切换。
+      if (rootRef.current?.contains(target) || portalHost.current?.contains(target)) return;
+      setOpen(false);
     };
     document.addEventListener("mousedown", onDown);
     return () => {
@@ -1097,23 +860,27 @@ function FieldSelect({ value, onChange, hideKeys = [], autoFocus = false }: { va
     };
   }, [open, measure]);
 
-  // 过滤（label/key 均可匹配）+ 最近使用置顶（去重，避免同 key 出现两处）
+  // 过滤（label/key 均可匹配）+ 最近使用置顶。
+  // 最近使用是快捷入口，不是字段总表的替代品；同一字段必须继续保留在原分组中。
   const q = query.trim().toLowerCase();
   const visible = useMemo(() => {
     // §3.8：字段表里的「排除标签」删除（并入排除区），新行不再能直接选 excludeTag；
     // 遗留 plan 中已有的 excludeTag 叶子仍可显示（labelOf 兜底），只是不能再新建。
-    const options = [...FIELD_OPTIONS, ...facetOptions].filter((o) => o.key !== "excludeTag" && !hideKeys.includes(o.key));
+    const options = [...FIELD_OPTIONS, ...facetOptions].filter((o) => o.visible !== false && o.key !== "excludeTag" && !hideKeys.includes(o.key));
     const matched = options.filter((o) => !q || o.label.toLowerCase().includes(q) || o.key.toLowerCase().includes(q));
-    const showRecent = !q && recent.length > 0;
-    const recentSet = new Set(showRecent ? recent : []);
-    const recents = matched.filter((o) => recentSet.has(o.key));
+    const matchedByKey = new Map(matched.map((o) => [o.key, o]));
+    // 按用户实际选择的时间顺序渲染，不能被字段总表的静态顺序打乱。
+    const recents = !q
+      ? recent.map((key) => matchedByKey.get(key)).filter((o): o is FieldOption => o !== undefined)
+      : [];
+    const showRecent = recents.length > 0;
     const groups = new Map<string, FieldOption[]>();
     for (const group of FIELD_GROUPS) {
-      const items = matched.filter((o) => o.group === group && !recentSet.has(o.key));
+      const items = matched.filter((o) => o.group === group);
       if (items.length > 0) groups.set(group, items);
     }
     return { showRecent, recents, groups, rest: Array.from(groups.values()).flat(), hasMatch: matched.length > 0 };
-  }, [q, recent]);
+  }, [q, recent, facetOptions, hideKeys]);
   const flat = visible.showRecent ? [...visible.recents, ...visible.rest] : visible.rest;
 
   const onKeyDown = (e: React.KeyboardEvent) => {
@@ -1210,62 +977,11 @@ function FieldSelect({ value, onChange, hideKeys = [], autoFocus = false }: { va
 }
 
 /** 是否需要独立运算符格：仅数值/元数据类字段需要显式运算符（等于/大于/介于…）。
- *  标签/关键词/素材类型/未打标/分面有无 —— 字段名本身已含语义，严格一行时不占运算符格（P1 减负）。 */
+ *  标签/关键词/素材类型/未打标/分面有无 —— 字段名本身已含语义，不额外占用操作行。 */
 function leafNeedsOperator(cond: LeafCond): boolean {
   return cond.type === "metadata" || cond.type === "facetNumber";
 }
 
-// ═════════ P1：实时人话预览 —— 把条件树/优先项翻译成一句中文，未完成条件自动跳过 ═════════
-function briefScalar(v: unknown): string {
-  if (v == null || v === "") return "…";
-  return String(v);
-}
-function metadataValueBrief(filter: MetadataFilter): string {
-  if (filter.op === "between") return `${briefScalar(filter.min)}~${briefScalar(filter.max)}`;
-  if (filter.op === "in") return (filter.values ?? []).map(briefScalar).join("、") || "…";
-  return briefScalar(filter.value);
-}
-/** 单个叶子条件 → 简短中文（用于底部预览句）。 */
-function leafBrief(cond: LeafCond, tags: FlatTag[]): string {
-  switch (cond.type) {
-    case "tag":
-    case "excludeTag": {
-      const byId = new Map(tags.map((t) => [t.id, t.name]));
-      const names = cond.tagIds.map((id) => byId.get(id) ?? `#${id}`);
-      return `标签 ${names.join("、") || "…"}`;
-    }
-    case "search":
-      return `关键词“${cond.value || "…"}”`;
-    case "assetType":
-      return `素材类型${cond.value === "image" ? "图片" : cond.value === "video" ? "视频" : "全部"}`;
-    case "untagged":
-      return "未打标";
-    case "facetHasAny":
-      return `${cond.facetKey}分类有标签`;
-    case "facetMissing":
-      return `${cond.facetKey}分类无标签`;
-    case "facetNumber":
-      return `${cond.facetKey} ${OP_LABELS[cond.op]} ${cond.value}${cond.op === "between" ? `~${cond.maxValue ?? ""}` : ""}`;
-    case "metadata": {
-      const label = FIELD_OPTIONS.find((o) => o.key === cond.filter.key)?.label ?? cond.filter.key;
-      return `${label} ${OP_LABELS[cond.filter.op] ?? cond.filter.op} ${metadataValueBrief(cond.filter)}`;
-    }
-    default:
-      return "";
-  }
-}
-/** 条件组 → 中文（且/或/至少N项；子组加括号；未完成叶子跳过；整组无完成项返回空串）。 */
-function groupBrief(node: VNode, tags: FlatTag[], circularKeys: ReadonlySet<string>): string {
-  if (node.kind === "leaf") {
-    return isComplete(node.cond, circularKeys) ? leafBrief(node.cond, tags) : "";
-  }
-  const parts = node.items
-    .map((it) => (it.kind === "group" ? `（${groupBrief(it, tags, circularKeys)}）` : groupBrief(it, tags, circularKeys)))
-    .filter(Boolean);
-  if (parts.length === 0) return "";
-  const core = node.op === "and" ? parts.join(" 且 ") : node.op === "or" ? parts.join(" 或 ") : `[${parts.join("、")}]中至少${node.min}项`;
-  return node.groupNegated ? `非（${core}）` : core;
-}
 function ConditionOperator({ cond, negated, onChange }: { cond: LeafCond; negated: boolean; onChange: (patch: Partial<VLeaf>) => void }) {
   // P1：标签/关键词/枚举/分面有无不再渲染只读「是/存在/缺失」占位（字段名已表达）。
   // 仅数值类保留真正的运算符下拉；遗留 NOT(leaf) 由 ConditionRow 在行内以「非」角标兜底，防止静默改义。
@@ -1411,7 +1127,7 @@ function TagValueCell({ isExclude, data, options, onChange }: { isExclude: boole
         const tag = byId.get(id);
         const name = tag?.name ?? `标签 #${id}`;
         return (
-          <span key={id} className="inline-flex h-6 max-w-full items-center gap-0.5 rounded-full border border-[var(--color-border)] bg-[var(--color-surface)] pr-0.5 pl-2 text-[11px] text-[var(--color-text)]">
+          <span key={id} className="inline-flex h-6 max-w-full items-center gap-0.5 rounded-full border border-[var(--color-border)] bg-transparent pr-0.5 pl-2 text-[11px] text-[var(--color-text)]">
             <span className="truncate">{name}</span>
             <button type="button" aria-label={`移除 ${name}`} title={`移除 ${name}`} onClick={() => toggle(id)} className="flex size-5 shrink-0 items-center justify-center rounded-full text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-hover)] hover:text-[var(--color-text)]">×</button>
           </span>
@@ -1420,7 +1136,7 @@ function TagValueCell({ isExclude, data, options, onChange }: { isExclude: boole
       <button ref={btnRef} type="button" aria-expanded={open} aria-label="选择标签" onClick={() => setOpen((o) => !o)} className="inline-flex h-6 shrink-0 items-center gap-1 rounded-full border border-dashed border-[var(--color-border-strong)] px-2 text-[11px] text-[var(--color-text-secondary)] hover:bg-[var(--color-surface)] hover:text-[var(--color-text)]">＋ {data.tagIds.length > 0 ? "添加" : "选择标签"}</button>
       {/* AI 回填的按词查：主行仅以可删小胶囊回显，不常驻输入框 */}
       {!isExclude && data.termQuery && data.termQuery.trim() && (
-        <span data-testid="term-query-chip" className="inline-flex h-6 items-center gap-1 rounded-full bg-[var(--color-surface-hover)] px-2 text-[10px] text-[var(--color-text-secondary)]">
+        <span data-testid="term-query-chip" className="inline-flex h-6 items-center gap-1 rounded-full border border-[var(--color-border)] px-2 text-[10px] text-[var(--color-text-secondary)]">
           词：{data.termQuery.trim()}
           <button type="button" aria-label="移除按词查" title="移除按词查" onClick={() => onChange({ ...data, termQuery: null })} className="text-[var(--color-text-secondary)] hover:text-[var(--color-danger)]">×</button>
         </span>
@@ -1494,12 +1210,19 @@ function TagValueCell({ isExclude, data, options, onChange }: { isExclude: boole
 function MetadataValue({ filter, onChange }: { filter: MetadataFilter; onChange: (filter: MetadataFilter) => void }) {
   const numericDomains = useNumericDomainStore((s) => s.domains);
   const metadataFacets = useMetadataStore((s) => s.facets);
-  // U-3：前三色走色块选择器（单选 eq + 占比阈值 / 多选 in）
-  if (filter.key === "palette_top3") return <PaletteValue filter={filter} onChange={onChange} />;
   // Phase 4（§5.3）：数值字段的 min/max/step/后缀/预设/环形全部来自 NumericDomain（单一事实源）。
   const domain = numericDomains.find((d) => d.key === filter.key);
+  // U-3：前三色走带中文名称的色板列表（单选 eq + 占比阈值 / 多选 in）
+  if (filter.key === "palette_top3") return <PaletteValue filter={filter} onChange={onChange} />;
+  // 宽高比是“预设或自定义比例”二选一，不能同时显示一排预设和一个含义不明的数字框。
+  if (filter.key === "aspect_ratio") return <AspectRatioValue filter={filter} presets={domain?.presets} onChange={onChange} />;
   const facetItems = metadataFacets.find((f) => f.key === filter.key)?.items;
   const kind = FIELD_OPTIONS.find((item) => item.key === filter.key)?.kind ?? "number";
+  // 有无定位是稳定的二元语义，即使空库没有分面数据也必须提供可理解的选择器。
+  const fallbackEnumItems: MetadataFacetItem[] = filter.key === "has_location"
+    ? [{ value: "yes", label: "有定位", count: 0 }, { value: "no", label: "无定位", count: 0 }]
+    : [];
+  const enumItems = facetItems && facetItems.length > 0 ? facetItems : fallbackEnumItems;
   if (filter.op === "between") {
     // Phase 4（§4-3）：范围一律成对 min/max；file_size 两侧共用同一个单位下拉（单位提升进 filter）。
     if (kind === "size") return <SizeBetweenValue filter={filter} onChange={onChange} />;
@@ -1521,29 +1244,16 @@ function MetadataValue({ filter, onChange }: { filter: MetadataFilter; onChange:
     );
   }
   // Phase 4（§5.5）：枚举字段（file_ext/camera/lens/folder…）的候选值带命中数下拉 —— 全库无条件计数。
-  if (filter.op === "eq" && kind === "text" && facetItems && facetItems.length > 0) {
-    return <EnumCountSelect key={filter.key} items={facetItems} value={typeof filter.value === "string" ? filter.value : ""} onChange={(v) => onChange({ ...filter, value: v })} />;
+  if (filter.op === "eq" && kind === "text" && enumItems.length > 0) {
+    return <EnumCountSelect key={filter.key} items={enumItems} showCount={Boolean(facetItems && facetItems.length > 0)} value={typeof filter.value === "string" ? filter.value : ""} onChange={(v) => onChange({ ...filter, value: v })} />;
   }
   // Phase 4（§4-4）：`属于任一` 对可枚举字段改为 chip 多选（可搜索面板；命中数随选项展示）。
-  if (filter.op === "in" && facetItems && facetItems.length > 0 && kind === "text") {
-    const selected = new Set((filter.values ?? []).map(String));
-    const toggle = (v: string) => {
-      const next = selected.has(v) ? (filter.values ?? []).filter((x) => String(x) !== v) : [...(filter.values ?? []), v];
-      onChange({ ...filter, values: next });
-    };
-    return (
-      <div className="flex min-w-0 flex-wrap items-center gap-1 self-start">
-        {facetItems.slice(0, 200).map((item) => {
-          const on = selected.has(item.value);
-          return (
-            <button key={item.value} type="button" role="checkbox" aria-checked={on} onClick={() => toggle(item.value)} className={`inline-flex h-6 max-w-full items-center gap-1 rounded-full border px-2 text-[11px] ${on ? "border-[var(--color-accent)] bg-[var(--color-accent)]/15 text-[var(--color-accent)]" : "border-[var(--color-border-strong)] text-[var(--color-text-secondary)] hover:bg-[var(--color-surface)]"}`}>
-              <span className="truncate">{item.label}</span>
-              <span className="shrink-0 text-[10px] opacity-70">({item.count})</span>
-            </button>
-          );
-        })}
-      </div>
-    );
+  if (filter.op === "in" && kind === "text") {
+    if (enumItems.length > 0) {
+      return <EnumMultiSelect items={enumItems} showCount={Boolean(facetItems && facetItems.length > 0)} values={filter.values ?? []} onChange={(values) => onChange({ ...filter, values })} />;
+    }
+    // 分面尚未加载或字段没有候选项时仍保持 `in` 的协议形状，避免把输入误写成 value。
+    return <EnumListValue filter={filter} onChange={onChange} />;
   }
   // Phase 4（§5.4 Stars）：rating eq → 0–5 星选择器
   if (filter.op === "eq" && domain?.unit === "stars") {
@@ -1555,16 +1265,47 @@ function MetadataValue({ filter, onChange }: { filter: MetadataFilter; onChange:
   return <ValueInput kind={kind} domain={domain} rich value={filter.value} dateSide={filter.op === "lte" ? "end" : "start"} onChange={(value) => onChange({ ...filter, value })} />;
 }
 /** Phase 4（§5.5）：带命中数的枚举单值下拉 —— label 显示命中数，提交 value（与后端分面同键）。 */
-function EnumCountSelect({ items, value, onChange }: { items: MetadataFacetItem[]; value: string; onChange: (v: string) => void }) {
+type EnumChoice = Pick<MetadataFacetItem, "value" | "label" | "count">;
+function EnumCountSelect({ items, showCount = true, value, onChange }: { items: EnumChoice[]; showCount?: boolean; value: string; onChange: (v: string) => void }) {
   const known = items.some((i) => i.value === value);
   return (
     <select aria-label="条件值" value={known ? value : ""} onChange={(e) => onChange(e.target.value)} className={`${controlClass} w-full`}>
       <option value="" disabled>选择…</option>
       {!known && value ? <option value={value}>{value}</option> : null}
       {items.map((item) => (
-        <option key={item.value} value={item.value}>{item.label}（{item.count}）</option>
+        <option key={item.value} value={item.value}>{showCount ? `${item.label}（${item.count}）` : item.label}</option>
       ))}
     </select>
+  );
+}
+function EnumMultiSelect({ items, showCount = true, values, onChange }: { items: EnumChoice[]; showCount?: boolean; values: unknown[]; onChange: (values: string[]) => void }) {
+  const selected = new Set(values.map(String));
+  const toggle = (value: string) => {
+    const next = selected.has(value) ? values.filter((x) => String(x) !== value).map(String) : [...values.map(String), value];
+    onChange(next);
+  };
+  return (
+    <div className="flex min-w-0 flex-wrap items-center gap-1 self-start">
+      {items.slice(0, 200).map((item) => {
+        const on = selected.has(item.value);
+        return (
+          <button key={item.value} type="button" role="checkbox" aria-checked={on} onClick={() => toggle(item.value)} className={`inline-flex h-6 max-w-full items-center gap-1 rounded-full border px-2 text-[11px] ${on ? "border-[var(--color-accent)] bg-[var(--color-accent)]/15 text-[var(--color-accent)]" : "border-[var(--color-border-strong)] text-[var(--color-text-secondary)] hover:bg-[var(--color-surface)]"}`}>
+            <span className="truncate">{item.label}</span>
+            {showCount && <span className="shrink-0 text-[10px] opacity-70">({item.count})</span>}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+/** 没有分面候选时的枚举多选回退，显式把逗号分隔内容写入 values。 */
+function EnumListValue({ filter, onChange }: { filter: MetadataFilter; onChange: (filter: MetadataFilter) => void }) {
+  const display = (filter.values ?? []).map(String).join(", ");
+  return (
+    <div className="flex min-w-0 flex-col gap-1 self-start">
+      <DraftInput ariaLabel="条件值" placeholder="输入值，多个用逗号分隔" displayValue={display} onCommit={(raw) => onChange({ ...filter, values: raw.split(/[，,]/).map((value) => value.trim()).filter(Boolean) })} className={`${controlClass} w-full`} />
+      <span className="text-[10px] text-[var(--color-text-tertiary)]">多个值用逗号分隔</span>
+    </div>
   );
 }
 /** Phase 4（§5.4 Stars）：0–5 星选择器（0 = 未评级，点当前星可清回 0）。 */
@@ -1592,6 +1333,150 @@ function StarValue({ value, onChange }: { value: number; onChange: (v: number) =
     </div>
   );
 }
+type AspectPreset = [string, number];
+const DEFAULT_ASPECT_PRESETS: AspectPreset[] = [
+  ["1:1", 1],
+  ["4:3", 4 / 3],
+  ["3:2", 3 / 2],
+  ["16:9", 16 / 9],
+  ["9:16", 9 / 16],
+];
+const ASPECT_RATIO_TOLERANCE = 0.0001;
+
+function parseAspectRatio(raw: string): number | undefined {
+  const match = raw.trim().match(/^(\d+(?:\.\d+)?)\s*:\s*(\d+(?:\.\d+)?)$/);
+  if (!match) return undefined;
+  const width = Number(match[1]);
+  const height = Number(match[2]);
+  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) return undefined;
+  return width / height;
+}
+
+function aspectValueNumber(value: string | number | undefined): number | undefined {
+  const n = typeof value === "number" ? value : typeof value === "string" && value.trim() ? Number(value) : undefined;
+  return n != null && Number.isFinite(n) && n > 0 ? n : undefined;
+}
+
+function aspectPresetFor(value: string | number | undefined, presets: AspectPreset[]): AspectPreset | undefined {
+  const n = aspectValueNumber(value);
+  return n == null ? undefined : presets.find(([, pv]) => Math.abs(n - pv) <= ASPECT_RATIO_TOLERANCE);
+}
+
+/** 把已持久化的数值比例回显为用户熟悉的“宽:高”，避免再次看到 1.7777 这类机器数值。 */
+function formatAspectRatio(value: string | number | undefined, presets: AspectPreset[]): string {
+  const n = aspectValueNumber(value);
+  if (n == null) return "";
+  const preset = aspectPresetFor(n, presets);
+  if (preset) return preset[0];
+  let bestNumerator = 0;
+  let bestDenominator = 1;
+  let bestError = Number.POSITIVE_INFINITY;
+  for (let denominator = 1; denominator <= 100; denominator += 1) {
+    const numerator = Math.max(1, Math.round(n * denominator));
+    const error = Math.abs(n - numerator / denominator);
+    if (error < bestError) {
+      bestNumerator = numerator;
+      bestDenominator = denominator;
+      bestError = error;
+    }
+  }
+  return bestError <= 0.003 ? `${bestNumerator}:${bestDenominator}` : n.toFixed(4).replace(/0+$/, "").replace(/\.$/, "");
+}
+
+/** 宽高比值编辑：预设和自定义输入互斥；自定义统一使用“宽:高”格式。 */
+function AspectRatioValue({ filter, presets: domainPresets, onChange }: { filter: MetadataFilter; presets?: AspectPreset[]; onChange: (f: MetadataFilter) => void }) {
+  const presets = domainPresets && domainPresets.length > 0 ? domainPresets : DEFAULT_ASPECT_PRESETS;
+  const currentPreset = aspectPresetFor(filter.value, presets);
+  const [choice, setChoice] = useState(currentPreset?.[0] ?? "custom");
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (filter.op === "between" || filter.op === "in") return;
+    setChoice(aspectPresetFor(filter.value, presets)?.[0] ?? "custom");
+    setError(null);
+  }, [filter.op, filter.value, presets]);
+
+  const commitSingle = (raw: string) => {
+    const value = parseAspectRatio(raw);
+    if (value == null) {
+      setError("请输入类似 3:2 的比例（宽:高）");
+      return;
+    }
+    setError(null);
+    onChange({ key: filter.key, op: filter.op, value });
+  };
+
+  if (filter.op === "between") {
+    const commitSide = (side: "min" | "max", raw: string) => {
+      const value = parseAspectRatio(raw);
+      if (value == null) {
+        setError("请输入类似 3:2 的比例（宽:高）");
+        return;
+      }
+      setError(null);
+      onChange({ ...filter, [side]: value });
+    };
+    return (
+      <div className="flex min-w-0 flex-col gap-1 self-start">
+        <div className="grid min-w-0 grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-center gap-1">
+          <DraftInput ariaLabel="宽高比下限" placeholder="例如 3:2" displayValue={formatAspectRatio(filter.min, presets)} onCommit={(raw) => commitSide("min", raw)} className={`${controlClass} w-full`} />
+          <span className="text-[11px] text-[var(--color-text-tertiary)]">至</span>
+          <DraftInput ariaLabel="宽高比上限" placeholder="例如 16:9" displayValue={formatAspectRatio(filter.max, presets)} onCommit={(raw) => commitSide("max", raw)} className={`${controlClass} w-full`} />
+        </div>
+        {error && <p role="alert" className="text-[10px] text-[var(--color-danger)]">{error}</p>}
+      </div>
+    );
+  }
+
+  if (filter.op === "in") {
+    const display = (filter.values ?? []).map((value) => formatAspectRatio(value, presets)).filter(Boolean).join("，");
+    const commitList = (raw: string) => {
+      const parts = raw.split(/[，,]/).map((part) => part.trim()).filter(Boolean);
+      const values = parts.map(parseAspectRatio);
+      if (parts.length === 0) { onChange({ key: filter.key, op: filter.op, values: [] }); return; }
+      if (values.some((value): value is undefined => value == null)) {
+        setError("请使用 1:1，4:3 这样的比例格式");
+        return;
+      }
+      setError(null);
+      onChange({ key: filter.key, op: filter.op, values: values as number[] });
+    };
+    return (
+      <div className="flex min-w-0 flex-col gap-1 self-start">
+        <DraftInput ariaLabel="宽高比列表" placeholder="例如 1:1，4:3" displayValue={display} onCommit={commitList} className={`${controlClass} w-full`} />
+        <span className="text-[10px] text-[var(--color-text-tertiary)]">多个比例用逗号分隔</span>
+        {error && <p role="alert" className="text-[10px] text-[var(--color-danger)]">{error}</p>}
+      </div>
+    );
+  }
+
+  const selectedChoice = choice === "custom" ? "custom" : (presets.some(([label]) => label === choice) ? choice : "custom");
+  return (
+    <div className="flex min-w-0 flex-col gap-1 self-start">
+      <select aria-label="宽高比选项" value={selectedChoice} onChange={(e) => {
+        const next = e.target.value;
+        setError(null);
+        setChoice(next);
+        if (next === "custom") {
+          onChange({ key: filter.key, op: filter.op, value: undefined });
+          return;
+        }
+        const preset = presets.find(([label]) => label === next);
+        if (preset) onChange({ key: filter.key, op: filter.op, value: preset[1] });
+      }} className={`${controlClass} w-full`}>
+        <option value="custom">自定义比例</option>
+        {presets.map(([label]) => <option key={label} value={label}>{label}</option>)}
+      </select>
+      {selectedChoice === "custom" && (
+        <>
+          <DraftInput ariaLabel="宽高比自定义值" placeholder="例如 3:2" displayValue={formatAspectRatio(filter.value, presets)} onCommit={commitSingle} className={`${controlClass} w-full`} />
+          <span className="text-[10px] text-[var(--color-text-tertiary)]">格式：宽:高，例如 3:2</span>
+        </>
+      )}
+      {error && <p role="alert" className="text-[10px] text-[var(--color-danger)]">{error}</p>}
+    </div>
+  );
+}
 // U-3：前三色色块 —— 12 hue（colorName.ts HUE_NAMES 端点中值，与 palette_bucket 桶序一致）+ 黑/灰/白
 const PALETTE_SWATCHES: { name: string; color: string }[] = [
   { name: "红", color: "hsl(7.5, 90%, 55%)" },
@@ -1616,8 +1501,8 @@ function paletteColorsFromFilter(filter: MetadataFilter): string[] {
   if (typeof v === "string") return [v];
   return Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : [];
 }
-/** U-3：色块选择器值单元格 —— 单选色 → eq（带占比阈值 min 0..1）；多选色 → in values。
- *  色相/饱和度/明度的高级数值输入仍保留在字段下拉「颜色」组（dominant_*）。 */
+/** U-3：颜色列表值单元格 —— 单选色 → eq（带占比阈值 min 0..1）；多选色 → in values。
+ *  颜色用“色点 + 中文名称”表达，避免只靠颜色本身猜含义。算法 hue/sat/lum 维度仍为结果卡片/历史条件的兼容字段，但不在手动字段列表中展示。 */
 function PaletteValue({ filter, onChange }: { filter: MetadataFilter; onChange: (f: MetadataFilter) => void }) {
   const colors = paletteColorsFromFilter(filter);
   const single = colors.length === 1;
@@ -1636,26 +1521,31 @@ function PaletteValue({ filter, onChange }: { filter: MetadataFilter; onChange: 
   };
   return (
     <div className="flex min-w-0 flex-col items-start gap-1 self-start">
-      <div className="flex flex-wrap items-center gap-1">
+      <div role="group" aria-label="颜色列表" className="flex min-w-0 flex-wrap items-center gap-1">
         {PALETTE_SWATCHES.map((sw) => {
           const on = colors.includes(sw.name);
           return (
             <button
               key={sw.name}
               type="button"
+              role="checkbox"
+              aria-checked={on}
               aria-label={sw.name}
-              aria-pressed={on}
               title={sw.name}
               onClick={() => commit(on ? colors.filter((c) => c !== sw.name) : [...colors, sw.name], on ? 0 : pct)}
-              className={`size-6 shrink-0 rounded-full border transition-transform ${on ? "scale-110 ring-2 ring-[var(--color-status)]" : "border-[var(--color-border-strong)]"}`}
-              style={{ backgroundColor: sw.color }}
-            />
+              className={`inline-flex h-7 shrink-0 items-center gap-1 rounded-md border px-1.5 text-[11px] transition-colors ${on ? "border-[var(--color-accent)] bg-[var(--color-accent)]/10 text-[var(--color-accent)]" : "border-[var(--color-border-strong)] text-[var(--color-text-secondary)] hover:bg-[var(--color-surface-hover)] hover:text-[var(--color-text)]"}`}
+            >
+              <span aria-hidden="true" className="size-3 shrink-0 rounded-full border border-[var(--color-border-strong)]" style={{ backgroundColor: sw.color }} />
+              <span>{sw.name}</span>
+              {on && <span aria-hidden="true" className="text-[10px]">✓</span>}
+            </button>
           );
         })}
       </div>
       {single && (
         <div className="flex w-full items-center gap-2 text-[11px] text-[var(--color-text-secondary)]">
-          <input aria-label="占比阈值" type="range" min={0} max={100} step={5} value={pct} onChange={(e) => commit(colors, Number(e.target.value))} className="h-1 min-w-0 flex-1 accent-[var(--color-accent)]" />
+          <span className="shrink-0">占比要求</span>
+          <input aria-label="颜色占比阈值" type="range" min={0} max={100} step={5} value={pct} onChange={(e) => commit(colors, Number(e.target.value))} className="h-1 min-w-0 flex-1 accent-[var(--color-accent)]" />
           <span className="shrink-0 whitespace-nowrap">{pct === 0 ? "不限占比" : `占 ${pct}% 以上`}</span>
         </div>
       )}
@@ -1665,8 +1555,8 @@ function PaletteValue({ filter, onChange }: { filter: MetadataFilter; onChange: 
 function ValueInput({ kind, value, onChange, dateSide, domain, rich }: { kind: NonNullable<FieldOption["kind"]>; value: string | number | undefined; dateSide?: "start" | "end"; domain?: NumericDomain; rich?: boolean; onChange: (value: string | number | undefined) => void }) {
   if (kind === "date") return <DateValue value={value} side={dateSide ?? "start"} onChange={onChange} />;
   if (kind === "text") return <DraftInput ariaLabel="条件值" placeholder="输入值" displayValue={String(value ?? "")} onCommit={(raw) => onChange(raw)} className={`${controlClass} w-full`} />;
-  const factor = kind === "duration" ? 1000 : kind === "resolution" ? 1_000_000 : 1;
-  const suffix = kind === "duration" ? "秒" : kind === "resolution" ? "MP" : domain?.unitLabel && kind === "number" ? domain.unitLabel : "";
+  const factor = kind === "duration" ? 1000 : 1;
+  const suffix = kind === "duration" ? "秒" : domain?.unitLabel && kind === "number" ? domain.unitLabel : "";
   const isPlainNumber = kind === "number";
   const min = isPlainNumber ? (domain?.min ?? undefined) : undefined;
   const max = isPlainNumber ? (domain?.max ?? undefined) : undefined;
@@ -1776,15 +1666,17 @@ function SizeBetweenValue({ filter, onChange }: { filter: MetadataFilter; onChan
   );
 }
 /** U-7 ②：date 快捷（今天/本周/本月/今年）—— start 侧（gte/区间下限）写期初，end 侧（lte/区间上限）写期末；
- *  选完立即落值并回到「自定义」，之后仍可手工改日期。
+ *  选完立即落值并回到带具体日期的「自定义」状态，之后仍可手工改日期。
  *  P0（日期线格式）：收发一律 YYYY-MM-DD 字符串（后端只认字符串；空串 → undefined 表示未填）。 */
 function DateValue({ value, side, onChange }: { value: string | number | undefined; side: "start" | "end"; onChange: (v: string | number | undefined) => void }) {
   const [pick, setPick] = useState("");
+  const displayDate = toDateInputValue(value);
+  const customLabel = displayDate ? `自定义：${displayDate}` : "选择日期";
   return (
     <div className="flex min-w-0 items-stretch gap-1">
-      <input aria-label="条件值" type="date" value={toDateInputValue(value)} onChange={(e) => { const v = e.target.value; onChange(v ? v : undefined); }} className={`${controlClass} w-full`} />
-      <select aria-label="日期快捷" value={pick} onChange={(e) => { const kind = e.target.value as DateShortcutKind | ""; if (!kind) return; const now = new Date(); onChange(side === "end" ? shortcutEndMs(kind, now) : shortcutStartMs(kind, now)); setPick(""); }} className={`${controlClass} w-[72px] shrink-0 text-[var(--color-text-secondary)]`}>
-        <option value="">自定义</option>
+      <input aria-label="条件值" type="date" value={displayDate} onChange={(e) => { const v = e.target.value; onChange(v ? v : undefined); }} className={`${controlClass} w-full`} />
+      <select aria-label="日期快捷" value={pick} onChange={(e) => { const kind = e.target.value as DateShortcutKind | ""; if (!kind) return; const now = new Date(); onChange(side === "end" ? shortcutEndMs(kind, now) : shortcutStartMs(kind, now)); setPick(""); }} className={`${controlClass} w-[132px] shrink-0 text-[var(--color-text-secondary)]`}>
+        <option value="">{customLabel}</option>
         {DATE_SHORTCUT_OPTIONS.map((o) => <option key={o.kind} value={o.kind}>{o.label}</option>)}
       </select>
     </div>

@@ -4,6 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use rusqlite::Connection;
 use serde::Serialize;
@@ -74,12 +75,22 @@ pub fn export_local<F: Fn(ExportProgress)>(
     let lock = || db.lock().map_err(|_| AppError::msg("数据库锁中毒"));
     let dest = PathBuf::from(dest_dir);
     fs::create_dir_all(&dest)?;
+    let started = Instant::now();
+    let total = asset_ids.len() as i64;
+    tracing::info!(
+        operation = "export_local",
+        task_id,
+        stage = "start",
+        mode = %mode,
+        layout = %layout,
+        total,
+        "开始本地导出"
+    );
     {
         let conn = lock()?;
         export::update_progress(&conn, task_id, 0, "running")?;
     }
 
-    let total = asset_ids.len() as i64;
     let mut done = 0i64;
     // P1-04：跨盘降级 copy 后源文件删除失败的计数（B04 有意保留副本，但用户应知情）
     let mut stale_sources: i64 = 0;
@@ -87,6 +98,15 @@ pub fn export_local<F: Fn(ExportProgress)>(
         if cancel.load(Ordering::Relaxed) {
             let conn = lock()?;
             export::finish_task(&conn, task_id, "cancelled", None, None)?;
+            tracing::warn!(
+                operation = "export_local",
+                task_id,
+                stage = "cancelled",
+                done,
+                total,
+                duration_ms = started.elapsed().as_millis() as u64,
+                "本地导出已取消"
+            );
             return Ok(());
         }
         let asset = {
@@ -112,6 +132,13 @@ pub fn export_local<F: Fn(ExportProgress)>(
                     Ok(cleaned) => {
                         if !cleaned {
                             stale_sources += 1;
+                            tracing::warn!(
+                                operation = "export_local",
+                                task_id,
+                                asset_id = id,
+                                stage = "stale_source",
+                                "文件已移动但源文件未能删除"
+                            );
                         }
                         // B04：move 成功后更新库记录指向新路径 + 新文件名
                         // （unique_dest 可能加了 (1) 后缀，file_name 需同步）
@@ -147,6 +174,19 @@ pub fn export_local<F: Fn(ExportProgress)>(
             Err(e) => Err(e),
         };
         if let Err(e) = r {
+            tracing::error!(
+                operation = "export_local",
+                task_id,
+                asset_id = id,
+                file_name = %asset.file_name,
+                stage = "file_failed",
+                error_code = e.code(),
+                error = %e,
+                done,
+                total,
+                duration_ms = started.elapsed().as_millis() as u64,
+                "导出单个素材失败"
+            );
             let conn = lock()?;
             export::finish_task(
                 &conn,
@@ -180,8 +220,31 @@ pub fn export_local<F: Fn(ExportProgress)>(
                     "{stale_sources} 个源文件未能清理，原位置仍有副本（文件已完整移动，可手动删除）"
                 ),
             )?;
+            tracing::warn!(
+                operation = "export_local",
+                task_id,
+                stage = "done_with_warning",
+                mode = %mode,
+                layout = %layout,
+                done,
+                total,
+                stale_sources,
+                duration_ms = started.elapsed().as_millis() as u64,
+                "本地导出完成但存在源文件残留"
+            );
         } else {
             export::finish_task(&conn, task_id, "done", None, None)?;
+            tracing::info!(
+                operation = "export_local",
+                task_id,
+                stage = "done",
+                mode = %mode,
+                layout = %layout,
+                done,
+                total,
+                duration_ms = started.elapsed().as_millis() as u64,
+                "本地导出完成"
+            );
         }
     }
     Ok(())
@@ -221,10 +284,7 @@ fn move_file(src: &Path, dst: &Path) -> AppResult<bool> {
             // B04：remove 失败不阻塞——文件已在新位置，源残留记录日志
             match fs::remove_file(src) {
                 Ok(()) => Ok(true),
-                Err(e) => {
-                    tracing::warn!("move 降级 copy 后删除源文件失败: {e}");
-                    Ok(false)
-                }
+                Err(_) => Ok(false),
             }
         }
     }

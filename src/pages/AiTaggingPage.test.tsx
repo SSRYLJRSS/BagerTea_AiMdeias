@@ -17,6 +17,9 @@ import type { Settings } from "@/types/settings";
 
 const mocks = vi.hoisted(() => ({
   onAiProgress: vi.fn(),
+  listAiConnections: vi.fn(),
+  getAiUsageBindings: vi.fn(),
+  setAiUsageBinding: vi.fn(),
 }));
 
 vi.mock("@/api/ai", () => ({
@@ -56,6 +59,11 @@ vi.mock("@/api/import", () => ({
 vi.mock("@/api/export", () => ({
   onExportProgress: vi.fn().mockRejectedValue(new Error("no tauri")),
 }));
+vi.mock("@/api/connections", () => ({
+  listAiConnections: mocks.listAiConnections,
+  getAiUsageBindings: mocks.getAiUsageBindings,
+  setAiUsageBinding: mocks.setAiUsageBinding,
+}));
 
 const mkBatch = (over: Partial<AiBatch> = {}): AiBatch => ({
   id: 1,
@@ -92,11 +100,10 @@ const mkSettings = (): Settings => ({
     ollamaSourceId: "auto",
     systemPromptTagging: "",
     systemPromptSearch: "",
-    autoAcceptExactTerms: true,
-    autoAdoptNewTerms: false,
     confidenceMinSuggest: 0.3,
   },
   theme: "system",
+  logLevel: "info",
   thumbnailCacheMb: 2048,
   tagCategories: [],
   libraryRoot: "",
@@ -121,6 +128,9 @@ beforeEach(() => {
     progressHandler = handler;
     return Promise.resolve(() => undefined);
   });
+  mocks.listAiConnections.mockResolvedValue([]);
+  mocks.getAiUsageBindings.mockResolvedValue({ super_search: null, tagging: null });
+  mocks.setAiUsageBinding.mockResolvedValue(undefined);
   useSettingsStore.setState({ settings: mkSettings(), loaded: true, previewAppearance: null });
   useTaskStore.setState({ tasks: [] });
   useAiStore.setState({
@@ -136,6 +146,72 @@ beforeEach(() => {
 });
 
 describe("AiTaggingPage 进度唯一化（FB6 需求一）", () => {
+  it("左栏不重复显示页面标题，直接从当前服务上下文开始", async () => {
+    render(<AiTaggingPage />);
+
+    expect(await screen.findByText("未选择打标服务")).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "打标" })).not.toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "当前模型" })).toBeInTheDocument();
+  });
+
+  it("当前模型读取 tagging 用途绑定，不展示遗留的 settings.ai.profiles 默认配置", async () => {
+    const legacySettings = mkSettings();
+    legacySettings.ai.profiles = [
+      {
+        id: "default",
+        name: "默认配置",
+        apiMode: "openai",
+        kind: "cloud",
+        baseUrl: "https://opencode.ai/zen/go/v1",
+        apiKey: "",
+        model: "mimo-v2.5",
+      },
+    ];
+    legacySettings.ai.activeProfile = "default";
+    mocks.listAiConnections.mockResolvedValue([
+      {
+        id: "cloud-1",
+        name: "agenes",
+        deployment: "cloud",
+        protocol: "openai_chat",
+        baseUrl: "https://api.agnes-ai.cn/v1",
+        model: "agnes-3.0-flash",
+        hasKey: true,
+        enabled: true,
+      },
+    ]);
+    mocks.getAiUsageBindings.mockResolvedValue({ super_search: null, tagging: "cloud-1" });
+    useSettingsStore.setState({ settings: legacySettings, loaded: true });
+
+    render(<AiTaggingPage />);
+
+    expect(await screen.findByRole("combobox", { name: "AI 打标服务" })).toHaveValue("cloud-1");
+    expect(screen.getByText("模型：agnes-3.0-flash")).toBeInTheDocument();
+    expect(screen.queryByText("默认配置")).not.toBeInTheDocument();
+    expect(screen.queryByText("mimo-v2.5")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "AI 打标" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "手动模式" })).not.toBeInTheDocument();
+  });
+
+  it("视频批次只读取设置页模式，不再出现第二套封面/抽帧控件", () => {
+    const video = {
+      ...mkSuggestion(1, 101),
+      assetPath: "d:/lib/clip.mp4",
+      mimeType: "video/mp4",
+    };
+    useSettingsStore.setState({
+      settings: { ...mkSettings(), ai: { ...mkSettings().ai, videoTagging: true, videoTaggingMode: "frames", videoFrameCount: 4 } },
+      loaded: true,
+    });
+    useAiStore.setState({ batches: [mkBatch({ total: 1 })], currentBatchId: 1, suggestions: [video] });
+
+    render(<AiTaggingPage />);
+
+    expect(screen.queryByRole("button", { name: "封面打标" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "抽帧打标" })).not.toBeInTheDocument();
+    expect(screen.getByText(/含 1 个视频 × 4/)).toBeInTheDocument();
+  });
+
   it("running 即立即出现页内进度条（starting 相位），不等后端事件", () => {
     useAiStore.setState({ batches: [mkBatch()], currentBatchId: 1, suggestions: [mkSuggestion(1, 101)], running: true });
     render(<AiTaggingPage />);
@@ -143,7 +219,7 @@ describe("AiTaggingPage 进度唯一化（FB6 需求一）", () => {
     expect(bars).toHaveLength(1);
     expect(bars[0]).not.toHaveAttribute("aria-valuenow"); // starting 不确定条
     expect(screen.getAllByText("正在连接 AI 服务，请稍候 · 不会卡住").length).toBeGreaterThanOrEqual(1);
-    expect(screen.getByText("云端生成建议 0/120")).toBeInTheDocument();
+    expect(screen.getByText("正在生成建议 0/120")).toBeInTheDocument();
   });
 
   it("进度事件驱动百分比与当前素材名；全页只有当前批次这一条进度条", () => {

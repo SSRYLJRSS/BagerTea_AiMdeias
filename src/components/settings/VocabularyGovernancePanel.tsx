@@ -111,7 +111,7 @@ export default function VocabularyGovernancePanel() {
 
   return (
     <div className="py-2">
-      <Field label="词表治理" hint="AI 候选词不直接进标签体系：先在这里确认/合并/拒绝（F6）">
+      <Field label="标签词库管理" hint="AI 候选词不会直接加入标签，需在此确认、合并或拒绝。">
         <span />
       </Field>
 
@@ -122,7 +122,7 @@ export default function VocabularyGovernancePanel() {
       {/* ── 新词待确认 ── */}
       <Field
         label={`新词待确认（${candidates.length}）`}
-        hint="AI 输出的词表外候选：采纳为正式词 / 合并到已有词（自动补同义词）/ 拒绝"
+        hint="这些是 AI 发现的新词，可采纳为正式标签、合并到已有标签或拒绝。"
       >
         <Button
           disabled={busy}
@@ -167,7 +167,7 @@ export default function VocabularyGovernancePanel() {
                 }))
               }
             >
-              <option value="">{opts.length === 0 ? "无同分面标签" : "合并到…"}</option>
+              <option value="">{opts.length === 0 ? "当前分类没有可选标签" : "合并到…"}</option>
               {opts.map((t) => (
                 <option key={t.id} value={t.id}>
                   {t.name}
@@ -214,7 +214,7 @@ export default function VocabularyGovernancePanel() {
       {/* ── 疑似重复 ── */}
       <Field
         label={`疑似重复（${groups.length} 组）`}
-        hint="近似匹配的连通分量（仅供人工判断，绝不自动合并）；每组把其余词并入目标词"
+        hint="系统根据名称相似度列出的候选组，不会自动合并。选择要保留的标签后，其余标签将并入其中。"
       >
         <span />
       </Field>

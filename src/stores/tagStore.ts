@@ -10,6 +10,7 @@ interface TagState {
   candidates: Tag[];
   loading: boolean;
   expanded: ReadonlySet<number>;
+  clear: () => void;
   refresh: () => Promise<void>;
   refreshFacet: (facetKey: string) => Promise<void>;
   searchCandidates: (facetKey: string | null, query: string) => Promise<void>;
@@ -27,6 +28,16 @@ export const useTagStore = create<TagState>((set) => ({
   candidates: [],
   loading: false,
   expanded: new Set<number>(),
+
+  clear: () =>
+    set({
+      tree: [],
+      facets: [],
+      treesByFacet: {},
+      candidates: [],
+      loading: false,
+      expanded: new Set<number>(),
+    }),
 
   refresh: async () => {
     set({ loading: true });
@@ -100,12 +111,11 @@ function collectExpandableIds(nodes: TagNode[]): ReadonlySet<number> {
 export function keyForLegacyName(name: string): string {
   const n = name.trim();
   const map: Record<string, string> = {
-    subject: "subject", scene: "scene", purpose: "purpose", style: "style", color: "color",
+    subject: "subject", scene: "scene", purpose: "purpose", color: "color",
     composition: "composition", lighting: "lighting", people: "people", technical: "technical", custom: "custom",
-    "主体": "subject", "主体/对象": "subject", "物体": "subject",
+    "主体": "subject", "主体/对象": "subject", "主体对象": "subject", "物体": "subject",
     "场景": "scene", "场景/地点": "scene",
     "用途": "purpose", "用途/项目类型": "purpose",
-    "风格": "style", "风格/氛围": "style", "色彩风格": "style", "氛围情绪": "style",
     "色彩": "color", "色调": "color",
     "构图": "composition", "构图视角": "composition", "构图/视角": "composition",
     "光线": "lighting", "时间": "lighting", "光线/时间": "lighting", "光线/时间氛围": "lighting",
@@ -126,6 +136,9 @@ export function buildWorkbenchFacets(
   const manualGroup: WorkbenchFacet[] = [];
   for (const f of facets) {
     if (f.status !== "active") continue;
+    // custom 只是后端未知 key 的路由兜底桶，不是工作台分面。
+    // 设置页同样隐藏它；若这里不过滤，会把系统兜底误显示成用户新增分类。
+    if (f.key === "custom") continue;
     // appliesTo：分面声明只适用于图片/视频时，另一类素材的工作台不显示它
     if (mediaKind !== "all" && f.appliesTo !== "all" && f.appliesTo !== mediaKind) continue;
     const item: WorkbenchFacet = {

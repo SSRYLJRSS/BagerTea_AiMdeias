@@ -1,14 +1,14 @@
-/** 自定义标题栏（无边框窗口）：左侧 logo + 设置按钮，中间拖拽区，右侧窗口控制（最小化/最大化/关闭）。
+/** 自定义标题栏（无边框窗口）：左侧 logo 设置入口，中间拖拽区，右侧窗口控制（最小化/最大化/关闭）。
  *  指导书 §3.3 施工要求：
- *   - 左侧不渲染“茶包素材 BagerTea V2”文字，logo 后紧跟设置按钮；
- *   - 设置按钮与窗口控制按钮都不带 data-tauri-drag-region（点击不触发拖拽）；
+ *   - 左侧不渲染“茶包素材 BagerTea V2”文字，点击 logo 进入设置；
+ *   - logo 设置入口与窗口控制按钮都不带 data-tauri-drag-region（点击不触发拖拽）；
  *   - 窗口控制拆分为独立 WindowControls 组件，只保留最小化/最大化(还原)/关闭三个按钮；
  *   - 保留现有非 Tauri 环境异常降级逻辑。
  *   tauri.conf.json 需保持 decorations: false；窗口命令需 core:window:allow-minimize / toggle-maximize / close。
  */
 import { useEffect, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { Minus, Maximize2, Minimize2, Settings, X } from "lucide-react";
+import { Minus, Maximize2, Minimize2, X } from "lucide-react";
 import appLogo from "@/assets/icon-logo.png";
 
 /** 窗口控制组：最小化 / 最大化(还原) / 关闭。与拖拽区隔离（按钮无 data-tauri-drag-region）。 */
@@ -108,14 +108,8 @@ export default function TitleBar() {
       data-tauri-drag-region
       className="relative flex h-10 shrink-0 select-none items-stretch border-b border-[var(--color-border)] bg-[var(--color-bg)]"
     >
-      {/* 左侧：logo + 设置按钮（无文字软件名；设置按钮无 data-tauri-drag-region） */}
-      <div data-tauri-drag-region className="flex items-center gap-1 pl-3 pr-1">
-        <img
-          src={appLogo}
-          alt="茶包素材"
-          className="pointer-events-none h-6 w-6 select-none"
-          draggable={false}
-        />
+      {/* 左侧：logo 同时作为设置入口（无文字软件名、无独立齿轮按钮） */}
+      <div data-tauri-drag-region className="flex items-center pr-1">
         <button
           type="button"
           onClick={() => window.dispatchEvent(new CustomEvent("app:navigate", { detail: "settings" }))}
@@ -123,7 +117,12 @@ export default function TitleBar() {
           title="设置"
           className="flex size-10 items-center justify-center text-[var(--color-text-secondary)] transition-colors hover:bg-[var(--color-surface)] hover:text-[var(--color-text)]"
         >
-          <Settings size={16} strokeWidth={1.75} aria-hidden="true" />
+          <img
+            src={appLogo}
+            alt=""
+            className="pointer-events-none h-6 w-6 select-none"
+            draggable={false}
+          />
         </button>
       </div>
 

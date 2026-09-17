@@ -107,12 +107,13 @@ function currentImportCellStep(): number {
 }
 
 describe("PendingList 固定动作头部", () => {
-  it("清单非空时提供添加文件/添加文件夹/清空入口与数量/大小", () => {
+  it("清单非空时提供添加文件/添加文件夹/清空入口，不重复展示左侧统计", () => {
     render(<PendingList items={items} running={false} onRemove={() => {}} />);
     expect(screen.getByRole("button", { name: "添加文件" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "添加文件夹" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "清空清单" })).toBeInTheDocument();
-    expect(screen.getByText(/3 项/)).toBeInTheDocument();
+    expect(screen.queryByText(/3 项/)).toBeNull();
+    expect(screen.queryByText("9.5 MB")).toBeNull();
   });
 
   it("点击添加文件/文件夹/清空调用对应事件（不直接 invoke）", () => {

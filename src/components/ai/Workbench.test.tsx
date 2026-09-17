@@ -1,6 +1,6 @@
 /**
  * Workbench 一句话描述字段测试（FB5-05 §7.6）：
- *  - 单行 input、maxLength 20、字符计数按 JS 字符迭代（N/20）；
+ *  - 单行 input、maxLength 30、字符计数按 JS 字符迭代（N/30）；
  *  - 确认按钮在「标签为空但描述非空」时仍可点击（§7.5）；
  *  - 已确认/已拒绝张只读展示（空描述显示「未生成描述」）。
  */
@@ -40,7 +40,7 @@ const mkSuggestion = (over: Partial<AiSuggestion> = {}): AiSuggestion => ({
 const facets: WorkbenchFacet[] = [
   {
     key: "subject",
-    displayName: "主体/对象",
+    displayName: "主体对象",
     description: "",
     inputMode: "ai_and_manual",
     selectionMode: "multi",
@@ -73,13 +73,13 @@ function renderWorkbench(over: Partial<AiSuggestion> = {}, description = "夜晚
 }
 
 describe("Workbench 一句话描述（FB5-05 §7.6）", () => {
-  it("描述为单行 input（maxLength 20），字符计数按 JS 字符迭代显示 N/20", () => {
+  it("描述为单行 input（maxLength 30），字符计数按 JS 字符迭代显示 N/30", () => {
     const { rerender } = renderWorkbench({}, "夜晚树下多人合影");
     const input = screen.getByRole("textbox", { name: "一句话描述" }) as HTMLInputElement;
     expect(input).toBeInTheDocument();
-    expect(input.maxLength).toBe(20);
-    // 8 个字符 → 8/20
-    expect(screen.getByText("8/20")).toBeInTheDocument();
+    expect(input.maxLength).toBe(30);
+    // 8 个字符 → 8/30
+    expect(screen.getByText("8/30")).toBeInTheDocument();
     // 输入触发 onChange（受控组件由父级更新 prop）
     fireEvent.change(input, { target: { value: "海边" } });
     rerender(
@@ -99,7 +99,7 @@ describe("Workbench 一句话描述（FB5-05 §7.6）", () => {
         onRestore={vi.fn().mockResolvedValue(undefined)}
       />,
     );
-    expect(screen.getByText("2/20")).toBeInTheDocument();
+    expect(screen.getByText("2/30")).toBeInTheDocument();
     // 表情符号（多字节）也按字符计
     rerender(
       <Workbench
@@ -118,7 +118,7 @@ describe("Workbench 一句话描述（FB5-05 §7.6）", () => {
         onRestore={vi.fn().mockResolvedValue(undefined)}
       />,
     );
-    expect(screen.getByText("3/20")).toBeInTheDocument();
+    expect(screen.getByText("3/30")).toBeInTheDocument();
   });
 
   it("标签为空但描述非空：确认按钮可点击（§7.5）", () => {
@@ -129,11 +129,49 @@ describe("Workbench 一句话描述（FB5-05 §7.6）", () => {
     expect(onConfirm).toHaveBeenCalledTimes(1);
   });
 
+  it("主体为空时显示「未识别」占位，不把占位词写成标签", () => {
+    const onTagsChange = vi.fn();
+    render(
+      <Workbench
+        suggestion={mkSuggestion({ suggestedTags: {} })}
+        aiGroup={facets}
+        manualGroup={[]}
+        tags={{}}
+        onTagsChange={onTagsChange}
+        description="城市建筑与树林交接的远景"
+        onDescriptionChange={vi.fn()}
+        index={0}
+        total={1}
+        onGoto={vi.fn()}
+        onConfirm={vi.fn().mockResolvedValue(undefined)}
+        onReject={vi.fn().mockResolvedValue(undefined)}
+        onRestore={vi.fn().mockResolvedValue(undefined)}
+      />,
+    );
+    expect(screen.getByTestId("subject-unrecognized")).toHaveTextContent("未识别");
+    expect(onTagsChange).not.toHaveBeenCalled();
+  });
+
   it("已确认张：描述只读展示（无 input）；空描述显示「未生成描述」", () => {
     renderWorkbench({ status: "confirmed", confirmedTags: { subject: ["猫"] } }, "");
     expect(screen.queryByRole("textbox", { name: "一句话描述" })).not.toBeInTheDocument();
     expect(screen.getByText("未生成描述")).toBeInTheDocument();
     expect(screen.getByText("✓ 已写入")).toBeInTheDocument();
+  });
+
+  it("确认栏在标签滚动区之外并位于工作台底部", () => {
+    renderWorkbench();
+    const scrollArea = screen.getByTestId("workbench-facet-scroll");
+    const confirmBar = screen.getByTestId("workbench-confirm-bar");
+    const confirmButton = screen.getByRole("button", { name: "确认写入" });
+
+    expect(confirmBar).toContainElement(confirmButton);
+    expect(scrollArea).not.toContainElement(confirmButton);
+    expect(confirmBar.previousElementSibling).toBe(scrollArea);
+    expect(screen.getByTestId("workbench-facet-panel")).toHaveClass(
+      "h-[clamp(15rem,38vh,22rem)]",
+      "shrink-0",
+    );
   });
 });
 

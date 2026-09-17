@@ -55,7 +55,7 @@ pub async fn import_files(
     rename_pattern: Option<String>,
 ) -> AppResult<ImportResult> {
     if paths.is_empty() {
-        return Err(AppError::msg("未选择任何文件"));
+        return Err(AppError::invalid_arg("未选择任何文件"));
     }
     state.import_cancel.store(false, Ordering::Relaxed);
     // W5c：入库进行中标志（restore_db 阻断依据）
@@ -110,31 +110,68 @@ pub async fn import_files(
             let ids = {
                 let conn = match pdb.lock() {
                     Ok(c) => c,
-                    Err(_) => return,
+                    Err(_) => {
+                        tracing::warn!(
+                            operation = "import_palette_refill",
+                            result = "skipped",
+                            reason = "db_lock",
+                            "入库后置色板补算跳过：数据库锁中毒"
+                        );
+                        return;
+                    }
                 };
                 match crate::db::assets::list_ids_needing_palette(&conn) {
                     Ok(v) => v,
-                    Err(_) => return,
+                    Err(e) => {
+                        tracing::warn!(
+                            operation = "import_palette_refill",
+                            result = "failed",
+                            reason = "list_ids",
+                            error = %e,
+                            "入库后置色板补算失败：无法读取待补算素材"
+                        );
+                        return;
+                    }
                 }
             };
             if ids.is_empty() {
+                tracing::debug!(
+                    operation = "import_palette_refill",
+                    result = "skipped",
+                    reason = "no_missing",
+                    "入库后置色板补算跳过：没有缺失项"
+                );
                 return;
             }
-            if let Some(Ok(s)) =
-                media_refill::try_rescan_palette_exclusive(&gate, &pdb, &ids, &pcancel, |_| {})
-            {
-                tracing::info!(
-                    "入库后置色板补算完成：总数 {} 成功 {} 跳过 {} 失败 {}",
-                    s.total,
-                    s.success,
-                    s.skipped,
-                    s.failed
-                );
-                // FB4-03（§6.4）：只有真实写库成功的素材非空才发全局事件（供 App 定向同步）。
-                // 闸被占用（None）、扫描错误（Some(Err)）、零更新（updatedIds 空）均不发。
-                if let Some(ev) = PaletteUpdatedEvent::from_import_summary(&s) {
-                    let _ = post_app.emit("palette://updated", ev);
+            match media_refill::try_rescan_palette_exclusive(&gate, &pdb, &ids, &pcancel, |_| {}) {
+                Some(Ok(s)) => {
+                    tracing::info!(
+                        operation = "import_palette_refill",
+                        result = "done",
+                        total = s.total,
+                        success = s.success,
+                        skipped = s.skipped,
+                        failed = s.failed,
+                        "入库后置色板补算完成"
+                    );
+                    // FB4-03（§6.4）：只有真实写库成功的素材非空才发全局事件（供 App 定向同步）。
+                    // 闸被占用（None）、扫描错误（Some(Err)）、零更新（updatedIds 空）均不发。
+                    if let Some(ev) = PaletteUpdatedEvent::from_import_summary(&s) {
+                        let _ = post_app.emit("palette://updated", ev);
+                    }
                 }
+                Some(Err(e)) => tracing::warn!(
+                    operation = "import_palette_refill",
+                    result = "failed",
+                    error = %e,
+                    "入库后置色板补算结束但结果失败"
+                ),
+                None => tracing::warn!(
+                    operation = "import_palette_refill",
+                    result = "skipped",
+                    reason = "gate_busy",
+                    "入库后置色板补算跳过：已有回填任务运行"
+                ),
             }
         });
     }
@@ -185,11 +222,11 @@ pub fn preview_rename(
 #[tauri::command]
 pub fn open_file_external(app: tauri::AppHandle, path: String) -> AppResult<()> {
     if path.trim().is_empty() {
-        return Err(AppError::msg("路径为空"));
+        return Err(AppError::invalid_arg("路径为空"));
     }
     let p = std::path::Path::new(&path);
     if !p.exists() {
-        return Err(AppError::msg(format!("文件不存在: {path}")));
+        return Err(AppError::not_found(format!("文件不存在: {path}")));
     }
     use tauri_plugin_opener::OpenerExt;
     app.opener()

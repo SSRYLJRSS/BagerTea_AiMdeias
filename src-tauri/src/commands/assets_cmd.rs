@@ -122,78 +122,113 @@ pub async fn delete_assets(
 ) -> AppResult<DeleteResult> {
     // 参数校验仍在主线程（快）
     if strategy != "remove_from_library" && strategy != "delete_file" {
-        return Err(AppError::msg("非法删除策略"));
+        return Err(AppError::invalid_arg("非法删除策略"));
     }
 
     let db = std::sync::Arc::clone(&state.db);
     let data_dir = state.data_dir.clone();
 
-    tauri::async_runtime::spawn_blocking(move || -> AppResult<DeleteResult> {
-        let thumbs = ThumbnailService::new(&data_dir)?;
-
-        // 阶段一：短锁收集待删文件路径（仅 delete_file 策略需要原文件路径）
-        let paths: Vec<(i64, PathBuf)> = if strategy == "delete_file" {
-            let conn = db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
-            ids.iter()
-                .filter_map(|&id| {
-                    assets::get(&conn, id)
-                        .ok()
-                        .map(|a| (id, PathBuf::from(a.file_path)))
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
-
-        // 阶段二：锁外删磁盘文件 + 收集失败（B03：不再吞错）
-        let failed_set: std::collections::HashSet<i64> = if strategy == "delete_file" {
-            paths
-                .iter()
-                .filter_map(|(id, p)| {
-                    if std::fs::remove_file(p).is_err() {
-                        Some(*id) // B03：记录磁盘删除失败的 id
-                    } else {
-                        None
-                    }
-                })
-                .collect()
-        } else {
-            std::collections::HashSet::new()
-        };
-
-        // 阶段三：短锁写库——delete_file 只删磁盘删除成功的；remove_from_library 软删入回收站（R-22）
-        let to_delete_db: Vec<i64> = if strategy == "delete_file" {
-            ids.iter()
-                .filter(|id| !failed_set.contains(id))
-                .copied()
-                .collect()
-        } else {
-            ids.clone()
-        };
-        let n = {
-            let conn = db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
-            if strategy == "delete_file" {
-                assets::delete(&conn, &to_delete_db)?
-            } else {
-                assets::soft_delete(&conn, &to_delete_db)?
-            }
-        };
-
-        // 阶段四：缩略图清理——仅硬删清理；软删保留缩略图供回收站预览/恢复（R-22）
-        if strategy == "delete_file" {
-            for &id in &to_delete_db {
-                thumbs.delete_for_asset(id);
-            }
-        }
-
-        let failed_files: Vec<i64> = failed_set.into_iter().collect();
-        Ok(DeleteResult {
-            deleted: n,
-            failed_files,
-        })
+    tauri::async_runtime::spawn_blocking(move || {
+        delete_assets_blocking(db, data_dir, ids, strategy)
     })
     .await
     .map_err(|e| AppError::msg(format!("删除线程异常: {e}")))?
+}
+
+/// 删除命令的锁/文件 IO 分阶段实现。
+///
+/// 设置页的“原始素材文件”重置需要一次性处理在库和回收站中的全部素材，
+/// 复用同一实现可保证磁盘删除失败时保留对应数据库记录（B03），不会出现假删除。
+fn delete_assets_blocking(
+    db: std::sync::Arc<std::sync::Mutex<rusqlite::Connection>>,
+    data_dir: PathBuf,
+    ids: Vec<i64>,
+    strategy: String,
+) -> AppResult<DeleteResult> {
+    let thumbs = ThumbnailService::new(&data_dir)?;
+
+    // 阶段一：短锁收集待删文件路径（仅 delete_file 策略需要原文件路径）
+    let paths: Vec<(i64, PathBuf)> = if strategy == "delete_file" {
+        let conn = db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
+        ids.iter()
+            .filter_map(|&id| {
+                // 删除只需要路径；不要为全库重置加载完整 Asset 与标签，
+                // 否则素材量大时会额外占用大量内存和查询时间。
+                conn.query_row(
+                    "SELECT file_path FROM assets WHERE id = ?1",
+                    [id],
+                    |row| row.get::<_, String>(0),
+                )
+                .ok()
+                .map(|path| (id, PathBuf::from(path)))
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    // 阶段二：锁外删磁盘文件 + 收集失败（B03：不再吞错）
+    let failed_set: std::collections::HashSet<i64> = if strategy == "delete_file" {
+        paths
+            .iter()
+            .filter_map(|(id, p)| {
+                if std::fs::remove_file(p).is_err() {
+                    Some(*id) // B03：记录磁盘删除失败的 id
+                } else {
+                    None
+                }
+            })
+            .collect()
+    } else {
+        std::collections::HashSet::new()
+    };
+
+    // 阶段三：短锁写库——delete_file 只删磁盘删除成功的；remove_from_library 软删入回收站（R-22）
+    let to_delete_db: Vec<i64> = if strategy == "delete_file" {
+        ids.iter()
+            .filter(|id| !failed_set.contains(id))
+            .copied()
+            .collect()
+    } else {
+        ids.clone()
+    };
+    let n = {
+        let conn = db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
+        if strategy == "delete_file" {
+            assets::delete(&conn, &to_delete_db)?
+        } else {
+            assets::soft_delete(&conn, &to_delete_db)?
+        }
+    };
+
+    // 阶段四：缩略图清理——仅硬删清理；软删保留缩略图供回收站预览/恢复（R-22）
+    if strategy == "delete_file" {
+        for &id in &to_delete_db {
+            thumbs.delete_for_asset(id);
+        }
+    }
+
+    let failed_files: Vec<i64> = failed_set.into_iter().collect();
+    Ok(DeleteResult {
+        deleted: n,
+        failed_files,
+    })
+}
+
+/// 设置页“删除原始素材文件”专用入口：收集全部在库与回收站素材 id，
+/// 然后复用批量硬删流程。该函数只在 settings_cmd 的 spawn_blocking 中调用，
+/// 不持有数据库锁执行文件 IO。
+pub fn delete_all_asset_files_for_reset(
+    db: std::sync::Arc<std::sync::Mutex<rusqlite::Connection>>,
+    data_dir: PathBuf,
+) -> AppResult<DeleteResult> {
+    let ids = {
+        let conn = db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
+        let mut stmt = conn.prepare("SELECT id FROM assets")?;
+        let rows = stmt.query_map([], |r| r.get::<_, i64>(0))?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    delete_assets_blocking(db, data_dir, ids, "delete_file".to_owned())
 }
 
 /// R-22 回收站恢复：deleted_at 置空，素材回到在库状态（缩略图未删，无需重建）
@@ -323,4 +358,54 @@ pub fn list_content_descriptions(
             description,
         })
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::{assets, init_memory};
+
+    #[test]
+    fn reset_file_helper_deletes_existing_files_but_keeps_failed_records() {
+        let conn = init_memory().unwrap();
+        let db = std::sync::Arc::new(std::sync::Mutex::new(conn));
+        let data_dir = tempfile::tempdir().unwrap();
+        let original = data_dir.path().join("keep-me.jpg");
+        std::fs::write(&original, b"test").unwrap();
+        let missing = data_dir.path().join("missing.jpg");
+
+        let (existing_id, missing_id) = {
+            let conn = db.lock().unwrap();
+            let a = assets::insert(
+                &conn,
+                original.to_string_lossy().as_ref(),
+                "keep-me.jpg",
+                "jpg",
+                4,
+                "image/jpeg",
+                1,
+            )
+            .unwrap();
+            let b = assets::insert(
+                &conn,
+                missing.to_string_lossy().as_ref(),
+                "missing.jpg",
+                "jpg",
+                0,
+                "image/jpeg",
+                1,
+            )
+            .unwrap();
+            (a, b)
+        };
+
+        let report =
+            delete_all_asset_files_for_reset(db.clone(), data_dir.path().to_path_buf()).unwrap();
+        assert_eq!(report.deleted, 1);
+        assert_eq!(report.failed_files, vec![missing_id]);
+        assert!(!original.exists());
+        let conn = db.lock().unwrap();
+        assert!(assets::get(&conn, existing_id).is_err());
+        assert!(assets::get(&conn, missing_id).is_ok());
+    }
 }

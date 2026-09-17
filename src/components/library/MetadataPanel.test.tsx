@@ -47,9 +47,12 @@ beforeEach(() => {
 describe("MetadataPanel", () => {
   it("支持单组折叠和全部展开收起", () => {
     render(<MetadataPanel />);
+    expect(screen.queryByText("旅行")).not.toBeInTheDocument();
+    expect(screen.queryByText("1–5 分钟")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "全部展开" }));
     expect(screen.getByText("旅行")).toBeVisible();
     expect(screen.getByText("1–5 分钟")).toBeVisible();
-
     fireEvent.click(screen.getByRole("button", { name: /所在文件夹/ }));
     expect(screen.queryByText("旅行")).not.toBeInTheDocument();
     expect(screen.getByText("1–5 分钟")).toBeVisible();
@@ -61,8 +64,22 @@ describe("MetadataPanel", () => {
     expect(screen.getByText("1–5 分钟")).toBeVisible();
   });
 
+  it("不显示分面说明文字", () => {
+    render(<MetadataPanel />);
+    expect(screen.queryByText("入库分库或素材原始目录")).not.toBeInTheDocument();
+    expect(screen.queryByText("ISO 拍摄参数")).not.toBeInTheDocument();
+    expect(screen.queryByText("仅显示视频素材的时长区间")).not.toBeInTheDocument();
+  });
+
+  it("属性项使用无圆角的连续列表样式", () => {
+    render(<MetadataPanel />);
+    fireEvent.click(screen.getByRole("button", { name: "全部展开" }));
+    expect(screen.getByText("旅行").closest("button")).toHaveClass("ui-nav-list-item");
+  });
+
   it("数值分面多选合并为 in 数值条件", () => {
     render(<MetadataPanel />);
+    fireEvent.click(screen.getByRole("button", { name: "全部展开" }));
     fireEvent.click(screen.getByRole("button", { name: /ISO 100/ }));
     fireEvent.click(screen.getByRole("button", { name: /ISO 800/ }));
     expect(useLibraryStore.getState().filter.metadataFilters).toEqual([
@@ -72,6 +89,7 @@ describe("MetadataPanel", () => {
 
   it("清除 ISO 条件恢复全库", () => {
     render(<MetadataPanel />);
+    fireEvent.click(screen.getByRole("button", { name: "全部展开" }));
     fireEvent.click(screen.getByRole("button", { name: /ISO 100/ }));
     fireEvent.click(screen.getByRole("button", { name: /ISO 800/ }));
     expect(useLibraryStore.getState().filter.metadataFilters).toEqual([
@@ -81,6 +99,31 @@ describe("MetadataPanel", () => {
     fireEvent.click(screen.getByRole("button", { name: /ISO 100/ }));
     fireEvent.click(screen.getByRole("button", { name: /ISO 800/ }));
     expect(useLibraryStore.getState().filter.metadataFilters).toEqual([]);
+  });
+
+  it("主要颜色支持多选并保持 10% 门槛", () => {
+    useMetadataStore.setState({
+      loading: false,
+      loaded: true,
+      facets: [{
+        key: "palette_top3",
+        displayName: "主要颜色",
+        description: "前三色",
+        items: [
+          { value: "红", label: "红", count: 3 },
+          { value: "蓝", label: "蓝", count: 2 },
+        ],
+      }],
+    });
+    render(<MetadataPanel />);
+    fireEvent.click(screen.getByRole("button", { name: "全部展开" }));
+    fireEvent.click(screen.getByRole("button", { name: /红/ }));
+    fireEvent.click(screen.getByRole("button", { name: /蓝/ }));
+    expect(useLibraryStore.getState().filter.metadataFilters).toEqual([
+      { key: "palette_top3", op: "in", values: ["红", "蓝"], min: 0.1 },
+    ]);
+    expect(screen.getByRole("button", { name: /红/ }).getAttribute("data-active")).toBe("true");
+    expect(screen.getByRole("button", { name: /蓝/ }).getAttribute("data-active")).toBe("true");
   });
 });
 
@@ -99,6 +142,7 @@ describe("W0-1/W0-2 分面点击与高亮", () => {
       ],
     });
     render(<MetadataPanel />);
+    fireEvent.click(screen.getByRole("button", { name: "全部展开" }));
     fireEvent.click(screen.getByRole("button", { name: /1920x1080/ }));
     const filters = useLibraryStore.getState().filter.metadataFilters;
     // 像素乘积 2073600 以数值进入 in 条件；字符串 "1920x1080" 会被后端 compile_number 拒绝
@@ -122,6 +166,7 @@ describe("W0-1/W0-2 分面点击与高亮", () => {
       ],
     });
     render(<MetadataPanel />);
+    fireEvent.click(screen.getByRole("button", { name: "全部展开" }));
     const jul = screen.getByRole("button", { name: /2025-07/ });
     fireEvent.click(jul);
     // 点选产出的 filter key 是 taken_at（duration→duration_ms、taken_month→taken_at 同理）

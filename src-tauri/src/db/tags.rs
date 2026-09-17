@@ -347,12 +347,268 @@ pub fn create_in_facet(
     })
 }
 
+const CORE_FACET_KEYS: &[&str] = &["subject", "scene", "people"];
+
+/// 核心分面默认词表：父节点用于浏览和宽泛筛选，叶子供 AI/手工打标。
+const CORE_TAXONOMY: &[(&str, &str, &[&str])] = &[
+    ("subject", "人物", &["人"]),
+    (
+        "subject",
+        "动物",
+        &["猫", "狗", "鸟", "鱼", "宠物", "野生动物"],
+    ),
+    ("subject", "植物", &["树木", "花卉", "绿植", "农作物"]),
+    ("subject", "食物饮品", &["食物", "饮品", "茶", "咖啡"]),
+    (
+        "subject",
+        "器物",
+        &["产品", "家具", "器皿", "电子设备", "日用品", "工具"],
+    ),
+    (
+        "subject",
+        "建筑设施",
+        &["建筑", "楼梯", "桥梁", "道路", "设施"],
+    ),
+    (
+        "subject",
+        "交通工具",
+        &["汽车", "自行车", "船", "飞机", "列车"],
+    ),
+    (
+        "subject",
+        "自然景观",
+        &["山", "水体", "天空", "云", "岩石", "雪"],
+    ),
+    ("subject", "其他", &[]),
+    ("scene", "空间类型", &["室内", "户外", "半室内"]),
+    (
+        "scene",
+        "环境类型",
+        &["城市", "自然", "乡村", "工业", "商业", "交通"],
+    ),
+    (
+        "scene",
+        "场所类型",
+        &[
+            "公园",
+            "街道",
+            "海边",
+            "湖边",
+            "树林",
+            "山地",
+            "草地",
+            "桥梁",
+            "餐饮空间",
+            "办公空间",
+            "商业空间",
+            "工业空间",
+        ],
+    ),
+    ("scene", "其他", &[]),
+    ("people", "人物状态", &["无人", "未知"]),
+    ("people", "人数", &["单人", "双人", "多人", "人群"]),
+    ("people", "性别", &["男性", "女性", "性别不明"]),
+    (
+        "people",
+        "年龄段",
+        &[
+            "婴幼儿",
+            "儿童",
+            "青少年",
+            "青年",
+            "中年",
+            "老年",
+            "年龄不明",
+        ],
+    ),
+    (
+        "people",
+        "穿着",
+        &[
+            "现代装",
+            "古装",
+            "民族服饰",
+            "职业装",
+            "制服",
+            "礼服",
+            "运动装",
+            "休闲装",
+            "泳装",
+        ],
+    ),
+    (
+        "people",
+        "动作状态",
+        &[
+            "站立", "坐姿", "行走", "奔跑", "交谈", "工作", "表演", "休息",
+        ],
+    ),
+    ("people", "其他", &[]),
+];
+
+/// 默认词表的常见同义说法。保留规范叶子，避免“女子/女性”等碎片。
+const CORE_TAXONOMY_ALIASES: &[(&str, &str, &str)] = &[
+    ("subject", "人", "人像"),
+    ("subject", "树木", "树"),
+    ("subject", "花卉", "花朵"),
+    ("subject", "水体", "水面"),
+    ("subject", "建筑", "建筑物"),
+    ("scene", "户外", "室外"),
+    ("scene", "街道", "城市街道"),
+    ("scene", "街道", "路边"),
+    ("scene", "海边", "海滩"),
+    ("scene", "海边", "海岸"),
+    ("scene", "湖边", "湖畔"),
+    ("scene", "山地", "山景"),
+    ("scene", "草地", "草坪"),
+    ("scene", "工业空间", "工厂"),
+    ("scene", "工业空间", "工业区"),
+    ("scene", "工业空间", "厂房"),
+    ("scene", "餐饮空间", "咖啡店"),
+    ("scene", "餐饮空间", "餐厅"),
+    ("people", "女性", "女子"),
+    ("people", "女性", "女孩"),
+    ("people", "女性", "女人"),
+    ("people", "男性", "男子"),
+    ("people", "男性", "男孩"),
+    ("people", "男性", "男人"),
+    ("people", "单人", "一个人"),
+    ("people", "双人", "两个人"),
+    ("people", "双人", "两人"),
+    ("people", "多人", "三人以上"),
+    ("people", "人群", "大量人群"),
+    ("people", "婴幼儿", "婴儿"),
+    ("people", "儿童", "孩子"),
+    ("people", "青少年", "少年"),
+    ("people", "青年", "年轻人"),
+    ("people", "老年", "老人"),
+    ("people", "老年", "年老"),
+    ("people", "现代装", "现代服装"),
+    ("people", "古装", "古代服饰"),
+    ("people", "民族服饰", "少数民族服饰"),
+    ("people", "职业装", "工作服"),
+    ("people", "运动装", "运动服"),
+    ("people", "休闲装", "便装"),
+    ("people", "站立", "站姿"),
+    ("people", "行走", "走路"),
+    ("people", "行走", "步行"),
+    ("people", "奔跑", "跑步"),
+    ("people", "交谈", "交流"),
+];
+
+fn find_named_tag(
+    conn: &Connection,
+    facet_key: &str,
+    parent_id: Option<i64>,
+    name: &str,
+) -> AppResult<Option<i64>> {
+    let sql = if parent_id.is_some() {
+        "SELECT id FROM tags WHERE facet_key = ?1 AND parent_id = ?2 AND name = ?3 LIMIT 1"
+    } else {
+        "SELECT id FROM tags WHERE facet_key = ?1 AND parent_id IS NULL AND name = ?2 LIMIT 1"
+    };
+    let id = if let Some(parent_id) = parent_id {
+        conn.query_row(sql, rusqlite::params![facet_key, parent_id, name], |r| {
+            r.get(0)
+        })
+        .optional()?
+    } else {
+        conn.query_row(sql, rusqlite::params![facet_key, name], |r| r.get(0))
+            .optional()?
+    };
+    Ok(id)
+}
+
+fn ensure_named_tag(
+    conn: &Connection,
+    facet_key: &str,
+    parent_id: Option<i64>,
+    name: &str,
+) -> AppResult<i64> {
+    if let Some(id) = find_named_tag(conn, facet_key, parent_id, name)? {
+        return Ok(id);
+    }
+    Ok(create_in_facet(conn, name, parent_id, Some(facet_key))?.id)
+}
+
+fn core_other_parent(conn: &Connection, facet_key: &str) -> AppResult<i64> {
+    let parent_id = ensure_named_tag(conn, facet_key, None, "其他")?;
+    conn.execute(
+        "UPDATE tags SET is_system = 1, is_preset = 1 WHERE id = ?1",
+        [parent_id],
+    )?;
+    Ok(parent_id)
+}
+
+fn seed_core_taxonomy_inner(conn: &Connection) -> AppResult<()> {
+    for (group_index, (facet_key, group_name, leaves)) in CORE_TAXONOMY.iter().enumerate() {
+        let parent_id = ensure_named_tag(conn, facet_key, None, group_name)?;
+        conn.execute(
+            "UPDATE tags SET is_system = 1, is_preset = 1, sort_order = ?1, status = 'active'
+              WHERE id = ?2",
+            rusqlite::params![(group_index as i64 + 1) * 100, parent_id],
+        )?;
+        for (leaf_index, leaf) in leaves.iter().enumerate() {
+            let leaf_id = ensure_named_tag(conn, facet_key, Some(parent_id), leaf)?;
+            conn.execute(
+                "UPDATE tags SET is_system = 0, is_preset = 0, sort_order = ?1, status = 'active'
+                  WHERE id = ?2",
+                rusqlite::params![
+                    (group_index as i64 + 1) * 100 + leaf_index as i64 + 1,
+                    leaf_id
+                ],
+            )?;
+        }
+    }
+    for (facet_key, canonical, alias) in CORE_TAXONOMY_ALIASES {
+        let tag_id = conn.query_row(
+            "SELECT id FROM tags
+              WHERE facet_key = ?1 AND name = ?2
+              ORDER BY parent_id IS NULL, id
+              LIMIT 1",
+            rusqlite::params![facet_key, canonical],
+            |r| r.get::<_, i64>(0),
+        )?;
+        add_alias(conn, tag_id, alias, None, "synonym")?;
+    }
+    Ok(())
+}
+
+/// 幂等播种三个核心分面的默认层级词表。
+pub fn seed_core_taxonomy(conn: &Connection) -> AppResult<()> {
+    transactional(conn, seed_core_taxonomy_inner)
+}
+
+/// 仅当标签表没有任何非废弃标签时播种，避免覆盖已有用户词表。
+pub fn seed_core_taxonomy_if_empty(conn: &Connection) -> AppResult<()> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM tags WHERE COALESCE(status, 'active') != 'deprecated'",
+        [],
+        |r| r.get(0),
+    )?;
+    if count == 0 {
+        seed_core_taxonomy(conn)?;
+    }
+    Ok(())
+}
+
 /// 新协议使用的规范标签创建：分面是独立实体，标签直接归属分面。
-/// F3-a/F5：查重已收口在 create_in_facet（find_by_term mode=Alias）——本函数直接走它。
+/// 核心分面的新词优先落到「其他」父类；普通/自建分面保持根级创建。
+/// F3-a/F5：查重已收口在 create_in_facet（find_by_term mode=Alias）。
 pub fn find_or_create_canonical(conn: &Connection, facet_key: &str, name: &str) -> AppResult<i64> {
     let normalized = normalize_name(name);
     if normalized.is_empty() {
         return Err(crate::error::AppError::msg("标签名称不能为空"));
+    }
+    if CORE_FACET_KEYS.contains(&facet_key) {
+        let lookup = find_by_term(conn, facet_key, &normalized, TermMatch::Alias)?;
+        if let Some(hit) = lookup.hits.first() {
+            if hit.tag_status == "active" {
+                return Ok(hit.tag_id);
+            }
+        }
+        let parent_id = core_other_parent(conn, facet_key)?;
+        return find_or_create_child(conn, parent_id, name);
     }
     Ok(create_in_facet(conn, name, None, Some(facet_key))?.id)
 }
@@ -669,7 +925,8 @@ pub fn list_by_facet(conn: &Connection, facet_key: &str) -> AppResult<Vec<TagNod
 
 /// W2-9 + F7：提示词候选词 —— 高频词优先（标签收敛更快），**按分面各取 Top-n**
 /// （ROW_NUMBER() OVER PARTITION BY facet_key），不再全库 LIMIT n —— 分面多时靠后的分面
-/// 不再拿不到候选词。标签名 >12 字截断；总输出 1500 字符上限按分面数**均摊配额**，
+/// 不再拿不到候选词。核心分面优先完整候选词，其他分面仍按高频优先。
+/// 标签名 >12 字截断；总输出 5000 字符上限按分面数**均摊配额**，
 /// 不再用 break 直接丢弃整个分面（谁被丢不由 facet_key 字母序决定）。
 /// 供 W5a 提示词拼入候选词（「含义相同就用已有的词」约束的事实基础）。
 pub fn top_tags_per_facet(conn: &Connection, n: usize) -> AppResult<Vec<(String, String)>> {
@@ -679,10 +936,18 @@ pub fn top_tags_per_facet(conn: &Connection, n: usize) -> AppResult<Vec<(String,
             SELECT t.facet_key, t.name, COUNT(at.asset_id) AS uses,
                    ROW_NUMBER() OVER (
                      PARTITION BY t.facet_key
-                     ORDER BY COUNT(at.asset_id) DESC, t.sort_order, t.id
+                     ORDER BY
+                       CASE WHEN t.facet_key IN ('subject', 'scene', 'people') THEN 0 ELSE 1 END,
+                       CASE WHEN t.facet_key IN ('subject', 'scene', 'people') THEN t.sort_order END,
+                       COUNT(at.asset_id) DESC,
+                       t.id
                    ) AS rn
-              FROM tags t JOIN asset_tags at ON at.tag_id = t.id
+              FROM tags t LEFT JOIN asset_tags at ON at.tag_id = t.id
              WHERE {AI_ASSIGNABLE_TAG}
+               AND NOT EXISTS (
+                 SELECT 1 FROM tags child
+                  WHERE child.parent_id = t.id AND COALESCE(child.status, 'active') = 'active'
+               )
              GROUP BY t.id
          ) ranked
           WHERE rn <= ?1
@@ -696,8 +961,8 @@ pub fn top_tags_per_facet(conn: &Connection, n: usize) -> AppResult<Vec<(String,
         .collect();
 
     // 按分面分组聚合成 "facet_key: 词1/词2/..."，超 12 字的词截断；
-    // F7：总量 1500 字符上限按分面数均摊（每分面至少保留 1 个词），不再 break 丢整个分面
-    const CAP: usize = 1500;
+    // F7：总量 5000 字符上限按分面数均摊（每分面至少保留 1 个词），不再 break 丢整个分面
+    const CAP: usize = 5000;
     let mut by_facet: std::collections::BTreeMap<String, Vec<String>> = Default::default();
     for (facet, name) in rows {
         let short: String = name.chars().take(12).collect();

@@ -59,11 +59,10 @@ const mkSettings = (): Settings => ({
     ollamaSourceId: "auto",
     systemPromptTagging: "",
     systemPromptSearch: "",
-    autoAcceptExactTerms: true,
-    autoAdoptNewTerms: false,
     confidenceMinSuggest: 0.3,
   },
   theme: "system",
+  logLevel: "info",
   thumbnailCacheMb: 2048,
   tagCategories: [],
   libraryRoot: "",
@@ -82,7 +81,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   useSettingsStore.setState({ settings: mkSettings(), loaded: true, loading: false, loadError: null, saving: false });
   useTagStore.setState({
-    facets: [mkFacet("subject", "主体/对象"), mkFacet("scene", "场景/地点")],
+    facets: [mkFacet("subject", "主体对象"), mkFacet("scene", "场景/地点")],
   });
 });
 
@@ -129,14 +128,14 @@ describe("ViewerTagBar（FB4-01）", () => {
     ]);
     const body = document.getElementById("viewer-tagbar-body")!;
     // 名称只出现一次（同组内不重复渲染分面名）
-    expect(screen.getByText("主体/对象")).toBeInTheDocument();
+    expect(screen.getByText("主体对象")).toBeInTheDocument();
     expect(screen.getByText("场景/地点")).toBeInTheDocument();
     // 两个分面 = 两个 grid item（body 的直接子元素为 2）
     const items = body.children;
     expect(items).toHaveLength(2);
     // 组内：名称与标签同在一个 grid item
     const subjectGroup = items[0] as HTMLElement;
-    expect(subjectGroup.textContent).toContain("主体/对象");
+    expect(subjectGroup.textContent).toContain("主体对象");
     expect(subjectGroup.textContent).toContain("猫");
     expect(subjectGroup.textContent).toContain("狗");
     expect(subjectGroup.textContent).not.toContain("海滩");
@@ -194,7 +193,7 @@ describe("ViewerTagBar 一句话描述（FB5-05 §7.6.1）", () => {
     // 描述是普通文本，不是 TagChip（无删除按钮/圆点）
     expect(descRow.querySelector("[aria-label^='移除标签']")).toBeNull();
     // 标签分面仍在第二项
-    expect(body.children[1]?.textContent).toContain("主体/对象");
+    expect(body.children[1]?.textContent).toContain("主体对象");
     // 高度契约不变：正文仍 96px
     expect(body.className).toContain("h-24");
   });

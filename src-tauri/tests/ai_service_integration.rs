@@ -160,11 +160,10 @@ fn settings_with(profile: ApiProfile) -> AiSettings {
         video_frame_count: 3,
         local_model_tier: "light".into(),
         batch_limit: 500,
+        local_batch_limit: 5,
         ollama_source_id: "auto".into(),
         system_prompt_tagging: String::new(),
         system_prompt_search: String::new(),
-        auto_accept_exact_terms: true,
-        auto_adopt_new_terms: false,
         confidence_min_suggest: 0.30,
     }
 }
@@ -175,6 +174,17 @@ fn categories() -> Vec<FacetPromptContext> {
         display_name: "场景".into(),
         description: "场景".into(),
         selection_mode: "single".into(),
+        max_items: Some(3),
+        ..Default::default()
+    }]
+}
+
+fn subject_categories() -> Vec<FacetPromptContext> {
+    vec![FacetPromptContext {
+        key: "subject".into(),
+        display_name: "主体对象".into(),
+        description: "画面中最具代表性的可见对象".into(),
+        selection_mode: "multi".into(),
         max_items: Some(3),
         ..Default::default()
     }]
@@ -217,8 +227,11 @@ fn openai_ok_body(tags_json: &str) -> String {
 // OpenAI 兼容模式：批次 pending→processing→done，建议 tags 落库，progress 回调推进
 conn_retry_test!(openai_success_writes_suggestions_and_progress, {
     let _g = common::net_lock_guard();
-    let srv =
-        MockServer::start(|_req| HttpResponse::ok_json(&openai_ok_body(r#"{"场景":["公园"]}"#)));
+    let srv = MockServer::start(|_req| {
+        HttpResponse::ok_json(&openai_ok_body(
+            r#"{"description":"公园里树木茂盛阳光温暖洒落","peoplePresence":{"status":"unknown","confidence":0.8},"tags":{"scene":[{"name":"公园","confidence":0.9}]},"numbers":{}}"#,
+        ))
+    });
     let dbm = Arc::new(Mutex::new(db::init_memory()?));
     let tmp = tempfile::tempdir()?;
     let thumbs = ThumbnailService::new(&tmp.path().join("data"))?;
@@ -277,16 +290,113 @@ conn_retry_test!(openai_success_writes_suggestions_and_progress, {
     Ok(())
 });
 
+// M2：低置信度标签被过滤后仍算“已分析”，续跑不能再次请求并覆盖描述。
+conn_retry_test!(all_low_confidence_is_not_reprocessed_on_resume, {
+    let _g = common::net_lock_guard();
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let calls2 = Arc::clone(&calls);
+    let srv = MockServer::start(move |_| {
+        calls2.fetch_add(1, Ordering::SeqCst);
+        HttpResponse::ok_json(&openai_ok_body(
+            r#"{"description":"公园里树木茂盛阳光温暖洒落","peoplePresence":{"status":"unknown","confidence":0.8},"tags":{"scene":[{"name":"公园","confidence":0.1}]},"numbers":{}}"#,
+        ))
+    });
+    let dbm = Arc::new(Mutex::new(db::init_memory()?));
+    let tmp = tempfile::tempdir()?;
+    let thumbs = ThumbnailService::new(&tmp.path().join("data"))?;
+    let ids = import_images(&dbm, &thumbs, 1)?;
+    let batch = ai::create_batch(&dbm.lock().unwrap(), &ids, "cloud")?;
+    let cfg = settings_with(profile(&srv.url(), "openai", "cloud"));
+
+    let (_, progress) = progress_sink();
+    ai_cloud::run_cloud_batch(
+        &dbm,
+        batch.id,
+        &cfg,
+        &categories(),
+        &categories(),
+        None,
+        &Arc::new(AtomicBool::new(false)),
+        progress,
+    )?;
+
+    {
+        let conn = dbm.lock().unwrap();
+        let sug = ai::list_suggestions(&conn, batch.id)?;
+        assert!(sug[0].suggested_tags.is_empty(), "低置信标签应被拦截");
+        assert!(
+            !sug[0].suggested_description.is_empty(),
+            "描述仍应保留待人工确认"
+        );
+    }
+
+    let (_, progress) = progress_sink();
+    let error = ai_cloud::run_cloud_batch(
+        &dbm,
+        batch.id,
+        &cfg,
+        &categories(),
+        &categories(),
+        None,
+        &Arc::new(AtomicBool::new(false)),
+        progress,
+    )
+    .expect_err("低置信度结果已经分析过，续跑不应再次请求");
+    assert!(error.to_string().contains("没有待打标"));
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "不应重复请求 AI");
+    Ok(())
+});
+
+// 主体为空不是错误：修复一次；description 有明确锚点时必须补 subject。
+conn_retry_test!(empty_subject_is_repaired_once, {
+    let _g = common::net_lock_guard();
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let calls2 = Arc::clone(&calls);
+    let srv = MockServer::start(move |_| {
+        let n = calls2.fetch_add(1, Ordering::SeqCst);
+        let content = if n == 0 {
+            r#"{"description":"城市建筑与树林交接的远景","peoplePresence":{"status":"absent","confidence":0.9},"tags":{"subject":[]},"numbers":{}}"#
+        } else {
+            r#"{"description":"城市建筑与树林交接的远景","peoplePresence":{"status":"absent","confidence":0.9},"tags":{"subject":[{"name":"城市建筑","confidence":0.9}]},"numbers":{}}"#
+        };
+        HttpResponse::ok_json(&openai_ok_body(content))
+    });
+    let dbm = Arc::new(Mutex::new(db::init_memory()?));
+    let tmp = tempfile::tempdir()?;
+    let thumbs = ThumbnailService::new(&tmp.path().join("data"))?;
+    let ids = import_images(&dbm, &thumbs, 1)?;
+    let batch = ai::create_batch(&dbm.lock().unwrap(), &ids, "cloud")?;
+
+    let (_, progress) = progress_sink();
+    ai_cloud::run_cloud_batch(
+        &dbm,
+        batch.id,
+        &settings_with(profile(&srv.url(), "openai", "cloud")),
+        &subject_categories(),
+        &subject_categories(),
+        None,
+        &Arc::new(AtomicBool::new(false)),
+        progress,
+    )?;
+
+    let sug = ai::list_suggestions(&dbm.lock().unwrap(), batch.id)?;
+    assert_eq!(
+        sug[0].suggested_tags.get("subject"),
+        Some(&vec!["城市建筑".to_string()])
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 2, "主体为空应只补调一次");
+    Ok(())
+});
+
 // Anthropic Messages 模式：POST {base}/messages，x-api-key + anthropic-version 头
 conn_retry_test!(anthropic_mode_sends_messages_and_key_header, {
     let _g = common::net_lock_guard();
     let srv = MockServer::start(|req| {
         assert_eq!(req.header_x_api_key.as_deref(), Some("test-key"));
         assert_eq!(req.path, "/messages");
-        // 旧用例返回 {"光线":[...]} 并断言 lighting，但 categories() 只注册 scene 分面，
-        // 响应会被 parse_tags_strict 判为不可解析（该缺陷因 lib 测试编译失败长期未暴露）。
-        // 与其余用例对齐：用 场景/scene 验证 anthropic 协议本身（路径 /messages + x-api-key 头）。
-        HttpResponse::ok_json(r#"{"content":[{"type":"text","text":"{\"场景\":[\"逆光\"]}"}]}"#)
+        HttpResponse::ok_json(
+            r#"{"content":[{"type":"tool_use","input":{"description":"画面呈现强烈逆光与温暖氛围","peoplePresence":{"status":"unknown","confidence":0.8},"tags":{"scene":[{"name":"逆光","confidence":0.9}]},"numbers":{}}}]}"#,
+        )
     });
     let dbm = Arc::new(Mutex::new(db::init_memory()?));
     let tmp = tempfile::tempdir()?;
@@ -333,11 +443,14 @@ conn_retry_test!(empty_tags_marks_rejected_and_batch_continues, {
     let calls2 = Arc::clone(&calls);
     let srv = MockServer::start(move |_| {
         let n = calls2.fetch_add(1, Ordering::SeqCst);
-        // 阶段 5 §8.3：单项失败重试 1 次——前 2 次返回空对象（重试仍失败→rejected），第 3 次起正常
-        if n < 2 {
+        // 阶段 5 §8.3：单项失败重试 1 次。V2 每次无效输出会先补调一次，
+        // 因此第 1 张两次请求尝试共 4 次均为空对象，随后才轮到第 2 张正常输出。
+        if n < 4 {
             HttpResponse::ok_json(&openai_ok_body("{}")) // 第 1 张：模型返回空对象（失败）
         } else {
-            HttpResponse::ok_json(&openai_ok_body(r#"{"场景":["海边"]}"#))
+            HttpResponse::ok_json(&openai_ok_body(
+                r#"{"description":"海边风景十分开阔且天色明亮","peoplePresence":{"status":"unknown","confidence":0.8},"tags":{"scene":[{"name":"海边","confidence":0.9}]},"numbers":{}}"#,
+            ))
         }
     });
     let dbm = Arc::new(Mutex::new(db::init_memory()?));
@@ -368,8 +481,8 @@ conn_retry_test!(empty_tags_marks_rejected_and_batch_continues, {
     assert_eq!(sug[0].suggested_tags.len(), 0);
     let err = sug[0].last_error.as_ref().expect("应记录失败原因");
     assert!(
-        err.contains("未返回可解析"),
-        "错误应带模型原始内容提示: {err}"
+        err.contains("打标 V2 缺少 description"),
+        "错误应说明 V2 结构缺少必需字段: {err}"
     );
     // 其余条正常出建议
     assert_eq!(
@@ -389,11 +502,14 @@ conn_retry_test!(http_500_marks_rejected_and_batch_done, {
     let calls2 = Arc::clone(&calls);
     let srv = MockServer::start(move |_| {
         let n = calls2.fetch_add(1, Ordering::SeqCst);
-        // 阶段 5 §8.3：单项失败重试 1 次——前 2 次返回 500（重试仍失败→rejected），第 3 次起正常
-        if n < 2 {
+        // 阶段 5 §8.3：单项失败重试 1 次。结构化等级会先降级，再执行一次素材级重试；
+        // 第 1 张耗尽这些请求后仍为 500，第 2 张开始正常。
+        if n < 6 {
             HttpResponse::status_only(500)
         } else {
-            HttpResponse::ok_json(&openai_ok_body(r#"{"场景":["街景"]}"#))
+            HttpResponse::ok_json(&openai_ok_body(
+                r#"{"description":"清晨城市街景在阳光下十分通透","peoplePresence":{"status":"unknown","confidence":0.8},"tags":{"scene":[{"name":"街景","confidence":0.9}]},"numbers":{}}"#,
+            ))
         }
     });
     let dbm = Arc::new(Mutex::new(db::init_memory()?));
@@ -440,7 +556,11 @@ conn_retry_test!(http_500_marks_rejected_and_batch_done, {
 // 取消（B11）：进度回调中触发 → 批次 cancelled、未完成保持 pending、不 panic
 conn_retry_test!(cancel_mid_batch_keeps_remaining_pending, {
     let _g = common::net_lock_guard();
-    let srv = MockServer::start(|_| HttpResponse::ok_json(&openai_ok_body(r#"{"场景":["公园"]}"#)));
+    let srv = MockServer::start(|_| {
+        HttpResponse::ok_json(&openai_ok_body(
+            r#"{"description":"公园里树木茂盛阳光温暖洒落","peoplePresence":{"status":"unknown","confidence":0.8},"tags":{"scene":[{"name":"公园","confidence":0.9}]},"numbers":{}}"#,
+        ))
+    });
     let dbm = Arc::new(Mutex::new(db::init_memory()?));
     let tmp = tempfile::tempdir()?;
     let thumbs = ThumbnailService::new(&tmp.path().join("data"))?;
@@ -493,7 +613,9 @@ conn_retry_test!(limit_two_then_resume_rest, {
     let calls2 = Arc::clone(&calls);
     let srv = MockServer::start(move |_| {
         calls2.fetch_add(1, Ordering::SeqCst);
-        HttpResponse::ok_json(&openai_ok_body(r#"{"场景":["续跑"]}"#))
+        HttpResponse::ok_json(&openai_ok_body(
+            r#"{"description":"测试续跑素材呈现公园晴朗景色","peoplePresence":{"status":"unknown","confidence":0.8},"tags":{"scene":[{"name":"续跑","confidence":0.9}]},"numbers":{}}"#,
+        ))
     });
     let dbm = Arc::new(Mutex::new(db::init_memory()?));
     let tmp = tempfile::tempdir()?;
@@ -594,7 +716,9 @@ conn_retry_test!(no_pending_run_errors_with_clear_message, {
     let calls2 = Arc::clone(&calls);
     let srv = MockServer::start(move |_| {
         calls2.fetch_add(1, Ordering::SeqCst);
-        HttpResponse::ok_json(&openai_ok_body(r#"{"场景":["公园"]}"#))
+        HttpResponse::ok_json(&openai_ok_body(
+            r#"{"description":"公园里树木茂盛阳光温暖洒落","peoplePresence":{"status":"unknown","confidence":0.8},"tags":{"scene":[{"name":"公园","confidence":0.9}]},"numbers":{}}"#,
+        ))
     });
     let dbm = Arc::new(Mutex::new(db::init_memory()?));
     let tmp = tempfile::tempdir()?;
@@ -664,7 +788,9 @@ conn_retry_test!(resume_after_cancel_skips_generated, {
     let calls2 = Arc::clone(&calls);
     let srv = MockServer::start(move |_| {
         calls2.fetch_add(1, Ordering::SeqCst);
-        HttpResponse::ok_json(&openai_ok_body(r#"{"场景":["公园"]}"#))
+        HttpResponse::ok_json(&openai_ok_body(
+            r#"{"description":"公园里树木茂盛阳光温暖洒落","peoplePresence":{"status":"unknown","confidence":0.8},"tags":{"scene":[{"name":"公园","confidence":0.9}]},"numbers":{}}"#,
+        ))
     });
     let dbm = Arc::new(Mutex::new(db::init_memory()?));
     let tmp = tempfile::tempdir()?;

@@ -1,6 +1,6 @@
 /** 设置页（指导书 §2.2/§6.1-§6.7）：
- *  左侧分组导航（含 AI 设置两个子页）+ 右侧分组内容；保存按钮在最后一项之后。
- *  IA：入库与总库 → AI 设置（超级搜索 AI/打标 AI）→ 标签与分类 → 通用外观 → 数据与缓存 → 关于。
+ *  左侧分组导航（含 AI 与模型三个子页）+ 右侧分组内容；保存按钮在最后一项之后。
+ *  IA：素材库与入库 → AI 与模型（服务管理/超级搜索/自动打标）→ 标签与分类 → 外观与浏览 → 存储与维护 → 诊断与支持 → 关于。
  *  AI 子页内使用「在线服务/本地服务」二选一，只渲染当前模式字段。
  */
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -10,7 +10,7 @@ import { open as pickDir, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { on } from "@/api/client";
 import Button from "@/components/common/Button";
 import { ollamaInstallStatus, ollamaRemoveInstaller } from "@/api/ollama";
-import { backupDb, clearThumbnailCache, getDataDir, openDataDir, openLogsDir, resetAppData, restoreDb, type ResetDataSelection } from "@/api/settings";
+import { backupDb, clearThumbnailCache, exportDiagnostics, getDataDir, openDataDir, openLogsDir, resetAppData, restoreDb, type ResetDataSelection } from "@/api/settings";
 import {
   rescanAssetMetadata,
   rescanAssetPalette,
@@ -25,10 +25,11 @@ import {
 import { listAiConnections, getAiUsageBindings, setAiUsageBinding } from "@/api/connections";
 import { videoProxyCacheStats, clearAllVideoProxies } from "@/api/video";
 import FacetManagePanel from "@/components/settings/FacetManagePanel";
-import DataIntegrityPanel from "@/components/settings/DataIntegrityPanel";
-import VocabularyGovernancePanel from "@/components/settings/VocabularyGovernancePanel";
 import ServiceManagement from "@/components/settings/ServiceManagement";
 import { useLibraryStore } from "@/stores/libraryStore";
+import { useMetadataStore } from "@/stores/metadataStore";
+import { useSelectionStore } from "@/stores/selectionStore";
+import { useTagStore } from "@/stores/tagStore";
 import { applyTheme, useSettingsStore, DEFAULT_APPEARANCE } from "@/stores/settingsStore";
 import { CELL_STEPS } from "@/types/settings";
 import type { CellAspect, CellFit, Settings } from "@/types/settings";
@@ -44,37 +45,38 @@ const CELL_ASPECTS: { value: CellAspect; label: string }[] = [
   { value: "9:16", label: "9:16" },
 ];
 const CELL_FITS: { value: CellFit; label: string }[] = [
-  { value: "cover", label: "裁切填满（cover）" },
-  { value: "contain", label: "完整显示（contain）" },
-  { value: "smart", label: "智能（smart）" },
+  { value: "cover", label: "裁切填满" },
+  { value: "contain", label: "完整显示" },
+  { value: "smart", label: "智能适应" },
 ];
 
 /** §6.1 路由状态：必须能表达 AI 的三个子页面（超级搜索 / 自动打标 / 服务管理） */
-type SettingsRoute = "library" | "ai.superSearch" | "ai.tagging" | "ai.services" | "tags" | "general" | "data" | "about";
+type SettingsRoute = "library" | "ai.superSearch" | "ai.tagging" | "ai.services" | "tags" | "general" | "data" | "diagnostics" | "about";
 
-/** §6.1 分组顺序：不得调整 */
+/** §6.1 分组顺序 */
 const GROUPS: {
-  key: "library" | "ai" | "tags" | "general" | "data" | "about";
+  key: "library" | "ai" | "tags" | "general" | "data" | "diagnostics" | "about";
   label: string;
   children?: { key: SettingsRoute; label: string }[];
 }[] = [
-  { key: "library", label: "入库与总库" },
+  { key: "library", label: "素材库与入库" },
   {
     key: "ai",
-    label: "AI 设置",
+    label: "AI 与模型",
     children: [
+      { key: "ai.services", label: "服务管理" },
       { key: "ai.superSearch", label: "超级搜索" },
       { key: "ai.tagging", label: "自动打标" },
-      { key: "ai.services", label: "服务管理" },
     ],
   },
   { key: "tags", label: "标签与分类" },
-  { key: "general", label: "通用外观" },
-  { key: "data", label: "数据与缓存" },
+  { key: "general", label: "外观与浏览" },
+  { key: "data", label: "存储与维护" },
+  { key: "diagnostics", label: "诊断与支持" },
   { key: "about", label: "关于" },
 ];
 
-/** 初始分组：入库与总库（第一项） */
+/** 初始分组：素材库与入库（第一项） */
 const DEFAULT_ROUTE: SettingsRoute = "library";
 
 export default function SettingsPage({ onBack }: { onBack?: () => void }) {
@@ -93,11 +95,12 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
   const [route, setRoute] = useState<SettingsRoute>(DEFAULT_ROUTE);
   const [dataDir, setDataDir] = useState("");
   const [dataDirError, setDataDirError] = useState(false);
+  const [exportingDiagnostics, setExportingDiagnostics] = useState(false);
   const [saved, setSaved] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  // A3：安装包缓存（「数据与缓存」分组展示占用/清理）
+  // A3：安装包缓存（「存储与维护」分组展示占用/清理）
   const [installerInfo, setInstallerInfo] = useState<{ path: string; size: number } | null>(null);
   const [removingInstaller, setRemovingInstaller] = useState(false);
   // §6.7：视频代理缓存统计（数量/占用）+ 清理
@@ -122,7 +125,7 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
       .catch(() => undefined);
     try {
       const r = await rescanAssetMetadata([], scope);
-      setRefillResult(`回填完成：总数 ${r.total}，成功 ${r.success}，失败 ${r.failed}，跳过 ${r.skipped}`);
+      setRefillResult(`媒体信息更新完成：总数 ${r.total}，成功 ${r.success}，失败 ${r.failed}，跳过 ${r.skipped}`);
     } catch (e) {
       setRefillResult(e instanceof Error ? e.message : String(e));
     } finally {
@@ -156,6 +159,7 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
     try {
       const r = await rescanAssetPalette([], scope);
       setPaletteResult(`回算完成：总数 ${r.total}，成功 ${r.success}，跳过 ${r.skipped}，失败 ${r.failed}`);
+      await useMetadataStore.getState().refresh();
     } catch (e) {
       setPaletteResult(e instanceof Error ? e.message : String(e));
     } finally {
@@ -184,7 +188,7 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
       .catch(() => undefined);
     try {
       const r = await rescanAssetPhash([], scope);
-      setPhashResult(`感知哈希回填完成：总数 ${r.total}，成功 ${r.success}，跳过 ${r.skipped}，失败 ${r.failed}`);
+      setPhashResult(`相似图数据生成完成：总数 ${r.total}，成功 ${r.success}，跳过 ${r.skipped}，失败 ${r.failed}`);
     } catch (e) {
       setPhashResult(e instanceof Error ? e.message : String(e));
     } finally {
@@ -206,6 +210,7 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
     try {
       const n = await rescanPaletteColors();
       setPaletteColorsResult(`色板关系表已重建：写入 ${n} 条（表已满时重复执行返回 0，属正常）`);
+      await useMetadataStore.getState().refresh();
     } catch (e) {
       setPaletteColorsResult(e instanceof Error ? e.message : String(e));
     } finally {
@@ -231,7 +236,7 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
       .catch(() => undefined);
     try {
       const r = await rescanImageDimensions([], scope);
-      setDimResult(`宽高回填完成：总数 ${r.total}，成功 ${r.success}，跳过 ${r.skipped}，失败 ${r.failed}`);
+      setDimResult(`分辨率更新完成：总数 ${r.total}，成功 ${r.success}，跳过 ${r.skipped}，失败 ${r.failed}`);
     } catch (e) {
       setDimResult(e instanceof Error ? e.message : String(e));
     } finally {
@@ -253,7 +258,7 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
   const generateUnsub = useRef<(() => void) | null>(null);
   useEffect(() => () => generateUnsub.current?.(), []);
 
-  /** FB4-03：重新读取色板状态（进入通用外观路由时调用；失败保留错误文案 + 重试入口）。 */
+  /** FB4-03：重新读取色板状态（进入外观与浏览路由时调用；失败保留错误文案 + 重试入口）。 */
   const refreshPaletteStatus = useCallback(async () => {
     try {
       const st = await getPaletteStatus();
@@ -264,7 +269,7 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
     }
   }, []);
 
-  // 进入通用外观路由时读取状态；总开关开关变化不需要重复触发扫描（§6.3）
+  // 进入外观与浏览路由时读取状态；总开关变化不需要重复触发扫描（§6.3）
   useEffect(() => {
     if (route !== "general") return;
     void refreshPaletteStatus();
@@ -299,6 +304,11 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
       } catch (e) {
         errors.push(`素材色条同步失败：${e instanceof Error ? e.message : String(e)}`);
       }
+      try {
+        await useMetadataStore.getState().refresh();
+      } catch (e) {
+        errors.push(`主要颜色刷新失败：${e instanceof Error ? e.message : String(e)}`);
+      }
       if (errors.length > 0) {
         setPaletteStatusError(errors.join("；"));
       }
@@ -331,7 +341,7 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
       .catch(() => setDataDirError(true));
   }, []);
 
-  // 进入「数据与缓存」分组时刷新安装包缓存 + 视频代理缓存统计
+  // 进入「存储与维护」分组时刷新安装包缓存 + 视频代理缓存统计
   useEffect(() => {
     if (route !== "data") return;
     ollamaInstallStatus()
@@ -447,6 +457,29 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
     }
   };
 
+  const onExportDiagnostics = async () => {
+    const stamp = new Date().toISOString().replace(/[-:]/g, "").slice(0, 13);
+    const target = await saveDialog({
+      title: "导出诊断包",
+      defaultPath: `bagertea-diagnostics-${stamp}.zip`,
+      filters: [{ name: "ZIP 压缩包", extensions: ["zip"] }],
+    });
+    if (!target) return;
+    setExportingDiagnostics(true);
+    setError(null);
+    try {
+      const report = await exportDiagnostics(target);
+      const truncation = report.truncatedLogs > 0 ? `，${report.truncatedLogs} 个文件保留尾部` : "";
+      setNotice(
+        `诊断包已导出：${report.logFiles} 个日志文件${truncation}，${(report.bytes / 1024).toFixed(0)} KB`,
+      );
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setExportingDiagnostics(false);
+    }
+  };
+
   const aiRoute: "ai.superSearch" | "ai.tagging" | null =
     route === "ai.superSearch" || route === "ai.tagging" ? route : null;
 
@@ -507,8 +540,10 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
       <div className="relative min-w-0 flex-1 overflow-y-auto">
         <div className="mx-auto flex max-w-[1040px] flex-col gap-6 px-6 py-6">
           {route === "library" && (
-            <Group title="入库与总库">
-              <Field label="总库位置" hint="配置后，入库将把文件复制到 总库/分库/ 下统一管理；留空 = 原位索引">
+            <>
+            <PageHeader title="素材库与入库" description="设置总库位置，以及 RAW/JPG 等同源文件的显示和打标行为。" />
+            <Group title="素材库位置">
+              <Field label="总库位置" hint="选择后，导入的文件会复制到总库统一管理；未选择时仅建立索引，文件保留在原位置。">
                 <div className="flex items-center gap-2">
                   <input
                     readOnly
@@ -524,6 +559,41 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
               </Field>
               {/* W4-5：删「分库与改名」说明行（那是入库页的操作说明，不是设置） */}
             </Group>
+            <Group title="同源文件">
+              <Field
+                label="同源文件打标同步"
+                hint="同一张照片的 RAW 与 JPG 版本只需打标一次，确认后标签会自动同步到另一版本。"
+              >
+                <Toggle
+                  checked={draftAppearance.kinship?.syncTagsToSiblings ?? true}
+                  onChange={(v) => {
+                    const next: Settings = {
+                      ...draft,
+                      appearance: { ...draftAppearance, kinship: { ...draftAppearance.kinship, syncTagsToSiblings: v } },
+                    };
+                    dirty(next);
+                    pushPreview(next.appearance);
+                  }}
+                />
+              </Field>
+              <Field
+                label="素材库合并显示同源文件"
+                hint="开启后，同一照片的 RAW 与 JPG 只显示一项（优先显示非 RAW）；关闭后分别显示。合并显示时，顶部数量仍按文件总数计算。"
+              >
+                <Toggle
+                  checked={draftAppearance.kinship?.mergeInLibrary ?? false}
+                  onChange={(v) => {
+                    const next: Settings = {
+                      ...draft,
+                      appearance: { ...draftAppearance, kinship: { ...draftAppearance.kinship, mergeInLibrary: v } },
+                    };
+                    dirty(next);
+                    pushPreview(next.appearance);
+                  }}
+                />
+              </Field>
+            </Group>
+            </>
           )}
 
           {aiRoute && (
@@ -533,7 +603,6 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
               patchAi={patchAi}
               notify={setNotice}
               fail={setError}
-              onOpenServices={() => setRoute("ai.services")}
             />
           )}
 
@@ -550,59 +619,18 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
           )}
 
           {route === "tags" && (
-            <Group title="标签与分类">
+            <div className="flex flex-col gap-6">
+              <PageHeader title="标签与分类" description="管理 AI 自动打标、手工填写和已停用的分类；分类行内可直接进入编辑或词条设置。" />
               {/* §9.2/§9.5：分面结构 + AI 行为 + 分类词条在同一个分面详情内完成；
-                   不再并列「AI 行为配置」独立列表与「分类词条」顶层卡片（§9.3） */}
-              <div className="p-2">
-                <FacetManagePanel draft={draft} onPatchAi={patchAi} />
-              </div>
-              {/* F2-e：数据完整性（V22b 约束能力状态 + 预检 + 启用） */}
-              <div className="pt-2">
-                <DataIntegrityPanel />
-              </div>
-              {/* F6-d：词表治理（新词待确认 + 疑似重复合并） */}
-              <div className="pt-2">
-                <VocabularyGovernancePanel />
-              </div>
-            </Group>
+                   说明标题置于容器外，描边容器只承载可编辑的分类行。 */}
+              <FacetManagePanel draft={draft} onPatchAi={patchAi} />
+            </div>
           )}
 
           {route === "general" && (
             <>
-              <Group title="通用外观">
-              {/* W5h：同源文件组（RAW+JPG）两个开关 —— 打标层默认开、浏览层默认关（用户定案） */}
-              <Field
-                label="同源文件打标同步"
-                hint="同一张照片的 RAW+JPG 只打一次标：AI 批次自动去重（请求减半），确认后标签自动同步到另一份"
-              >
-                <Toggle
-                  checked={draftAppearance.kinship?.syncTagsToSiblings ?? true}
-                  onChange={(v) => {
-                    const next: Settings = {
-                      ...draft,
-                      appearance: { ...draftAppearance, kinship: { ...draftAppearance.kinship, syncTagsToSiblings: v } },
-                    };
-                    dirty(next);
-                    pushPreview(next.appearance);
-                  }}
-                />
-              </Field>
-              <Field
-                label="素材库合并显示同源文件"
-                hint="开启后每组 RAW+JPG 只显示一个（非 RAW 优先）；关闭则两份都显示。注意：合并显示下顶栏计数仍为后端总数"
-              >
-                <Toggle
-                  checked={draftAppearance.kinship?.mergeInLibrary ?? false}
-                  onChange={(v) => {
-                    const next: Settings = {
-                      ...draft,
-                      appearance: { ...draftAppearance, kinship: { ...draftAppearance.kinship, mergeInLibrary: v } },
-                    };
-                    dirty(next);
-                    pushPreview(next.appearance);
-                  }}
-                />
-              </Field>
+              <PageHeader title="外观与浏览" description="调整主题、素材框、悬停预览和主色色条的显示方式。" />
+              <Group title="基础外观">
               <Field label="主题" hint="跟随系统 / 浅色 / 深色；切换即时预览，保存后记住">
                 <select
                   value={draft.theme}
@@ -620,10 +648,9 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
               </Field>
             </Group>
 
-            {/* FB2-02（§8.4）：素材框 —— 统一比例 + 填充方式 + 双边格子大小 + 悬停预览。
-                所有外观字段即时生效（写 draft + previewAppearance），保存时随 draft 落库。 */}
+            {/* FB2-02（§8.4）：素材框 —— 统一比例 + 填充方式 + 双边格子大小。 */}
             <Group title="素材框">
-              <Field label="统一比例" hint="素材库与入库网格共用同一比例，任意混排都无锯齿行">
+              <Field label="统一比例" hint="素材库与导入页使用相同的缩略图比例。">
                 <select
                   value={draft.appearance?.grid.cellAspect ?? "1:1"}
                   onChange={(e) => {
@@ -641,7 +668,7 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
                   ))}
                 </select>
               </Field>
-              <Field label="填充方式" hint="cover 裁切填满 / contain 完整显示 / smart 按内容自动权衡，绝不拉伸">
+              <Field label="填充方式" hint="裁切填满、完整显示或按内容自动适应；不会拉伸素材。">
                 <select
                   value={draftAppearance.grid.cellFit}
                   onChange={(e) => {
@@ -659,7 +686,7 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
                   ))}
                 </select>
               </Field>
-              <Field label="contain 留边填主色" hint="将留边底色填成素材主色的低饱和版本（视觉延伸，非缺口）">
+              <Field label="留边区域填充主色" hint="完整显示产生留边时，用素材主色的浅色版本填充留边区域。">
                 <Toggle
                   checked={draft.appearance.grid.matchDominantColor}
                   onChange={() => {
@@ -672,13 +699,16 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
                   }}
                 />
               </Field>
-              <Field label="素材库格子大小" hint="档位化缩放；Alt/Ctrl/Cmd+滚轮或 Ctrl/Cmd+± 也可调整">
+              <Field label="素材库格子大小" hint="调整素材库缩略图大小；也可使用滚轮或快捷键缩放。">
                 <RangeSteps value={draftAppearance.grid.libraryCellStep} max={CELL_STEPS.length - 1} labelForStep={(i) => `${CELL_STEPS[i]}px`} onChange={(v) => patchGrid({ ...draftAppearance.grid, libraryCellStep: v })} />
               </Field>
-              <Field label="入库格子大小" hint="入库页网格的默认档位（两页各存一份）">
+              <Field label="入库格子大小" hint="设置导入页缩略图的默认大小。">
                 <RangeSteps value={draftAppearance.grid.importCellStep} max={CELL_STEPS.length - 1} labelForStep={(v) => `${CELL_STEPS[v]}px`} onChange={(v) => patchGrid({ ...draftAppearance.grid, importCellStep: v })} />
               </Field>
-              <Field label="悬停自动播放" hint="鼠标停在视频卡片上约 300 毫秒后，在卡片内部静音播放片段；移开鼠标立即停止，不会打开大浮层">
+            </Group>
+
+            <Group title="悬停预览">
+              <Field label="悬停自动播放" hint="鼠标停留在视频卡片上时，在卡片内静音播放；移开后停止。">
                 <Toggle
                   checked={draftAppearance.hoverPreview.enabled}
                   onChange={() => {
@@ -707,7 +737,7 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
                 </Field>
               )}
               {draftAppearance.hoverPreview.enabled && (
-                <Field label="素材库也启用悬停预览" hint="默认只在素材库悬停播放；关闭后素材库仅显示封面（设置只影响素材库网格，查看器内播放不受此开关控制）">
+                <Field label="素材库也启用悬停预览" hint="关闭后，素材库中的视频只显示封面；查看器中的播放不受影响。">
                   <Toggle
                     checked={draftAppearance.hoverPreview.inLibraryGrid}
                     onChange={() => {
@@ -718,8 +748,11 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
                   />
                 </Field>
               )}
-              {/* FB2-08（§14.11）+ FB3-10（§12.2）+ FB4-03（§4.5）：算法主色色条设置。
-                  总开关关闭时位置/样式行不渲染；状态行（色条数据）即使总开关关闭也显示。 */}
+            </Group>
+
+            {/* FB2-08（§14.11）+ FB3-10（§12.2）+ FB4-03（§4.5）：算法主色色条设置。
+                总开关关闭时位置/样式行不渲染；状态行（色条数据）即使总开关关闭也显示。 */}
+            <Group title="主色色条">
               <Field label="显示算法主色色条" hint="从图片或视频封面中提取几种主要颜色，仅在本机计算，不调用 AI">
                 <Toggle
                   checked={draftAppearance.colorStrip.enabled}
@@ -781,7 +814,7 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
               {generateResult && (
                 <p className="px-4 py-2 text-xs text-[var(--color-text-secondary)]">{generateResult}</p>
               )}
-              {/* W4-5：色条细节折叠（7 控件压成 1 开关 + 折叠，通用外观可见控件 ≤12） */}
+              {/* W4-5：色条细节折叠（7 控件压成 1 开关 + 折叠，外观与浏览可见控件 ≤12） */}
               {draftAppearance.colorStrip.enabled && (
                 <div className="px-4 py-1">
                   <button
@@ -846,8 +879,10 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
           )}
 
           {route === "data" && (
-            <Group title="数据与缓存">
-              <Field label="软件数据保存位置" hint="数据库与缩略图所在目录，备份/转移素材库时复制此目录">
+            <>
+            <PageHeader title="存储与维护" description="查看软件数据位置，管理缓存、索引、备份和重置操作。" />
+            <Group title="存储位置">
+              <Field label="软件数据保存位置" hint="数据库与缩略图所在目录；备份或转移素材库时，请复制此目录。">
                 <div className="flex items-center gap-2">
                   <span className="max-w-52 truncate text-xs text-[var(--color-text-secondary)]" title={dataDir}>
                     {dataDirError ? "暂不可用" : dataDir || "…"}
@@ -855,7 +890,9 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
                   <Button onClick={() => void openDataDir()}>打开文件夹</Button>
                 </div>
               </Field>
-              <Field label="高清缩略图缓存" hint="浏览大图时生成的清晰版缩略图。删除后会按需重新生成，不影响原文件；上限超出后自动清理最久未用的">
+            </Group>
+            <Group title="缓存管理">
+              <Field label="高清缩略图缓存" hint="浏览大图时生成的清晰版缩略图，不影响原文件。删除后会按需重新生成；超过容量上限时，会自动清理最久未使用的内容。">
                 <div className="flex items-center gap-2">
                   <input
                     type="number"
@@ -880,7 +917,7 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
                   </Button>
                 )}
               </Field>
-              <Field label="回收站" hint="超期后启动时自动彻底清理；0 = 不自动清理">
+              <Field label="回收站" hint="超过保留期限后，会在启动时自动清理；设为 0 时不自动清理。">
                 <input
                   type="number"
                   className="ui-control w-20 rounded-md px-2 py-1.5 text-sm outline-none"
@@ -889,13 +926,27 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
                 />
               </Field>
               <Field
-                label="媒体元数据回填"
-                hint="重新读取文件本身的技术信息（分辨率、编码、时长、帧率、音频编码、拍摄参数），不改变原文件和标签。适用：旧素材导入时读取失败、程序升级后新增字段、视频时长显示为空。失败会记录原因，不阻塞其他素材"
+                label="视频代理缓存"
+                hint={
+                  proxyStats && proxyStats.count > 0
+                    ? `当原视频无法直接播放时生成的兼容副本（当前 ${proxyStats.count} 个，约 ${(proxyStats.bytes / 1024 / 1024).toFixed(1)} MB）。清理不会删除原视频，需要时会重新生成。`
+                    : "当原视频无法直接播放时，会自动生成兼容副本。清理不会删除原视频；当前没有可清理的副本。"
+                }
+              >
+                <Button variant="danger" disabled={clearingProxies} onClick={() => void onClearVideoProxies()}>
+                  {clearingProxies ? "清理中…" : "清理全部"}
+                </Button>
+              </Field>
+            </Group>
+            <Group title="数据维护">
+              <Field
+                label="媒体信息更新"
+                hint="重新读取分辨率、时长、编码、帧率和拍摄参数等信息，不修改原文件或标签。适用于旧素材信息缺失，或软件升级后新增了信息类型。失败的项目会记录原因，不影响其他素材。"
               >
                 <div className="flex items-center gap-2">
                   {/* 与色板回算互斥（FX-12 后端也会拒绝）；前端 disabled 是为了不让用户点了才知道 */}
                   <Button disabled={refilling || paletteRunning} onClick={() => void onRefill("missing")}>
-                    只补缺失信息
+                    仅补充缺失信息
                   </Button>
                   <Button disabled={refilling || paletteRunning} onClick={() => void onRefill("all")}>
                     重新读取全部视频
@@ -907,7 +958,7 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
               </Field>
               {refillProgress && refilling && (
                 <p className="px-4 py-2 text-xs text-[var(--color-text-secondary)]">
-                  回填中 {refillProgress.done}/{refillProgress.total}（成功 {refillProgress.success} · 失败 {refillProgress.failed} · 跳过 {refillProgress.skipped}）
+                  更新中 {refillProgress.done}/{refillProgress.total}（成功 {refillProgress.success} · 失败 {refillProgress.failed} · 跳过 {refillProgress.skipped}）
                 </p>
               )}
               {refillResult && (
@@ -915,14 +966,14 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
               )}
               {/* FB2-08（§14.7）+ FB3-11（§13.2）：算法色板回算（白话说明 + 危险性写清） */}
               <Field
-                label="算法色板回算"
-                hint="用本地算法从图片或视频封面估算主色，生成色条和按颜色筛选所需的索引。不调用 AI，不会创建标签。只补缺失＝只处理还没有色板的素材（快）；全部重算＝覆盖旧色板（适合算法升级或结果明显不准时）。视频需要先浏览过（生成封面）才能算，没有封面的会计入「跳过」"
+                label="色板重新计算"
+                hint="从图片或视频封面中提取主要颜色，用于生成色条和按颜色筛选。不会调用 AI，也不会创建标签。仅补充缺失项会跳过已有色板；全部重新计算会覆盖旧色板，适合结果明显不准确时使用。视频需先生成封面才能处理。"
               >
                 <div className="flex items-center gap-2">
-                  <Button disabled={paletteRunning || refilling} onClick={() => void onRescanPalette("missing")}>
-                    只补缺失色板
+                  <Button aria-label="补充缺失的色板" disabled={paletteRunning || refilling} onClick={() => void onRescanPalette("missing")}>
+                    仅补充缺失项
                   </Button>
-                  <Button disabled={paletteRunning || refilling} onClick={() => void onRescanPalette("all")}>
+                  <Button aria-label="重新计算全部色板" disabled={paletteRunning || refilling} onClick={() => void onRescanPalette("all")}>
                     全部重新计算
                   </Button>
                   {paletteRunning ? (
@@ -939,7 +990,7 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
               </Field>
               {paletteProgress && paletteRunning && (
                 <p className="px-4 py-2 text-xs text-[var(--color-text-secondary)]">
-                  色板回算中 {paletteProgress.done}/{paletteProgress.total}（成功 {paletteProgress.success} · 跳过 {paletteProgress.skipped} · 失败 {paletteProgress.failed}）
+                  色板计算中 {paletteProgress.done}/{paletteProgress.total}（成功 {paletteProgress.success} · 跳过 {paletteProgress.skipped} · 失败 {paletteProgress.failed}）
                 </p>
               )}
               {paletteResult && (
@@ -948,12 +999,12 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
               {/* R1-2：色板关系表重建（从 palette_json 重灌 asset_palette_colors，不解码图片）
                   —— 「前三色包含红」类筛选的表源；老库/重置后为空时点一次即可补齐 */}
               <Field
-                label="色板关系表重建"
-                hint="从每张素材已算好的 palette_json 重建「前三色包含」筛选用的索引表（asset_palette_colors）。不解码图片、不调 AI，毫秒级且幂等。素材的色板数据改动（如回算）后如有遗漏，再点一次即可对齐"
+                label="颜色筛选索引重建"
+                hint="根据素材现有的色板数据，重新生成按颜色筛选所需的索引，不会重新计算色板。色板数据更新后如有遗漏，可再次运行。"
               >
                 <div className="flex items-center gap-2">
                   <Button disabled={paletteColorsRunning || paletteRunning || refilling} onClick={() => void onRescanPaletteColors()}>
-                    {paletteColorsRunning ? "重建中…" : "重建前三色索引"}
+                    {paletteColorsRunning ? "重建中…" : "重建颜色索引"}
                   </Button>
                 </div>
               </Field>
@@ -962,15 +1013,15 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
               )}
               {/* W5d（§W5d）：感知哈希回填（相似图去重的前提；新导入的图片已自动计算，这里只补存量） */}
               <Field
-                label="感知哈希回填"
-                hint="用本地算法给图片算感知哈希（dHash），供「查找重复素材 → 相似图」识别连拍/同画面。新导入的图片已自动计算；这里只处理升级前导入的存量。只补缺失＝只处理还没有哈希的图片（快）；全部重算＝覆盖已有哈希（适合算法升级后）。纯本地计算，不调 AI"
+                label="相似图识别数据"
+                hint="为图片生成相似度识别所需的数据，用于查找重复素材和相似画面。新导入的图片会自动处理，此处用于补齐旧素材；全部重新计算会覆盖已有结果。"
               >
                 <div className="flex items-center gap-2">
-                  <Button disabled={phashRunning || paletteRunning || refilling} onClick={() => void onRescanPhash("missing")}>
-                    只补缺失哈希
+                  <Button aria-label="补充缺失的相似图数据" disabled={phashRunning || paletteRunning || refilling} onClick={() => void onRescanPhash("missing")}>
+                    仅补充缺失项
                   </Button>
-                  <Button disabled={phashRunning || paletteRunning || refilling} onClick={() => void onRescanPhash("all")}>
-                    全部重算
+                  <Button aria-label="重新计算全部相似图数据" disabled={phashRunning || paletteRunning || refilling} onClick={() => void onRescanPhash("all")}>
+                    全部重新计算
                   </Button>
                   {phashRunning ? (
                     <Button
@@ -986,7 +1037,7 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
               </Field>
               {phashProgress && phashRunning && (
                 <p className="px-4 py-2 text-xs text-[var(--color-text-secondary)]">
-                  感知哈希回填中 {phashProgress.done}/{phashProgress.total}（成功 {phashProgress.success} · 跳过 {phashProgress.skipped} · 失败 {phashProgress.failed}）
+                  相似图数据生成中 {phashProgress.done}/{phashProgress.total}（成功 {phashProgress.success} · 跳过 {phashProgress.skipped} · 失败 {phashProgress.failed}）
                 </p>
               )}
               {phashResult && (
@@ -994,15 +1045,15 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
               )}
               {/* R1-2：图片宽高存量回填（命令已注册但此前前端不可达；与其余回填共用互斥闸） */}
               <Field
-                label="图片宽高回填"
-                hint="重新探测图片/RAW 的宽高并写入素材记录（分辨率筛选用）。RAW 文件在导入时若分辨率探测失败会留下空宽高，这里只处理存量；新导入的已自动探测。只补缺失＝只处理还没有宽高的图片（快）；全部重算＝覆盖已有宽高（适合探测逻辑升级后）"
+                label="图片分辨率回填"
+                hint="重新读取图片的宽高信息，供分辨率筛选使用。仅处理未读取到宽高的旧素材，新导入的图片会自动读取；全部重新计算会覆盖已有结果。"
               >
                 <div className="flex items-center gap-2">
-                  <Button disabled={dimRunning || phashRunning || paletteRunning || refilling} onClick={() => void onRescanDimensions("missing")}>
-                    只补缺失宽高
+                  <Button aria-label="补充缺失的图片分辨率" disabled={dimRunning || phashRunning || paletteRunning || refilling} onClick={() => void onRescanDimensions("missing")}>
+                    仅补充缺失项
                   </Button>
-                  <Button disabled={dimRunning || phashRunning || paletteRunning || refilling} onClick={() => void onRescanDimensions("all")}>
-                    全部重算
+                  <Button aria-label="重新计算全部图片分辨率" disabled={dimRunning || phashRunning || paletteRunning || refilling} onClick={() => void onRescanDimensions("all")}>
+                    全部重新计算
                   </Button>
                   {dimRunning ? (
                     <Button
@@ -1018,31 +1069,23 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
               </Field>
               {dimProgress && dimRunning && (
                 <p className="px-4 py-2 text-xs text-[var(--color-text-secondary)]">
-                  宽高回填中 {dimProgress.done}/{dimProgress.total}（成功 {dimProgress.success} · 跳过 {dimProgress.skipped} · 失败 {dimProgress.failed}）
+                  分辨率更新中 {dimProgress.done}/{dimProgress.total}（成功 {dimProgress.success} · 跳过 {dimProgress.skipped} · 失败 {dimProgress.failed}）
                 </p>
               )}
               {dimResult && (
                 <p className="px-4 py-2 text-xs text-[var(--color-text-secondary)]">{dimResult}</p>
               )}
-              <Field
-                label="视频代理缓存"
-                hint={
-                  proxyStats && proxyStats.count > 0
-                    ? `原视频编码不兼容时生成的 H.264/AAC 临时副本（当前 ${proxyStats.count} 个，约 ${(proxyStats.bytes / 1024 / 1024).toFixed(1)} MB）。清理不删除原视频，需要时会重新生成`
-                    : "原视频播放不兼容时按需生成 H.264/AAC MP4 临时副本；清理不删除原视频。暂无可清理的代理"
-                }
-              >
-                <Button variant="danger" disabled={clearingProxies} onClick={() => void onClearVideoProxies()}>
-                  {clearingProxies ? "清理中…" : "清理全部"}
-                </Button>
-              </Field>
               {/* W5c：数据库备份/恢复（指导书 §W5c）——你的库唯一的副本入口 */}
+            </Group>
+            <Group title="备份与恢复">
               <Field
                 label="数据库备份与恢复"
-                hint="备份把整个素材库导出成一个 .db 文件（含素材记录、标签、AI 配置），建议存到移动硬盘或网盘；恢复会用备份文件整体替换当前库，恢复后软件自动重启"
+                hint="备份会将素材记录、标签和 AI 配置导出为一个 .db 文件，建议保存到移动硬盘或网盘。恢复会整体替换当前数据库，并自动重启软件。"
               >
                 <BackupRestorePanel notify={setNotice} fail={setError} />
               </Field>
+            </Group>
+            <Group title="危险操作">
               <ResetDataPanel
                 notify={setNotice}
                 fail={setError}
@@ -1053,23 +1096,41 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
                     const fresh = useSettingsStore.getState().settings;
                     if (fresh) setDraft(structuredClone(fresh));
                   }
-                  // 素材/标签变化：刷新素材库列表
-                  if (sel.assets || sel.tags) {
-                    await useLibraryStore.getState().refresh();
+                  // 素材删除后旧选中 id 已失效；标签删除后筛选条与标签树也必须同步失效
+                  if (sel.assets || sel.assetFiles) useSelectionStore.getState().clear();
+                  if (sel.tags) {
+                    useLibraryStore.getState().clearTagFilters();
+                    useTagStore.getState().clear();
                   }
+                  const refreshes: Promise<void>[] = [];
+                  if (sel.assets || sel.assetFiles || sel.tags) refreshes.push(useLibraryStore.getState().refresh());
+                  if (sel.tags) refreshes.push(useTagStore.getState().refresh());
+                  if (sel.assets || sel.assetFiles) refreshes.push(useMetadataStore.getState().refresh());
+                  await Promise.all(refreshes);
                 }}
               />
             </Group>
+            </>
           )}
 
           {route === "about" && (
-            <Group title="关于">
+            <>
+            <PageHeader title="关于" description="查看当前版本与许可证信息。" />
+            <Group title="应用信息">
               <Field label="版本" hint="茶包素材 BagerTea AiMdeias V2 · 本地素材库">
                 <span className="text-sm text-[var(--color-text-secondary)]">v1.0.1（演示构建）</span>
               </Field>
-              <Field label="许可证" hint="本项目相关组件许可证">
+              <Field label="许可证" hint="本软件使用的开源组件许可证信息。">
                 <span className="text-xs text-[var(--color-text-secondary)]">本地私有工具 · 部分组件 Apache-2.0 / MIT</span>
               </Field>
+            </Group>
+            </>
+          )}
+
+          {route === "diagnostics" && (
+            <>
+            <PageHeader title="诊断与支持" description="查看日志、导出诊断包并获取问题反馈所需的信息。" />
+            <Group title="日志与诊断">
               <Field label="数据与日志目录" hint="数据库、缩略图与日志所在目录">
                 <div className="flex items-center gap-2">
                   <span className="max-w-52 truncate text-xs text-[var(--color-text-secondary)]" title={dataDir}>
@@ -1078,13 +1139,33 @@ export default function SettingsPage({ onBack }: { onBack?: () => void }) {
                   <Button onClick={() => void openDataDir()}>打开文件夹</Button>
                 </div>
               </Field>
-              <Field label="日志目录" hint="运行日志（保留 7 天）；遇到问题时打包此目录发给支持">
-                <Button onClick={() => void openLogsDir()}>打开日志目录</Button>
+              <Field label="诊断日志级别" hint="默认 info；排障时可临时切到 debug 或 trace，完成后建议切回 info 以控制日志体积。">
+                <select
+                  aria-label="诊断日志级别"
+                  value={draft.logLevel}
+                  onChange={(e) => dirty({ ...draft, logLevel: e.target.value as Settings["logLevel"] })}
+                  className="ui-control rounded-md px-2 py-1.5 text-sm outline-none"
+                >
+                  <option value="info">info（日常）</option>
+                  <option value="debug">debug（详细）</option>
+                  <option value="trace">trace（极详细）</option>
+                </select>
               </Field>
-              <Field label="反馈" hint="功能建议或问题反馈">
-                <span className="text-xs text-[var(--color-text-secondary)]">可在素材库问题反馈入口提交</span>
+              <Field label="运行日志" hint="日志保留 30 天；诊断包只包含日志、版本、系统与数据库摘要，不包含 API Key 或素材内容。">
+                <div className="flex items-center gap-2">
+                  <Button onClick={() => void openLogsDir()}>打开日志目录</Button>
+                  <Button disabled={exportingDiagnostics} onClick={() => void onExportDiagnostics()}>
+                    {exportingDiagnostics ? "导出中…" : "导出诊断包…"}
+                  </Button>
+                </div>
               </Field>
             </Group>
+            <Group title="支持">
+              <Field label="反馈" hint="提交功能建议或问题反馈">
+                <span className="text-xs text-[var(--color-text-secondary)]">请通过素材库中的反馈入口提交</span>
+              </Field>
+            </Group>
+            </>
           )}
 
           {/* 保存按钮统一在最后一项设置之后（sticky 底部，§13 保存栏清晰状态） */}
@@ -1112,14 +1193,12 @@ function AiPurposePanel({
   patchAi,
   notify,
   fail,
-  onOpenServices,
 }: {
   usage: "ai.superSearch" | "ai.tagging";
   draft: Settings;
   patchAi: (patch: Partial<Settings["ai"]>) => void;
   notify: (msg: string) => void;
   fail: (msg: string) => void;
-  onOpenServices: () => void;
 }) {
   const isSuperSearch = usage === "ai.superSearch";
   const title = isSuperSearch ? "超级搜索" : "自动打标";
@@ -1129,8 +1208,8 @@ function AiPurposePanel({
       <div className="px-4 py-3">
         <p className="text-xs leading-5 text-[var(--color-text-secondary)]">
           {isSuperSearch
-            ? "通过在线服务理解搜索意图并匹配素材；素材会按所选服务发送。服务在「服务管理」中维护。"
-            : "通过在线服务分析素材并建议标签；素材会按所选服务发送。服务在「服务管理」中维护。"}
+            ? "通过所选服务理解搜索意图并匹配素材；使用在线服务时，素材会发送给服务提供方。"
+            : "通过所选服务分析素材并建议标签；使用在线服务时，素材会发送给服务提供方。"}
         </p>
       </div>
 
@@ -1141,21 +1220,10 @@ function AiPurposePanel({
         fail={fail}
       />
 
-      {/* 服务管理入口提示（唯一入口在 AI 设置 → 服务管理，不在此重复渲染列表） */}
-      <div className="px-4 py-2">
-        <button
-          type="button"
-          onClick={onOpenServices}
-          className="text-xs text-[var(--color-text-secondary)] underline decoration-dotted underline-offset-2 transition-colors hover:text-[var(--color-text)]"
-        >
-          管理 AI 服务（新增/编辑/测试/删除）
-        </button>
-      </div>
-
       {/* W0-6：删「打标时机」死配置（auto_tagging 后端零消费点，选「自动」无任何效果）。
           替代品为 W5g「一键送打标」。 */}
       {!isSuperSearch && (
-        <Field label="视频 AI 打标" hint="对视频抽帧后打标（耗时更长）">
+        <Field label="视频 AI 打标" hint="允许 AI 分析视频，具体方式由「视频打标模式」决定。">
           <span className="flex items-center gap-2">
             <Toggle checked={draft.ai.videoTagging} onChange={(v) => patchAi({ videoTagging: v })} />
             <span className="w-16 text-xs whitespace-nowrap text-[var(--color-text-secondary)]">
@@ -1171,8 +1239,8 @@ function AiPurposePanel({
             label="视频打标模式"
             hint={
               draft.ai.videoTaggingMode === "frames"
-                ? "抽多帧分别识别后取多数标签，召回率更高；需要 ffmpeg，每个视频多帧解码"
-                : "复用入库封面的低开销 1 次请求；未生成高清封面的视频用第一帧，夜景可能偏暗"
+                ? "从视频中抽取多帧分别识别，结果更全面，但处理时间更长。"
+                : "每个视频只分析一张封面，速度更快。未生成封面的视频会使用第一帧。"
             }
           >
             <select
@@ -1180,12 +1248,12 @@ function AiPurposePanel({
               onChange={(e) => patchAi({ videoTaggingMode: e.target.value as Settings["ai"]["videoTaggingMode"] })}
               className="ui-control rounded-md px-2 py-1.5 text-sm outline-none"
             >
-              <option value="cover">封面打标（默认，省开销）</option>
-              <option value="frames">抽帧打标（召回率更高）</option>
+              <option value="cover">封面打标（更快）</option>
+              <option value="frames">抽帧打标（更准确）</option>
             </select>
           </Field>
           {draft.ai.videoTaggingMode === "frames" && (
-            <Field label="抽帧数" hint="抽帧模式下每个视频抽取的帧数（2–8），越多召回越高、开销越大">
+            <Field label="抽帧数" hint="每个视频抽取的帧数（2–8）；数量越多，识别更全面，处理时间也越长。">
               <TextInput
                 type="number"
                 value={String(draft.ai.videoFrameCount)}
@@ -1195,11 +1263,10 @@ function AiPurposePanel({
           )}
         </>
       )}
-      {/* FB3-07：批大小设置只在云端模式显示（本地模型固定每轮 15 张，设置不生效） */}
-      {!isSuperSearch && !draft.ai.profiles.some((p) => p.id === draft.ai.activeProfile && p.kind === "local") && (
+      {!isSuperSearch && (
         <Field
-          label="每批处理数量（云端）"
-          hint="一次 AI 任务中云端每轮处理的素材数。不会减少选中的总数：选 120 张、设 20，仍会处理 120 张，只是分 6 轮完成。数字越大速度可能更快，但占用内存和失败重试成本也更高（10–50）"
+          label="在线服务每批处理数量"
+          hint="不会改变任务中的素材总数，只调整在线服务每批处理的数量（10–50）。"
         >
           <div className="flex items-center gap-2">
             <input
@@ -1210,7 +1277,7 @@ function AiPurposePanel({
               value={Math.max(10, Math.min(50, draft.ai.batchLimit))}
               onChange={(e) => patchAi({ batchLimit: Math.max(10, Math.min(50, Number(e.target.value) || 30)) })}
               className="ui-range w-40"
-              aria-label="每批处理数量"
+              aria-label="在线服务每批处理数量"
             />
             <span className="w-10 text-right text-xs tabular-nums text-[var(--color-text-secondary)]">
               {Math.max(10, Math.min(50, draft.ai.batchLimit))}
@@ -1218,63 +1285,38 @@ function AiPurposePanel({
           </div>
         </Field>
       )}
-      {!isSuperSearch && draft.ai.profiles.some((p) => p.id === draft.ai.activeProfile && p.kind === "local") && (
-        <Field label="每批处理数量" hint="当前为本地模型：固定每轮 15 张，此设置不生效（切换回在线服务后可调）">
-          <span className="text-xs text-[var(--color-text-secondary)]">本地固定 15 张/轮</span>
+      {!isSuperSearch && (
+        <Field
+          label="本机服务每批处理数量"
+          hint="不会改变任务中的素材总数。配置较低时可减少处理压力（1–20）。"
+        >
+          <div className="flex items-center gap-2">
+            <input
+              type="range"
+              min={1}
+              max={20}
+              step={1}
+              value={Math.max(1, Math.min(20, draft.ai.localBatchLimit ?? 5))}
+              onChange={(e) => patchAi({ localBatchLimit: Math.max(1, Math.min(20, Number(e.target.value) || 5)) })}
+              className="ui-range w-40"
+              aria-label="本机服务每批处理数量"
+            />
+            <span className="w-10 text-right text-xs tabular-nums text-[var(--color-text-secondary)]">
+              {Math.max(1, Math.min(20, draft.ai.localBatchLimit ?? 5))}
+            </span>
+          </div>
         </Field>
       )}
-      {/* A4 置信度策略：与后端 AiSettings 逐字段对应；必须随整份设置一起保存，
-          否则 save_settings 整份覆写会把这三项刷回默认（后端读得到、前端丢得掉）。 */}
-      {!isSuperSearch && (
-        <>
-          <Field
-            label="自动接收精确命中"
-            hint="AI 输出与词表中的规范名或别名完全一致时，直接写入素材标签（ai_unreviewed），不再逐条确认。关闭后精确命中也会进「新词待确认」供你逐个勾选"
-          >
-            <span className="flex items-center gap-2">
-              <Toggle checked={draft.ai.autoAcceptExactTerms} onChange={(v) => patchAi({ autoAcceptExactTerms: v })} />
-              <span className="w-16 text-xs whitespace-nowrap text-[var(--color-text-secondary)]">
-                {draft.ai.autoAcceptExactTerms ? "已开启" : "已关闭"}
-              </span>
-            </span>
-          </Field>
-          <Field
-            label="AI 自动新建标签"
-            hint="⚠ 风险选项（默认关闭）：开启后，AI 在词表中找不到合适标签时会直接创建新标签并写入素材，词表会被 AI 输出持续扩充，可能产生大量一次性标签。保持关闭时，新词只会进入「新词待确认」由你逐个采纳"
-          >
-            <span className="flex items-center gap-2">
-              <Toggle checked={draft.ai.autoAdoptNewTerms} onChange={(v) => patchAi({ autoAdoptNewTerms: v })} />
-              <span className="w-16 text-xs whitespace-nowrap text-[var(--color-text-secondary)]">
-                {draft.ai.autoAdoptNewTerms ? "已开启" : "已关闭"}
-              </span>
-            </span>
-          </Field>
-          <Field
-            label="建议最低置信度"
-            hint="AI 建议的置信度低于此阈值时直接丢弃（不进建议列表也不打标）。0.30 = 30%，与指导书默认一致；0.00 = 不设下限，所有建议都保留"
-          >
-            <div className="flex items-center gap-2">
-              <input
-                type="number"
-                min={0}
-                max={1}
-                step={0.05}
-                value={draft.ai.confidenceMinSuggest}
-                onChange={(e) => {
-                  const v = Number(e.target.value);
-                  patchAi({ confidenceMinSuggest: Number.isFinite(v) ? Math.max(0, Math.min(1, v)) : 0.3 });
-                }}
-                aria-label="建议最低置信度"
-                className="ui-control w-24 px-2 py-1.5 text-sm"
-              />
-              <span className="w-12 text-xs text-[var(--color-text-secondary)]">
-                {Math.round((draft.ai.confidenceMinSuggest ?? 0.3) * 100)}%
-              </span>
-            </div>
-          </Field>
-        </>
-      )}
     </Group>
+  );
+}
+
+function PageHeader({ title, description }: { title: string; description: string }) {
+  return (
+    <header>
+      <h1 className="text-base font-medium text-[var(--color-text)]">{title}</h1>
+      <p className="mt-1 text-sm leading-5 text-[var(--color-text-secondary)]">{description}</p>
+    </header>
   );
 }
 
@@ -1377,7 +1419,7 @@ function Toggle({
   );
 }
 
-/** W5c 备份/恢复面板（数据与缓存）：备份 = save 对话框 → backupDb；
+/** W5c 备份/恢复面板（存储与维护）：备份 = save 对话框 → backupDb；
  *  恢复 = open 对话框 → 两步强警告确认 → restoreDb（成功后应用自动重启，Promise 不返回）。
  *  运行中任务阻断在 后端命令层（入库/回填/导出/AI 批次）。 */
 function BackupRestorePanel({ notify, fail }: { notify: (m: string) => void; fail: (m: string) => void }) {
@@ -1488,23 +1530,36 @@ function BackupRestorePanel({ notify, fail }: { notify: (m: string) => void; fai
   );
 }
 
-/** 重置数据面板（数据与缓存）：勾选分类 → 两步确认 → resetAppData。
- *  只清数据库记录与本软件派生缓存，绝不触碰素材原文件。 */
-const RESET_ITEMS: { key: keyof ResetDataSelection; label: string; hint: string }[] = [
-  { key: "assets", label: "素材库记录", hint: "所有素材记录、搜索索引、导出任务；会同时清掉缩略图/预览/代理缓存文件" },
-  { key: "tags", label: "标签与分类", hint: "所有标签、分面结构、别名、打标流水" },
+/** 重置数据面板（存储与维护）：勾选分类 → 两步确认 → resetAppData。
+ *  “素材库记录”只清索引与派生数据；原始文件单列并要求输入确认短语。 */
+const RESET_ITEMS: { key: keyof ResetDataSelection; label: string; hint: string; danger?: boolean }[] = [
+  { key: "assets", label: "素材库记录", hint: "所有素材记录、搜索索引、导出任务，以及缩略图、预览和代理缓存；不影响原始文件" },
+  {
+    key: "assetFiles",
+    label: "原始素材文件",
+    hint: "永久删除磁盘上的图片/视频；成功删除的文件会同时移除素材记录，删除失败的记录会保留",
+    danger: true,
+  },
+  { key: "exportTasks", label: "导出任务记录", hint: "导出队列和历史记录，不影响素材和原始文件" },
+  { key: "tags", label: "标签与分类", hint: "所有标签、分类结构、别名和打标记录" },
   { key: "aiTasks", label: "AI 打标任务", hint: "打标批次与建议记录" },
-  { key: "aiConnections", label: "AI 服务配置", hint: "连接档案、用途绑定，以及系统里保存的 API 密钥" },
+  { key: "aiConnections", label: "AI 服务配置", hint: "服务配置、功能绑定，以及系统里保存的 API 密钥" },
   { key: "preferences", label: "偏好设置", hint: "恢复全部默认设置（主题、外观、总库位置、缓存上限等）" },
+  { key: "searchState", label: "搜索条件与界面草稿", hint: "清除超级搜索条件和最近使用的筛选字段（仅本机浏览器数据）" },
   { key: "caches", label: "缓存文件", hint: "缩略图/预览/视频代理缓存文件（不影响素材记录）" },
+  { key: "logs", label: "诊断日志", hint: "删除本软件生成的运行日志；正在占用的日志文件可能会保留" },
 ];
 const RESET_NONE: ResetDataSelection = {
   assets: false,
+  assetFiles: false,
+  exportTasks: false,
   tags: false,
   aiTasks: false,
   aiConnections: false,
   preferences: false,
+  searchState: false,
   caches: false,
+  logs: false,
 };
 
 function ResetDataPanel({
@@ -1520,7 +1575,23 @@ function ResetDataPanel({
   const [confirming, setConfirming] = useState(false);
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState<string | null>(null);
+  const [confirmationText, setConfirmationText] = useState("");
   const any = Object.values(sel).some(Boolean);
+  const allSelected = RESET_ITEMS.every((item) => sel[item.key]);
+  const destructive = sel.assetFiles || allSelected;
+  const requiredPhrase = allSelected ? "恢复出厂设置" : "删除原文件";
+  const confirmationReady = !destructive || confirmationText.trim() === requiredPhrase;
+
+  const toggleAll = () => {
+    const next = !allSelected;
+    const nextSelection: ResetDataSelection = { ...RESET_NONE };
+    RESET_ITEMS.forEach((item) => {
+      nextSelection[item.key] = next;
+    });
+    setSel(nextSelection);
+    setConfirming(false);
+    setConfirmationText("");
+  };
 
   const onReset = async () => {
     const done = sel;
@@ -1530,22 +1601,31 @@ function ResetDataPanel({
       const r = await resetAppData(done);
       const parts: string[] = [];
       if (r.assetsDeleted > 0) parts.push(`素材 ${r.assetsDeleted} 条`);
+      if (r.assetFilesDeleted > 0) parts.push(`原始文件 ${r.assetFilesDeleted} 个`);
+      if (r.assetFilesFailed > 0) parts.push(`原始文件删除失败 ${r.assetFilesFailed} 个（记录已保留）`);
+      if (r.exportTasksDeleted > 0) parts.push(`导出任务记录 ${r.exportTasksDeleted} 条`);
       if (r.tagsDeleted > 0) parts.push(`标签 ${r.tagsDeleted} 条`);
       if (r.aiTasksDeleted > 0) parts.push(`AI 任务记录 ${r.aiTasksDeleted} 条`);
       if (r.connectionsDeleted > 0) parts.push(`AI 服务配置 ${r.connectionsDeleted} 个`);
       if (r.preferencesReset) parts.push("设置已恢复默认");
+      if (r.searchStateReset) parts.push("搜索条件已清除");
       if (r.cacheFilesDeleted > 0) parts.push(`缓存文件 ${r.cacheFilesDeleted} 个`);
+      if (r.logFilesDeleted > 0) parts.push(`诊断日志 ${r.logFilesDeleted} 个`);
       const msg = parts.length > 0 ? `重置完成：已清除${parts.join("，")}` : "重置完成：所选数据本来就是空的";
       setResult(msg);
       notify(msg);
       setSel(RESET_NONE);
       setConfirming(false);
-      // P0-0：重置只清库记录与派生缓存，localStorage 不在库里清不掉 ——
-      // 陈旧条件里可能是旧 epoch 日期格式，不清会让日期 P0 修完后仍 hydrate 报错。
-      try {
-        localStorage.removeItem("super-search-conditions");
-      } catch {
-        /* localStorage 不可用时静默跳过（非阻断步骤） */
+      setConfirmationText("");
+      // localStorage 不在数据库事务里。用户明确选择、标签结构失效或偏好恢复默认时一并清掉，
+      // 避免陈旧条件继续 hydrate；清缓存等无关操作不误删用户已保存的搜索条件。
+      if (done.searchState || done.tags || done.preferences) {
+        try {
+          localStorage.removeItem("super-search-conditions");
+          localStorage.removeItem("qb:recent-fields");
+        } catch {
+          /* localStorage 不可用时静默跳过（非阻断步骤） */
+        }
       }
       await onDataReset(done);
     } catch (e) {
@@ -1562,7 +1642,7 @@ function ResetDataPanel({
       <div>
         <p className="text-sm text-[var(--color-text)]">重置数据</p>
         <p className="mt-0.5 text-xs leading-5 text-[var(--color-text-secondary)]">
-          勾选要清空的数据后点「重置所选数据」。只清软件数据库里的记录和本软件生成的缓存文件，不会删除你的图片、视频原文件
+          按需勾选要清空的数据。默认不会删除图片、视频原文件；勾选「原始素材文件」后会永久删除对应磁盘文件。全选等同恢复出厂设置，请先备份数据库和原始素材。
         </p>
       </div>
       <div className="grid gap-1.5 sm:grid-cols-2">
@@ -1576,32 +1656,68 @@ function ResetDataPanel({
               onChange={(e) => {
                 setSel((s) => ({ ...s, [item.key]: e.target.checked }));
                 setConfirming(false);
+                setConfirmationText("");
               }}
             />
             <span className="min-w-0">
-              {item.label}
+              <span className={item.danger ? "text-[var(--color-danger)]" : undefined}>{item.label}</span>
               <span className="block text-xs leading-4 text-[var(--color-text-secondary)]">{item.hint}</span>
             </span>
           </label>
         ))}
       </div>
+      <p className="text-xs leading-5 text-[var(--color-text-secondary)]">
+        本地 AI 模型和 Ollama 安装包由服务管理/缓存管理单独管理，不纳入此处全选；模型空间请到「AI 与模型 → 服务管理」逐个删除，安装包请在「缓存管理」清理。
+      </p>
       <div className="flex flex-wrap items-center gap-2">
         {confirming ? (
           <>
-            <span className="text-xs font-medium text-[var(--color-danger)]">
-              确认清空所选数据？此操作不可撤销，请先确认没有需要备份的内容
-            </span>
-            <Button variant="danger" disabled={busy || !any} onClick={() => void onReset()}>
+            <div className="w-full rounded-md border border-[var(--color-danger)] px-3 py-2 text-xs leading-5">
+              <p className="font-medium text-[var(--color-danger)]">
+                {allSelected
+                  ? "这是恢复出厂设置：会清空软件数据，并永久删除所选原始素材文件。"
+                  : sel.assetFiles
+                    ? "即将永久删除在库与回收站中的全部图片/视频原文件，成功项无法恢复。"
+                    : "确认清空所选软件数据？此操作不可撤销。"}
+              </p>
+              <p className="mt-1 text-[var(--color-text-secondary)]">
+                {destructive
+                  ? `请输入“${requiredPhrase}”后继续。删除失败的文件会保留素材记录，便于修复后重试。`
+                  : "请先确认没有需要备份的内容。"}
+              </p>
+              {destructive && (
+                <input
+                  aria-label="确认短语"
+                  value={confirmationText}
+                  disabled={busy}
+                  onChange={(e) => setConfirmationText(e.target.value)}
+                  placeholder={requiredPhrase}
+                  className="ui-control mt-2 w-56 rounded-md px-2 py-1.5 text-sm outline-none focus:border-[var(--color-danger)]"
+                />
+              )}
+            </div>
+            <Button variant="danger" disabled={busy || !any || !confirmationReady} onClick={() => void onReset()}>
               {busy ? "重置中…" : "确认重置"}
             </Button>
-            <Button disabled={busy} onClick={() => setConfirming(false)}>
+            <Button
+              disabled={busy}
+              onClick={() => {
+                setConfirming(false);
+                setConfirmationText("");
+              }}
+            >
               取消
             </Button>
           </>
         ) : (
-          <Button variant="danger" disabled={busy || !any} onClick={() => setConfirming(true)}>
-            重置所选数据
-          </Button>
+          <>
+            <Button variant="danger" disabled={busy || !any} onClick={() => setConfirming(true)}>
+              重置所选数据
+            </Button>
+            <Button disabled={busy} onClick={toggleAll}>
+              {allSelected ? "取消全选" : "全选（恢复出厂设置）"}
+            </Button>
+          </>
         )}
         {result && <span className="text-xs text-[var(--color-text-secondary)]">{result}</span>}
       </div>

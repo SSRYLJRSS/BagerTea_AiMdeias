@@ -1836,6 +1836,10 @@ pub fn migrate(conn: &Connection) -> AppResult<()> {
     // + ai_suggestion_items 数值两列。无条件幂等段（逐列容错 ALTER + IF NOT EXISTS），
     // 不推进 user_version（与 V23 同理；存量库每次启动自愈补齐）。
     migrate_v24(conn)?;
+    // 产品默认修正：用途和可用性/技术特征需要人工判断，不再进入 AI 提示词。
+    migrate_manual_only_system_facets(conn)?;
+    // 风格/氛围无法由 AI 稳定判断，且历史结果几乎全是「未知」；彻底下线该系统分面。
+    migrate_remove_style_facet(conn)?;
     Ok(())
 }
 
@@ -1904,8 +1908,80 @@ CREATE INDEX IF NOT EXISTS ix_afn_value ON asset_facet_numbers(facet_key, value,
     Ok(())
 }
 
+/// 用独立标记只修正一次存量库；之后用户若主动移回 AI 组，不会在重启时被覆盖。
+fn migrate_manual_only_system_facets(conn: &Connection) -> AppResult<()> {
+    let applied: Option<String> = conn
+        .query_row(
+            "SELECT value FROM settings WHERE key='manual_only_system_facets_v1'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if applied.as_deref() == Some("1") {
+        return Ok(());
+    }
+    let now = chrono::Utc::now().timestamp_millis();
+    conn.execute(
+        "UPDATE tag_facets
+            SET cfg_ai_assignable = 0, input_mode = 'manual_only', updated_at = ?1
+          WHERE is_system = 1 AND key IN ('purpose', 'technical')",
+        [now],
+    )?;
+    conn.execute(
+        "INSERT INTO settings (key, value) VALUES ('manual_only_system_facets_v1', '1')
+         ON CONFLICT(key) DO UPDATE SET value='1'",
+        [],
+    )?;
+    Ok(())
+}
+
+/// 一次性移除 `style / 风格/氛围` 系统分面，并级联清理标签、素材关联、建议项和流水。
+/// 标记保证迁移只执行一次；以后用户若主动创建同名自定义分面，不会被启动迁移再次删除。
+fn migrate_remove_style_facet(conn: &Connection) -> AppResult<()> {
+    let applied: Option<String> = conn
+        .query_row(
+            "SELECT value FROM settings WHERE key='style_facet_removed_v1'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if applied.as_deref() == Some("1") {
+        return Ok(());
+    }
+
+    let is_system_style: Option<i64> = conn
+        .query_row(
+            "SELECT is_system FROM tag_facets WHERE key='style'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if is_system_style == Some(1) {
+        crate::db::tag_facets::delete_facet_cascade(conn, "style")?;
+    }
+    // 分面级联只清 ai_suggestion_items；历史建议 JSON 仍会被工作台读取，必须一并移除 style。
+    conn.execute(
+        "UPDATE ai_suggestions
+            SET suggested_tags = json_remove(suggested_tags, '$.style'),
+                confirmed_tags = CASE
+                    WHEN confirmed_tags IS NULL THEN NULL
+                    ELSE json_remove(confirmed_tags, '$.style')
+                END
+          WHERE json_type(suggested_tags, '$.style') IS NOT NULL
+             OR (confirmed_tags IS NOT NULL AND json_type(confirmed_tags, '$.style') IS NOT NULL)",
+        [],
+    )?;
+
+    conn.execute(
+        "INSERT INTO settings (key, value) VALUES ('style_facet_removed_v1', '1')
+         ON CONFLICT(key) DO UPDATE SET value='1'",
+        [],
+    )?;
+    Ok(())
+}
+
 /// V23（C-1）：色板关系表 —— 色名分桶查询（rank/ratio 是字符串方案表达不了的维度）。
-/// 幂等：CREATE TABLE IF NOT EXISTS。回填由 rescan_palette_colors 命令走 palette_json。
+/// 幂等：CREATE TABLE IF NOT EXISTS；旧库首次启动从 palette_json 自动补齐。
 fn migrate_v23(conn: &Connection) -> AppResult<()> {
     conn.execute_batch(
         r#"
@@ -1919,6 +1995,22 @@ CREATE TABLE IF NOT EXISTS asset_palette_colors (
 CREATE INDEX IF NOT EXISTS ix_apc_bucket ON asset_palette_colors(color_bucket, rank, asset_id);
 "#,
     )?;
+    // 旧库首次具备关系表时，从已有色板补齐；完成标记避免每次启动重复全量重建。
+    let indexed: Option<String> = conn
+        .query_row(
+            "SELECT value FROM settings WHERE key='palette_colors_indexed_v1'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if indexed.as_deref() != Some("1") {
+        super::assets::rescan_palette_colors(conn)?;
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES ('palette_colors_indexed_v1', '1')
+             ON CONFLICT(key) DO UPDATE SET value='1'",
+            [],
+        )?;
+    }
     Ok(())
 }
 
@@ -2896,5 +2988,135 @@ mod tests {
             )
             .unwrap();
         assert_eq!(manual_state, "manual");
+    }
+
+    #[test]
+    fn manual_only_system_facets_migration_runs_once() {
+        let c = crate::db::init_memory().unwrap();
+        for key in ["purpose", "technical"] {
+            let ai: i64 = c
+                .query_row(
+                    "SELECT cfg_ai_assignable FROM tag_facets WHERE key=?1",
+                    [key],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(ai, 0, "{key} 首次迁移后应为人工填写");
+        }
+
+        // 用户后来主动移回 AI 组；启动时重跑无条件迁移段不得覆盖用户选择。
+        c.execute(
+            "UPDATE tag_facets SET cfg_ai_assignable=1, input_mode='ai_and_manual' WHERE key='purpose'",
+            [],
+        )
+        .unwrap();
+        migrate_manual_only_system_facets(&c).unwrap();
+        let ai: i64 = c
+            .query_row(
+                "SELECT cfg_ai_assignable FROM tag_facets WHERE key='purpose'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(ai, 1, "一次性迁移不得在后续启动覆盖用户设置");
+    }
+
+    #[test]
+    fn style_system_facet_removed_once_but_user_facet_is_preserved() {
+        let c = crate::db::init_memory().unwrap();
+        c.execute(
+            "INSERT INTO tag_facets
+               (key, display_name, description, selection_mode, sort_order, is_system, status, created_at, updated_at)
+             VALUES ('style', '风格/氛围', '视觉风格与整体情绪', 'multi', 40, 1, 'active', 1, 1)",
+            [],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO tags (name, normalized_name, canonical_name, facet_key, is_system, status, sort_order)
+             VALUES ('未知', '未知', '未知', 'style', 0, 'active', 0)",
+            [],
+        )
+        .unwrap();
+        let asset_id: i64 = c
+            .query_row(
+                "INSERT INTO assets (file_path, file_name, file_ext, file_size, mime_type, created_at, modified_at)
+                 VALUES ('/style.jpg', 'style.jpg', 'jpg', 1, 'image/jpeg', 1, 1) RETURNING id",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let batch_id: i64 = c
+            .query_row(
+                "INSERT INTO ai_batches (status, mode, total, created_at)
+                 VALUES ('done', 'cloud', 1, 1) RETURNING id",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let suggestion_id: i64 = c
+            .query_row(
+                "INSERT INTO ai_suggestions
+                   (batch_id, asset_id, suggested_tags, confirmed_tags, status, created_at)
+                 VALUES (?1, ?2, '{\"style\":[\"未知\"],\"scene\":[\"海边\"]}',
+                                      '{\"style\":[\"未知\"],\"scene\":[\"海边\"]}', 'confirmed', 1)
+                 RETURNING id",
+                rusqlite::params![batch_id, asset_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        // init_memory 已跑过全新库迁移；移除标记以模拟尚未执行本次清理的存量库。
+        c.execute(
+            "DELETE FROM settings WHERE key='style_facet_removed_v1'",
+            [],
+        )
+        .unwrap();
+
+        migrate_remove_style_facet(&c).unwrap();
+        let count: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM tag_facets WHERE key='style'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0, "历史系统 style 分面应被删除");
+        let tag_count: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM tags WHERE facet_key='style'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(tag_count, 0, "style 标签应随分面级联删除");
+        let remaining: (Option<String>, Option<String>) = c
+            .query_row(
+                "SELECT json_extract(suggested_tags, '$.style'),
+                        json_extract(confirmed_tags, '$.style')
+                   FROM ai_suggestions WHERE id=?1",
+                [suggestion_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(remaining, (None, None), "旧建议 JSON 中的 style 必须清理");
+        let scene: String = c
+            .query_row(
+                "SELECT json_extract(suggested_tags, '$.scene[0]') FROM ai_suggestions WHERE id=?1",
+                [suggestion_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(scene, "海边", "清理 style 不得影响其他建议标签");
+
+        // 迁移标记写入后，用户主动创建的同名自定义分面不得被后续启动再次删除。
+        crate::db::tag_facets::create(&c, "style", "我的风格", "", "multi", None, "all").unwrap();
+        migrate_remove_style_facet(&c).unwrap();
+        let is_system: i64 = c
+            .query_row(
+                "SELECT is_system FROM tag_facets WHERE key='style'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(is_system, 0, "用户自定义 style 分面应保留");
     }
 }

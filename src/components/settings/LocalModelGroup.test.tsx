@@ -39,7 +39,7 @@ const draft = {
     model: "",
     profileMode: "cloud",
     localBaseUrl: "http://localhost:11434",
-    localModel: "qwen2.5vl:7b",
+    localModel: "qwen3.5:4b",
     ollamaSourceId: "auto",
     ollamaCustomSources: [],
   },

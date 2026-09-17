@@ -1,12 +1,23 @@
 /** 全局任务条状态（阶段 1 契约，见指导书 §4.5/§4.6）：只由 taskStore 驱动。
  *  入库任务按 taskId 隔离（旧任务事件不污染新任务）；后端只发阶段进度，前端按权重计算整体展示进度。
- *  完成（done）后短暂停留再自动消失；失败保留文字与状态（不纯红）。 */
+ *  入库完成（done）后保留最终状态，直到下一次新入库开始；失败保留文字与状态（不纯红）。 */
 import { create } from "zustand";
 import { onImportProgress, type ImportPhase, type ImportProgress } from "@/api/import";
 import { onExportProgress } from "@/api/export";
 import type { UnlistenFn } from "@tauri-apps/api/event";
+import { logger } from "@/utils/logger";
 
 export type TaskKind = "import" | "export";
+
+export interface ImportTaskProgress {
+  phase: ImportPhase;
+  phaseCurrent: number;
+  phaseTotal: number | null;
+  file?: string;
+  imported: number;
+  duplicates: number;
+  failed: number;
+}
 
 export interface TaskItem {
   /** 唯一键：入库用 taskId；导出/AI 用 kind */
@@ -21,6 +32,8 @@ export interface TaskItem {
   error?: string | null;
   /** 已入完成停留期 */
   done?: boolean;
+  /** 入库专用明细；导出任务不设置 */
+  importProgress?: ImportTaskProgress;
 }
 
 interface TaskState {
@@ -44,6 +57,10 @@ const PHASE_LABELS: Record<ImportPhase, string> = {
   previewing: "正在生成快速预览",
   done: "已完成",
 };
+
+export function importPhaseLabel(phase: ImportPhase): string {
+  return PHASE_LABELS[phase] ?? phase;
+}
 
 /** 由阶段进度计算整体展示进度；phaseTotal 未知时返回 null（不确定进度，不伪造百分比）。 */
 export function importOverall(phase: ImportPhase, current: number, total: number | null): number | null {
@@ -89,7 +106,9 @@ export function upsertImport(p: ImportProgress) {
   const overall = importOverall(p.phase, p.phaseCurrent, p.phaseTotal);
   const done = p.phase === "done";
   useTaskStore.setState((s) => {
-    const others = s.tasks.filter((t) => t.id !== p.taskId);
+    const others = s.tasks.filter(
+      (t) => t.id !== p.taskId && !(t.kind === "import" && t.done),
+    );
     const task: TaskItem = {
       id: p.taskId,
       kind: "import",
@@ -99,10 +118,38 @@ export function upsertImport(p: ImportProgress) {
       // 完成/失败时给出明确文案；失败不纯红，用文字+符号表达
       error: done && p.failed > 0 ? `成功 ${p.imported} · 重复 ${p.duplicates} · 失败 ${p.failed}` : null,
       done,
+      importProgress: {
+        phase: p.phase,
+        phaseCurrent: p.phaseCurrent,
+        phaseTotal: p.phaseTotal,
+        file: p.file,
+        imported: p.imported,
+        duplicates: p.duplicates,
+        failed: p.failed,
+      },
     };
     return { tasks: [...others, task] };
   });
-  if (done) scheduleLinger(p.taskId);
+}
+
+/** 取最近一条入库任务；页面侧栏只消费 taskStore，不重复订阅后端事件。 */
+export function latestImportTask(tasks: TaskItem[]): TaskItem | undefined {
+  for (let i = tasks.length - 1; i >= 0; i--) {
+    if (tasks[i].kind === "import") return tasks[i];
+  }
+  return undefined;
+}
+
+/** 命令级失败不会收到 done 事件，清理未完成任务，避免页面永久保持“进行中”。 */
+export function clearActiveImportTask() {
+  useTaskStore.setState((s) => {
+    for (let i = s.tasks.length - 1; i >= 0; i--) {
+      if (s.tasks[i].kind === "import" && !s.tasks[i].done) {
+        return { tasks: s.tasks.filter((_, index) => index !== i) };
+      }
+    }
+    return s;
+  });
 }
 
 function upsertGeneric(key: TaskKind, label: string, done: number, total: number) {
@@ -157,10 +204,10 @@ export async function startGlobalTaskWatch(): Promise<void> {
       }
       for (const fn of unlisteners.splice(0)) fn();
       subscribed = false;
-      console.error(`全局任务监听订阅失败 ${failures}/2 个事件，已回收并允许重试`);
+      logger.error(`全局任务监听订阅失败 ${failures}/2 个事件，已回收并允许重试`);
     }
   } catch (e) {
     subscribed = false;
-    console.error("全局任务监听订阅异常", e);
+    logger.error("全局任务监听订阅异常", { error: e instanceof Error ? e.stack : String(e) });
   }
 }

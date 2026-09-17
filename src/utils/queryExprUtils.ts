@@ -271,7 +271,7 @@ function notLabel(leaf: QueryExpr, nameById: Map<number, ResolvedTag>): string {
 
 /** W3：系统分面显示名兜底（纯函数无法读 store）；自建分面回退显示 key。 */
 const FACET_NAMES: Record<string, string> = {
-  subject: "主体/对象", scene: "场景/地点", purpose: "用途", style: "风格/氛围",
+  subject: "主体对象", scene: "场景/地点", purpose: "用途",
   color: "色彩", composition: "构图/视角", lighting: "光线/时间", people: "人物属性",
   technical: "可用性/技术特征", custom: "自定义",
 };
@@ -307,7 +307,7 @@ function leafLabel(leaf: QueryExpr, nameById: Map<number, ResolvedTag>): string 
 
 const LABELS: Record<string, string> = {
   file_ext: "格式", mime_type: "MIME", width: "宽", height: "高",
-  resolution: "分辨率", aspect_ratio: "宽高比", file_size: "文件大小",
+  resolution: "像素总量", aspect_ratio: "宽高比", file_size: "文件大小",
   duration_ms: "视频时长", taken_at: "拍摄时间", created_at: "入库时间",
   modified_at: "修改时间", camera: "相机", lens: "镜头", iso: "ISO",
   aperture: "光圈", shutter: "快门", focal: "焦距", video_codec: "视频编码",

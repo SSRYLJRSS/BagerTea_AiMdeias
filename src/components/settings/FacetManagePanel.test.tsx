@@ -2,7 +2,7 @@
  * W4 FacetManagePanel 测试：两组列表 + 弹窗化编辑/新建/删除。
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { render, screen, waitFor, fireEvent } from "@testing-library/react";
+import { render, screen, waitFor, fireEvent, within } from "@testing-library/react";
 import FacetManagePanel from "@/components/settings/FacetManagePanel";
 import { listAllTagFacets, createTagFacet, updateTagFacet, deleteTagFacet, getTagFacetImpact, restoreTagFacet, setFacetKind, convertFacetKind, type ConversionReport } from "@/api/tags";
 import type { TagFacet } from "@/types/tag";
@@ -34,12 +34,11 @@ const mkDraft = (over: Partial<Settings["ai"]> = {}): Settings => ({
     systemPromptTagging: "",
     systemPromptSearch: "",
     ollamaSourceId: "auto",
-    autoAcceptExactTerms: true,
-    autoAdoptNewTerms: false,
     confidenceMinSuggest: 0.3,
     ...over,
   },
   theme: "system",
+  logLevel: "info",
   thumbnailCacheMb: 2048,
   tagCategories: [],
   libraryRoot: "",
@@ -91,8 +90,12 @@ describe("W4 facetManagePanel_two_groups", () => {
     renderPanel();
     await waitFor(() => expect(screen.getByText("衣服颜色")).toBeInTheDocument());
     // 两个组标题都在
-    expect(screen.getByText("AI 自动打标的分类")).toBeInTheDocument();
-    expect(screen.getByText("只手工填写的分类")).toBeInTheDocument();
+    expect(screen.getByText("AI 自动打标分类")).toBeInTheDocument();
+    expect(screen.getByText("手工填写分类")).toBeInTheDocument();
+    expect(screen.queryByText("分类标签")).not.toBeInTheDocument();
+    expect(screen.queryByText("画面摘要")).not.toBeInTheDocument();
+    expect(screen.getByText(/AI 根据画面内容生成分类标签和画面摘要/)).toBeInTheDocument();
+    expect(screen.getByText(/填写后可用于搜索和筛选/)).toBeInTheDocument();
     // 停用的折叠（默认收起，只显示计数）
     expect(screen.getByText(/已停用的分类（1）/)).toBeInTheDocument();
     expect(screen.queryByText("旧货")).not.toBeInTheDocument();
@@ -106,10 +109,12 @@ describe("W4 facetManagePanel_two_groups", () => {
     vi.mocked(listAllTagFacets).mockResolvedValue([facet()]);
     renderPanel();
     await waitFor(() => expect(screen.getByText("衣服颜色")).toBeInTheDocument());
-    fireEvent.click(screen.getByRole("button", { name: "编辑" }));
+    const facetRow = screen.getByText("衣服颜色").closest("li");
+    expect(facetRow).not.toBeNull();
+    fireEvent.click(within(facetRow!).getByRole("button", { name: "编辑" }));
     // 弹窗字段
     expect(screen.getByLabelText("分类名称")).toBeInTheDocument();
-    expect(screen.getByLabelText("这类标签是什么")).toBeInTheDocument();
+    expect(screen.getByLabelText("标签描述")).toBeInTheDocument();
     // 改名 + 改归类 → 一次保存
     fireEvent.change(screen.getByLabelText("分类名称"), { target: { value: "服装颜色" } });
     fireEvent.click(screen.getByLabelText("只手工填写"));
@@ -131,7 +136,7 @@ describe("W4 facetManagePanel_two_groups", () => {
     fireEvent.click(screen.getAllByRole("button", { name: "+ 新增分类" })[0]);
     // 中文名（slugify 产出空）+ 描述都填 → 不报错，直接创建成功（key 用自动兜底 facet_xxx）
     fireEvent.change(screen.getByLabelText("分类名称"), { target: { value: "人物服装颜色" } });
-    fireEvent.change(screen.getByLabelText("这类标签是什么"), { target: { value: "人物服装的主色调" } });
+    fireEvent.change(screen.getByLabelText("标签描述"), { target: { value: "人物服装的主色调" } });
     fireEvent.click(screen.getByRole("button", { name: "创建" }));
     await waitFor(() =>
       expect(createTagFacet).toHaveBeenCalledWith(
@@ -151,7 +156,7 @@ describe("W4 facetManagePanel_two_groups", () => {
     await waitFor(() => expect(screen.getByText("衣服颜色")).toBeInTheDocument());
     fireEvent.click(screen.getAllByRole("button", { name: "+ 新增分类" })[0]);
     fireEvent.change(screen.getByLabelText("分类名称"), { target: { value: "人物服装颜色" } });
-    fireEvent.change(screen.getByLabelText("这类标签是什么"), { target: { value: "人物服装的主色调" } });
+    fireEvent.change(screen.getByLabelText("标签描述"), { target: { value: "人物服装的主色调" } });
     // 覆盖自动 key
     fireEvent.change(screen.getByLabelText("英文标识"), { target: { value: "clothing_color" } });
     // 又清空 → 明确报错
@@ -199,20 +204,37 @@ describe("W4 facetManagePanel_two_groups", () => {
     expect(getTagFacetImpact).not.toHaveBeenCalled();
   });
 
-  it("一句话描述：可点开条目，展开看内容；提示词编辑进 draft（onPatchAi）", async () => {
+  it("画面摘要作为 AI 子类，行结构与分类一致，编辑/词条各司其职", async () => {
     vi.mocked(listAllTagFacets).mockResolvedValue([facet()]);
     const { onPatchAi, draft } = renderPanel();
     await waitFor(() => expect(screen.getByText("衣服颜色")).toBeInTheDocument());
-    // 折叠条目可见（含 0 条计数），默认收起
-    const toggle = screen.getByRole("button", { name: /一句话描述（AI 生成）/ });
-    expect(screen.getByText("0 条")).toBeInTheDocument();
-    // 点开 → 展开空态说明
-    fireEvent.click(toggle);
-    expect(await screen.findByText(/还没有一句话描述/)).toBeInTheDocument();
-    // 展开提示词编辑区
-    fireEvent.click(screen.getByRole("button", { name: /提示词/ }));
-    const tagging = screen.getByLabelText(/AI 打标提示词/);
-    const search = screen.getByLabelText(/超级搜索提示词/);
+    const aiSection = screen.getByRole("heading", { name: "AI 自动打标分类" }).closest("section");
+    const manualSection = screen.getByRole("heading", { name: "手工填写分类" }).closest("section");
+    expect(aiSection).not.toBeNull();
+    expect(manualSection).not.toBeNull();
+    const facetRow = screen.getByText("衣服颜色").closest("li");
+    const summaryRow = within(aiSection!).getByText("画面摘要（一句话描述）").closest("li");
+    expect(facetRow).not.toBeNull();
+    expect(summaryRow).not.toBeNull();
+    expect(summaryRow!.className).toBe(facetRow!.className);
+    expect(within(aiSection!).queryByText("查看")).not.toBeInTheDocument();
+    expect(within(aiSection!).queryByText("收起")).not.toBeInTheDocument();
+
+    // 编辑：复用分类编辑弹窗的视觉与字段结构
+    fireEvent.click(within(summaryRow!).getByRole("button", { name: "编辑" }));
+    expect(await screen.findByText(/编辑画面摘要：画面摘要（一句话描述）/)).toBeInTheDocument();
+    expect(screen.getByLabelText("分类名称")).toBeDisabled();
+    expect(screen.getByLabelText("标签描述")).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "取消" }));
+
+    // 词条：进入摘要自己的提示词设置，不展示分类字段
+    fireEvent.click(within(summaryRow!).getByRole("button", { name: "词条" }));
+    expect(await screen.findByText(/画面摘要词条：画面摘要（一句话描述）/)).toBeInTheDocument();
+    expect(screen.queryByRole("textbox", { name: "分类名称" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("textbox", { name: "标签描述" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /高级/ })).not.toBeInTheDocument();
+    const tagging = screen.getByRole("textbox", { name: /AI 打标提示词/ });
+    const search = screen.getByRole("textbox", { name: /超级搜索提示词/ });
     expect(tagging).toHaveValue(draft.ai.systemPromptTagging);
     // 输入 → onPatchAi 收到对应 patch
     fireEvent.change(tagging, { target: { value: "你是素材打标助手" } });
@@ -235,14 +257,14 @@ describe("V24 facetManagePanel_number_facet_form", () => {
     expect(await screen.findByText("类型")).toBeTruthy();
 
     // 选「数值」→ 值域配置出现
-    const numberRadio = screen.getByLabelText(/数值（AI \/ 手工填一个数/);
+    const numberRadio = screen.getByLabelText("数值（如人数）");
     fireEvent.click(numberRadio);
     expect(screen.getByLabelText("数值下限")).toBeTruthy();
     fireEvent.change(screen.getByLabelText("数值下限"), { target: { value: "0" } });
     fireEvent.change(screen.getByLabelText("数值上限"), { target: { value: "50" } });
     fireEvent.change(screen.getByLabelText("数值单位"), { target: { value: "人" } });
     fireEvent.change(screen.getByLabelText("分类名称"), { target: { value: "人数" } });
-    fireEvent.change(screen.getByLabelText("这类标签是什么"), { target: { value: "画面中的人数" } });
+    fireEvent.change(screen.getByLabelText("标签描述"), { target: { value: "画面中的人数" } });
 
     fireEvent.click(screen.getByRole("button", { name: "创建" }));
     await waitFor(() => expect(setFacetKind).toHaveBeenCalled());
@@ -260,7 +282,8 @@ describe("V24 facetManagePanel_number_facet_form", () => {
     renderPanel();
     await screen.findByText("人数");
     fireEvent.click(screen.getAllByRole("button", { name: "编辑" })[0]);
-    expect(await screen.findByText(/数值型不可改回标签型/)).toBeTruthy();
+    expect(await screen.findByText("数值设置")).toBeTruthy();
+    expect(screen.getByText(/数值类型创建后不可改回标签类型/)).toBeTruthy();
     fireEvent.change(screen.getByLabelText("数值上限"), { target: { value: "99" } });
     fireEvent.click(screen.getByRole("button", { name: "保存" }));
     await waitFor(() => expect(setFacetKind).toHaveBeenCalledWith("people_count", "number", expect.objectContaining({ numMax: 99, numUnit: "人" })));

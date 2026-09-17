@@ -265,7 +265,6 @@ export default function PendingList({
   onOpenItemFallback,
 }: PendingListProps) {
   const [view, setView] = useState<ViewMode>("list");
-  const totalSize = items.reduce((s, i) => s + i.size, 0);
   // FB2-01/02：入库网格格宽档位驱动（CELL_STEPS[importCellStep]）
   const { grid } = useAppearance();
 
@@ -342,7 +341,7 @@ export default function PendingList({
 
   return (
     <div className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-lg border border-[var(--color-border)]">
-      {/* 固定动作头部：添加文件/文件夹、视图切换、清空、数量与总大小。按钮不直接 invoke，事件交上层页面。 */}
+      {/* 固定动作头部：添加文件/文件夹、视图切换、清空。统计只由左侧清单摘要承担。 */}
       <div className="flex h-10 shrink-0 items-center gap-2 border-b border-[var(--color-border)] px-2">
         <button
           type="button"
@@ -364,9 +363,7 @@ export default function PendingList({
         >
           + 添加文件夹
         </button>
-        <span className="ml-auto shrink-0 text-[11px] text-[var(--color-text-tertiary)]">
-          {items.length} 项 · {formatSize(totalSize)}
-        </span>
+        <span className="ml-auto" />
         <div className="flex overflow-hidden rounded-md border border-[var(--color-border)] bg-[var(--color-bg)]">
           {(
             [

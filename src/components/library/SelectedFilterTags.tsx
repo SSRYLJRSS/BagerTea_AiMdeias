@@ -35,6 +35,7 @@ const LABELS: Record<string, string> = {
   video_codec: "视频编码",
   audio_codec: "音频编码",
   folder: "文件夹",
+  palette_top3: "主要颜色",
 };
 
 const OP_TEXT: Record<string, string> = {
@@ -59,6 +60,10 @@ function fmt(op: string, v?: string | number): string {
 /** 元数据条件 → 可读芯片标签 */
 function metaLabel(f: MetadataFilter): string {
   const name = LABELS[f.key] ?? f.key;
+  if (f.key === "palette_top3") {
+    const colors = f.op === "in" ? (f.values ?? []) : f.value === undefined ? [] : [f.value];
+    return `${name}：${colors.map(fmtValue).join("、")}`;
+  }
   if (f.op === "between") {
     return `${name} ${fmtValue(f.min ?? "")}–${fmtValue(f.max ?? "")}`;
   }

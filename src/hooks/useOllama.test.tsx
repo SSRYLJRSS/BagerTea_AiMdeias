@@ -18,7 +18,7 @@ describe("useOllamaPull", () => {
     const { result } = renderHook(() => useOllamaPull());
     let promise: Promise<void>;
     act(() => {
-      promise = result.current.pull("http://localhost:11434", "qwen2.5vl:7b");
+      promise = result.current.pull("http://localhost:11434", "qwen3.5:4b");
     });
     expect(result.current.pullBusy).toBe(true);
     expect(result.current.pullState?.status).toBe("正在连接…");
@@ -26,7 +26,7 @@ describe("useOllamaPull", () => {
       await promise;
     });
     expect(result.current.pullBusy).toBe(false);
-    expect(pullOllamaModel).toHaveBeenCalledWith("http://localhost:11434", "qwen2.5vl:7b");
+    expect(pullOllamaModel).toHaveBeenCalledWith("http://localhost:11434", "qwen3.5:4b");
   });
 
   it("拉取失败也复位 busy（错误由调用方提示）", async () => {

@@ -1,7 +1,7 @@
 //! RAW 真解码兜底层（Phase 2 F04，基于 rawler 0.7.2）
 //!
 //! 定位：内嵌预览缺失/过小时的兜底，只进高清按需层与查看器大图，
-//! **严禁进占位图路径**（会打爆入库速度，见 PHASE2_FORMATS.md 红线）。
+//! **严禁进占位图路径**（会打爆入库速度，见 docs/ARCHITECTURE.md 红线）。
 //!
 //! 缩略图优化：2×2 Bayer binning——每 2×2 块按 CFA 通道归组取均值，
 //! 直接得到半分辨率 RGB（零插值伪影、1/4 内存），45MP 传感器产出 ~4K×3K，
@@ -14,7 +14,9 @@
 use image::{DynamicImage, ImageBuffer};
 use rawler::{RawImage, RawImageData};
 
-/// 超过该像素数的 RAW 拒绝全解码（内存保护红线，见 PHASE2_FORMATS.md）
+use super::imaging;
+
+/// 超过该像素数的 RAW 拒绝全解码（内存保护红线，见 docs/ARCHITECTURE.md）
 const MAX_DECODE_PIXELS: usize = 150_000_000;
 
 /// XYZ(D65) → sRGB 线性矩阵
@@ -30,13 +32,20 @@ const XYZ_TO_SRGB: [[f32; 3]; 3] = [
 /// 注意：decode_file 会读整个文件（非只读头），45MP 级文件每次调用约百毫秒~秒级，
 /// 适合入库单次与手动回填，不适合批量热路径。
 pub fn probe_dimensions(src: &std::path::Path) -> Option<(u32, u32)> {
-    let raw = rawler::decode_file(src).ok()?;
-    Some((raw.width as u32, raw.height as u32))
+    let _permit = imaging::acquire();
+    catch_raw_panics(src, || {
+        let raw = rawler::decode_file(src).ok()?;
+        Some((raw.width as u32, raw.height as u32))
+    })
 }
 
 /// RAW 真解码为 DynamicImage（半分辨率 binning 结果，未缩放到目标边长）
 /// 调用方负责再 thumbnail()；失败返回 None 由策略链降级
 pub fn decode_raw(src: &std::path::Path) -> Option<DynamicImage> {
+    catch_raw_panics(src, || decode_raw_inner(src))
+}
+
+fn decode_raw_inner(src: &std::path::Path) -> Option<DynamicImage> {
     let mut raw = rawler::decode_file(src).ok()?;
     if raw.width * raw.height > MAX_DECODE_PIXELS {
         tracing::warn!("RAW 超过解码像素上限，跳过: {src:?}");
@@ -49,12 +58,26 @@ pub fn decode_raw(src: &std::path::Path) -> Option<DynamicImage> {
     if raw.cpp != 1 {
         return None;
     }
-    let cfa = raw.cropped_cfa();
+    // rawler 0.7.2 的 cropped_cfa() 仍是 todo!()。这里按完整传感器坐标
+    // 使用相机 CFA，后续 color_at(y, x) 也传原始坐标，不需要再额外平移。
+    let cfa = &raw.camera.cfa;
     // X-Trans 等非 2×2 阵列：binning 不适用，降级灰度预览（聊胜于无）
     if cfa.width != 2 || cfa.height != 2 {
         return grayscale_preview(&mut raw);
     }
     bayer_binning(&mut raw)
+}
+
+/// rawler 0.7.2 仍有多处 `todo!()/unimplemented!()`。单个异常文件不能把
+/// Rayon 入库线程连同整批任务一起打掉，因此把上游 panic 降级为 None。
+fn catch_raw_panics<T>(src: &std::path::Path, f: impl FnOnce() -> Option<T>) -> Option<T> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(value) => value,
+        Err(_) => {
+            tracing::warn!("RAW 解码 panic，已降级跳过: {}", src.display());
+            None
+        }
+    }
 }
 
 /// 2×2 Bayer binning → 半分辨率 sRGB u8
@@ -74,7 +97,7 @@ fn bayer_binning(raw: &mut RawImage) -> Option<DynamicImage> {
         return None;
     }
 
-    let cfa = raw.cropped_cfa();
+    let cfa = &raw.camera.cfa;
     let wb = neutral_wb(raw);
     // 黑/白电平按 2×2 Bayer 位置展开（0=R 1=G1 2=B 3=G2）
     let bl4 = raw.blacklevel.as_bayer_array();
@@ -218,5 +241,27 @@ mod tests {
     #[test]
     fn decode_nonexistent_returns_none() {
         assert!(decode_raw(std::path::Path::new("不存在的文件.cr2")).is_none());
+    }
+
+    #[test]
+    fn raw_panic_is_contained() {
+        let result = catch_raw_panics(std::path::Path::new("panic.raw"), || -> Option<()> {
+            panic!("not yet implemented")
+        });
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn decode_real_crw_no_longer_hits_upstream_todo() {
+        let sample =
+            std::path::Path::new(r"F:\testdata\S2_formats\raw\Canon - EOS D30 - RAW (3_2).CRW");
+        if !sample.exists() {
+            eprintln!("跳过：CRW 真机样本不存在（{}）", sample.display());
+            return;
+        }
+        assert!(
+            decode_raw(sample).is_some(),
+            "CRW 真解码不应 panic 或返回空"
+        );
     }
 }

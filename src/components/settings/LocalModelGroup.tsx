@@ -411,7 +411,7 @@ export default function LocalModelGroup({ draft, onPatchAi, onPatchSettings, not
                 <div className="flex flex-col gap-2 p-3">
                     <p className="text-sm text-[var(--color-danger)]">本地环境检测失败</p>
                     <p className="text-xs leading-5 text-[var(--color-text-secondary)]">
-                        无法判断 Ollama 是否已安装。这不影响「自动打标」和视频 AI 打标；可稍后重试，或到「自动打标」分组使用云端 API。
+                        无法确认 Ollama 是否已安装。这不影响在线 AI 服务；可稍后重试，或在「服务管理」中选择在线服务。
                     </p>
                     <div>
                         <Button variant="ghost" onClick={() => void refresh()}>
@@ -436,7 +436,7 @@ export default function LocalModelGroup({ draft, onPatchAi, onPatchSettings, not
             <div className="flex flex-col gap-2 p-3">
                 <p className="text-sm text-[var(--color-text)]">未检测到 Ollama 本地引擎</p>
                 <p className="text-xs leading-5 text-[var(--color-text-secondary)]">
-                    点击下方按钮，应用内自动完成「下载 → 安装 → 启动」，全程无需离开本软件；之后再一键拉取视觉模型即可离线免费打标。下载源可选、可测速，国内网络可优先选响应最快的镜像。
+                    点击下方按钮即可完成下载、安装和启动；之后可下载视觉模型，在本机离线打标。下载源支持测速，可选择响应较快的镜像。
                 </p>
 
                 {/* 下载源选择 + 测速 */}
@@ -515,7 +515,7 @@ export default function LocalModelGroup({ draft, onPatchAi, onPatchSettings, not
                 ) : (
                     <div ref={customFormRef} className="flex flex-col gap-1.5 rounded-md border border-dashed border-[var(--color-border)] p-2">
                         <p className="text-[11px] text-[var(--color-text-secondary)]">
-                            社区常用镜像，点一下自动填入后再测速：
+                            常用镜像源（选择后自动填入）：
                         </p>
                         <div className="flex flex-wrap gap-1.5">
                             {CANDIDATE_MIRRORS.map((c) => (
@@ -558,7 +558,7 @@ export default function LocalModelGroup({ draft, onPatchAi, onPatchSettings, not
                 <div className="flex flex-col gap-1">
                     <ProgressBar value={0.05} />
                     <p className="text-[11px] text-[var(--color-text-secondary)]">
-                        正在连接（{activeSrcLabel}）… 慢速网络可能需要一会儿
+                        正在连接（{activeSrcLabel}）… 网络较慢时可能需要较长时间
                     </p>
                 </div>
             )}
@@ -572,7 +572,7 @@ export default function LocalModelGroup({ draft, onPatchAi, onPatchSettings, not
                 </div>
             )}
                 {busy && p?.phase === "install" && (
-                    <p className="text-[11px] text-[var(--color-text-secondary)]">正在静默安装（约 1–2 分钟，此阶段进度条不更新属正常，请勿关闭应用）…</p>
+                    <p className="text-[11px] text-[var(--color-text-secondary)]">正在安装（约 1–2 分钟，安装期间进度条可能不会更新，请勿关闭应用）…</p>
                 )}
                 {busy && p?.phase === "verify" && (
                     <p className="text-[11px] text-[var(--color-text-secondary)]">安装完成，正在等待服务启动（最多 30 秒）…</p>
@@ -588,7 +588,7 @@ export default function LocalModelGroup({ draft, onPatchAi, onPatchSettings, not
                         {/* 卡死 / 异常警示 */}
                         {stalled && (
                             <p className="rounded border border-[var(--color-danger)] px-1.5 py-1 text-[11px] font-medium text-[var(--color-danger)]">
-                                ⚠️ 已 25 秒无数据流入，疑似卡住或网络中断。可等待（连接超时最长 20s/源）或核对网络后重试。
+                                ⚠️ 已 25 秒未收到下载数据，可能因网络中断或服务器无响应。可继续等待，或检查网络后重试。
                             </p>
                         )}
                         <div
@@ -668,9 +668,9 @@ export default function LocalModelGroup({ draft, onPatchAi, onPatchSettings, not
                                 </>
                             ) : (
                                 <>
-                                    运行中（外部服务，非应用启动）
+                                    运行中（由其他程序启动）
                                     <span className="ml-1.5 text-[10px] text-[var(--color-text-secondary)]">
-                                        应用不会停止外部服务
+                                        应用不会停止此服务
                                     </span>
                                 </>
                             )}
@@ -681,7 +681,7 @@ export default function LocalModelGroup({ draft, onPatchAi, onPatchSettings, not
                         disabled={stopping || runtime.ownership.kind !== "appOwned"}
                         onClick={() => void onStopService()}
                     >
-                        {stopping ? "停止中…" : runtime.ownership.kind === "appOwned" ? "停止服务" : "外部服务"}
+                        {stopping ? "停止中…" : runtime.ownership.kind === "appOwned" ? "停止服务" : "非应用启动"}
                     </Button>
                 </div>
             )}
@@ -703,7 +703,7 @@ export default function LocalModelGroup({ draft, onPatchAi, onPatchSettings, not
                         disabled={pullBusy}
                         onClick={() => void onPick(r.name)}
                     >
-                        {modelInstalled(r.name) ? "已安装 · 使用" : "一键拉取并配置"}
+                        {modelInstalled(r.name) ? "已安装 · 使用" : "下载并配置"}
                     </Button>
                 </div>
             ))}
@@ -758,7 +758,7 @@ export default function LocalModelGroup({ draft, onPatchAi, onPatchSettings, not
                     ))}
                     {models.length === 0 && !modelsLoading && (
                         <p className="text-[11px] text-[var(--color-text-secondary)]">
-                            暂无已安装模型，可从上方向导一键拉取视觉模型
+                            暂无已安装模型，可使用上方向导下载视觉模型
                         </p>
                     )}
                 </div>
@@ -773,7 +773,7 @@ export default function LocalModelGroup({ draft, onPatchAi, onPatchSettings, not
                     onKeyDown={(e) => {
                         if (e.key === "Enter" && manualModel.trim()) void onPick(manualModel.trim());
                     }}
-                    placeholder="输入官方库模型名，如 qwen3:8b、deepseek-r1:7b（回车拉取）"
+                    placeholder="输入官方库模型名，如 qwen3.5:4b、qwen3.5:2b（按回车下载）"
                     className="min-w-0 flex-1 rounded-md border border-[var(--color-border)] bg-[var(--color-surface)] px-2 py-1 text-xs outline-none focus:border-[var(--color-accent)]"
                 />
                 <Button
@@ -781,12 +781,12 @@ export default function LocalModelGroup({ draft, onPatchAi, onPatchSettings, not
                     disabled={pullBusy || !manualModel.trim()}
                     onClick={() => void onPick(manualModel.trim())}
                 >
-                    拉取
+                    下载
                 </Button>
             </div>
 
             <p className="text-[11px] leading-4 text-[var(--color-text-secondary)]">
-                模型文件约 2–4.5GB，默认存于用户目录 .ollama，可在上方「已安装模型」列表删除不需要的模型释放磁盘空间；模型下载走 Ollama 官方通道（registry.ollama.ai），由 Ollama 进程自行下载。下载太慢可先配置下方代理，或改用离线导入。配置写入后需点页面底部「保存设置」生效。
+                模型文件约 1.0–6.6GB（取决于模型规格），默认保存在用户目录的 .ollama 文件夹。可在上方「已安装模型」中删除不需要的模型以释放磁盘空间。下载较慢时，可配置下方代理，或使用离线导入。修改后需点击页面底部「保存设置」生效。
             </p>
 
             {/* 模型下载代理（加速项 A：拉起 serve 时注入 HTTPS_PROXY） */}
@@ -796,12 +796,12 @@ export default function LocalModelGroup({ draft, onPatchAi, onPatchSettings, not
                     <input
                         value={draft.modelDownloadProxy ?? ""}
                         onChange={(e) => onPatchSettings({ modelDownloadProxy: e.target.value.trim() })}
-                        placeholder="如 http://127.0.0.1:7890（留空 = 直连）"
+                        placeholder="如 http://127.0.0.1:7890（留空表示直连）"
                         className="min-w-0 flex-1 rounded-md border border-[var(--color-border)] bg-[var(--color-surface)] px-2 py-1 text-xs outline-none focus:border-[var(--color-accent)]"
                     />
                 </div>
                 <p className="text-[11px] leading-4 text-[var(--color-text-secondary)]">
-                    国内下载模型慢时填代理地址（Clash/v2ray 等本地端口），点「启动服务并复检」后生效；Ollama 已在运行时改完需重启 Ollama。
+                    下载模型较慢时，可填写本机代理地址。修改后需重新启动服务；若 Ollama 已在运行，请先重启 Ollama。
                 </p>
             </div>
 
@@ -811,18 +811,18 @@ export default function LocalModelGroup({ draft, onPatchAi, onPatchSettings, not
                     onClick={() => setShowOffline((v) => !v)}
                     className="self-start text-[11px] text-[var(--color-accent)] hover:underline"
                 >
-                    {showOffline ? "收起" : "下载太慢？试试离线导入（魔搭）"} {showOffline ? "▴" : "▾"}
+                    {showOffline ? "收起" : "离线导入模型（魔搭）"} {showOffline ? "▴" : "▾"}
                 </button>
                 {showOffline && (
                     <ol className="list-decimal space-y-1 pl-4 text-[11px] leading-4 text-[var(--color-text-secondary)]">
                         <li>
-                            浏览器打开魔搭 modelscope.cn，搜「你的模型名 + GGUF」（如 qwen/Qwen2.5-7B-Instruct-GGUF），下载 .gguf 文件。
+                            浏览器打开魔搭 modelscope.cn，搜「你的模型名 + GGUF」（如 Qwen3.5-4B-GGUF），下载 .gguf 文件。
                         </li>
                         <li>在 .gguf 同目录新建文件 <code className="rounded bg-[var(--color-surface)] px-1">Modelfile</code>，内容一行：<code className="rounded bg-[var(--color-surface)] px-1">FROM ./你的模型.gguf</code></li>
                         <li>
                             在该目录打开终端执行：<code className="rounded bg-[var(--color-surface)] px-1">ollama create 我的模型 -f ./Modelfile</code>
                         </li>
-                        <li>回本页点「已安装 · 使用」或下拉选模型即可。完全绕开海外网络，国内直连满速。</li>
+                        <li>返回本页点击「已安装 · 使用」，或从下拉列表选择模型即可。适用于无法直接下载模型的网络环境。</li>
                     </ol>
                 )}
             </div>
@@ -837,7 +837,7 @@ function toCustom(src: DownloadSource): CustomSource {
 
 const PHASE_LABELS: Record<string, string> = {
     download: "下载",
-    install: "静默安装",
+    install: "安装",
     verify: "就绪复检",
     done: "完成",
 };

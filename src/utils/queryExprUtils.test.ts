@@ -90,7 +90,7 @@ describe("flattenExprForDisplay（§9.6.1）", () => {
   ];
   it("AND 顶层叶无组标签；标签名取自 resolvedTags", () => {
     const chips = flattenExprForDisplay({ op: "and", children: [tagLeaf("lighting", [1]), tagLeaf("subject", [2])] }, tags);
-    expect(chips.map((c) => c.label)).toEqual(["光线/时间：夜景", "主体/对象：树"]);
+    expect(chips.map((c) => c.label)).toEqual(["光线/时间：夜景", "主体对象：树"]);
     expect(chips.every((c) => !c.group)).toBe(true);
   });
   it("OR 根按组标注「任一组 N」", () => {

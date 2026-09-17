@@ -5,11 +5,16 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import clsx from "clsx";
 import { useShallow } from "zustand/react/shallow";
 import Button from "@/components/common/Button";
-import LegacyProfileModelField from "@/components/common/LegacyProfileModelField";
 import AiTaggingProgress, { assetFileLabel } from "@/components/ai/AiTaggingProgress";
 import Filmstrip from "@/components/ai/Filmstrip";
 import Workbench from "@/components/ai/Workbench";
 import { aiApplyTags, aiDecideSuggestionItem, aiListSuggestionItems, onAiProgress } from "@/api/ai";
+import {
+  getAiUsageBindings,
+  listAiConnections,
+  setAiUsageBinding,
+  type AiConnection,
+} from "@/api/connections";
 import { recentTagOps, undoTagBatch } from "@/api/tags";
 import { useTauriEvent } from "@/hooks/hooks";
 import { useAiStore } from "@/stores/aiStore";
@@ -24,7 +29,7 @@ import type { TagOp } from "@/types/asset";
 
 export default function AiTaggingPage() {
   const {
-    batches, currentBatchId, suggestions, running, cancelling, error, pendingAssetIds, pendingMode, lastProgressAssetId,
+    batches, currentBatchId, suggestions, running, cancelling, error, pendingAssetIds, lastProgressAssetId,
   } = useAiStore(
     useShallow((s) => ({
       batches: s.batches,
@@ -34,7 +39,6 @@ export default function AiTaggingPage() {
       cancelling: s.cancelling,
       error: s.error,
       pendingAssetIds: s.pendingAssetIds,
-      pendingMode: s.pendingMode,
       lastProgressAssetId: s.lastProgressAssetId,
     })),
   );
@@ -57,8 +61,8 @@ export default function AiTaggingPage() {
   const refreshLibrary = useLibraryStore((s) => s.refresh);
   const tagFacets = useTagStore((s) => s.facets);
   const refreshTags = useTagStore((s) => s.refresh);
-  const { settings, loaded, load, save } = useSettingsStore(
-    useShallow((s) => ({ settings: s.settings, loaded: s.loaded, load: s.load, save: s.save })),
+  const { settings, loaded, load } = useSettingsStore(
+    useShallow((s) => ({ settings: s.settings, loaded: s.loaded, load: s.load })),
   );
 
   // 阶段 6 §9.2/§9.3：工作台分面 = tag_facets（唯一事实源）+ aiFacetConfigs 覆盖；系统分面恒显
@@ -71,8 +75,6 @@ export default function AiTaggingPage() {
     if (tagFacets.length === 0) void refreshTags();
   }, [tagFacets.length, refreshTags]);
 
-  // 打标模式（v2.10 / P3-01a）：AI 打标（云端/本地按激活档案自动解析）/ 手动
-  const [mode, setMode] = useState<"auto" | "manual">("auto");
   // 打标范围（v2.11）：全部 / 仅前 N 张
   const [scopeAll, setScopeAll] = useState(true);
   const [scopeN, setScopeN] = useState("10");
@@ -81,45 +83,56 @@ export default function AiTaggingPage() {
     if (!loaded) void load();
   }, [loaded, load]);
 
-  // 素材库选好跳过来 → 只自动建批次展示图片，AI 由左栏「开始打标」手动启动（v2.10 修订）
+  // 素材库选好跳过来 → 只自动建批次展示图片，AI 由左栏「开始打标」手动启动。
   useEffect(() => {
-    if (pendingAssetIds.length > 0 && !running) void createBatch(pendingMode);
-  }, [pendingAssetIds, running, pendingMode, createBatch]);
+    if (pendingAssetIds.length > 0 && !running) void createBatch();
+  }, [pendingAssetIds, running, createBatch]);
 
-  const activeProfile =
-    settings?.ai.profiles.find((p) => p.id === settings.ai.activeProfile) ?? settings?.ai.profiles[0] ?? null;
+  // 当前模型以 ai_connections + tagging 用途绑定为唯一数据源；
+  // settings.ai.profiles 只是 V15 迁移前的历史输入，不再参与打标页展示或切换。
+  const [aiConnections, setAiConnections] = useState<AiConnection[]>([]);
+  const [taggingConnectionId, setTaggingConnectionId] = useState<string | null>(null);
+  const [connectionsLoaded, setConnectionsLoaded] = useState(false);
+  const [connectionError, setConnectionError] = useState<string | null>(null);
+  const [bindingSaving, setBindingSaving] = useState(false);
+  const activeConnection =
+    aiConnections.find((connection) => connection.id === taggingConnectionId) ?? null;
 
-  // 打标页切换档案/模型即保存生效（PRD 5.3：中转站快速切换）
-  // P2-10：保存失败不再被 void 吞掉——显示错误，避免 UI 已切换而后端仍用旧配置
-  const [saveError, setSaveError] = useState<string | null>(null);
-  const switchProfile = useCallback(
-    async (id: string) => {
-      if (!settings) return;
-      try {
-        await save({ ...settings, ai: { ...settings.ai, activeProfile: id } });
-        setSaveError(null);
-      } catch (e) {
-        setSaveError(e instanceof Error ? e.message : String(e));
-      }
-    },
-    [settings, save],
-  );
-  const changeModel = useCallback(
-    async (v: string) => {
-      if (settings && activeProfile) {
-        try {
-          await save({
-            ...settings,
-            ai: { ...settings.ai, profiles: settings.ai.profiles.map((p) => (p.id === activeProfile.id ? { ...p, model: v } : p)) },
-          });
-          setSaveError(null);
-        } catch (e) {
-          setSaveError(e instanceof Error ? e.message : String(e));
-        }
-      }
-    },
-    [settings, activeProfile, save],
-  );
+  const loadTaggingConnection = useCallback(async () => {
+    setConnectionsLoaded(false);
+    setConnectionError(null);
+    try {
+      const [connections, bindings] = await Promise.all([
+        listAiConnections(),
+        getAiUsageBindings(),
+      ]);
+      setAiConnections(connections);
+      setTaggingConnectionId(bindings.tagging);
+    } catch (e) {
+      setConnectionError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setConnectionsLoaded(true);
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadTaggingConnection();
+  }, [loadTaggingConnection]);
+
+  // 页面内只切换“此功能使用的服务”，服务名称/地址/模型/密钥仍在设置页统一维护。
+  const switchConnection = useCallback(async (id: string) => {
+    if (!id) return;
+    setBindingSaving(true);
+    setConnectionError(null);
+    try {
+      await setAiUsageBinding("tagging", id);
+      setTaggingConnectionId(id);
+    } catch (e) {
+      setConnectionError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBindingSaving(false);
+    }
+  }, []);
 
   const [reviewIdx, setReviewIdx] = useState(0);
 
@@ -140,10 +153,6 @@ export default function AiTaggingPage() {
   );
 
   const current = batches.find((b) => b.id === currentBatchId) ?? null;
-  /** 当前批次是否走 AI 管线（云端或本地，P3-01a：开始打标按钮对两者常显） */
-  const isAiBatch = current?.mode === "cloud" || current?.mode === "local";
-  const aiLabel = current?.mode === "local" ? "本地" : "云端";
-
   // FB6 需求一：派生页内进度 UI 状态（AiTaggingUiState）。
   // 收尾快照只在 running 翻转为 false 的一刻记录（完成/取消/失败显示静态最终状态，不继续滚动）。
   const [aiFinal, setAiFinal] = useState<{ status: string | null; error: string | null; processed: number; total: number } | null>(null);
@@ -189,33 +198,9 @@ export default function AiTaggingPage() {
     [suggestions],
   );
   const videoTaggingOn = settings?.ai.videoTagging ?? false;
-  // FB2-07（§13.6）：视频打标子模式与帧数（即时预览，随 settings 同步；批次启动时生效）
-  const [videoMode, setVideoMode] = useState<"cover" | "frames">("cover");
-  const [videoFrameCount, setVideoFrameCount] = useState(3);
-  useEffect(() => {
-    if (!settings) return;
-    setVideoMode(settings.ai.videoTaggingMode === "frames" ? "frames" : "cover");
-    setVideoFrameCount(settings.ai.videoFrameCount);
-  }, [settings]);
-  /** FB2-07：子模式/帧数改动即时落库（后端批次读 DB 配置），保存失败静默。 */
-  const persistVideoMode = useCallback(
-    (mode: "cover" | "frames", frameCount: number) => {
-      if (!settings) return;
-      void save({
-        ...settings,
-        ai: { ...settings.ai, videoTaggingMode: mode, videoFrameCount: frameCount },
-      });
-    },
-    [settings, save],
-  );
-  const onSelectVideoMode = (m: "cover" | "frames") => {
-    setVideoMode(m);
-    persistVideoMode(m, videoFrameCount);
-  };
-  const onSelectVideoFrame = (n: number) => {
-    setVideoFrameCount(n);
-    persistVideoMode(videoMode, n);
-  };
+  // 视频模式只在设置页维护；这里读取已保存值，用于请求次数预估和后端执行前提示。
+  const videoMode = settings?.ai.videoTaggingMode === "frames" ? "frames" : "cover";
+  const videoFrameCount = settings?.ai.videoFrameCount ?? 3;
   // FB-03 §9.5：区分「设置未加载」与「真未开启」，避免加载失败误报
   const settingsUnloaded = settings === null;
   // B-1 批次统计语义：待生成 / 待确认 / 已确认 / 失败 分开，不再用「处理中」混淆多种状态。
@@ -384,93 +369,54 @@ export default function AiTaggingPage() {
     <div className="flex h-full bg-[var(--color-bg)]">
       {/* 左侧数据栏 */}
       <aside className="flex w-[252px] shrink-0 flex-col border-r border-[var(--color-border)] bg-[var(--color-bg)]">
-        <div className="border-b border-[var(--color-border)] px-4 py-4">
-          <h3 className="ui-section-title mb-3">
-            打标模式
-          </h3>
-          <div className="grid grid-cols-2 rounded-[var(--radius-control)] bg-[var(--color-surface)] p-1 text-sm">
-            {(
-              [
-                ["auto", "AI 打标"],
-                ["manual", "手动模式"],
-              ] as const
-            ).map(([m, label]) => (
-              <button
-                key={m}
-                onClick={() => setMode(m)}
-                className={clsx(
-                  "rounded-md px-2 py-1.5 text-center text-xs font-medium transition-colors",
-                  mode === m
-                    ? "bg-[var(--color-surface-raised)] text-[var(--color-text)] shadow-sm"
-                    : "text-[var(--color-text-secondary)] hover:text-[var(--color-text)]",
-                )}
-              >
-                {label}
-              </button>
-            ))}
-          </div>
-          {/* FB2-07（§13.6）：视频子打标模式 —— 仅当批次含视频且为 AI 模式时显示，纯图片批次不出现 */}
-          {mode === "auto" && batchHasVideo && (
-            <div className="mt-3">
-              <div className="grid grid-cols-2 rounded-[var(--radius-control)] bg-[var(--color-surface)] p-1 text-sm">
-                {(
-                  [
-                    ["cover", "封面打标"],
-                    ["frames", "抽帧打标"],
-                  ] as const
-                ).map(([m, label]) => (
-                  <button
-                    key={m}
-                    onClick={() => onSelectVideoMode(m)}
-                    className={clsx(
-                      "rounded-md px-2 py-1.5 text-center text-xs font-medium transition-colors",
-                      videoMode === m
-                        ? "bg-[var(--color-surface-raised)] text-[var(--color-text)] shadow-sm"
-                        : "text-[var(--color-text-secondary)] hover:text-[var(--color-text)]",
-                    )}
-                  >
-                    {label}
-                  </button>
-                ))}
-              </div>
-              <p className="mt-2 text-[10px] leading-4 text-[var(--color-text-secondary)]">
-                {videoMode === "cover"
-                  ? "复制入库封面零额外开销，每视频一次请求；未生成高清封面的视频用第一帧，夜景可能偏暗。"
-                  : `抽 ${videoFrameCount} 帧分别识别后取多数标签，召回率更高；需要 ffmpeg，每个视频 ${videoFrameCount} 次请求。`}
-              </p>
-              {videoMode === "frames" && (
-                <div className="mt-2 flex items-center gap-2 text-xs text-[var(--color-text-secondary)]">
-                  <span>帧数</span>
-                  <select
-                    value={videoFrameCount}
-                    onChange={(e) => onSelectVideoFrame(Math.max(2, Math.min(8, Number(e.target.value) || 3)))}
-                    className="ui-control rounded-md bg-[var(--color-surface)] px-2 py-1 text-xs outline-none"
-                  >
-                    {[2, 3, 4, 5, 6, 8].map((n) => (
-                      <option key={n} value={n}>{n}</option>
-                    ))}
-                  </select>
-                  <span>· {videoFrameCount} 次/视频</span>
-                </div>
+        <div className="border-b border-[var(--color-border)] px-4 py-3.5">
+          <div className="flex min-w-0 items-center gap-2" aria-live="polite">
+            <span
+              className={clsx(
+                "size-1.5 shrink-0 rounded-full",
+                connectionsLoaded && activeConnection
+                  ? "bg-[var(--color-success)]"
+                  : "bg-[var(--color-border-strong)]",
               )}
-            </div>
-          )}
-          {mode === "auto" && (
-              <p className="mt-2 text-[10px] leading-4 text-[var(--color-text-secondary)]">
-                {activeProfile?.kind === "local"
-                  ? `当前走本地服务（${activeProfile.name || "未命名"}）`
-                  : "当前走云端 API；本地打标请到「设置 → 本地打标」配置本地模型并选中使用"}
-              </p>
+              aria-hidden="true"
+            />
+            <span className="min-w-0 flex-1 truncate text-xs font-medium text-[var(--color-text)]">
+              {!connectionsLoaded
+                ? "正在读取打标服务…"
+                : activeConnection
+                  ? activeConnection.name || "未命名服务"
+                  : "未选择打标服务"}
+            </span>
+            {activeConnection && (
+              <span className="shrink-0 text-[10px] text-[var(--color-text-tertiary)]">
+                {activeConnection.deployment === "local" ? "本机" : "在线"}
+              </span>
             )}
+          </div>
+          {connectionsLoaded && !activeConnection && (
+            <p className="mt-1 pl-3.5 text-[10px] leading-4 text-[var(--color-text-secondary)]">
+              请到设置中选择打标服务
+            </p>
+          )}
           {/* AI 批次启动区：不在运行中就常显「开始打标」（打完也保留，可续跑剩余 pending；v2.12） */}
-          {isAiBatch && !running && (
-            <div className="mt-4 flex flex-col gap-2">
-              <label className="flex min-h-7 items-center gap-2 text-xs text-[var(--color-text-secondary)]">
-                <input type="radio" checked={scopeAll} onChange={() => setScopeAll(true)} />
+          {current && !running && (
+            <div className="mt-3 flex flex-col gap-2">
+              <label className="flex min-h-7 cursor-pointer items-center gap-2 text-xs text-[var(--color-text-secondary)]">
+                <input
+                  type="radio"
+                  checked={scopeAll}
+                  onChange={() => setScopeAll(true)}
+                  className="shrink-0 accent-[var(--color-accent)]"
+                />
                 打标全部（{current.total} 张）
               </label>
-              <label className="flex min-h-7 items-center gap-2 text-xs text-[var(--color-text-secondary)]">
-                <input type="radio" checked={!scopeAll} onChange={() => setScopeAll(false)} />
+              <label className="flex min-h-7 cursor-pointer items-center gap-2 text-xs text-[var(--color-text-secondary)]">
+                <input
+                  type="radio"
+                  checked={!scopeAll}
+                  onChange={() => setScopeAll(false)}
+                  className="shrink-0 accent-[var(--color-accent)]"
+                />
                 仅打标前
                 <input
                   value={scopeN}
@@ -510,69 +456,75 @@ export default function AiTaggingPage() {
               {cancelling ? "已请求取消…" : "取消"}
             </Button>
           )}
-          <p className="mt-2 text-[10px] leading-4 text-[var(--color-text-tertiary)]">
+          <p className="mt-3 text-[11px] leading-4 text-[var(--color-text-tertiary)]">
             {running
               ? cancelling
                 ? "取消已受理，当前图片完成后停止" // P2-01：300s 单请求超时不可打断，诚实告知
-                : `${aiLabel}打标中…`
-              : isAiBatch
+                : "正在生成标签建议…"
+              : current
                 ? current?.status === "pending"
-                  ? `批次已就绪，图片已载入——点「开始打标」启动${aiLabel}打标`
+                  ? "批次已就绪，图片已载入——点「开始打标」生成建议，也可直接手工填写"
                   : "点「开始打标」可继续处理剩余未打标项"
-                : "在素材库选中素材后，顶栏「打标 → AI/手动」直达本页"}
+                : "在素材库选中素材后，点顶栏「打标」直达本页"}
           </p>
         </div>
 
-        {settings && mode === "auto" && (
-          <div className="border-b border-[var(--color-border)] px-4 py-4">
-            <h3 className="ui-section-title mb-3">
-              当前模型
-            </h3>
-            {settings.ai.profiles.length === 0 ? (
-              <div className="flex items-center gap-2">
-                <p className="text-xs leading-5 text-[var(--color-text-secondary)]">
-                  还没有 API 配置，去「设置 → AI 打标」添加中转站或本地服务
-                </p>
-                {/* W5f-f3：纯文字改跳转按钮 */}
-                <button
-                  type="button"
-                  onClick={() => window.dispatchEvent(new CustomEvent("app:navigate", { detail: "settings" }))}
-                  className="rounded-md bg-[var(--color-accent)] px-2.5 py-1 text-xs font-medium text-[var(--color-accent-text)]"
-                >
-                  去设置添加
-                </button>
-              </div>
-            ) : (
-              <div className="flex flex-col gap-2">
-                <select
-                  value={activeProfile?.id ?? ""}
-                  onChange={(e) => switchProfile(e.target.value)}
-                  className="ui-control w-full px-3 py-2 text-sm"
-                >
-                  {settings.ai.profiles.map((p) => (
-                    <option key={p.id} value={p.id}>
-                      {p.name || "未命名"}
-                    </option>
-                  ))}
-                </select>
-                {activeProfile && (
-                  <LegacyProfileModelField
-                    apiMode={activeProfile.apiMode}
-                    kind={activeProfile.kind}
-                    baseUrl={activeProfile.baseUrl}
-                    apiKey={activeProfile.apiKey}
-                    model={activeProfile.model}
-                    onModelChange={changeModel}
-                  />
+        <div className="border-b border-[var(--color-border)] px-4 py-3.5">
+          <h3 className="ui-section-title mb-2.5">当前模型</h3>
+          {!connectionsLoaded ? (
+            <p className="text-xs leading-5 text-[var(--color-text-secondary)]">
+              正在读取打标服务…
+            </p>
+          ) : aiConnections.length === 0 ? (
+            <div className="flex items-center gap-2">
+              <p className="text-xs leading-5 text-[var(--color-text-secondary)]">
+                还没有 AI 服务，去「设置 → 服务管理」添加
+              </p>
+              <button
+                type="button"
+                onClick={() => window.dispatchEvent(new CustomEvent("app:navigate", { detail: "settings" }))}
+                className="rounded-md bg-[var(--color-accent)] px-2.5 py-1 text-xs font-medium text-[var(--color-accent-text)]"
+              >
+                去设置添加
+              </button>
+            </div>
+          ) : (
+            <div className="flex flex-col gap-2">
+              <select
+                aria-label="AI 打标服务"
+                value={taggingConnectionId ?? ""}
+                disabled={bindingSaving}
+                onChange={(e) => void switchConnection(e.target.value)}
+                className="ui-control w-full px-3 py-2 text-sm"
+              >
+                <option value="" disabled>请选择服务</option>
+                {aiConnections.map((connection) => (
+                  <option key={connection.id} value={connection.id}>
+                    {connection.name || "未命名"}
+                  </option>
+                ))}
+              </select>
+              <div className="min-w-0 text-[11px] leading-4 text-[var(--color-text-secondary)]">
+                {activeConnection ? (
+                  <>
+                    <div className="truncate" title={activeConnection.baseUrl}>
+                      {activeConnection.deployment === "local" ? "本机服务" : "在线服务"} · {activeConnection.baseUrl}
+                    </div>
+                    <div className="truncate" title={activeConnection.model}>
+                      模型：{activeConnection.model || "未设置"}
+                    </div>
+                  </>
+                ) : (
+                  <span>当前用途尚未绑定服务，请选择一个服务。</span>
                 )}
               </div>
-            )}
-          </div>
-        )}
+            </div>
+          )}
+        </div>
 
         {current && (
-          <div className="border-b border-[var(--color-border)] px-4 py-4">
-            <div className="mb-3 flex items-center justify-between">
+          <div className="border-b border-[var(--color-border)] px-4 py-3.5">
+            <div className="mb-2.5 flex items-center justify-between">
               <h3 className="ui-section-title">当前批次</h3>
               <span className="text-[11px] text-[var(--color-text-tertiary)]">#{current.id} · 共 {suggestions.length} 张</span>
             </div>
@@ -604,7 +556,7 @@ export default function AiTaggingPage() {
               <div className="mt-2">
                 <AiTaggingProgress state={aiState} currentAssetName={aiCurrentName} />
                 <p className="mt-1 text-[10px] text-[var(--color-text-secondary)]">
-                  {current.mode === "manual" ? "手动模式：请逐张编辑标签" : `${aiLabel}生成建议 ${current.processed}/${current.total}`}
+                  {`正在生成建议 ${current.processed}/${current.total}`}
                 </p>
               </div>
             )}
@@ -613,7 +565,7 @@ export default function AiTaggingPage() {
                 全部确认（{stats.awaitingConfirmation}）
               </Button>
             )}
-            {current.mode !== "manual" && !running && stats.awaitingConfirmation === 0 && stats.awaitingGeneration === 0 && stats.failed === 0 && stats.total > 0 && (
+            {!running && stats.awaitingConfirmation === 0 && stats.awaitingGeneration === 0 && stats.failed === 0 && stats.total > 0 && (
               <p className="mt-2 text-[10px] leading-4 text-[var(--color-text-tertiary)]">
                 当前没有待确认的建议；可逐张编辑标签后「确认写入」。
               </p>
@@ -622,7 +574,7 @@ export default function AiTaggingPage() {
         )}
 
         {(batches.length > 0 || recentOps.length > 0) && (
-          <div className="min-h-0 flex-1 overflow-y-auto px-2 py-3">
+          <div className="min-h-0 flex-1 overflow-y-auto px-2 py-2.5">
             {batches.length > 0 && (
               <>
                 <h3 className="ui-section-title mb-2 px-2">
@@ -634,7 +586,7 @@ export default function AiTaggingPage() {
                   };
                   const canResume = b.status === "interrupted" || (b.status !== "processing" && b.status !== "undone" && b.processed < b.total);
                   // D-4：只有 done/cancelled 且存在可撤销写入的批次显示「撤销」；undone 不再显示
-                  const canUndo = b.mode !== "manual" && (b.status === "done" || b.status === "cancelled") && b.confirmed > 0;
+                  const canUndo = (b.status === "done" || b.status === "cancelled") && b.confirmed > 0;
                   return (
                   <div key={b.id} className="flex items-center gap-1">
                     <button
@@ -645,7 +597,7 @@ export default function AiTaggingPage() {
                       data-active={b.id === currentBatchId}
                       className="ui-nav-item min-w-0 flex-1 px-2.5 py-2 text-left text-xs text-[var(--color-text-secondary)] transition-colors hover:bg-[var(--color-surface)] hover:text-[var(--color-text)]"
                     >
-                      #{b.id} · {b.mode === "cloud" ? "云端" : b.mode === "manual" ? "手动" : "本地"} · {b.confirmed}/{b.total}
+                      #{b.id} · {b.confirmed}/{b.total}
                       <span className="mt-0.5 flex items-center gap-1.5 text-[10px] text-[var(--color-text-tertiary)]">
                         {new Date(b.createdAt).toLocaleDateString()}
                         <span className={clsx(
@@ -715,7 +667,7 @@ export default function AiTaggingPage() {
       {/* 右侧工作流：大图 → 胶片条 → EXIF → 标签 → 操作 */}
       <div className="flex min-w-0 flex-1 flex-col">
         {error && <p className="px-4 pt-2 text-xs text-[var(--color-danger)]">{error}</p>}
-        {saveError && <p className="px-4 pt-2 text-xs text-[var(--color-danger)]">配置保存失败：{saveError}</p>}
+        {connectionError && <p className="px-4 pt-2 text-xs text-[var(--color-danger)]">服务切换失败：{connectionError}</p>}
 
         {currentSuggestion ? (
           <>
@@ -777,10 +729,10 @@ export default function AiTaggingPage() {
         ) : (
           <div className="flex flex-1 items-center justify-center text-sm text-[var(--color-text-secondary)]">
             {running
-              ? `${aiLabel}正在生成标签建议…`
+                ? "正在生成标签建议…"
               : suggestions.length > 0
                 ? "本批次已全部处理完毕"
-                : "还没有打标批次——去素材库选中素材，点顶部「AI 打标」"}
+                : "还没有打标批次——去素材库选中素材，点顶部「打标」"}
           </div>
         )}
       </div>

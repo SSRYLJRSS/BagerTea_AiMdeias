@@ -29,6 +29,11 @@ export default function BottomBar({ current, onNavigate, onOpenSuperSearch }: Bo
   const tasks = useTaskStore((s) => s.tasks);
   const [showSuperSearchHint, setShowSuperSearchHint] = useState(false);
   const hintTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const visibleTasks = tasks.filter((task) => {
+    if (task.kind !== "import") return true;
+    if (current === "import") return false;
+    return !task.done;
+  });
 
   // 当前页为超级搜索时，底栏仍高亮「素材库」；其余按原映射
   const activeTab = (key: TabKey): boolean =>
@@ -61,9 +66,9 @@ export default function BottomBar({ current, onNavigate, onOpenSuperSearch }: Bo
   return (
     <>
       {/* 全局任务层：只由 taskStore 驱动，位于底栏上方（距底栏上边缘 8px），不遮导航 */}
-      {tasks.length > 0 && (
+      {visibleTasks.length > 0 && (
         <div className="fixed inset-x-0 bottom-14 z-20 flex flex-col items-center gap-1 px-4 pb-2">
-          {tasks.map((t) => (
+          {visibleTasks.map((t) => (
             <TaskRow key={t.id} task={t} />
           ))}
         </div>

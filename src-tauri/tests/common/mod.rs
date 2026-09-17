@@ -81,6 +81,7 @@ impl HttpResponse {
 
 pub struct MockServer {
     addr: SocketAddr,
+    #[allow(dead_code)]
     log: Arc<Mutex<Vec<RecordedRequest>>>,
     /// 已 accept 的连接数（含解析失败的连接）；用于定位「请求根本没到/到一半断开」类偶发。
     /// 仅 ai_service_integration 读取；其它测试 target 编译时属 unreachable 字段 → allow
@@ -162,6 +163,7 @@ impl MockServer {
     }
 
     /// 返回已接收到请求的日志（按到达顺序）
+    #[allow(dead_code)]
     pub fn requests(&self) -> Vec<RecordedRequest> {
         self.log.lock().unwrap().clone()
     }

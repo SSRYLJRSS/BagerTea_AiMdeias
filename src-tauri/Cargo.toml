@@ -38,6 +38,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # W0-9：日志落文件（发布版 windows_subsystem="windows" 无控制台，stdout 日志不可见）
 tracing-appender = "0.2"
+# 日志系统 F10：一键诊断包把日志和脱敏环境摘要打成 zip
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 # W0-10：迁移失败需在 tauri app 启动前弹原生 dialog（plugin dialog 需要 AppHandle；
 # 版本与 tauri-plugin-dialog 2.7 传递依赖一致，避免双份 rfd）
 rfd = "0.16"
@@ -49,7 +51,7 @@ base64 = "0.22"
 # Phase 2 F04：RAW 真解码（darktable 系纯 Rust 解析器；API 不守 SemVer，锁精确版本）
 rawler = "=0.7.2"
 # Phase 2 F02：HEIC/HEIF 解码（预编译静态链接 libheif+libde265，免 vcpkg；
-# Apache-2.0 封装；libheif 本体 LGPL-3 静态链接——闭源分发合规见 PROGRESS 决策日志）
+# Apache-2.0 封装；libheif 本体 LGPL-3 静态链接——闭源分发合规见 docs/ARCHITECTURE.md）
 heif-rs = "26.7"
 # 指导书 §6.3：API Key 系统凭据存储（Windows Credential Manager 后端；service/username 见 credentials.rs）
 keyring = { version = "3", features = ["windows-native"] }
