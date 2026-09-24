@@ -41,7 +41,7 @@
 3. **格式与性能**：在目标机器上复测 RAW/HEIC、视频播放、3 万级搜索和网格滚动。
 4. **工作区交付边界**：所有应发布改动必须完成审查、测试并形成可回退提交。
 5. **发布门禁**：`scripts/smoke.ps1`、严格 Rust 门禁、前端门禁和人工 UAT 必须全部有结果记录。
-6. **三端远端门禁**：产品代码提交 `b9ac04ff2b07414c7c963440a51aff6b694eb165` 的 code-gate 首次运行由 Linux x64、macOS Apple Silicon、Windows x64 和前端 job 全部通过（[workflow run 35965863783](https://github.com/SSRYLJRSS/BagerTea_AiMdeias/actions/runs/35965863783)）。其后的仅文档提交 `ca3bd72386f4ad7bbf457210d5f5478720497e48` 在 workflow run `35969019646` 首次尝试的 frontend 单测有一项失败，失败 job 单独复跑后该 run 最终 success；该一次性失败尚未定位根因，不能隐去或视为已修复。但 `main` 当前没有有效分支保护/规则集：branch protection API 返回 `Branch not protected`，仓库 rulesets 与 main 的有效规则均为空；Required checks 尚未被设置为合并硬门禁。
+6. **三端远端门禁**：工作分支代码级 CI 已通过，但 GitHub `main` 尚未启用有效保护规则/Required checks，因此 CI 不是合并阻断硬门禁；最新运行证据见 §2.3，历史失败与复验说明见 §2.4。
 7. **macOS/Linux 真机验收**：当前没有这两类目标设备的验收证据；自动构建成功也不能标记为支持。
 8. **媒体依赖合规**：FFmpeg/HEIF/RAW 相关二进制的来源、对应源码/再分发材料和最终许可义务尚未完成独立复核；HEIF 的三目标归档、解压后静态库 SHA256、源码提交和 LGPL/GPL 许可证摘要已固定并随候选附带，但这不替代法律审查，许可证文本本身不足以解除分发阻塞。
 
@@ -59,13 +59,13 @@
 | 固定五步人工验收 | 操作脚本已纳入 QA 手册 | 仍需 Windows、Apple Silicon、Ubuntu 目标设备逐一执行 |
 | 候选包交付给熟人测试 | 暂不允许 | 完成媒体许可复核，且目标平台核心五步通过后再发知情测试者 |
 
-集成改动已推送到 `origin/codex/platform-integration`。本轮源码/测试清理提交为 `36a5d352af85490f8dc37ed02e3b321be573c208`，对应 [三端 code-gate run 35986278018](https://github.com/SSRYLJRSS/BagerTea_AiMdeias/actions/runs/35986278018) 的 frontend、Linux x64、macOS Apple Silicon、Windows x64 jobs 全部 success。远端 `main` 仍为 `683628ae25feb610fdd84aeb37b036e18187a5fe`，本轮没有创建 PR 或合并。之前在独立临时目录生成的 Windows MSI/NSIS 来自未提交工作树，未安装或分发，不能作为当前提交的候选包。
+集成分支当前 HEAD `a26f8f98b06350a3ced1f32ab181b129da6dcbe9` 的 [三端 code-gate run 35992128310](https://github.com/SSRYLJRSS/BagerTea_AiMdeias/actions/runs/35992128310) 中 frontend、Linux x64、macOS Apple Silicon、Windows x64 jobs 全部 success。最后一次产品源码改动为 `36a5d352af85490f8dc37ed02e3b321be573c208`，其本机门禁与 [run 35986278018](https://github.com/SSRYLJRSS/BagerTea_AiMdeias/actions/runs/35986278018) 也全部通过；之后的提交仅更新文档。远端 `main` 仍为 `683628ae25feb610fdd84aeb37b036e18187a5fe`，未创建 PR 或合并。独立临时目录生成的旧 Windows MSI/NSIS 来自未提交源码树，未安装/分发，不能作为当前候选包。
 
 ### 2.4 当前审计结论与证据边界
 
 - 范围审计以 `main` `683628a`、Windows 快照 `4c2e140` 和平台快照 `b59188a` 为基线。逐路径核对结论：当前差异属于既有 Windows 行为、平台兼容、缺陷修复、回归测试、文档与门禁；未发现无来源的新增产品入口、AI 能力、搜索语法或数据含义。Windows 快照中已有的 SearchIntent V3、AI 图像输入规范化、V25、AI 连接限流和帮助入口不得误判为本轮新增或擅自删除。此结论不等于逐行无缺陷或真机验收通过。
 - 源码清理提交 `36a5d352af85490f8dc37ed02e3b321be573c208` 的本机门禁和三端 code-gate 已通过：前端 709 passed/2 skipped、lint 无 warning；Rust all-features 788 passed/8 ignored；完整 smoke 和 Windows strict media check 通过。远端证据：[code-gate run 35986278018](https://github.com/SSRYLJRSS/BagerTea_AiMdeias/actions/runs/35986278018)。本批未新增产品功能。
-- 未解释的测试信号：较早远端 run 中 `SettingsPage.test.tsx:478` 有一次前端断言失败；定向/完整本机测试通过，失败 job 重跑后 workflow 成功，但根因未定位。该事实保留，不以重跑成功宣称问题已修复。更早的三端依赖、条件编译和平台测试失败已有对应修正提交。
+- workflow run `35969019646` attempt 1 的 `SettingsPage.test.tsx` 失败发生在“初始未修改时不显示未保存状态”断言；日志实际显示该提示元素存在。它紧随本文件内的色条设置测试，而该测试曾留下 800ms 防抖 timer。`36a5d35` 将该前置测试改为假时钟、在本测试中完成防抖保存/回读，并在 `afterEach` 恢复真实时钟；这与失败路径构成具体的跨测试 timer 泄漏解释。修复版该测试文件顺序运行 3 次，均为 37 passed/2 skipped；后续完整前端及三端 run `35992128310` 通过。结论：timer 泄漏是有代码路径支持的根因判断并已做针对性隔离，但历史 attempt 本身未能在修复前稳定重现；若未来复发仍需重新诊断。
 - 当前分支为 `codex/platform-integration`，远端 `main` 仍为 `683628ae25feb610fdd84aeb37b036e18187a5fe`；本轮未创建 PR、未合并、未改保护规则。具体提交和三端门禁状态见 §2.3；Required checks、候选包、三端真机 UAT 与许可复核等未关闭项见 §2.2。自动化通过不等于可发布或平台支持等级已升级。
 
 ## 3. 里程碑
