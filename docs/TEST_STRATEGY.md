@@ -81,12 +81,10 @@ pwsh ./scripts/smoke.ps1
 Windows P0 冒烟由 `.github/workflows/smoke.yml` 执行。三目标代码门的配置位于
 `.github/workflows/code-gate.yml`：前端 typecheck/lint/unit/build 一次，Rust fmt、clippy、tests
 和本机 Tauri 二进制编译分别在 Windows x64、Apple Silicon macOS、Ubuntu 24.04 x64 执行。
-截至本次集成分支复盘，`code-gate.yml` 仍是本地集成工作树中的新增文件，尚未进入默认分支，
-因此尚无 GitHub runner 执行结果；网络 mock 类目标按脚本设计串行重试一次，其他失败不自动忽略。
-本地 YAML/配置和测试成功不等于远端 workflow 已运行，也不等于仓库 Required checks 已生效。
-首次真实 runner 结果和适用于 `main` 的 Required checks 均须单独核实后才能报告为远端门禁。
-截至 2026-09-23，GitHub runner 文档将 `macos-15` 列为 Apple Silicon M1/arm64（public preview）；
-workflow 保留 OS、CPU 架构与 Rust target 断言，首次真实运行仍须确认当前仓库/账号可用性。
+工作流保留 OS、CPU 架构与 Rust target 断言；网络 mock 类目标按脚本设计串行重试一次，其他失败不自动忽略。
+本地测试、远端 workflow 成功和 GitHub Required checks 是不同证据：只有实际生效于 `main` 的规则
+才构成合并阻断门禁。当前 workflow 所在分支、已执行结果和 `main` 规则状态只记录在
+[PROJECT_PLAN.md](PROJECT_PLAN.md)，不在此处复制易过时的运行状态。
 参见 [GitHub-hosted runners reference](https://docs.github.com/en/actions/reference/runners/github-hosted-runners)。
 
 ## 5. 定向测试要求
@@ -155,12 +153,12 @@ workflow 保留 OS、CPU 架构与 Rust target 断言，首次真实运行仍须
 
 ## 8. CI 与候选包
 
-目标配置是在 push/PR 到 `main` 时并行执行 Windows P0 smoke 与三目标 code-gate。当前集成工作树的
-`code-gate.yml` 尚未进入默认分支，因此这只是待验证配置，不是当前已生效的三端远端门禁。
-工作流进入默认分支后，Windows、Apple Silicon macOS 和 Ubuntu 24.04 x64 任一受支持 runner 的编译
-或测试失败都应阻止合并；只有有期限、恢复条件和责任人的基础设施临时豁免可以例外，不能设置永久
-`continue-on-error`。首次真实 workflow 运行后，仓库管理员还须将 `smoke` 与 code-gate 的必要 job
-配置为 `main` Required checks，并只读核实规则实际适用于 `main`。
+目标配置是在 push/PR 到 `main` 时并行执行 Windows P0 smoke 与三目标 code-gate。工作流进入默认分支后，
+Windows、Apple Silicon macOS 和 Ubuntu 24.04 x64 任一受支持 runner 的编译或测试失败都应阻止合并；
+只有有期限、恢复条件和责任人的基础设施临时豁免可以例外，不能设置永久 `continue-on-error`。
+仓库管理员还须将 `smoke` 与 code-gate 的必要 job 配置为 `main` Required checks，并只读核实规则
+实际适用于 `main`。当前工作流是否已进入默认分支、远端结果和 Required checks 生效状态见
+[PROJECT_PLAN.md](PROJECT_PLAN.md)。
 
 `.github/workflows/release-candidate.yml` 仅允许手动运行，从同一个 workflow commit 分别打包三个
 目标；收集前必须断言当前 `HEAD` 等于 workflow commit，且源码工作树没有已跟踪或未跟踪改动，避免
