@@ -28,8 +28,7 @@ use common::{HttpResponse, MockServer, RecordedRequest};
 /// - "error sending request"：reqwest 发送/连接阶段失败
 /// - "connection closed" / "os error 10053/10054"：对端中止/重置（WSAECONNABORTED/RESET）
 /// - "error decoding response body" / "error reading a body"：响应在传输中被中止
-/// - "io_failures="：服务器侧读请求失败计数（请求到达但连接中断；任何断言消息中
-///   出现该字段都视为环境噪声——若为正常 0 值则测试不会失败到此处）
+/// - "io_failures=N" 且 N > 0：服务器侧读请求失败计数（请求到达但连接中断）
 ///
 /// 其余错误（5xx、解析失败、业务错误）不属于连接层特征，不会触发重试。
 fn is_conn_err_text(s: &str) -> bool {
@@ -39,7 +38,13 @@ fn is_conn_err_text(s: &str) -> bool {
         || s.contains("os error 10054")
         || s.contains("error decoding response body")
         || s.contains("error reading a body")
-        || s.contains("io_failures=")
+        || s.match_indices("io_failures=").any(|(index, _)| {
+            s[index + "io_failures=".len()..]
+                .split(|ch: char| !ch.is_ascii_digit())
+                .next()
+                .and_then(|value| value.parse::<usize>().ok())
+                .is_some_and(|count| count > 0)
+        })
 }
 
 /// Windows 本地回环瞬态连接失败（mock + reqwest blocking 大 body POST 实测
@@ -382,7 +387,14 @@ conn_retry_test!(empty_subject_is_repaired_once, {
     let sug = ai::list_suggestions(&dbm.lock().unwrap(), batch.id)?;
     assert_eq!(
         sug[0].suggested_tags.get("subject"),
-        Some(&vec!["城市建筑".to_string()])
+        Some(&vec!["城市建筑".to_string()]),
+        "status={} error={:?} calls={} accepts={} io_failures={} requests={}",
+        sug[0].status,
+        sug[0].last_error,
+        calls.load(Ordering::SeqCst),
+        srv.accepts(),
+        srv.io_failures(),
+        srv.requests().len(),
     );
     assert_eq!(calls.load(Ordering::SeqCst), 2, "主体为空应只补调一次");
     Ok(())
