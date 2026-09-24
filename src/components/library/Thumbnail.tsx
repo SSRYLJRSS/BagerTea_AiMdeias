@@ -1,6 +1,6 @@
 /** 双层缩略图：占位图立即显示，进入可见区后按需生成高清（PRD R-01）。
  *  §9.2/§9.3：高清 URL 走模块级缓存（虚拟滚动重挂载不复位、不重复淡入）；
- *  组件用 generation 做代际保护，卸载/切张后旧 Promise 不更新当前素材。
+ *  异步请求按 effect 清理标记隔离，卸载/切张后旧 Promise 不更新当前素材。
  */
 import { memo, useEffect, useRef, useState } from "react";
 import { toFileUrl } from "@/api/thumbnail";
@@ -31,9 +31,6 @@ export default memo(function Thumbnail({ assetId, placeholderPath, alt, size, fi
   );
   const [placeholderFailed, setPlaceholderFailed] = useState(false); // B27：占位图加载失败标记
 
-  // §9.3：代际保护——每次 assetId/size 变化或卸载都推进 generation，旧 Promise 不得写状态/缓存
-  const gen = useRef(0);
-
   // 占位图路径后到时补转 URL（入库刚完成的行）
   useEffect(() => {
     if (!placeholderUrl && placeholderPath) setPlaceholderUrl(toFileUrl(placeholderPath));
@@ -42,14 +39,17 @@ export default memo(function Thumbnail({ assetId, placeholderPath, alt, size, fi
   // B27：占位图加载失败 → 触发 hd 生成（原逻辑 hd 只在 hdUrl 为 null 时触发，现补充占位图失败也触发）
   useEffect(() => {
     if (placeholderFailed && !hdUrl) {
-      const my = ++gen.current;
+      let active = true;
       requestThumbnail(assetId, "hd", size)
         .then((url) => {
-          if (gen.current !== my) return;
+          if (!active) return;
           setHdUrl(url);
           setHdReady(true);
         })
         .catch(() => undefined);
+      return () => {
+        active = false;
+      };
     }
   }, [placeholderFailed, hdUrl, assetId, size]);
 
@@ -57,14 +57,14 @@ export default memo(function Thumbnail({ assetId, placeholderPath, alt, size, fi
   useEffect(() => {
     const el = rootRef.current;
     if (!el || hdUrl) return;
-    const my = ++gen.current;
+    let active = true;
     const io = new IntersectionObserver(
       (entries) => {
-        if (entries.some((e) => e.isIntersecting)) {
+        if (active && entries.some((e) => e.isIntersecting)) {
           io.disconnect();
           requestThumbnail(assetId, "hd", size)
             .then((url) => {
-              if (gen.current !== my) return;
+              if (!active) return;
               setHdUrl(url);
               setHdReady(true);
             })
@@ -76,7 +76,7 @@ export default memo(function Thumbnail({ assetId, placeholderPath, alt, size, fi
     io.observe(el);
     return () => {
       io.disconnect();
-      gen.current++;
+      active = false;
     };
   }, [assetId, hdUrl, size]);
 

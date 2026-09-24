@@ -15,7 +15,7 @@ use bagertea_ai_media_v2_lib::db::ai::{self, AiSuggestion};
 use bagertea_ai_media_v2_lib::db::settings::{AiSettings, ApiProfile};
 use bagertea_ai_media_v2_lib::db::tag_facets::FacetPromptContext;
 use bagertea_ai_media_v2_lib::db::{self, assets};
-use bagertea_ai_media_v2_lib::error::AppResult;
+use bagertea_ai_media_v2_lib::error::{AppError, AppResult};
 use bagertea_ai_media_v2_lib::services::thumbnail::ThumbnailService;
 use bagertea_ai_media_v2_lib::services::{ai_cloud, importer};
 use bagertea_ai_media_v2_lib::state::Database;
@@ -28,11 +28,12 @@ use common::{HttpResponse, MockServer, RecordedRequest};
 /// - "error sending request"：reqwest 发送/连接阶段失败
 /// - "connection closed" / "os error 10053/10054"：对端中止/重置（WSAECONNABORTED/RESET）
 /// - "error decoding response body" / "error reading a body"：响应在传输中被中止
-/// - "io_failures=N" 且 N > 0：服务器侧读请求失败计数（请求到达但连接中断）
+/// - "io_failures=N" 且 N > 0：服务器侧请求/响应处理失败计数（连接到达但 IO 未完成）
 ///
 /// 其余错误（5xx、解析失败、业务错误）不属于连接层特征，不会触发重试。
 fn is_conn_err_text(s: &str) -> bool {
-    s.contains("error sending request")
+    s.contains("无法连接服务，请检查服务地址或网络")
+        || s.contains("error sending request")
         || s.contains("connection closed")
         || s.contains("os error 1005")
         || s.contains("os error 10054")
@@ -500,9 +501,13 @@ conn_retry_test!(empty_tags_marks_rejected_and_batch_continues, {
     assert_eq!(
         sug[1].suggested_tags.get("scene"),
         Some(&vec!["海边".to_string()]),
-        "第 2 条建议未收到标签：status={} last_error={:?}",
+        "第 2 条建议未收到标签：status={} last_error={:?} calls={} accepts={} io_failures={} requests={:?}",
         sug[1].status,
         sug[1].last_error,
+        calls.load(Ordering::SeqCst),
+        srv.accepts(),
+        srv.io_failures(),
+        srv.request_summaries(),
     );
     Ok(())
 });
@@ -670,7 +675,7 @@ conn_retry_test!(limit_two_then_resume_rest, {
         "第一轮应只有 2 次请求：accepts={} io_failures={} requests={:?}",
         srv.accepts(),
         srv.io_failures(),
-        srv.requests(),
+        srv.request_summaries(),
     );
 
     // 第二轮：续跑剩余 3 条（F15a 修复后不重复处理前 2 条）
@@ -710,7 +715,7 @@ conn_retry_test!(limit_two_then_resume_rest, {
         "两轮合计应 5 次请求：accepts={} io_failures={} requests={:?}",
         srv.accepts(),
         srv.io_failures(),
-        srv.requests(),
+        srv.request_summaries(),
     );
     assert_eq!(
         calls.load(Ordering::SeqCst),
@@ -756,7 +761,7 @@ conn_retry_test!(no_pending_run_errors_with_clear_message, {
         "accepts={} io_failures={} requests={:?}",
         srv.accepts(),
         srv.io_failures(),
-        srv.requests(),
+        srv.request_summaries(),
     );
 
     // 确认掉唯一一条 → 无待打标项
@@ -837,7 +842,7 @@ conn_retry_test!(resume_after_cancel_skips_generated, {
         "accepts={} io_failures={} requests={:?}",
         srv.accepts(),
         srv.io_failures(),
-        srv.requests(),
+        srv.request_summaries(),
     );
 
     // 第二轮：续跑跳过第 1 张（已有候选），只处理 2、3 张
@@ -888,7 +893,14 @@ conn_retry_test!(list_models_parses_openai_response, {
             r#"{"object":"list","data":[{"id":"qwen-vl-plus"},{"id":"qwen-vl-max"}]}"#,
         )
     });
-    let models = ai_cloud::discover_models(&srv.url(), "k", "openai_chat", false)?;
+    let models = ai_cloud::discover_models(&srv.url(), "k", "openai_chat", false).map_err(|e| {
+        AppError::msg(format!(
+            "{e}; mock accepts={} io_failures={} requests={:?}",
+            srv.accepts(),
+            srv.io_failures(),
+            srv.request_summaries(),
+        ))
+    })?;
     // discover_models 去重 + 大小写不敏感排序（qwen-vl-max < qwen-vl-plus）
     assert_eq!(models, vec!["qwen-vl-max", "qwen-vl-plus"]);
     let reqs = srv.requests();

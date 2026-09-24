@@ -6,7 +6,7 @@
  *  - 加载失败后点击重试会再次调用 load，成功后进入表单。
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { render, screen, waitFor, fireEvent } from "@testing-library/react";
+import { act, render, screen, waitFor, fireEvent } from "@testing-library/react";
 import { StrictMode as ReactStrictMode } from "react";
 import SettingsPage from "@/pages/SettingsPage";
 import { useSettingsStore } from "@/stores/settingsStore";
@@ -289,11 +289,13 @@ describe("SettingsPage §6.1 信息架构", () => {
     expect(screen.queryByText("入库网格显示")).toBeNull();
     expect(screen.getByText("色条高度")).toBeInTheDocument();
 
-    // 点击总开关 → draft 关闭 + pushPreview（commitAppearanceDebounced）被调用
+    // 点击总开关 → draft 关闭 + pushPreview（commitAppearanceDebounced）被调用。
+    // 使用假时钟并在本测试内完成防抖保存，避免模块级 timer 的回读请求泄漏到后续测试。
+    vi.useFakeTimers();
     const previewSpy = vi.spyOn(useSettingsStore.getState(), "commitAppearanceDebounced");
     const master = fieldSwitch("显示算法主色色条");
     fireEvent.click(master);
-    await waitFor(() => expect(previewSpy).toHaveBeenCalled());
+    expect(previewSpy).toHaveBeenCalledTimes(1);
     // 关闭后位置/样式行整体不渲染（条件渲染，不是 disabled）；状态行（色条数据）仍可见
     expect(screen.queryByText("素材库卡片显示")).toBeNull();
     expect(screen.queryByText("大图浏览显示")).toBeNull();
@@ -301,7 +303,15 @@ describe("SettingsPage §6.1 信息架构", () => {
     expect(screen.getByText("色条数据")).toBeInTheDocument();
     // 再打开恢复渲染（折叠保持展开状态）
     fireEvent.click(fieldSwitch("显示算法主色色条"));
-    await waitFor(() => expect(screen.getByText("素材库卡片显示")).toBeInTheDocument());
+    expect(screen.getByText("素材库卡片显示")).toBeInTheDocument();
+    expect(previewSpy).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(800);
+    });
+    expect(vi.mocked(saveSettings)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(getSettings)).toHaveBeenCalledTimes(1);
+    expect(useSettingsStore.getState().saving).toBe(false);
   });
 
   it("AI 子页「自动打标」只显示「此功能使用的服务」+ 功能参数，不再重复服务管理列表", async () => {
@@ -397,6 +407,7 @@ describe("SettingsPage AI 打标审核流程", () => {
 });
 
 afterEach(() => {
+  vi.useRealTimers();
   vi.restoreAllMocks();
 });
 
@@ -419,6 +430,7 @@ describe("SettingsPage 加载与 Hook 安全", () => {
 
     await waitFor(() => expect(screen.getByText(/设置加载失败：后端未连接/)).toBeInTheDocument());
     expect(useSettingsStore.getState().loadError).toBe("后端未连接");
+    expect(vi.mocked(getSettings)).toHaveBeenCalledTimes(1);
 
     fireEvent.click(screen.getByRole("button", { name: /重试/ }));
     await waitFor(() => expect(screen.getByText("保存设置")).toBeInTheDocument());

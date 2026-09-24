@@ -33,15 +33,16 @@ function defaultTab(a: Asset): Tab {
 }
 
 export default function AssetInfoPanel({ asset, onRefreshed }: { asset: Asset; onRefreshed?: (asset: Asset) => void }) {
+  const assetDefaultTab = defaultTab(asset);
   const [activeTab, setActiveTab] = useState<Tab>(() => defaultTab(asset));
   const [rescanning, setRescanning] = useState(false);
   const [rescanMsg, setRescanMsg] = useState<string | null>(null);
 
   // 切张时按素材类型重置默认标签（手动选择在本次会话内保留到切张）
   useEffect(() => {
-    setActiveTab(defaultTab(asset));
+    setActiveTab(assetDefaultTab);
     setRescanMsg(null);
-  }, [asset.id]);
+  }, [asset.id, assetDefaultTab]);
 
   const common = useMemo(() => buildCommonFields(asset), [asset]);
   const image = useMemo(() => buildImageFields(asset), [asset]);

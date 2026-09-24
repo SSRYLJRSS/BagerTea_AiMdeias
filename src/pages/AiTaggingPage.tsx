@@ -288,10 +288,12 @@ export default function AiTaggingPage() {
 
   // FB5-05（§7.6）：当前张审核中的一句话描述（切张重置：确认值 → 素材当前值 → 建议值）
   const [draftDescription, setDraftDescription] = useState("");
+  const reviewDescription = currentSuggestion ? pickReviewDescription(currentSuggestion) : null;
+  const currentSuggestionStatus = currentSuggestion?.status;
   useEffect(() => {
-    if (!currentSuggestion) return;
-    setDraftDescription(pickReviewDescription(currentSuggestion));
-  }, [currentSuggestion?.id, currentSuggestion?.status, currentSuggestion?.confirmedDescription, currentSuggestion?.suggestedDescription, currentSuggestion?.currentDescription]);
+    if (reviewDescription === null) return;
+    setDraftDescription(reviewDescription);
+  }, [currentSuggestionId, currentSuggestionStatus, reviewDescription]);
 
   // 胶片条多选（批量套用用，按 assetId）
   const [selectedAssets, setSelectedAssets] = useState<Set<number>>(new Set());

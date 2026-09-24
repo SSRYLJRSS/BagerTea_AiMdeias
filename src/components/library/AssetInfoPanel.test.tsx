@@ -57,6 +57,18 @@ describe("AssetInfoPanel 媒体属性重读", () => {
     expect(screen.getByText("未读取")).toBeInTheDocument(); // 缺失字段语义
   });
 
+  it("同一素材对象刷新保留手动标签；切换素材后恢复类型默认标签", () => {
+    const view = render(<AssetInfoPanel asset={mkVideo()} />);
+    fireEvent.click(screen.getByRole("button", { name: "通用" }));
+    expect(screen.getByRole("button", { name: "通用" })).toHaveClass("font-medium");
+
+    view.rerender(<AssetInfoPanel asset={mkVideo({ fileSize: 2048 })} />);
+    expect(screen.getByRole("button", { name: "通用" })).toHaveClass("font-medium");
+
+    view.rerender(<AssetInfoPanel asset={mkVideo({ id: 2 })} />);
+    expect(screen.getByRole("button", { name: "视频" })).toHaveClass("font-medium");
+  });
+
   it("点击「重新读取」调用 rescan + getAsset 并回调 onRefreshed", async () => {
     const onRefreshed = vi.fn();
     render(<AssetInfoPanel asset={mkVideo()} onRefreshed={onRefreshed} />);

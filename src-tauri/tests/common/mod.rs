@@ -87,7 +87,7 @@ pub struct MockServer {
     /// 仅 ai_service_integration 读取；其它测试 target 编译时属 unreachable 字段 → allow
     #[allow(dead_code)]
     accepts: Arc<std::sync::atomic::AtomicUsize>,
-    /// 请求头/体读取失败的连接数（连接到了但解析失败）；同上仅 ai 集成测试读取
+    /// 已接收但请求/响应处理失败的连接数；同上仅 ai 集成测试读取
     #[allow(dead_code)]
     io_failures: Arc<std::sync::atomic::AtomicUsize>,
     stop: Arc<std::sync::atomic::AtomicBool>,
@@ -129,14 +129,22 @@ impl MockServer {
                 match listener.accept() {
                     Ok((stream, _)) => {
                         accepts2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        // Listener 为轮询关闭而设为 nonblocking；显式把已接收连接设回阻塞，
+                        // 避免 HTTP 请求分段到达时 read_line/read_exact 提前返回 WouldBlock。
+                        let stream_ready = stream.set_nonblocking(false).is_ok();
                         // 连接处理内任何 panic 都不得杀死 accept 循环：
                         // 服务器线程一旦死亡，后续所有请求都会连接失败（“error sending request”），
                         // 这是偶发失败的机制性根源之一
-                        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            if !handle_connection(stream, &handler, &log_accept) {
-                                io_failures2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                            }
-                        }));
+                        let handled = stream_ready
+                            && matches!(
+                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    handle_connection(stream, &handler, &log_accept)
+                                })),
+                                Ok(true)
+                            );
+                        if !handled {
+                            io_failures2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        }
                     }
                     Err(_) => {
                         // WouldBlock 或瞬态错误一律容忍继续；stop 后退出
@@ -168,6 +176,22 @@ impl MockServer {
         self.log.lock().unwrap().clone()
     }
 
+    /// 紧凑的失败诊断摘要；避免断言失败时把可能很大的请求体写进测试日志。
+    #[allow(dead_code)]
+    pub fn request_summaries(&self) -> Vec<String> {
+        self.requests()
+            .iter()
+            .map(|request| {
+                format!(
+                    "{} {} body_bytes={}",
+                    request.method,
+                    request.path,
+                    request.body.len()
+                )
+            })
+            .collect()
+    }
+
     /// 已 accept 的连接总数（含解析失败者）——与 requests().len() 对比可区分
     /// 「请求未到达」（accepts < 预期）与「到达但 IO 失败」（io_failures > 0）。
     /// 仅 ai_service_integration 使用（其它 target 视为死代码）→ allow
@@ -176,7 +200,7 @@ impl MockServer {
         self.accepts.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// 读请求头/体失败的连接数；同上仅 ai 集成测试使用
+    /// 请求/响应处理失败的连接数；同上仅 ai 集成测试使用
     #[allow(dead_code)]
     pub fn io_failures(&self) -> usize {
         self.io_failures.load(std::sync::atomic::Ordering::SeqCst)
@@ -186,7 +210,7 @@ impl MockServer {
 /// 单个连接的服务：读一个请求 → 返回一个响应 → 关闭连接。
 /// 只服务一个请求（Connection: close + shutdown），避免 keep-alive 复用时序竞态
 /// （实测：Windows + reqwest blocking 连接池复用下仍有偶发 send error，单请求即关最稳）。
-/// 返回是否成功读到并记录了请求（false = 连接/解析失败，计入 io_failures）
+/// 返回是否成功读写请求/响应（false = 连接、解析、响应写入失败，计入 io_failures）
 fn handle_connection<F>(
     mut stream: std::net::TcpStream,
     handler: &F,
@@ -206,11 +230,11 @@ where
                 l.push(req.clone());
             }
             let resp = handler(&req);
-            let _ = write_response(&mut stream, &resp);
+            let response_written = write_response(&mut stream, &resp).is_ok();
             // 只关写方向发 FIN；不 drain（drain 会阻塞 accept 循环等待对端 FIN，
             // 拖死后续请求；等待由对端 close 自行收尾）
             let _ = stream.shutdown(std::net::Shutdown::Write);
-            true
+            response_written
         }
         Err(_) => {
             // 解析失败：关闭连接（等价于流式中断）

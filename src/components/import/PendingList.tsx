@@ -167,6 +167,7 @@ interface PendingItemProps {
 /** §10 PendingItem：relative + 封面 absolute inset-0 + 视频层仅 active 挂载 + 角标 + 文件名 */
 function PendingItem({ item, running, onRemove, onOpenItem }: PendingItemProps) {
   const hover = useHoverIntent({ disabled: running });
+  const cancelHover = hover.cancel;
   // FB2-02（§9.4）：入库网格卡片比例与填充沿用 appearance.grid（决策 4：一个设置管两页）
   const { grid } = useAppearance();
   const aspectCSS = ASPECT_CSS[grid.cellAspect] ?? ASPECT_CSS["1:1"];
@@ -180,8 +181,8 @@ function PendingItem({ item, running, onRemove, onOpenItem }: PendingItemProps) 
   );
   // 入库开始：强制释放预览（视频层卸载 + pause）
   useEffect(() => {
-    if (running) hover.cancel();
-  }, [running, hover.cancel]);
+    if (running) cancelHover();
+  }, [running, cancelHover]);
 
   const isVideo = item.kind === "video";
 

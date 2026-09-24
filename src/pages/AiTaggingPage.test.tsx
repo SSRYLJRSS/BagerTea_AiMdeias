@@ -6,7 +6,7 @@
  *  - 底部全局任务条不出现「AI 打标中」胶囊（taskStore 已移除 AI 订阅），入库/导出不受影响。
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { act, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen } from "@testing-library/react";
 import AiTaggingPage from "@/pages/AiTaggingPage";
 import BottomBar from "@/components/layout/BottomBar";
 import { useAiStore } from "@/stores/aiStore";
@@ -293,5 +293,27 @@ describe("AiTaggingPage 进度唯一化（FB6 需求一）", () => {
     rerender(<AiTaggingPage />);
     expect(screen.queryByText(/打标结束/)).not.toBeInTheDocument();
     expect(screen.queryByRole("progressbar")).not.toBeInTheDocument();
+  });
+});
+
+describe("AiTaggingPage 一句话描述草稿同步", () => {
+  it("忽略建议对象的无关更新；有效描述变化时按优先级重置草稿", () => {
+    const suggestion = { ...mkSuggestion(1, 101), suggestedDescription: "初始建议" };
+    useAiStore.setState({ batches: [mkBatch({ total: 1 })], currentBatchId: 1, suggestions: [suggestion] });
+    render(<AiTaggingPage />);
+
+    const input = screen.getByRole("textbox", { name: "一句话描述" });
+    expect(input).toHaveValue("初始建议");
+    fireEvent.change(input, { target: { value: "用户正在编辑" } });
+
+    act(() => {
+      useAiStore.setState({ suggestions: [{ ...suggestion, lastError: "无关字段更新" }] });
+    });
+    expect(screen.getByRole("textbox", { name: "一句话描述" })).toHaveValue("用户正在编辑");
+
+    act(() => {
+      useAiStore.setState({ suggestions: [{ ...suggestion, suggestedDescription: "更新建议" }] });
+    });
+    expect(screen.getByRole("textbox", { name: "一句话描述" })).toHaveValue("更新建议");
   });
 });

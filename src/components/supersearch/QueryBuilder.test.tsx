@@ -1050,7 +1050,7 @@ describe("Phase 4 · 数值输入统一", () => {
     clickMustFirstCondition();
     pickField(label);
   }
-  function leafFilter(): any {
+  function leafFilter() {
     const e = useSuperSearchStore.getState().expr;
     if (!e || e.op !== "leaf" || e.cond.type !== "metadata") return undefined;
     return e.cond.filter;
