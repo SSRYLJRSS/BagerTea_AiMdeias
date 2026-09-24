@@ -59,14 +59,14 @@
 | 固定五步人工验收 | 操作脚本已纳入 QA 手册 | 仍需 Windows、Apple Silicon、Ubuntu 目标设备逐一执行 |
 | 候选包交付给熟人测试 | 暂不允许 | 完成媒体许可复核，且目标平台核心五步通过后再发知情测试者 |
 
-最近已完成的 source code gate 是源码提交 `36a5d352af85490f8dc37ed02e3b321be573c208` 的 [run 35986278018](https://github.com/SSRYLJRSS/BagerTea_AiMdeias/actions/runs/35986278018)；最近一次文档 HEAD `952e0d5` 的 [run 35996481530](https://github.com/SSRYLJRSS/BagerTea_AiMdeias/actions/runs/35996481530) 也由 frontend、Linux x64、macOS Apple Silicon、Windows x64 jobs 全部通过。当前 follow-up 仅调整 `SettingsPage.test.tsx` 的异步测试等待，不改产品行为；其本地门禁结果见 §2.4，推送后需按新 SHA 核对远端 workflow。远端 `main` 仍为 `683628ae25feb610fdd84aeb37b036e18187a5fe`，未创建 PR 或合并。旧 Windows MSI/NSIS 来自未提交工作树，未安装/分发，不能作为当前候选包。
+最新已完成的 source code gate 是源码提交 `fd319ebcfc551b791664fa69eccfc1512faf7be3` 的 [run 36000987683](https://github.com/SSRYLJRSS/BagerTea_AiMdeias/actions/runs/36000987683)：frontend、Linux x64、macOS Apple Silicon、Windows x64 四个 jobs 全部通过。前序源码提交 `36a5d352af85490f8dc37ed02e3b321be573c208` 的 [run 35986278018](https://github.com/SSRYLJRSS/BagerTea_AiMdeias/actions/runs/35986278018) 和文档 HEAD `952e0d5` 的 [run 35996481530](https://github.com/SSRYLJRSS/BagerTea_AiMdeias/actions/runs/35996481530) 也均通过。`fd319eb` 只调整 `SettingsPage.test.tsx` 的异步测试等待，不改产品行为；该 follow-up 的本地门禁结果见 §2.4。远端 `main` 仍为 `683628ae25feb610fdd84aeb37b036e18187a5fe`，未创建 PR 或合并。旧 Windows MSI/NSIS 来自未提交工作树，未安装/分发，不能作为当前候选包。
 
 ### 2.4 当前审计结论与证据边界
 
 - 范围审计以 `main` `683628a`、Windows 快照 `4c2e140` 和平台快照 `b59188a` 为基线。逐路径核对结论：当前差异属于既有 Windows 行为、平台兼容、缺陷修复、回归测试、文档与门禁；未发现无来源的新增产品入口、AI 能力、搜索语法或数据含义。Windows 快照中已有的 SearchIntent V3、AI 图像输入规范化、V25、AI 连接限流和帮助入口不得误判为本轮新增或擅自删除。此结论不等于逐行无缺陷或真机验收通过。
 - 源码清理提交 `36a5d352af85490f8dc37ed02e3b321be573c208` 的本机门禁和三端 code-gate 已通过：前端 709 passed/2 skipped、lint 无 warning；Rust all-features 788 passed/8 ignored；完整 smoke 和 Windows strict media check 通过。远端证据：[code-gate run 35986278018](https://github.com/SSRYLJRSS/BagerTea_AiMdeias/actions/runs/35986278018)。本批未新增产品功能。
 - workflow run `35969019646` attempt 1 的 `SettingsPage.test.tsx` 失败发生在“初始未修改时不显示未保存状态”断言；日志实际显示该提示元素存在。它紧随本文件内的色条设置测试，而该测试曾留下 800ms 防抖 timer。`36a5d35` 将该前置测试改为假时钟、在本测试中完成防抖保存/回读，并在 `afterEach` 恢复真实时钟；这与失败路径构成具体的跨测试 timer 泄漏解释。修复版该测试文件顺序运行 3 次，均为 37 passed/2 skipped；后续完整前端及三端 run `35992128310` 通过。结论：timer 泄漏是有代码路径支持的根因判断并已做针对性隔离，但历史 attempt 本身未能在修复前稳定重现；若未来复发仍需重新诊断。
-- 本次进一步发现同一测试文件的另一个异步测试隔离问题：AI 自动打标测试切页后未等待 `UsageBindingLine` 的绑定加载，单项运行出现 3 条 React `act` 警告。测试现等待已有的“此功能使用的服务”行，不更改生产组件；单项通过、整份文件连续 3 次均 37 passed/2 skipped 且无该警告。`typecheck`、`lint`、`test:tooling`（15/15）、完整前端单测（709 passed/2 skipped）和 `npm run build` 均通过；build 仍有既有约 664 kB JS chunk 体积提示，未做无关拆包。该 follow-up 的三端远端结果须以新 SHA 的 CI 为准。
+- 本次进一步发现同一测试文件的另一个异步测试隔离问题：AI 自动打标测试切页后未等待 `UsageBindingLine` 的绑定加载，单项运行出现 3 条 React `act` 警告。测试现等待已有的“此功能使用的服务”行，不更改生产组件；单项通过、整份文件连续 3 次均 37 passed/2 skipped 且无该警告。`typecheck`、`lint`、`test:tooling`（15/15）、完整前端单测（709 passed/2 skipped）和 `npm run build` 均通过；build 仍有既有约 664 kB JS chunk 体积提示，未做无关拆包。对应源码提交 `fd319ebcfc551b791664fa69eccfc1512faf7be3` 的 [三端 code-gate run 36000987683](https://github.com/SSRYLJRSS/BagerTea_AiMdeias/actions/runs/36000987683) 已全部通过。
 - 当前分支为 `codex/platform-integration`，远端 `main` 仍为 `683628ae25feb610fdd84aeb37b036e18187a5fe`；本轮未创建 PR、未合并、未改保护规则。具体提交和三端门禁状态见 §2.3；Required checks、候选包、三端真机 UAT 与许可复核等未关闭项见 §2.2。自动化通过不等于可发布或平台支持等级已升级。
 
 ## 3. 里程碑
@@ -165,7 +165,7 @@
 | P1 429 回归调查 | 已完成（未复现） | `ai_adversarial_sim::http_429_stops_batch_and_preserves_pending` 曾出现预期 pending、实际 rejected；随后单项、默认并行 3 次和全量 Rust 测试通过，但根因未知，不宣称已修复。 |
 | P2 平台与数据安全 | 代码复核完成 | 既有平台差异、安全路径和回归修正已纳入当前集成；目标设备人工验收仍按 §2.2 未关闭。 |
 | P3 规范和文档收口 | 已完成 | 本地 lint 无 warning；权威文档只记录当前行为、证据和开放门禁。 |
-| P4 同一源码验证 | 前一产品源码提交 `36a5d35` 已完成全本机与三端门禁；当前 follow-up 仅为 SettingsPage 测试夹具修改，typecheck、lint、tooling、完整前端单测和 build 均本地通过 | 推送后需验证该新提交对应的三端 workflow；不得沿用旧 SHA 的 CI 结果。 |
+| P4 同一源码验证 | 当前源码提交 `fd319ebcfc551b791664fa69eccfc1512faf7be3` 的本机门禁已通过，且同一 SHA 的 frontend、Windows x64、macOS Apple Silicon、Linux x64 远端 code-gate 全绿 | 已完成代码级验证；CI 不是 `main` 的 Required check，且不替代候选产物、真机 UAT 和许可审查。 |
 | P5 主线合并与候选验收 | 暂停在授权边界 | 用户要求暂不合并 `main`。Required checks、候选包、三端真机 UAT、安装包 manifest 实产和媒体许可复核均未完成；需分别满足授权与证据条件后再继续。 |
 
 本阶段结束不代表项目可发布。下一步仅处理 §2.2 中的证据缺口；不得由 AI 自动启动新功能、创建 PR、配置保护规则、合并、安装或分发。
