@@ -3,17 +3,134 @@
 //! T04 修订：db / import_cancel 改 Arc，长任务命令 spawn_blocking 时可 Move 进工作线程
 
 use std::collections::HashMap;
+use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use rusqlite::Connection;
 
 use crate::db::schema_features::SchemaFeatureStatus;
 use crate::services::ollama_runtime::OllamaRuntimeState;
 
+/// Database connection access is serialized with a lifecycle gate.
+/// Ordinary callers take a shared lifecycle lease plus the connection mutex;
+/// restore/reset maintenance takes the exclusive lease and may release the
+/// connection mutex while doing filesystem work without exposing a half-swapped DB.
+pub struct Database {
+    lifecycle: RwLock<()>,
+    connection: Mutex<Connection>,
+    blocked: AtomicBool,
+}
+
+impl Database {
+    pub fn new(connection: Connection) -> Self {
+        Self {
+            lifecycle: RwLock::new(()),
+            connection: Mutex::new(connection),
+            blocked: AtomicBool::new(false),
+        }
+    }
+
+    pub fn lock(&self) -> crate::error::AppResult<DbConnectionGuard<'_>> {
+        let lifecycle = self
+            .lifecycle
+            .read()
+            .map_err(|_| crate::error::AppError::msg("数据库生命周期锁中毒"))?;
+        if self.blocked.load(Ordering::Acquire) {
+            return Err(crate::error::AppError::internal(
+                "数据库恢复未完成，已暂停所有数据库操作。请按错误提示恢复备份或重启应用。",
+            ));
+        }
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| crate::error::AppError::msg("数据库锁中毒"))?;
+        Ok(DbConnectionGuard {
+            _lifecycle: lifecycle,
+            connection,
+        })
+    }
+
+    pub fn maintenance(&self) -> crate::error::AppResult<DatabaseMaintenanceGuard<'_>> {
+        let lifecycle = self
+            .lifecycle
+            .write()
+            .map_err(|_| crate::error::AppError::msg("数据库生命周期锁中毒"))?;
+        Ok(DatabaseMaintenanceGuard {
+            database: self,
+            _lifecycle: lifecycle,
+        })
+    }
+}
+
+pub struct DbConnectionGuard<'a> {
+    _lifecycle: RwLockReadGuard<'a, ()>,
+    connection: MutexGuard<'a, Connection>,
+}
+
+impl Deref for DbConnectionGuard<'_> {
+    type Target = Connection;
+
+    fn deref(&self) -> &Self::Target {
+        &self.connection
+    }
+}
+
+impl DerefMut for DbConnectionGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.connection
+    }
+}
+
+/// Exclusive lifecycle lease. The inner connection mutex is held only for
+/// checkpoint/close or connection replacement, never across file IO.
+pub struct DatabaseMaintenanceGuard<'a> {
+    database: &'a Database,
+    _lifecycle: RwLockWriteGuard<'a, ()>,
+}
+
+impl DatabaseMaintenanceGuard<'_> {
+    pub fn block_access(&self) {
+        self.database.blocked.store(true, Ordering::Release);
+    }
+
+    pub fn with_connection<T>(
+        &self,
+        f: impl FnOnce(&Connection) -> crate::error::AppResult<T>,
+    ) -> crate::error::AppResult<T> {
+        let connection = self
+            .database
+            .connection
+            .lock()
+            .map_err(|_| crate::error::AppError::msg("数据库锁中毒"))?;
+        f(&connection)
+    }
+
+    pub fn take_connection(&self) -> crate::error::AppResult<Connection> {
+        let placeholder = Connection::open_in_memory()
+            .map_err(|e| crate::error::AppError::msg(format!("占位连接创建失败: {e}")))?;
+        let mut current = self
+            .database
+            .connection
+            .lock()
+            .map_err(|_| crate::error::AppError::msg("数据库锁中毒"))?;
+        Ok(std::mem::replace(&mut *current, placeholder))
+    }
+
+    pub fn replace_connection(&self, connection: Connection) -> crate::error::AppResult<()> {
+        let mut current = self
+            .database
+            .connection
+            .lock()
+            .map_err(|_| crate::error::AppError::msg("数据库锁中毒"))?;
+        *current = connection;
+        Ok(())
+    }
+}
+
 pub struct AppState {
-    pub db: Arc<Mutex<Connection>>,
+    pub db: Arc<Database>,
     /// 应用数据目录（$APP_DATA_DIR/bagertea_ai_media_v2）
     pub data_dir: PathBuf,
     /// 入库取消标志
@@ -41,7 +158,7 @@ pub struct AppState {
 impl AppState {
     pub fn new(conn: Connection, data_dir: PathBuf) -> Self {
         Self {
-            db: Arc::new(Mutex::new(conn)),
+            db: Arc::new(Database::new(conn)),
             data_dir,
             import_cancel: Arc::new(AtomicBool::new(false)),
             import_running: Arc::new(AtomicBool::new(false)),
@@ -72,5 +189,33 @@ impl AppState {
                 *cache = list;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Database;
+    use rusqlite::Connection;
+    use std::sync::{mpsc, Arc};
+    use std::time::Duration;
+
+    #[test]
+    fn ordinary_database_access_waits_for_maintenance_without_holding_connection_mutex() {
+        let database = Arc::new(Database::new(Connection::open_in_memory().unwrap()));
+        let maintenance = database.maintenance().unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+        let reader_db = Arc::clone(&database);
+        let reader = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let _connection = reader_db.lock().unwrap();
+            acquired_tx.send(()).unwrap();
+        });
+
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(acquired_rx.recv_timeout(Duration::from_millis(25)).is_err());
+        drop(maintenance);
+        acquired_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        reader.join().unwrap();
     }
 }

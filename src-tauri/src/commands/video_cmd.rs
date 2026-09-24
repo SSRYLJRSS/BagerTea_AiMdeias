@@ -1,4 +1,4 @@
-//! 视频兼容代理命令（指导书 §8.3）：按需生成 H.264/AAC MP4、查询状态、取消、清理。
+//! 视频兼容代理命令（指导书 §8.3）：按需生成平台兼容代理、查询状态、取消、清理。
 //! 生成在 spawn_blocking（不阻塞 UI 主线程）；转码为单 ffmpeg 子进程并带超时 + 取消。
 
 use std::sync::atomic::AtomicBool;
@@ -11,7 +11,14 @@ use crate::error::{AppError, AppResult};
 use crate::services::{video, video_proxy};
 use crate::state::AppState;
 
-fn lock_db(state: &AppState) -> AppResult<std::sync::MutexGuard<'_, rusqlite::Connection>> {
+fn resolve_variant(variant: Option<String>) -> AppResult<(String, video::ProxyVariant)> {
+    let variant =
+        variant.unwrap_or_else(|| crate::services::platform::preferred_video_proxy().to_string());
+    let parsed = video::ProxyVariant::parse(&variant)?;
+    Ok((variant, parsed))
+}
+
+fn lock_db(state: &AppState) -> AppResult<crate::state::DbConnectionGuard<'_>> {
     state.db.lock().map_err(|_| AppError::msg("数据库锁中毒"))
 }
 
@@ -21,13 +28,7 @@ pub async fn ensure_video_proxy(
     asset_id: i64,
     variant: Option<String>,
 ) -> AppResult<VideoProxy> {
-    let variant = variant.unwrap_or_else(|| "h264_mp4".into());
-    if !variant
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '_')
-    {
-        return Err(AppError::invalid_arg("非法代理变体"));
-    }
+    let (variant, parsed_variant) = resolve_variant(variant)?;
     let db = Arc::clone(&state.db);
     let proxy_dir = state.data_dir.join("proxies");
     let cancel = Arc::new(AtomicBool::new(false));
@@ -47,7 +48,8 @@ pub async fn ensure_video_proxy(
             asset_id,
             &variant,
             &cancel,
-            |src, tmp, c| video::transcode_to_h264(src, tmp, Some(c)),
+            video::ffmpeg_tool_fingerprint,
+            move |src, tmp, c| video::transcode_variant(src, tmp, parsed_variant, Some(c)),
         );
         // 收尾清理取消标志
         if let Ok(mut m) = proxy_cancel_reg.lock() {
@@ -69,7 +71,7 @@ pub fn get_video_proxy_status(
     variant: Option<String>,
 ) -> AppResult<Option<VideoProxy>> {
     let conn = lock_db(&state)?;
-    let variant = variant.unwrap_or_else(|| "h264_mp4".into());
+    let (variant, _) = resolve_variant(variant)?;
     crate::db::video_proxy::get(&conn, asset_id, &variant)
 }
 
@@ -80,7 +82,7 @@ pub fn cancel_video_proxy(
     asset_id: i64,
     variant: Option<String>,
 ) -> AppResult<()> {
-    let variant = variant.unwrap_or_else(|| "h264_mp4".into());
+    let (variant, _) = resolve_variant(variant)?;
     let key = format!("{asset_id}:{variant}");
     let m = state
         .video_proxy_cancel
@@ -111,4 +113,30 @@ pub fn video_proxy_cache_stats(state: State<AppState>) -> AppResult<(i64, u64)> 
 pub fn clear_all_video_proxies(state: State<AppState>) -> AppResult<u64> {
     let proxy_dir = state.data_dir.join("proxies");
     video_proxy::clear_all_proxies(&state.db, &proxy_dir)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn omitted_proxy_variant_uses_platform_capability() {
+        let (name, parsed) = resolve_variant(None).unwrap();
+        let expected = crate::services::platform::preferred_video_proxy();
+        assert_eq!(name, expected);
+        assert_eq!(parsed, video::ProxyVariant::parse(expected).unwrap());
+        assert_eq!(
+            name,
+            if cfg!(target_os = "linux") {
+                "vp8_webm"
+            } else {
+                "h264_mp4"
+            }
+        );
+    }
+
+    #[test]
+    fn invalid_explicit_proxy_variant_is_rejected() {
+        assert!(resolve_variant(Some("h265_hevc".into())).is_err());
+    }
 }

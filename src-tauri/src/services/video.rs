@@ -1,12 +1,11 @@
 //! 视频服务：ffprobe 元数据 + ffmpeg 抽帧。
-//! 二进制解析策略（T03）：优先 PATH；未安装则全部降级（元数据尽力而为、封面走通用占位图）。
-//! 随应用分发（ffmpeg-sidecar/打包资源目录）在打包阶段接入，resolve_binary 已预留入口。
+//! 发布构建只允许使用应用相邻 sidecar；仅开发构建可以回退用户 PATH。
 //!
 //! 指导书 阶段 2 §7.2：ffprobe stdout 必须 `piped` 并读取（历史 bug 是 `.stdout(Stdio::null())` 后再解析空 buffer，
 //! 导致所有视频元数据探测静默失败）；stderr 保留到错误摘要；探测有真实墙钟超时并返回可识别错误。
 
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::Ordering;
 use std::sync::Mutex;
@@ -18,22 +17,176 @@ use serde::Deserialize;
 /// 统一加墙防止无界等待；超时后 kill + wait 并返回 `ProbeError::Timeout`。
 const FFMPEG_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// 输出格式随平台代理策略显式选择，避免把 Linux 目标的 H.264 能力当作必需依赖。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProxyVariant {
+    H264Mp4,
+    Vp8Webm,
+}
+
+impl ProxyVariant {
+    pub fn parse(value: &str) -> crate::error::AppResult<Self> {
+        match value {
+            "h264_mp4" => Ok(Self::H264Mp4),
+            "vp8_webm" => Ok(Self::Vp8Webm),
+            _ => Err(crate::error::AppError::invalid_arg(format!(
+                "非法视频代理变体：{value}"
+            ))),
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::H264Mp4 => "h264_mp4",
+            Self::Vp8Webm => "vp8_webm",
+        }
+    }
+
+    pub const fn file_extension(self) -> &'static str {
+        match self {
+            Self::H264Mp4 => "mp4",
+            Self::Vp8Webm => "webm",
+        }
+    }
+}
+
+fn proxy_codec_args(variant: ProxyVariant) -> &'static [&'static str] {
+    match variant {
+        ProxyVariant::H264Mp4 => &[
+            "-c:v",
+            "libx264",
+            "-preset",
+            "fast",
+            "-crf",
+            "23",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            "-movflags",
+            "+faststart",
+        ],
+        ProxyVariant::Vp8Webm => &[
+            "-c:v",
+            "libvpx",
+            "-crf",
+            "30",
+            "-b:v",
+            "1M",
+            "-c:a",
+            "libvorbis",
+            "-b:a",
+            "128k",
+        ],
+    }
+}
+
 /// ffprobe 可用性探测的短期缓存有效期（指导书 §7.2：PATH 探测不能每次素材请求都无界阻塞）
 const BINARY_CACHE_TTL: Duration = Duration::from_secs(60);
 
 /// ffmpeg/ffprobe 可用性结果缓存（短 TTL）。静态全局，进程内共享。
 static BINARY_CACHE: Mutex<Option<(String, Instant, bool)>> = Mutex::new(None);
 
-/// 解析二进制路径：PATH → （预留）应用资源目录
-fn resolve_binary(name: &str) -> Option<String> {
-    Command::new(name)
+/// Tauri 将 sidecar 放到主可执行文件旁边；这里返回该相邻路径，供同步服务直接管理子进程。
+fn sidecar_path(executable: &Path, name: &str) -> Option<std::path::PathBuf> {
+    let directory = executable.parent()?;
+    let mut filename = std::ffi::OsString::from(name);
+    #[cfg(target_os = "windows")]
+    filename.push(".exe");
+
+    let path = directory.join(filename);
+    path.is_file().then_some(path)
+}
+
+fn resolve_binary_with(
+    name: &str,
+    executable: Option<&Path>,
+    allow_path_fallback: bool,
+    mut is_available: impl FnMut(&Path) -> bool,
+) -> Option<PathBuf> {
+    let bundled = executable.and_then(|executable| sidecar_path(executable, name));
+    if let Some(path) = bundled {
+        if is_available(&path) {
+            return Some(path);
+        }
+        // A packaged sidecar is the release contract. Do not silently substitute an arbitrary
+        // system binary when the package is incomplete or the sidecar cannot run.
+        if !allow_path_fallback {
+            return None;
+        }
+    }
+
+    if !allow_path_fallback {
+        return None;
+    }
+
+    let path = PathBuf::from(name);
+    is_available(&path).then_some(path)
+}
+
+fn executable_responds_to_version(path: &Path) -> bool {
+    Command::new(path)
         .arg("-version")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
+        .is_ok_and(|status| status.success())
+}
+
+fn resolve_binary(name: &str) -> Option<PathBuf> {
+    let executable = std::env::current_exe().ok();
+    resolve_binary_with(
+        name,
+        executable.as_deref(),
+        cfg!(debug_assertions),
+        executable_responds_to_version,
+    )
+}
+
+/// 返回 FFmpeg 工具身份指纹，不读取整个可执行文件。
+///
+/// 指纹由已解析的实际路径、文件大小、修改时间和 `-version` 首行组成；获取过程位于
+/// 调用方的阻塞线程，且必须在数据库锁之外。它用于代理缓存失效，不是供应链签名。
+pub fn ffmpeg_tool_fingerprint() -> crate::error::AppResult<String> {
+    use sha2::{Digest, Sha256};
+    use std::time::UNIX_EPOCH;
+
+    let path = resolve_binary("ffmpeg").ok_or_else(|| {
+        crate::error::AppError::unsupported("FFmpeg sidecar 不可用（仅开发构建允许从 PATH 回退）")
+    })?;
+    let output = Command::new(&path)
+        .arg("-version")
+        .output()
+        .map_err(|e| crate::error::AppError::msg(format!("读取 FFmpeg 版本失败: {e}")))?;
+    if !output.status.success() {
+        return Err(crate::error::AppError::unsupported(
+            "FFmpeg sidecar 存在但无法通过版本探测",
+        ));
+    }
+    let version_line = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_owned();
+    let metadata = std::fs::metadata(&path)?;
+    let modified_ns = metadata
+        .modified()
         .ok()
-        .filter(|s| s.success())
-        .map(|_| name.to_string())
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"ffmpeg-tool-identity-v1\0");
+    hasher.update(path.to_string_lossy().as_bytes());
+    hasher.update([0]);
+    hasher.update(metadata.len().to_le_bytes());
+    hasher.update(modified_ns.to_le_bytes());
+    hasher.update(version_line.as_bytes());
+    Ok(format!("ffmpeg-meta-v1:{:x}", hasher.finalize()))
 }
 
 /// 带短 TTL 缓存的 ffprobe 可用性探测：避免每次素材请求都 spawn `ffprobe -version`。
@@ -515,11 +668,20 @@ pub fn extract_frame(path: &Path, time_ms: i64, out: &Path, size: u32) -> bool {
     ok && out.exists()
 }
 
-/// 把视频转码为 H.264/AAC MP4（指导书 §8.3 兼容代理）。带真实墙钟超时 + 可选取消；stderr 保留到错误摘要。
-/// 注意：输出格式由 out 扩展名决定（.mp4）。返回不同的可辨识错误（ffmpeg 缺失/启动/超时/取消/非 0 退出）。
+/// 向后兼容入口：转码为 H.264/AAC MP4。
 pub fn transcode_to_h264(
     src: &Path,
     out: &Path,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> crate::error::AppResult<()> {
+    transcode_variant(src, out, ProxyVariant::H264Mp4, cancel)
+}
+
+/// 按显式容器/编码器策略生成视频兼容代理。
+pub fn transcode_variant(
+    src: &Path,
+    out: &Path,
+    variant: ProxyVariant,
     cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> crate::error::AppResult<()> {
     let Some(ffmpeg) = resolve_binary("ffmpeg") else {
@@ -528,22 +690,7 @@ pub fn transcode_to_h264(
     let mut child = Command::new(ffmpeg)
         .args(["-y", "-i"])
         .arg(src)
-        .args([
-            "-c:v",
-            "libx264",
-            "-preset",
-            "fast",
-            "-crf",
-            "23",
-            "-pix_fmt",
-            "yuv420p",
-            "-c:a",
-            "aac",
-            "-b:a",
-            "128k",
-            "-movflags",
-            "+faststart",
-        ])
+        .args(proxy_codec_args(variant))
         .arg(out)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -628,9 +775,107 @@ pub fn extract_keyframes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     fn json(s: &str) -> Vec<u8> {
         s.as_bytes().to_vec()
+    }
+
+    #[test]
+    fn proxy_variants_select_matching_format_and_encoders() {
+        let mp4 = ProxyVariant::parse("h264_mp4").unwrap();
+        assert_eq!(mp4.file_extension(), "mp4");
+        assert!(proxy_codec_args(mp4).contains(&"libx264"));
+        assert!(proxy_codec_args(mp4).contains(&"aac"));
+
+        let webm = ProxyVariant::parse("vp8_webm").unwrap();
+        assert_eq!(webm.file_extension(), "webm");
+        assert!(proxy_codec_args(webm).contains(&"libvpx"));
+        assert!(proxy_codec_args(webm).contains(&"libvorbis"));
+        assert!(ProxyVariant::parse("mp4").is_err());
+    }
+
+    #[test]
+    fn packaged_sidecar_is_resolved_beside_the_app_executable() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = dir.path().join("bagertea");
+        let sidecar = dir.path().join(if cfg!(target_os = "windows") {
+            "ffprobe.exe"
+        } else {
+            "ffprobe"
+        });
+        fs::write(&sidecar, b"test binary placeholder").unwrap();
+
+        assert_eq!(sidecar_path(&app, "ffprobe"), Some(sidecar));
+    }
+
+    #[test]
+    fn resolver_prefers_a_working_packaged_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = dir.path().join("bagertea");
+        let sidecar = dir.path().join(if cfg!(target_os = "windows") {
+            "ffmpeg.exe"
+        } else {
+            "ffmpeg"
+        });
+        fs::write(&sidecar, b"sidecar").unwrap();
+        let mut tested = Vec::new();
+
+        let resolved = resolve_binary_with("ffmpeg", Some(&app), true, |candidate| {
+            tested.push(candidate.to_path_buf());
+            true
+        });
+
+        assert_eq!(resolved, Some(sidecar.clone()));
+        assert_eq!(tested, vec![sidecar]);
+    }
+
+    #[test]
+    fn release_resolver_never_uses_path_when_sidecar_is_missing_or_invalid() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = dir.path().join("bagertea");
+        let mut tested = Vec::new();
+
+        let missing = resolve_binary_with("ffmpeg", Some(&app), false, |candidate| {
+            tested.push(candidate.to_path_buf());
+            true
+        });
+        assert_eq!(missing, None);
+        assert!(tested.is_empty(), "sidecar 缺失时不能探测 PATH");
+
+        let sidecar = dir.path().join(if cfg!(target_os = "windows") {
+            "ffmpeg.exe"
+        } else {
+            "ffmpeg"
+        });
+        fs::write(&sidecar, b"not executable").unwrap();
+        let invalid = resolve_binary_with("ffmpeg", Some(&app), false, |candidate| {
+            tested.push(candidate.to_path_buf());
+            false
+        });
+        assert_eq!(invalid, None);
+        assert_eq!(tested, vec![sidecar], "坏 sidecar 后不能回退 PATH");
+    }
+
+    #[test]
+    fn development_resolver_falls_back_to_path_after_bad_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = dir.path().join("bagertea");
+        let sidecar = dir.path().join(if cfg!(target_os = "windows") {
+            "ffprobe.exe"
+        } else {
+            "ffprobe"
+        });
+        fs::write(&sidecar, b"bad sidecar").unwrap();
+        let mut tested = Vec::new();
+
+        let resolved = resolve_binary_with("ffprobe", Some(&app), true, |candidate| {
+            tested.push(candidate.to_path_buf());
+            candidate == Path::new("ffprobe")
+        });
+
+        assert_eq!(resolved, Some(PathBuf::from("ffprobe")));
+        assert_eq!(tested, vec![sidecar, PathBuf::from("ffprobe")]);
     }
 
     #[test]

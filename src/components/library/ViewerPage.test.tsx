@@ -112,7 +112,7 @@ describe("ViewerPage 视频识别（§7.1）", () => {
     expect(video).not.toBeNull();
     // 触发播放错误
     video.dispatchEvent(new Event("error"));
-    await waitFor(() => expect(ensureVideoProxy).toHaveBeenCalledWith(1, "h264_mp4"));
+    await waitFor(() => expect(ensureVideoProxy).toHaveBeenCalledWith(1));
     await waitFor(() =>
       expect((container.querySelector("video") as HTMLVideoElement).getAttribute("src")).toContain("asset://proxy/"),
     );
@@ -231,7 +231,9 @@ describe("ViewerPage 沉浸浏览（FB5-01 §4.1/§13.1）", () => {
       expect((document as unknown as { fullscreenElement: HTMLElement | null }).fullscreenElement).not.toBeNull(),
     );
     // 沉浸分支：无工具条/属性栏/标签区/胶片条
-    expect(screen.queryByRole("button", { name: "返回素材库" })).not.toBeInTheDocument();
+    await waitFor(() =>
+      expect(screen.queryByRole("button", { name: "返回素材库" })).not.toBeInTheDocument(),
+    );
     expect(screen.queryByRole("button", { name: /信息/ })).not.toBeInTheDocument();
     expect(container.querySelector("[data-viewer-immersive]")).not.toBeNull();
     // 图片沉浸为白底（surface 变体）

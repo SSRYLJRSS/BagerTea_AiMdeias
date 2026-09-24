@@ -3,7 +3,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Instant;
 
 use rusqlite::Connection;
@@ -11,6 +11,7 @@ use serde::Serialize;
 
 use crate::db::{assets, export};
 use crate::error::{AppError, AppResult};
+use crate::state::Database;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -63,7 +64,7 @@ fn sanitize_dirname(name: &str) -> String {
 /// 收进结构体会波及命令层与既有调用点，收益低，集中豁免。
 #[allow(clippy::too_many_arguments)]
 pub fn export_local<F: Fn(ExportProgress)>(
-    db: &Arc<Mutex<Connection>>,
+    db: &Arc<Database>,
     task_id: i64,
     asset_ids: &[i64],
     dest_dir: &str,
@@ -126,7 +127,7 @@ pub fn export_local<F: Fn(ExportProgress)>(
         // BUG-QA-1：unique_dest 失败不走 ?（会跳过 finish_task 导致任务卡 running），
         // 纳入 r 让下方 if let Err(e) = r 捕获后正常 finish_task("failed")
         let r = match unique_dest(&target_dir, &asset.file_name) {
-            Ok(dst) if mode == "move" => {
+            Ok((dst, norm)) if mode == "move" => {
                 // 文件移动（可能耗时）：不持 DB 锁
                 match move_file(&src, &dst) {
                     Ok(cleaned) => {
@@ -142,7 +143,6 @@ pub fn export_local<F: Fn(ExportProgress)>(
                         }
                         // B04：move 成功后更新库记录指向新路径 + 新文件名
                         // （unique_dest 可能加了 (1) 后缀，file_name 需同步）
-                        let norm = crate::utils::path::normalize_path(&dst.to_string_lossy());
                         let new_name = dst
                             .file_name()
                             .and_then(|n| n.to_str())
@@ -167,7 +167,7 @@ pub fn export_local<F: Fn(ExportProgress)>(
                     Err(e) => Err(e),
                 }
             }
-            Ok(dst) => {
+            Ok((dst, _)) => {
                 // 文件复制（可能耗时）：不持 DB 锁
                 fs::copy(&src, &dst).map(|_| ()).map_err(AppError::from)
             }
@@ -251,10 +251,12 @@ pub fn export_local<F: Fn(ExportProgress)>(
 }
 
 /// 同名冲突自动加 (1)(2) 后缀；B06b：冲突超限(999)时报错而非回退覆盖
-fn unique_dest(dir: &Path, name: &str) -> AppResult<PathBuf> {
+fn unique_dest(dir: &Path, name: &str) -> AppResult<(PathBuf, String)> {
     let candidate = dir.join(name);
     if !candidate.exists() {
-        return Ok(candidate);
+        let path = crate::utils::path::encode_native_path(&candidate)?;
+        let norm = crate::utils::path::normalize_path(&path);
+        return Ok((candidate, norm));
     }
     let stem = Path::new(name)
         .file_stem()
@@ -268,7 +270,9 @@ fn unique_dest(dir: &Path, name: &str) -> AppResult<PathBuf> {
     for i in 1..1000 {
         let c = dir.join(format!("{stem}({i}){ext}"));
         if !c.exists() {
-            return Ok(c);
+            let path = crate::utils::path::encode_native_path(&c)?;
+            let norm = crate::utils::path::normalize_path(&path);
+            return Ok((c, norm));
         }
     }
     Err(AppError::msg(format!("目标目录同名文件过多: {name}")))
@@ -344,7 +348,7 @@ pub fn write_csv_manifest(
         buf.extend_from_slice(b"\r\n");
     }
     // P1-03：不走固定文件名——已存在同名清单时自动加序号，绝不覆盖用户旧文件
-    let out = unique_dest(&dest, "导出清单.csv")?;
+    let (out, _) = unique_dest(&dest, "导出清单.csv")?;
     // 原子写：临时文件写完后 rename（同目录 rename 原子；Windows 下目标不存在即成功）
     let tmp = out.with_extension("csv.tmp");
     fs::write(&tmp, &buf)?;

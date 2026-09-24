@@ -66,7 +66,7 @@ export function WindowControls() {
   };
 
   return (
-    <div className="flex items-stretch">
+    <div role="group" aria-label="窗口控制" className="flex items-stretch">
       <button
         type="button"
         onClick={minimize}

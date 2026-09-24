@@ -1,0 +1,4 @@
+# 未准备经 SHA256 验证的目标库时，使用不存在的哨兵路径阻止 heif-rs 隐式联网下载。
+# Cargo 从仓库根或 src-tauri 启动都能读取本设置；CI/desktop 入口或调用者必须显式提供已验证目录。
+[env]
+HEIF_BINARIES_DIR = { value = "native/heif/__bagertea_prepare_first__", force = false }

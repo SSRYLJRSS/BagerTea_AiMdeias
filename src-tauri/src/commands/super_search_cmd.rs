@@ -12,11 +12,9 @@ use crate::db::tag_facets;
 use crate::error::{AppError, AppResult};
 use crate::services::super_search_ai;
 use crate::services::super_search_ai::{AiSearchParseResult, SearchIntentV3};
-use crate::state::AppState;
+use crate::state::{AppState, Database, DbConnectionGuard};
 
-fn lock_db(
-    db: &Arc<std::sync::Mutex<rusqlite::Connection>>,
-) -> AppResult<std::sync::MutexGuard<'_, rusqlite::Connection>> {
+fn lock_db(db: &Arc<Database>) -> AppResult<DbConnectionGuard<'_>> {
     db.lock().map_err(|_| AppError::msg("数据库锁中毒"))
 }
 
@@ -41,20 +39,22 @@ pub async fn ai_parse_search_query(
                 super_search_ai::MAX_INPUT_LEN
             )));
         }
-        // 2. 短锁读取 AI 档案（用途绑定优先）+ 分面 + 标签词典 + 库能力摘要，读取后立即放锁
+        // 2. 凭据服务先解析用途绑定（DB guard 已释放后才访问 keyring），随后短锁读取
+        // AI 设置、分面、标签词典和库能力摘要。
+        let usage_profile = crate::services::credentials::usage_profile_with_system_credential(
+            &db,
+            "super_search",
+        )?;
         let (cfg, facets, dict, capabilities) = {
             let conn = lock_db(&db)?;
             let mut s = settings::get_settings(&conn)?;
             if s.ai.active().is_none() {
                 return Err(AppError::not_found("请先在设置页添加 API 配置（中转站）"));
             }
-            // §4.4：超级搜索按用途绑定读取连接档案；无绑定时回退默认 active 档案。
-            let _ =
-                crate::db::ai_connections::apply_usage_binding(&conn, "super_search", &mut s.ai)
-                    .map_err(|e| {
-                        tracing::warn!("超级搜索读取用途绑定失败，回退默认档案: {e}");
-                        e
-                    })?;
+            // 无绑定时继续使用旧 active 档案；有绑定时使用 keyring 已解析的快照。
+            if let Some(profile) = usage_profile.clone() {
+                crate::db::ai_connections::apply_profile(&mut s.ai, profile);
+            }
             let facets = tag_facets::build_prompt_context(&conn, "all")?;
             let dict = super_search_ai::collect_tag_dictionary(&conn, &facets)?;
             // C-3：实时库能力摘要（缓存 60s，只告知不改写）；失败时静默给空串不阻塞搜索

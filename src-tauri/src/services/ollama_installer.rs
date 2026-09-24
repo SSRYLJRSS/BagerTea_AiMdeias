@@ -147,6 +147,11 @@ pub struct DetectResult {
     pub version: Option<String>,
 }
 
+#[cfg(windows)]
+const OLLAMA_EXE_NAME: &str = "ollama.exe";
+#[cfg(not(windows))]
+const OLLAMA_EXE_NAME: &str = "ollama";
+
 /// 单源测速结果
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -203,34 +208,43 @@ impl PartMeta {
     }
 }
 
-/// 探测已装 Ollama：先查默认安装目录（Inno 用户级安装落点），再 PATH 兜底
-pub fn detect_installed() -> DetectResult {
-    let mut exe: Option<PathBuf> = None;
-    if let Ok(la) = std::env::var("LOCALAPPDATA") {
-        let cand = PathBuf::from(la)
+/// 探测已装 Ollama：先查默认安装目录（Inno 用户级安装落点），再用原生 PATH 项兜底。
+/// 不调用 `where`/shell 解析路径文本，避免本地代码页或非 UTF-8 路径被有损解码。
+pub fn detect_installed_executable() -> Option<PathBuf> {
+    let mut exe = None;
+    if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
+        let cand = PathBuf::from(local_app_data)
             .join("Programs")
             .join("Ollama")
-            .join("ollama.exe");
-        if cand.exists() {
+            .join(OLLAMA_EXE_NAME);
+        if cand.is_file() {
             exe = Some(cand);
         }
     }
     if exe.is_none() {
-        if let Ok(o) = std::process::Command::new("where").arg("ollama").output() {
-            if o.status.success() {
-                if let Some(line) = String::from_utf8_lossy(&o.stdout).lines().next() {
-                    let cand = PathBuf::from(line.trim());
-                    if cand.exists() {
-                        exe = Some(cand);
-                    }
-                }
-            }
+        if let Some(path) = std::env::var_os("PATH") {
+            exe = find_ollama_in_path(&path);
         }
     }
+    exe
+}
+
+fn find_ollama_in_path(path: &std::ffi::OsStr) -> Option<PathBuf> {
+    std::env::split_paths(path)
+        // An empty PATH component means the current directory on some platforms. Do not turn
+        // the working directory into an implicit executable search path.
+        .filter(|directory| !directory.as_os_str().is_empty())
+        .map(|directory| directory.join(OLLAMA_EXE_NAME))
+        .find(|candidate| candidate.is_file())
+}
+
+/// 前端探测 DTO 只返回无损 UTF-8 路径；实际启动使用 detect_installed_executable 的 PathBuf。
+pub fn detect_installed() -> DetectResult {
+    let exe = detect_installed_executable();
     let version = exe.as_ref().and_then(|p| query_version(p));
     DetectResult {
         installed: exe.is_some(),
-        exe_path: exe.map(|p| p.to_string_lossy().into_owned()),
+        exe_path: exe.as_deref().and_then(Path::to_str).map(str::to_owned),
         version,
     }
 }
@@ -889,13 +903,13 @@ pub fn remove_installer_at(path: &Path) -> AppResult<bool> {
 
 /// 已装但服务未跑：拉起 `ollama serve`（无窗口分离进程，随系统托盘由官方安装包管理后续自启）。
 /// 不做代理设置（纯拉起）。
-pub fn start_service(exe_path: &str) -> AppResult<std::process::Child> {
+pub fn start_service(exe_path: &Path) -> AppResult<std::process::Child> {
     start_service_inner(exe_path, None)
 }
 
 /// 拉起 `ollama serve` 并可注入模型下载代理（改造方案·加速项 A：HTTPS_PROXY/HTTP_PROXY）。
 /// proxy 形如 "http://127.0.0.1:7890"（留空/None 则不注入，行为同 start_service）
-pub fn start_service_with_proxy(exe_path: &str, proxy: &str) -> AppResult<std::process::Child> {
+pub fn start_service_with_proxy(exe_path: &Path, proxy: &str) -> AppResult<std::process::Child> {
     let proxy = proxy.trim();
     start_service_inner(exe_path, if proxy.is_empty() { None } else { Some(proxy) })
 }
@@ -908,7 +922,7 @@ pub const KEEP_ALIVE_IDLE: &str = "2m";
 /// - 注入 OLLAMA_KEEP_ALIVE（L1 止血：模型空闲自动卸载）；
 /// - 可选注入模型下载代理 HTTPS_PROXY/HTTP_PROXY（保留代理环境变量）；
 /// - Windows 无窗口标志。
-fn build_serve_command(exe_path: &str, proxy: Option<&str>) -> std::process::Command {
+fn build_serve_command(exe_path: &Path, proxy: Option<&str>) -> std::process::Command {
     let mut cmd = std::process::Command::new(exe_path);
     cmd.arg("serve");
     // L1：空闲保留时长注入（不记录密钥；值固定常量无敏感内容）
@@ -926,7 +940,7 @@ fn build_serve_command(exe_path: &str, proxy: Option<&str>) -> std::process::Com
     cmd
 }
 
-fn start_service_inner(exe_path: &str, proxy: Option<&str>) -> AppResult<std::process::Child> {
+fn start_service_inner(exe_path: &Path, proxy: Option<&str>) -> AppResult<std::process::Child> {
     // L2（§8.2）：返回 Child（不再丢弃），由命令层保存 pid/ownership 供停服与防重复启动
     build_serve_command(exe_path, proxy)
         .spawn()
@@ -936,6 +950,35 @@ fn start_service_inner(exe_path: &str, proxy: Option<&str>) -> AppResult<std::pr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ollama_path_lookup_preserves_unicode_native_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let install_dir = temp.path().join("茶包 空间");
+        std::fs::create_dir(&install_dir).unwrap();
+        let executable = install_dir.join(OLLAMA_EXE_NAME);
+        std::fs::write(&executable, b"test").unwrap();
+        let path = std::env::join_paths([&install_dir]).unwrap();
+
+        assert_eq!(find_ollama_in_path(&path), Some(executable));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ollama_path_lookup_preserves_non_utf8_native_paths() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let install_dir = temp
+            .path()
+            .join(std::ffi::OsStr::from_bytes(b"install-\xff"));
+        std::fs::create_dir(&install_dir).unwrap();
+        let executable = install_dir.join(OLLAMA_EXE_NAME);
+        std::fs::write(&executable, b"test").unwrap();
+        let path = std::env::join_paths([&install_dir]).unwrap();
+
+        assert_eq!(find_ollama_in_path(&path), Some(executable));
+    }
 
     #[test]
     fn builtin_sources_four_in_order() {
@@ -985,7 +1028,10 @@ mod tests {
     // L1（§8.1）：命令构造测试——注入 OLLAMA_KEEP_ALIVE + 保留代理 + serve 参数
     #[test]
     fn build_serve_command_injects_keep_alive_and_proxy() {
-        let cmd = build_serve_command("C:\\ollama\\ollama.exe", Some("http://127.0.0.1:7890"));
+        let cmd = build_serve_command(
+            Path::new("C:\\ollama\\ollama.exe"),
+            Some("http://127.0.0.1:7890"),
+        );
         let args: Vec<_> = cmd
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
@@ -1006,7 +1052,7 @@ mod tests {
 
     #[test]
     fn build_serve_command_no_proxy_omits_proxy_env() {
-        let cmd = build_serve_command("ollama", None);
+        let cmd = build_serve_command(Path::new(OLLAMA_EXE_NAME), None);
         let envs: Vec<_> = cmd.get_envs().collect();
         assert!(envs
             .iter()

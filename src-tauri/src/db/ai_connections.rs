@@ -16,6 +16,10 @@ pub struct AiConnection {
     pub base_url: String,
     pub model: String,
     pub api_key_ref: Option<String>,
+    /// 外部 AI 服务限流配置；0 表示不限。
+    pub max_concurrency: i64,
+    pub requests_per_minute: i64,
+    pub requests_per_hour: i64,
     pub enabled: bool,
     pub created_at: i64,
     pub updated_at: i64,
@@ -24,7 +28,9 @@ pub struct AiConnection {
 /// 按 id 读取连接档案。
 pub fn get(conn: &Connection, id: &str) -> AppResult<Option<AiConnection>> {
     let mut stmt = conn.prepare(
-        "SELECT id, name, deployment, protocol, base_url, model, api_key_ref, enabled, created_at, updated_at
+        "SELECT id, name, deployment, protocol, base_url, model, api_key_ref,
+                max_concurrency, requests_per_minute, requests_per_hour,
+                enabled, created_at, updated_at
          FROM ai_connections WHERE id = ?1",
     )?;
     let mut rows = stmt.query(params![id])?;
@@ -36,7 +42,9 @@ pub fn get(conn: &Connection, id: &str) -> AppResult<Option<AiConnection>> {
 
 pub fn list(conn: &Connection) -> AppResult<Vec<AiConnection>> {
     let mut stmt = conn.prepare(
-        "SELECT id, name, deployment, protocol, base_url, model, api_key_ref, enabled, created_at, updated_at
+        "SELECT id, name, deployment, protocol, base_url, model, api_key_ref,
+                max_concurrency, requests_per_minute, requests_per_hour,
+                enabled, created_at, updated_at
          FROM ai_connections ORDER BY created_at",
     )?;
     let rows = stmt.query_map([], map_connection)?;
@@ -56,9 +64,12 @@ fn map_connection(row: &rusqlite::Row) -> rusqlite::Result<AiConnection> {
         base_url: row.get(4)?,
         model: row.get(5)?,
         api_key_ref: row.get(6)?,
-        enabled: row.get::<_, i64>(7)? != 0,
-        created_at: row.get(8)?,
-        updated_at: row.get(9)?,
+        max_concurrency: row.get(7)?,
+        requests_per_minute: row.get(8)?,
+        requests_per_hour: row.get(9)?,
+        enabled: row.get::<_, i64>(10)? != 0,
+        created_at: row.get(11)?,
+        updated_at: row.get(12)?,
     })
 }
 
@@ -66,6 +77,7 @@ fn map_connection(row: &rusqlite::Row) -> rusqlite::Result<AiConnection> {
 pub fn binding_for(conn: &Connection, usage: &str) -> AppResult<Option<AiConnection>> {
     let mut stmt = conn.prepare(
         "SELECT c.id, c.name, c.deployment, c.protocol, c.base_url, c.model, c.api_key_ref,
+                c.max_concurrency, c.requests_per_minute, c.requests_per_hour,
                 c.enabled, c.created_at, c.updated_at
          FROM ai_usage_bindings b JOIN ai_connections c ON c.id = b.connection_id
          WHERE b.usage = ?1 AND c.enabled = 1",
@@ -86,33 +98,43 @@ pub fn protocol_to_api_mode(protocol: &str) -> &'static str {
     }
 }
 
-/// 按用途解析出可直接喂给现有 AI HTTP service 的 ApiProfile（老管线兼容形态）。
-/// 读取 keyring 拿 API Key：读取失败返回错误（不静默吞）；未配置返回空 key。
-/// 该函数读 DB + 系统凭据，调用方负责在短锁作用域内调用（keyring 读取耗时极短）。
+/// 按用途读取 AI HTTP service 所需的纯数据库元数据。
+/// keyring IO 必须在调用方释放 Database guard 后通过 `services::credentials` 完成。
+pub fn usage_profile_metadata(
+    conn: &Connection,
+    usage: &str,
+) -> AppResult<Option<(crate::db::settings::ApiProfile, Option<String>)>> {
+    let Some(c) = binding_for(conn, usage)? else {
+        return Ok(None);
+    };
+    let credential_ref = c.api_key_ref.clone();
+    Ok(Some((
+        crate::db::settings::ApiProfile {
+            id: c.id.clone(),
+            name: c.name.clone(),
+            api_mode: protocol_to_api_mode(&c.protocol).to_string(),
+            kind: c.deployment.clone(),
+            base_url: c.base_url.clone(),
+            api_key: String::new(),
+            model: c.model.clone(),
+            max_concurrency: c.max_concurrency,
+            requests_per_minute: c.requests_per_minute,
+            requests_per_hour: c.requests_per_hour,
+        },
+        credential_ref,
+    )))
+}
+
+/// Backwards-compatible pure metadata projection; never reads the system keyring.
 pub fn usage_profile(
     conn: &Connection,
     usage: &str,
 ) -> AppResult<Option<crate::db::settings::ApiProfile>> {
-    let Some(c) = binding_for(conn, usage)? else {
-        return Ok(None);
-    };
-    let api_key = match &c.api_key_ref {
-        Some(_) => crate::services::credentials::get_api_key(&c.id)?.unwrap_or_default(),
-        None => String::new(),
-    };
-    Ok(Some(crate::db::settings::ApiProfile {
-        id: c.id.clone(),
-        name: c.name.clone(),
-        api_mode: protocol_to_api_mode(&c.protocol).to_string(),
-        kind: c.deployment.clone(),
-        base_url: c.base_url.clone(),
-        api_key,
-        model: c.model.clone(),
-    }))
+    Ok(usage_profile_metadata(conn, usage)?.map(|(profile, _)| profile))
 }
 
-/// 把用途绑定的连接覆盖到调用方持有的 AiSettings 上（不动库内 settings 本体），
-/// 使现有 `cfg.active()` 直接命中绑定档案——共用现有 AI HTTP service（指导书 §4.4）。
+/// 把用途绑定的连接纯元数据覆盖到调用方持有的 AiSettings 上（不动库内 settings 本体）；
+/// 返回值只表示是否有绑定。密钥需在释放数据库锁后另行解析。
 /// 返回是否命中绑定（false = 无绑定，调用方继续用默认 active 档案）。
 pub fn apply_usage_binding(
     conn: &Connection,
@@ -122,6 +144,17 @@ pub fn apply_usage_binding(
     let Some(profile) = usage_profile(conn, usage)? else {
         return Ok(false);
     };
+    apply_profile(cfg, profile);
+    Ok(true)
+}
+
+/// Inject a resolved profile into an in-memory AI settings snapshot.
+/// Credential lookup is deliberately not performed here; callers must resolve it
+/// through `services::credentials` after releasing the DB guard.
+pub fn apply_profile(
+    cfg: &mut crate::db::settings::AiSettings,
+    profile: crate::db::settings::ApiProfile,
+) {
     // 把绑定连接注入 profiles（替换同 id，或追加），并设为 active
     let id = profile.id.clone();
     if let Some(existing) = cfg.profiles.iter_mut().find(|p| p.id == id) {
@@ -130,7 +163,6 @@ pub fn apply_usage_binding(
         cfg.profiles.push(profile);
     }
     cfg.active_profile = id;
-    Ok(true)
 }
 
 /// 写入/覆盖连接档案（upsert）。api_key_ref 由调用方决定（成功写凭据后置为 id）。
@@ -146,23 +178,81 @@ pub fn upsert(
     model: &str,
     api_key_ref: Option<&str>,
 ) -> AppResult<()> {
+    upsert_with_limits(
+        conn,
+        id,
+        name,
+        deployment,
+        protocol,
+        base_url,
+        model,
+        api_key_ref,
+        0,
+        0,
+        0,
+    )
+}
+
+/// 写入连接档案和限额配置。0 表示不限；非法数值在持久化前拒绝。
+#[allow(clippy::too_many_arguments)]
+pub fn upsert_with_limits(
+    conn: &Connection,
+    id: &str,
+    name: &str,
+    deployment: &str,
+    protocol: &str,
+    base_url: &str,
+    model: &str,
+    api_key_ref: Option<&str>,
+    max_concurrency: i64,
+    requests_per_minute: i64,
+    requests_per_hour: i64,
+) -> AppResult<()> {
     if !matches!(deployment, "cloud" | "local") {
         return Err(AppError::msg("非法部署类型（cloud|local）"));
     }
     if !matches!(protocol, "openai_chat" | "anthropic_messages") {
         return Err(AppError::msg("非法协议（openai_chat|anthropic_messages）"));
     }
+    for (label, value, max) in [
+        ("最大并发数", max_concurrency, 128),
+        ("每分钟请求数", requests_per_minute, 1_000_000),
+        ("每小时请求数", requests_per_hour, 10_000_000),
+    ] {
+        if !(0..=max).contains(&value) {
+            return Err(AppError::invalid_arg(format!(
+                "{label}必须是 0–{max} 的整数（0 表示不限）"
+            )));
+        }
+    }
     let now = chrono::Utc::now().timestamp_millis();
     conn.execute(
         "INSERT INTO ai_connections
-           (id, name, deployment, protocol, base_url, model, api_key_ref, enabled, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, ?8, ?8)
+           (id, name, deployment, protocol, base_url, model, api_key_ref,
+            max_concurrency, requests_per_minute, requests_per_hour,
+            enabled, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11, ?11)
          ON CONFLICT(id) DO UPDATE SET
            name = excluded.name, deployment = excluded.deployment, protocol = excluded.protocol,
            base_url = excluded.base_url, model = excluded.model,
            api_key_ref = COALESCE(excluded.api_key_ref, ai_connections.api_key_ref),
+           max_concurrency = excluded.max_concurrency,
+           requests_per_minute = excluded.requests_per_minute,
+           requests_per_hour = excluded.requests_per_hour,
            updated_at = excluded.updated_at",
-        params![id, name, deployment, protocol, base_url, model, api_key_ref, now],
+        params![
+            id,
+            name,
+            deployment,
+            protocol,
+            base_url,
+            model,
+            api_key_ref,
+            max_concurrency,
+            requests_per_minute,
+            requests_per_hour,
+            now
+        ],
     )?;
     Ok(())
 }
@@ -283,5 +373,42 @@ mod tests {
         let conn = init_memory().unwrap();
         assert!(upsert(&conn, "x", "X", "bad", "openai_chat", "u", "m", None).is_err());
         assert!(upsert(&conn, "x", "X", "cloud", "bad_proto", "u", "m", None).is_err());
+    }
+
+    #[test]
+    fn rate_limit_fields_roundtrip_and_reject_invalid_values() {
+        let conn = init_memory().unwrap();
+        upsert_with_limits(
+            &conn,
+            "limited",
+            "限流服务",
+            "cloud",
+            "openai_chat",
+            "https://example.invalid/v1",
+            "model",
+            None,
+            3,
+            20,
+            400,
+        )
+        .unwrap();
+        let connection = get(&conn, "limited").unwrap().unwrap();
+        assert_eq!(connection.max_concurrency, 3);
+        assert_eq!(connection.requests_per_minute, 20);
+        assert_eq!(connection.requests_per_hour, 400);
+        assert!(upsert_with_limits(
+            &conn,
+            "bad",
+            "invalid",
+            "cloud",
+            "openai_chat",
+            "u",
+            "m",
+            None,
+            -1,
+            0,
+            0
+        )
+        .is_err());
     }
 }

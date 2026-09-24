@@ -47,6 +47,13 @@ pub struct ApiProfile {
     pub api_key: String,
     #[serde(default = "default_model")]
     pub model: String,
+    /// 在线连接限流；0 表示不限。Windows 应用托管 Ollama 忽略这些值。
+    #[serde(default)]
+    pub max_concurrency: i64,
+    #[serde(default)]
+    pub requests_per_minute: i64,
+    #[serde(default)]
+    pub requests_per_hour: i64,
 }
 
 impl ApiProfile {
@@ -122,6 +129,9 @@ impl AiSettings {
                 base_url: self.base_url.clone(),
                 api_key: self.api_key.clone(),
                 model: self.model.clone(),
+                max_concurrency: 0,
+                requests_per_minute: 0,
+                requests_per_hour: 0,
             });
             self.active_profile = "default".into();
         }
@@ -714,6 +724,9 @@ mod tests {
             base_url: "u".into(),
             api_key: "k".into(),
             model: "m".into(),
+            max_concurrency: 0,
+            requests_per_minute: 0,
+            requests_per_hour: 0,
         });
         ai.active_profile = "not-exist".into();
         assert_eq!(ai.active().unwrap().id, "p1");

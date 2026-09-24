@@ -212,7 +212,7 @@ export default function ViewerPage({ asset: initial, onClose, listItems, listTot
     setProxying(true);
     setProxyError(null);
     try {
-      const proxy = await ensureVideoProxy(id, "h264_mp4");
+      const proxy = await ensureVideoProxy(id);
       if (proxy.status === "ready" && proxy.path) {
         setVideoSrc(toProxyFileUrl(proxy.path));
         setProxyError(null);
@@ -227,7 +227,7 @@ export default function ViewerPage({ asset: initial, onClose, listItems, listTot
   }, [current.id]);
 
   const handleCancelProxy = () => {
-    void cancelVideoProxy(current.id, "h264_mp4").catch(() => undefined);
+    void cancelVideoProxy(current.id).catch(() => undefined);
     setProxyError("已取消生成代理");
   };
 

@@ -37,7 +37,7 @@ export default memo(function AssetCardVideoLayer({ asset, previewSeconds }: Asse
     setFailed(true);
     if (proxyAttempted.current) return;
     proxyAttempted.current = true;
-    void ensureVideoProxy(asset.id, "h264_mp4").then((p) => {
+    void ensureVideoProxy(asset.id).then((p) => {
       if (p.status === "ready" && p.path) {
         setSrc(toProxyFileUrl(p.path));
         setFailed(false);

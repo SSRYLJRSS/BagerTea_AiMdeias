@@ -433,7 +433,7 @@ pub fn create_batch_with_retag(
         if !sync {
             asset_ids.to_vec()
         } else {
-            // 读全部 (id, file_path)，按 kinship_key 分组，每组保留非 RAW（若无非 RAW 保留第一个）
+            // 读取全库完整同源组；只有恰好 1 RAW + 1 非 RAW 且两者均被选中时，才折叠 RAW。
             let mut stmt =
                 tx.prepare("SELECT id, file_path FROM assets WHERE deleted_at IS NULL")?;
             let rows: Vec<(i64, String)> = stmt
@@ -441,36 +441,31 @@ pub fn create_batch_with_retag(
                 .filter_map(|r| r.ok())
                 .collect();
             drop(stmt);
-            let path_by_id: std::collections::HashMap<i64, &str> =
-                rows.iter().map(|(id, p)| (*id, p.as_str())).collect();
-            let mut group_best: std::collections::HashMap<String, i64> = Default::default();
+
+            let mut groups: std::collections::HashMap<String, Vec<(i64, bool)>> =
+                Default::default();
             for (id, path) in &rows {
                 let (key, is_raw) = crate::services::kinship::kinship_key(path);
-                let selected = asset_ids.contains(id);
-                if !selected {
-                    continue;
-                }
-                match group_best.get(&key) {
-                    Some(&cur) => {
-                        // 已有代表：非 RAW 优先替换
-                        let cur_raw = path_by_id
-                            .get(&cur)
-                            .map(|p| crate::services::kinship::kinship_key(p).1)
-                            .unwrap_or(false);
-                        if cur_raw && !is_raw {
-                            group_best.insert(key, *id);
-                        }
-                    }
-                    None => {
-                        group_best.insert(key, *id);
+                groups.entry(key).or_default().push((*id, is_raw));
+            }
+
+            let mut drop_ids: std::collections::HashSet<i64> = Default::default();
+            for members in groups.values() {
+                if let crate::services::kinship::KinshipGroup::Paired { raw, non_raw } =
+                    crate::services::kinship::classify_kinship_group(members)
+                {
+                    // 只选中 RAW 时不能凭空丢掉用户选择；两者都选中才将 RAW 作为同步代表折叠。
+                    if asset_ids.contains(&raw) && asset_ids.contains(&non_raw) {
+                        drop_ids.insert(raw);
                     }
                 }
             }
-            // 保持用户传入顺序（去重不重排）
+
+            // 保持用户传入顺序，只移除已确认可折叠的 RAW。
             asset_ids
                 .iter()
                 .copied()
-                .filter(|id| group_best.values().any(|v| v == id))
+                .filter(|id| !drop_ids.contains(id))
                 .collect()
         }
     };
@@ -1253,7 +1248,9 @@ pub fn apply_tags(conn: &Connection, asset_ids: &[i64], tags: &CategorizedTags) 
 /// 撤销拒绝（v2.11）：已拒绝建议恢复为待确认，防误触
 pub fn restore_suggestion(conn: &Connection, id: i64) -> AppResult<()> {
     conn.execute(
-        "UPDATE ai_suggestions SET status = 'pending' WHERE id = ?1 AND status = 'rejected'",
+        "UPDATE ai_suggestions
+         SET status = 'pending', last_error = NULL
+         WHERE id = ?1 AND status = 'rejected'",
         rusqlite::params![id],
     )?;
     conn.execute(

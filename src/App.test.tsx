@@ -5,9 +5,10 @@
  *  - viewerOpen=true 时全局 BottomBar 隐藏（Viewer 自带胶片条，避免双重导航），TitleBar 保留。
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import App from "@/App";
 import { useSettingsStore } from "@/stores/settingsStore";
+import { usePlatformStore } from "@/stores/platformStore";
 import { useLibraryStore } from "@/stores/libraryStore";
 import { useMetadataStore } from "@/stores/metadataStore";
 import type { Settings } from "@/types/settings";
@@ -92,9 +93,15 @@ vi.mock("@/api/ai", () => ({
 const clientMocks = vi.hoisted(() => ({
   on: vi.fn(),
 }));
+const platformMocks = vi.hoisted(() => ({
+  getPlatformCapabilities: vi.fn(),
+}));
 vi.mock("@/api/client", () => ({
   on: clientMocks.on,
   invoke: vi.fn(),
+}));
+vi.mock("@/api/platform", () => ({
+  getPlatformCapabilities: platformMocks.getPlatformCapabilities,
 }));
 
 vi.stubGlobal("ResizeObserver", class {
@@ -138,6 +145,20 @@ const emptySettingsStore = {
 beforeEach(() => {
   vi.clearAllMocks();
   useSettingsStore.setState(emptySettingsStore);
+  usePlatformStore.setState({
+    status: "ready",
+    error: null,
+    capabilities: {
+      schemaVersion: 1,
+      os: "windows",
+      arch: "x86_64",
+      managedOllama: true,
+      preferredVideoProxy: "h264_mp4",
+      nativeWindowControls: false,
+      primaryModifier: "ctrl",
+      libraryTransferVersion: null,
+    },
+  });
   useLibraryStore.setState({
     items: [],
     total: 0,
@@ -168,6 +189,16 @@ beforeEach(() => {
   mocks.toFileUrl.mockImplementation((p: string) => `asset://${p}`);
   // 默认：on() 不捕获（订阅失败路径由 useTauriEvent 兜底）
   clientMocks.on.mockReset().mockRejectedValue(new Error("no tauri"));
+  platformMocks.getPlatformCapabilities.mockResolvedValue({
+    schemaVersion: 1,
+    os: "windows",
+    arch: "x86_64",
+    managedOllama: true,
+    preferredVideoProxy: "h264_mp4",
+    nativeWindowControls: false,
+    primaryModifier: "ctrl",
+    libraryTransferVersion: null,
+  });
 });
 
 describe("App 启动骨架（§3.2）", () => {
@@ -184,6 +215,67 @@ describe("App 启动骨架（§3.2）", () => {
     const event = new MouseEvent("contextmenu", { bubbles: true, cancelable: true });
     document.body.dispatchEvent(event);
     expect(event.defaultPrevented).toBe(true);
+  });
+
+  it("启动时加载平台能力，供平台门控与路径显示共享使用", async () => {
+    useSettingsStore.setState({ ...emptySettingsStore, settings: mkSettings(), loaded: true });
+    usePlatformStore.setState({ status: "idle", capabilities: null, error: null });
+    render(<App />);
+    await waitFor(() => expect(platformMocks.getPlatformCapabilities).toHaveBeenCalledTimes(1));
+    await waitFor(() =>
+      expect(usePlatformStore.getState().capabilities?.managedOllama).toBe(true),
+    );
+  });
+
+  it("平台能力加载失败时展示重试并保持安全降级", async () => {
+    useSettingsStore.setState({ ...emptySettingsStore, settings: mkSettings(), loaded: true });
+    usePlatformStore.setState({ status: "idle", capabilities: null, error: null });
+    platformMocks.getPlatformCapabilities
+      .mockRejectedValueOnce(new Error("platform unavailable"))
+      .mockResolvedValueOnce({
+        schemaVersion: 1,
+        os: "windows",
+        arch: "x86_64",
+        managedOllama: true,
+        preferredVideoProxy: "h264_mp4",
+        nativeWindowControls: false,
+        primaryModifier: "ctrl",
+        libraryTransferVersion: null,
+      });
+    render(<App />);
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("平台专属功能已安全禁用");
+    expect(usePlatformStore.getState().capabilities).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "重试" }));
+    await waitFor(() => expect(platformMocks.getPlatformCapabilities).toHaveBeenCalledTimes(2));
+    await waitFor(() =>
+      expect(usePlatformStore.getState().capabilities?.managedOllama).toBe(true),
+    );
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("macOS 与无边框 Tauri 配置一致：报告自绘控件并继续显示可访问标题栏", () => {
+    useSettingsStore.setState({ ...emptySettingsStore, settings: mkSettings(), loaded: true });
+    usePlatformStore.setState({
+      status: "ready",
+      error: null,
+      capabilities: {
+        schemaVersion: 1,
+        os: "macos",
+        arch: "aarch64",
+        managedOllama: false,
+        preferredVideoProxy: "h264_mp4",
+        nativeWindowControls: false,
+        primaryModifier: "meta",
+        libraryTransferVersion: null,
+      },
+    });
+    render(<App />);
+    expect(screen.getByRole("button", { name: "设置" })).toBeInTheDocument();
+    expect(screen.getByRole("group", { name: "窗口控制" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "最小化" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /最大化|还原/ })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "关闭" })).toBeInTheDocument();
   });
 });
 

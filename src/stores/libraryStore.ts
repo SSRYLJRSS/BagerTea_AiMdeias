@@ -11,17 +11,22 @@ const PAGE_SIZE = 200;
 /** W5h-d：同源合并显示的纯前端折叠 —— 每组（同目录同主干名 + 一 RAW 一非 RAW）只留代表（非 RAW 优先）。
  *  不动后端查询：total/分页/分面计数语义全部保持（计划书 §W5h-d 关键取舍）。
  *  is_raw 判定用扩展名白名单（与后端 utils::mime::is_raw_ext 同源）。 */
-const RAW_EXTS = new Set(["raw", "cr2", "cr3", "crw", "nef", "nrw", "arw", "srf", "sr2", "dng", "raf", "orf", "rw2", "pef", "iiq", "3fr", "erf", "srw", "kdc", "dcr", "mos", "mef", "x3f", "rwl"]);
+const RAW_EXTS = new Set([
+  "raw", "cr2", "cr3", "crw", "nef", "nrw", "arw", "srf", "sr2", "dng", "raf", "orf", "rw2",
+  "pef", "srw", "x3f", "mrw", "iiq", "3fr", "fff", "kdc", "dcr", "mos", "mef", "erf",
+]);
 
 function kinshipKeyOf(a: Asset): { key: string; isRaw: boolean } {
-  const p = (a.filePath ?? "").split("\\").join("/").toLowerCase();
+  // 与后端 services/kinship.rs 对齐：只按 `/` 切目录，Unix 的反斜杠是合法文件名字符；
+  // 目录大小写保留，只折叠主干名，避免 Linux `/A` 与 `/a` 被错误合并。
+  const p = a.filePath ?? "";
   const slash = p.lastIndexOf("/");
   const dir = slash >= 0 ? p.slice(0, slash) : "";
   const name = slash >= 0 ? p.slice(slash + 1) : p;
   const dot = name.lastIndexOf(".");
   const stem = dot >= 0 ? name.slice(0, dot) : name;
-  const ext = dot >= 0 ? name.slice(dot + 1) : "";
-  return { key: `${dir}/${stem}`, isRaw: RAW_EXTS.has(ext) };
+  const ext = dot >= 0 ? name.slice(dot + 1).toLowerCase() : "";
+  return { key: `${dir}/${stem.toLowerCase()}`, isRaw: RAW_EXTS.has(ext) };
 }
 
 export function collapseKinship(items: Asset[]): Asset[] {

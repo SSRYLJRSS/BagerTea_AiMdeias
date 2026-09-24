@@ -47,6 +47,8 @@ export interface ImportPlanItem {
   path: string;
   kind: "image" | "video";
   size: number;
+  previewStatus: "ready" | "limited" | "unsupported";
+  previewMessage?: string;
 }
 
 export interface ImportPlan {
@@ -54,6 +56,7 @@ export interface ImportPlan {
   images: number;
   videos: number;
   totalSize: number;
+  warnings: string[];
 }
 
 /** 扫描路径生成待入库清单（不落库，两段式入库用） */

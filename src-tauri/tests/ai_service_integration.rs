@@ -18,6 +18,7 @@ use bagertea_ai_media_v2_lib::db::{self, assets};
 use bagertea_ai_media_v2_lib::error::AppResult;
 use bagertea_ai_media_v2_lib::services::thumbnail::ThumbnailService;
 use bagertea_ai_media_v2_lib::services::{ai_cloud, importer};
+use bagertea_ai_media_v2_lib::state::Database;
 
 use common::{HttpResponse, MockServer, RecordedRequest};
 
@@ -103,11 +104,7 @@ fn make_image(dir: &Path, name: &str, salt: u32) {
 }
 
 /// 入库 N 张真实小图，返回 asset ids（file_path 均指向真实文件，request_tags 可读）
-fn import_images(
-    dbm: &Arc<Mutex<rusqlite::Connection>>,
-    thumbs: &ThumbnailService,
-    n: usize,
-) -> AppResult<Vec<i64>> {
+fn import_images(dbm: &Arc<Database>, thumbs: &ThumbnailService, n: usize) -> AppResult<Vec<i64>> {
     let tmp = tempfile::tempdir()?;
     let src = tmp.path().join("src");
     std::fs::create_dir_all(&src)?;
@@ -143,6 +140,9 @@ fn profile(base_url: &str, api_mode: &str, kind: &str) -> ApiProfile {
         base_url: base_url.into(),
         api_key: "test-key".into(),
         model: "qwen-vl-plus".into(),
+        max_concurrency: 0,
+        requests_per_minute: 0,
+        requests_per_hour: 0,
     }
 }
 
@@ -232,7 +232,7 @@ conn_retry_test!(openai_success_writes_suggestions_and_progress, {
             r#"{"description":"公园里树木茂盛阳光温暖洒落","peoplePresence":{"status":"unknown","confidence":0.8},"tags":{"scene":[{"name":"公园","confidence":0.9}]},"numbers":{}}"#,
         ))
     });
-    let dbm = Arc::new(Mutex::new(db::init_memory()?));
+    let dbm = Arc::new(Database::new(db::init_memory()?));
     let tmp = tempfile::tempdir()?;
     let thumbs = ThumbnailService::new(&tmp.path().join("data"))?;
     let ids = import_images(&dbm, &thumbs, 1)?;
@@ -301,7 +301,7 @@ conn_retry_test!(all_low_confidence_is_not_reprocessed_on_resume, {
             r#"{"description":"公园里树木茂盛阳光温暖洒落","peoplePresence":{"status":"unknown","confidence":0.8},"tags":{"scene":[{"name":"公园","confidence":0.1}]},"numbers":{}}"#,
         ))
     });
-    let dbm = Arc::new(Mutex::new(db::init_memory()?));
+    let dbm = Arc::new(Database::new(db::init_memory()?));
     let tmp = tempfile::tempdir()?;
     let thumbs = ThumbnailService::new(&tmp.path().join("data"))?;
     let ids = import_images(&dbm, &thumbs, 1)?;
@@ -361,7 +361,7 @@ conn_retry_test!(empty_subject_is_repaired_once, {
         };
         HttpResponse::ok_json(&openai_ok_body(content))
     });
-    let dbm = Arc::new(Mutex::new(db::init_memory()?));
+    let dbm = Arc::new(Database::new(db::init_memory()?));
     let tmp = tempfile::tempdir()?;
     let thumbs = ThumbnailService::new(&tmp.path().join("data"))?;
     let ids = import_images(&dbm, &thumbs, 1)?;
@@ -398,7 +398,7 @@ conn_retry_test!(anthropic_mode_sends_messages_and_key_header, {
             r#"{"content":[{"type":"tool_use","input":{"description":"画面呈现强烈逆光与温暖氛围","peoplePresence":{"status":"unknown","confidence":0.8},"tags":{"scene":[{"name":"逆光","confidence":0.9}]},"numbers":{}}}]}"#,
         )
     });
-    let dbm = Arc::new(Mutex::new(db::init_memory()?));
+    let dbm = Arc::new(Database::new(db::init_memory()?));
     let tmp = tempfile::tempdir()?;
     let thumbs = ThumbnailService::new(&tmp.path().join("data"))?;
     let ids = import_images(&dbm, &thumbs, 1)?;
@@ -453,7 +453,7 @@ conn_retry_test!(empty_tags_marks_rejected_and_batch_continues, {
             ))
         }
     });
-    let dbm = Arc::new(Mutex::new(db::init_memory()?));
+    let dbm = Arc::new(Database::new(db::init_memory()?));
     let tmp = tempfile::tempdir()?;
     let thumbs = ThumbnailService::new(&tmp.path().join("data"))?;
     let ids = import_images(&dbm, &thumbs, 2)?;
@@ -502,9 +502,9 @@ conn_retry_test!(http_500_marks_rejected_and_batch_done, {
     let calls2 = Arc::clone(&calls);
     let srv = MockServer::start(move |_| {
         let n = calls2.fetch_add(1, Ordering::SeqCst);
-        // 阶段 5 §8.3：单项失败重试 1 次。结构化等级会先降级，再执行一次素材级重试；
-        // 第 1 张耗尽这些请求后仍为 500，第 2 张开始正常。
-        if n < 6 {
+        // 单项失败重试 1 次；外部 OpenAI 兼容服务遇到 5xx 不会把服务端故障
+        // 误判成格式兼容问题反复降级，因此第 1 张消耗两次请求后仍失败，第 2 张正常。
+        if n < 2 {
             HttpResponse::status_only(500)
         } else {
             HttpResponse::ok_json(&openai_ok_body(
@@ -512,7 +512,7 @@ conn_retry_test!(http_500_marks_rejected_and_batch_done, {
             ))
         }
     });
-    let dbm = Arc::new(Mutex::new(db::init_memory()?));
+    let dbm = Arc::new(Database::new(db::init_memory()?));
     let tmp = tempfile::tempdir()?;
     let thumbs = ThumbnailService::new(&tmp.path().join("data"))?;
     let ids = import_images(&dbm, &thumbs, 2)?;
@@ -561,7 +561,7 @@ conn_retry_test!(cancel_mid_batch_keeps_remaining_pending, {
             r#"{"description":"公园里树木茂盛阳光温暖洒落","peoplePresence":{"status":"unknown","confidence":0.8},"tags":{"scene":[{"name":"公园","confidence":0.9}]},"numbers":{}}"#,
         ))
     });
-    let dbm = Arc::new(Mutex::new(db::init_memory()?));
+    let dbm = Arc::new(Database::new(db::init_memory()?));
     let tmp = tempfile::tempdir()?;
     let thumbs = ThumbnailService::new(&tmp.path().join("data"))?;
     let ids = import_images(&dbm, &thumbs, 3)?;
@@ -617,7 +617,7 @@ conn_retry_test!(limit_two_then_resume_rest, {
             r#"{"description":"测试续跑素材呈现公园晴朗景色","peoplePresence":{"status":"unknown","confidence":0.8},"tags":{"scene":[{"name":"续跑","confidence":0.9}]},"numbers":{}}"#,
         ))
     });
-    let dbm = Arc::new(Mutex::new(db::init_memory()?));
+    let dbm = Arc::new(Database::new(db::init_memory()?));
     let tmp = tempfile::tempdir()?;
     let thumbs = ThumbnailService::new(&tmp.path().join("data"))?;
     let ids = import_images(&dbm, &thumbs, 5)?;
@@ -720,7 +720,7 @@ conn_retry_test!(no_pending_run_errors_with_clear_message, {
             r#"{"description":"公园里树木茂盛阳光温暖洒落","peoplePresence":{"status":"unknown","confidence":0.8},"tags":{"scene":[{"name":"公园","confidence":0.9}]},"numbers":{}}"#,
         ))
     });
-    let dbm = Arc::new(Mutex::new(db::init_memory()?));
+    let dbm = Arc::new(Database::new(db::init_memory()?));
     let tmp = tempfile::tempdir()?;
     let thumbs = ThumbnailService::new(&tmp.path().join("data"))?;
     let ids = import_images(&dbm, &thumbs, 1)?;
@@ -792,7 +792,7 @@ conn_retry_test!(resume_after_cancel_skips_generated, {
             r#"{"description":"公园里树木茂盛阳光温暖洒落","peoplePresence":{"status":"unknown","confidence":0.8},"tags":{"scene":[{"name":"公园","confidence":0.9}]},"numbers":{}}"#,
         ))
     });
-    let dbm = Arc::new(Mutex::new(db::init_memory()?));
+    let dbm = Arc::new(Database::new(db::init_memory()?));
     let tmp = tempfile::tempdir()?;
     let thumbs = ThumbnailService::new(&tmp.path().join("data"))?;
     let ids = import_images(&dbm, &thumbs, 3)?;
@@ -894,11 +894,11 @@ conn_retry_test!(list_models_error_propagates, {
     Ok(())
 });
 
-// 连接拒绝（本地档案）：错误信息含「无法连接本地服务」引导（P3-01a）
+// 自定义端口即使标记为 local 也是外部兼容服务：连接拒绝应给通用请求失败提示。
 conn_retry_test!(connection_refused_local_profile_hint, {
     let _g = common::net_lock_guard();
     // 127.0.0.1:1 基本必拒绝（无需 mock）
-    let dbm = Arc::new(Mutex::new(db::init_memory()?));
+    let dbm = Arc::new(Database::new(db::init_memory()?));
     let tmp = tempfile::tempdir()?;
     let thumbs = ThumbnailService::new(&tmp.path().join("data"))?;
     let ids = import_images(&dbm, &thumbs, 1)?;
@@ -921,8 +921,8 @@ conn_retry_test!(connection_refused_local_profile_hint, {
     assert_eq!(sug[0].status, "rejected");
     let err = sug[0].last_error.as_ref().expect("应记录失败原因");
     assert!(
-        err.contains("无法连接本地服务"),
-        "本地档案提示应可操作: {err}"
+        err.contains("视觉请求请求失败"),
+        "自定义端口不得误报为应用托管 Ollama: {err}"
     );
     Ok(())
 });

@@ -66,6 +66,7 @@ describe("ImportPage", () => {
       images: 0,
       videos: 0,
       totalSize: 0,
+      warnings: [],
     });
     render(<ImportPage />);
     fireEvent.click(screen.getByText("选择文件…"));
@@ -74,13 +75,69 @@ describe("ImportPage", () => {
     });
   });
 
-  it("入库命令级失败后解除 busy，允许重试且不再显示取消状态", async () => {
-    vi.mocked(pickFiles).mockResolvedValue(["d:/raw/X3F"]);
+  it("无法生成缩略图的文件先拦截，确认剔除后保留可导入项", async () => {
+    vi.mocked(pickFiles).mockResolvedValue(["d:/raw/mixed"]);
     vi.mocked(inspectImport).mockResolvedValue({
-      items: [{ path: "d:/raw/X3F", kind: "image", size: 1024 }],
+      items: [
+        { path: "d:/raw/ok.jpg", kind: "image", size: 1024, previewStatus: "ready" },
+        {
+          path: "d:/raw/unsupported.x3f",
+          kind: "image",
+          size: 2048,
+          previewStatus: "unsupported",
+          previewMessage: "无法解析缩略图",
+        },
+      ],
+      images: 2,
+      videos: 0,
+      totalSize: 3072,
+      warnings: [],
+    });
+
+    render(<ImportPage />);
+    fireEvent.click(screen.getByText("选择文件…"));
+
+    expect(await screen.findByRole("dialog", { name: "有文件无法生成缩略图" })).toBeInTheDocument();
+    expect(screen.getByText("d:/raw/unsupported.x3f")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "剔除并保留可导入项" }));
+
+    expect(screen.queryByRole("dialog", { name: "有文件无法生成缩略图" })).toBeNull();
+    expect(screen.getByText("开始入库（1）")).toBeInTheDocument();
+  });
+
+  it("可解析但可能受限的 RAW 入队时显示非阻断说明", async () => {
+    vi.mocked(pickFiles).mockResolvedValue(["d:/raw/limited.cr2"]);
+    vi.mocked(inspectImport).mockResolvedValue({
+      items: [
+        {
+          path: "d:/raw/limited.cr2",
+          kind: "image",
+          size: 1024,
+          previewStatus: "limited",
+          previewMessage: "可解析缩略图但后续功能可能受限",
+        },
+      ],
       images: 1,
       videos: 0,
       totalSize: 1024,
+      warnings: [],
+    });
+
+    render(<ImportPage />);
+    fireEvent.click(screen.getByText("选择文件…"));
+
+    expect(await screen.findByText(/高清预览、元数据或 AI 功能可能受限/)).toBeInTheDocument();
+    expect(screen.getByText("开始入库（1）")).toBeInTheDocument();
+  });
+
+  it("入库命令级失败后解除 busy，允许重试且不再显示取消状态", async () => {
+    vi.mocked(pickFiles).mockResolvedValue(["d:/raw/X3F"]);
+    vi.mocked(inspectImport).mockResolvedValue({
+      items: [{ path: "d:/raw/X3F", kind: "image", size: 1024, previewStatus: "ready" }],
+      images: 1,
+      videos: 0,
+      totalSize: 1024,
+      warnings: [],
     });
     vi.mocked(importFiles).mockRejectedValue(new Error("入库线程异常: task 124 panicked"));
 
@@ -94,6 +151,25 @@ describe("ImportPage", () => {
     });
     expect(screen.getByText("开始入库（1）")).toBeTruthy();
     expect(screen.queryByText("取消入库")).toBeNull();
+  });
+
+  it("入库前显示扫描跳过项，即使没有可入库文件", async () => {
+    vi.mocked(pickFiles).mockResolvedValue(["d:/raw"]);
+    vi.mocked(inspectImport).mockResolvedValue({
+      items: [],
+      images: 0,
+      videos: 0,
+      totalSize: 0,
+      warnings: ["d:/raw/bad.jpg: 文件名不是有效 UTF-8，首版暂不支持无损入库"],
+    });
+
+    render(<ImportPage />);
+    fireEvent.click(screen.getByText("选择文件…"));
+
+    expect(await screen.findByText("扫描时跳过或遇到 1 项，请在导入前确认。")).toBeInTheDocument();
+    fireEvent.click(screen.getByText("查看扫描提示"));
+    expect(screen.getByText(/文件名不是有效 UTF-8/)).toBeInTheDocument();
+    expect(screen.queryByText("开始入库（0）")).toBeNull();
   });
 
   it("计算/入库阶段只展示真实阶段进度，不显示尚未产生的结果计数", () => {

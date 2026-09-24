@@ -371,6 +371,9 @@ fn settings_roundtrip() -> AppResult<()> {
         base_url: "https://api.example.com/v1".into(),
         api_key: "sk-test".into(),
         model: "qwen-vl-plus".into(),
+        max_concurrency: 0,
+        requests_per_minute: 0,
+        requests_per_hour: 0,
     });
     s2.ai.active_profile = "p1".into();
     s2.theme = "dark".into();
@@ -2325,6 +2328,45 @@ fn assign_syncs_to_kinship_siblings() -> AppResult<()> {
 }
 
 #[test]
+fn ambiguous_kinship_group_does_not_expand_tag_assignment() -> AppResult<()> {
+    let conn = setup();
+    let jpg = add_asset(&conn, "d:/all/X.JPG", "X.JPG", "jpg", "image/jpeg");
+    let raw = add_asset(&conn, "d:/all/X.RW2", "X.RW2", "rw2", "image/x-raw");
+    let png = add_asset(&conn, "d:/all/X.PNG", "X.PNG", "png", "image/png");
+    let tag = tags::create_in_facet(&conn, "海边", None, Some("scene"))?;
+
+    asset_tags::assign(&conn, &[jpg], &[tag.id], "manual")?;
+
+    assert_eq!(asset_tags::get_asset_tags(&conn, jpg)?.len(), 1);
+    assert!(asset_tags::get_asset_tags(&conn, raw)?.is_empty());
+    assert!(asset_tags::get_asset_tags(&conn, png)?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn restoring_rejected_suggestion_clears_stale_error() -> AppResult<()> {
+    let conn = setup();
+    let id = add_asset(
+        &conn,
+        "d:/p/restore-error.jpg",
+        "restore-error.jpg",
+        "jpg",
+        "image/jpeg",
+    );
+    let batch = ai::create_batch(&conn, &[id], "local")?;
+    let suggestion = ai::list_suggestions(&conn, batch.id)?.remove(0);
+    ai::set_suggestion_error(&conn, suggestion.id, "旧的模型失败原因")?;
+    ai::reject_suggestion(&conn, suggestion.id)?;
+
+    ai::restore_suggestion(&conn, suggestion.id)?;
+
+    let restored = ai::list_suggestions(&conn, batch.id)?.remove(0);
+    assert_eq!(restored.status, "pending");
+    assert_eq!(restored.last_error, None);
+    Ok(())
+}
+
+#[test]
 fn assign_records_ops_for_both() -> AppResult<()> {
     let conn = setup();
     let (jpg, _raw) = add_kinship_pair(&conn);
@@ -2442,6 +2484,21 @@ fn create_batch_dedups_kinship() -> AppResult<()> {
         |r| r.get(0),
     )?;
     assert_eq!(rep, jpg, "代表应为非 RAW（JPG 解码快有内嵌预览）");
+    Ok(())
+}
+
+#[test]
+fn ambiguous_kinship_group_keeps_each_selected_ai_suggestion() -> AppResult<()> {
+    let conn = setup();
+    let jpg = add_asset(&conn, "d:/all/X.JPG", "X.JPG", "jpg", "image/jpeg");
+    let raw = add_asset(&conn, "d:/all/X.RW2", "X.RW2", "rw2", "image/x-raw");
+    let png = add_asset(&conn, "d:/all/X.PNG", "X.PNG", "png", "image/png");
+
+    // 完整库里 1 RAW + 2 非 RAW 是歧义组；即使本次只选 RAW/JPG，也不能静默折叠。
+    let partial = ai::create_batch(&conn, &[raw, jpg], "cloud")?;
+    assert_eq!(partial.total, 2);
+    let all = ai::create_batch(&conn, &[jpg, raw, png], "cloud")?;
+    assert_eq!(all.total, 3);
     Ok(())
 }
 

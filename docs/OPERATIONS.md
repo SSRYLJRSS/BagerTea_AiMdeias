@@ -1,6 +1,6 @@
 # 运维与交接手册
 
-> 更新日期：2026-09-16
+> 更新日期：2026-09-23
 >
 > 本文档覆盖本地运行、数据位置、发布、备份恢复、本地模型和应急处理。性能细节见 [PERFORMANCE.md](PERFORMANCE.md)，故障症状见 [TROUBLESHOOTING.md](TROUBLESHOOTING.md)。
 
@@ -19,21 +19,27 @@
 
 环境：
 
-- Node.js 20+
-- Rust stable MSVC
+- Node.js 22–24
+- Rust 1.98.1（仓库根目录 toolchain 固定）
 - Visual Studio C++ Build Tools
-- 可选 `ffmpeg` / `ffprobe`
+- 开发环境可选安装 `ffmpeg` / `ffprobe` 并配置 `PATH`；发布构建不使用系统 `PATH`，只使用经严格检查的包内 sidecar
 
 ```powershell
 npm install
-npm run tauri dev
+npm run desktop:dev
 ```
+
+桌面入口会从 [固定 HEIF manifest](../src-tauri/native/heif-manifest.json) 准备当前目标静态库，并校验归档、头文件版本和许可证摘要。直接运行 Cargo 测试时，需先运行 `npm run prepare-heif-libraries -- --target <当前目标>`，再将 `HEIF_BINARIES_DIR` 指向 `src-tauri/native/heif/<当前目标>`。
 
 构建：
 
 ```powershell
-npm run tauri build
+npm run prepare-media-tools -- --target x86_64-pc-windows-msvc
+npm run desktop:check:strict -- --target x86_64-pc-windows-msvc
+npm run desktop:build -- --target x86_64-pc-windows-msvc
 ```
+
+Windows MSI 的安装器界面使用英文 `en-US`，并通过 `src-tauri/wix/en-us.wxl` 指定 Windows-936 code page，以保留中文产品名；不要移除该 locale 覆盖或把 `TauriCodepage` 改回 1252。
 
 正式交付前：
 
@@ -114,17 +120,38 @@ pwsh ./scripts/smoke.ps1
 6. 检查数据库从上一版本升级。
 7. 检查安装包和 License。
 
-### 5.2 构建产物
+### 5.2 三端候选构建
 
-默认输出：
+一般本地安装包构建必须在目标原生系统上进行，并显式提供 target：
+
+```powershell
+# 以 Windows x64 为例；macOS/Linux 应在对应目标机或受支持 runner 上执行
+npm ci
+npm run prepare-media-tools -- --target x86_64-pc-windows-msvc
+npm run prepare-heif-libraries -- --target x86_64-pc-windows-msvc
+npm run desktop:check:strict -- --target x86_64-pc-windows-msvc
+npm run desktop:build -- --target x86_64-pc-windows-msvc
+```
+
+手动候选工作流 `.github/workflows/release-candidate.yml` 从同一个 workflow commit 并行生成三端
+安装包，并附 `build-manifest.json`、runner OS/架构、每个安装包的大小与 SHA256、整体 SHA256 清单、FFmpeg 与 HEIF 许可证文本及其固定来源。验证 job 检查目标、版本、提交、必需包类型、runner 架构和摘要；artifact 只保留 7 天，不会发布到 Releases。macOS 包目前没有签名/公证流程。
+
+**当前硬阻塞**：HEIF 依赖包含静态链接的 LGPL 组件和 GPL 许可的 x265。许可证文本、版本、来源和 SHA256 不能代替对应二进制的源码、构建参数、许可义务和再分发
+条件审查。在这些材料被独立审查确认之前，不得把 artifact 交给熟人测试，也不得公开分发。生成 artifact
+本身不是发布授权。首次远端 code-gate 全绿、GitHub `main` Required checks 配置和三个平台人工核心
+五步验收也都尚待完成。
+
+### 5.3 构建产物
+
+三端目标输出目录：
 
 ```text
-src-tauri/target/release/bundle/
+src-tauri/target/<target-triple>/release/bundle/
 ```
 
 不要提交 `target*/`、`dist/` 或安装包。
 
-### 5.3 回滚
+### 5.4 回滚
 
 应用回滚不等于数据库自动回滚。发布前必须明确：
 
@@ -149,13 +176,13 @@ src-tauri/target/release/bundle/
 
 恢复流程：
 
-1. 校验备份文件。
-2. 拒绝存在运行中导入、导出或 AI 批次时恢复。
-3. 保留现有库为 `library.db.old`。
-4. 用备份替换主库。
-5. 重启并执行迁移和自检。
+1. 校验备份文件，在当前主库仍可用时复制到数据目录同卷的唯一暂存文件，并再次校验副本。
+2. 拒绝正在运行的导入、媒体回填、导出、AI 批次或待处理 AI 批次；取得独占数据库生命周期门后再次检查，避免校验与执行间隙启动任务。
+3. 若 `library.db.old` 已存在，恢复会停止并保留该文件；必须由操作者确认其来源、另行安全归档后，才能重试。应用不会覆盖或自动删除它。
+4. 保留现库为 `library.db.old`，再把校验过的暂存副本原子移动为 `library.db`，执行迁移和启动自检。切换时其他数据库命令等待，但连接 mutex 不跨复制、重命名或迁移文件 IO。
+5. 成功后重启应用并加载新库。成功恢复前的库仍保留为 `.old`；后续恢复若仍占用该名称会被拒绝。
 
-恢复失败时不要删除 `.old` 文件。
+恢复失败时不要删除或覆盖 `.old`、失败恢复副本或暂存副本。可回滚时应用从 `.old` 复制回 `library.db` 并重新打开；无法证明数据库连接有效时应用会封锁后续数据库命令并明确报告保留路径。若 `library.db` 缺失，启动只会在 `.old` 校验通过后复制恢复，绝不会悄悄创建空库，也不会移除 `.old`。此时不要手工新建同名空数据库。
 
 ### 6.3 重置数据
 
@@ -204,6 +231,8 @@ src-tauri/target/release/bundle/
 - 支持 OpenAI 兼容接口和 Anthropic 模式。
 - API Key 存系统凭据库，不写设置 JSON。
 - 连接档案可以绑定到不同用途。
+- 运行时密钥读取发生在数据库 guard 释放后；系统密钥服务不可用时会明确报错，不会当成“尚未配置”。更新/删除失败会尽量恢复原密钥；若补偿也失败，必须保留错误信息并停止后续操作。
+- 设置页重置“AI 服务配置”时，若任一凭据不可读/不可删会中止连接表清理；数据库重置失败则会尝试恢复已删除凭据。
 - 修改连接后应验证打标和超级搜索都读取同一绑定。
 - 日志和截图中不得暴露完整凭据。
 

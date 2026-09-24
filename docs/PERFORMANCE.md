@@ -109,6 +109,8 @@ opt-level = 3
 图像相关：
 
 ```powershell
+npm run prepare-heif-libraries -- --target x86_64-pc-windows-msvc
+$env:HEIF_BINARIES_DIR = (Resolve-Path "src-tauri/native/heif/x86_64-pc-windows-msvc").Path
 cd src-tauri
 cargo test --test format_matrix
 cargo test --test perf_probe -- --ignored --nocapture

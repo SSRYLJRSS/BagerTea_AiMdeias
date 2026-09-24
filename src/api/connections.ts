@@ -5,6 +5,9 @@ export type AiDeployment = "cloud" | "local";
 /** §6.4 协议：apiMode → protocol 迁移后的取值 */
 export type AiProtocol = "openai_chat" | "anthropic_messages";
 
+/** 凭据三态（B3）：configured=已配置且可读；missing=未配置；unavailable=系统密钥服务不可用/锁定。 */
+export type CredentialStatus = "configured" | "missing" | "unavailable";
+
 export interface AiConnection {
   id: string;
   name: string;
@@ -12,7 +15,15 @@ export interface AiConnection {
   protocol: AiProtocol;
   baseUrl: string;
   model: string;
+  maxConcurrency: number;
+  requestsPerMinute: number;
+  requestsPerHour: number;
+  /** 兼容旧 UI：等价 credentialStatus === "configured"。UI 三态请以 credentialStatus 为准。 */
   hasKey: boolean;
+  /** B3 三态凭据状态。 */
+  credentialStatus: CredentialStatus;
+  /** 仅 unavailable 时的可执行文案（不含密钥值）。 */
+  credentialMessage?: string | null;
   enabled: boolean;
 }
 
@@ -31,6 +42,9 @@ export function saveAiConnection(input: {
   baseUrl: string;
   model: string;
   apiKey?: string | null;
+  maxConcurrency?: number;
+  requestsPerMinute?: number;
+  requestsPerHour?: number;
 }): Promise<AiConnection> {
   return invoke<AiConnection>("save_ai_connection", {
     id: input.id,
@@ -40,6 +54,9 @@ export function saveAiConnection(input: {
     baseUrl: input.baseUrl,
     model: input.model,
     apiKey: input.apiKey,
+    maxConcurrency: input.maxConcurrency,
+    requestsPerMinute: input.requestsPerMinute,
+    requestsPerHour: input.requestsPerHour,
   });
 }
 

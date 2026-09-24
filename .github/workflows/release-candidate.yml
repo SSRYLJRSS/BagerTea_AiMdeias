@@ -1,0 +1,89 @@
+name: release-candidate
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bundle:
+    name: bundle (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 100
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+          - target: aarch64-apple-darwin
+            runner: macos-15
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+          targets: ${{ matrix.target }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Log and assert native runner, Rust, and Node target
+        run: node scripts/build-environment.mjs --target ${{ matrix.target }}
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential curl wget file pkg-config libssl-dev libxdo-dev libdbus-1-dev libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev libayatana-appindicator3-dev patchelf libasound2-dev libclang-dev unzip
+      - run: npm ci
+      - name: Prepare pinned target HEIF libraries and licenses
+        run: npm run prepare-heif-libraries -- --target ${{ matrix.target }}
+      - name: Prepare pinned media sidecars
+        run: npm run prepare-media-tools -- --target ${{ matrix.target }}
+      - name: Require sidecar hashes, encoders, and app version agreement
+        run: npm run desktop:check:strict -- --target ${{ matrix.target }}
+      - name: Build native installer
+        env:
+          CANDIDATE_BUILD_LOG: ${{ runner.temp }}/bagertea-build-${{ matrix.target }}.log
+        run: npm run desktop:build -- --target ${{ matrix.target }}
+      - name: Collect test candidate and hashes
+        shell: bash
+        env:
+          BUILD_COMMIT: ${{ github.sha }}
+          CANDIDATE_BUILD_LOG: ${{ runner.temp }}/bagertea-build-${{ matrix.target }}.log
+        run: >-
+          node scripts/collect-candidate.mjs
+          --target '${{ matrix.target }}'
+          --commit "$BUILD_COMMIT"
+          --out 'artifacts/${{ matrix.target }}'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bagertea-${{ matrix.target }}
+          path: artifacts/${{ matrix.target }}
+          if-no-files-found: error
+          retention-days: 7
+
+  verify:
+    needs: bundle
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Fail if any platform bundle failed
+        if: needs.bundle.result != 'success'
+        run: exit 1
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Test candidate contract verifier
+        run: npm run test:tooling
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Verify shared version, commit, license notice, and checksums
+        env:
+          BUILD_COMMIT: ${{ github.sha }}
+        run: node scripts/verify-candidates.mjs artifacts "$BUILD_COMMIT"

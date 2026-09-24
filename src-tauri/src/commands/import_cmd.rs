@@ -57,6 +57,14 @@ pub async fn import_files(
     if paths.is_empty() {
         return Err(AppError::invalid_arg("未选择任何文件"));
     }
+    // 防止绕过入库页直接调用 IPC：正式复制/写库前再次确认所有图片都能生成
+    // 快速缩略图。不可预览项必须先从队列剔除，不能进入半成功的导入任务。
+    let preflight_paths = paths.clone();
+    let preflight =
+        tauri::async_runtime::spawn_blocking(move || importer::inspect_paths(&preflight_paths))
+            .await
+            .map_err(|e| AppError::msg(format!("入库预检查线程异常: {e}")))?;
+    importer::require_previewable(&preflight)?;
     state.import_cancel.store(false, Ordering::Relaxed);
     // W5c：入库进行中标志（restore_db 阻断依据）
     state.import_running.store(true, Ordering::Relaxed);

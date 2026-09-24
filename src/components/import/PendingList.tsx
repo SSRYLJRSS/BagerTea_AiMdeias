@@ -14,6 +14,7 @@ import { useHoverIntent } from "@/hooks/useHoverIntent";
 import { useDoubleAction } from "@/hooks/useDoubleAction";
 import { useHoverPreviewPlayback } from "@/hooks/useHoverPreviewPlayback";
 import { acquireVideoSlot } from "@/utils/videoSlot";
+import { displayBasename } from "@/utils/pathDisplay";
 import { useAppearance } from "@/hooks/useAppearance";
 import { CELL_STEPS } from "@/types/settings";
 import { currentAppearance, useSettingsStore } from "@/stores/settingsStore";
@@ -29,7 +30,8 @@ export function formatSize(bytes: number): string {
 }
 
 function fileName(path: string): string {
-  return path.split(/[\\/]/).pop() ?? path;
+  // X-18：分隔符按平台判定，Unix 反斜杠是合法文件名字符
+  return displayBasename(path);
 }
 
 /** 懒加载缩略图：进入视口才请求，淡入过渡；失败显示类型占位。
@@ -198,6 +200,14 @@ function PendingItem({ item, running, onRemove, onOpenItem }: PendingItemProps) 
       {/* 角标 */}
       {isVideo && (
         <span className="absolute top-1 left-1 rounded bg-black/55 px-1 py-0.5 text-[9px] text-white">视频</span>
+      )}
+      {item.previewStatus === "limited" && !isVideo && (
+        <span
+          className="absolute top-1 left-1 rounded bg-black/60 px-1 py-0.5 text-[9px] text-[var(--color-status)]"
+          title={item.previewMessage}
+        >
+          可能受限
+        </span>
       )}
       {/* 文件名/错误原因 */}
       <div className="absolute inset-x-0 bottom-0 flex items-center justify-between gap-1 bg-gradient-to-t from-black/60 to-transparent px-1.5 pt-3 pb-1">
@@ -414,6 +424,11 @@ export default function PendingList({
                   {fileName(i.path)}
                 </span>
                 <span className="shrink-0 text-xs text-[var(--color-text-secondary)]">{formatSize(i.size)}</span>
+                {i.previewStatus === "limited" && (
+                  <span className="shrink-0 text-[10px] text-[var(--color-status)]" title={i.previewMessage}>
+                    可能受限
+                  </span>
+                )}
                 {!running && (
                   <button
                     aria-label="移除"

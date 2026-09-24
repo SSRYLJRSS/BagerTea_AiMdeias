@@ -8,7 +8,7 @@ use crate::db::{asset_tags, tag_ops, tags};
 use crate::error::{AppError, AppResult};
 use crate::state::AppState;
 
-fn lock_db(state: &AppState) -> AppResult<std::sync::MutexGuard<'_, rusqlite::Connection>> {
+fn lock_db(state: &AppState) -> AppResult<crate::state::DbConnectionGuard<'_>> {
     state.db.lock().map_err(|_| AppError::msg("数据库锁中毒"))
 }
 

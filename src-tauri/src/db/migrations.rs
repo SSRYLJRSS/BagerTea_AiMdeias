@@ -1836,6 +1836,10 @@ pub fn migrate(conn: &Connection) -> AppResult<()> {
     // + ai_suggestion_items 数值两列。无条件幂等段（逐列容错 ALTER + IF NOT EXISTS），
     // 不推进 user_version（与 V23 同理；存量库每次启动自愈补齐）。
     migrate_v24(conn)?;
+    // V25：在线连接限额字段。无版本幂等段，旧库启动时自动补齐。
+    migrate_v25(conn)?;
+    // V26：视频代理缓存指纹。无版本幂等追加；旧 ready 代理的 NULL 指纹会触发安全重建。
+    migrate_v26_video_proxy_fingerprints(conn)?;
     // 产品默认修正：用途和可用性/技术特征需要人工判断，不再进入 AI 提示词。
     migrate_manual_only_system_facets(conn)?;
     // 风格/氛围无法由 AI 稳定判断，且历史结果几乎全是「未知」；彻底下线该系统分面。
@@ -1904,6 +1908,58 @@ CREATE INDEX IF NOT EXISTS ix_afn_value ON asset_facet_numbers(facet_key, value,
     }
     if !item_cols.iter().any(|c| c == "num_value") {
         conn.execute_batch("ALTER TABLE ai_suggestion_items ADD COLUMN num_value REAL")?;
+    }
+    Ok(())
+}
+
+/// V25：在线连接限流字段。无版本幂等段，兼容当前 V22 user_version 与 V23/V24
+/// 的存量自愈迁移约定；只追加列，不改变既有连接的默认行为。
+fn migrate_v25(conn: &Connection) -> AppResult<()> {
+    for (column, sql) in [
+        (
+            "max_concurrency",
+            "ALTER TABLE ai_connections ADD COLUMN max_concurrency INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "requests_per_minute",
+            "ALTER TABLE ai_connections ADD COLUMN requests_per_minute INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "requests_per_hour",
+            "ALTER TABLE ai_connections ADD COLUMN requests_per_hour INTEGER NOT NULL DEFAULT 0",
+        ),
+    ] {
+        if !has_column(conn, "ai_connections", column)? {
+            conn.execute(sql, [])?;
+        }
+    }
+    Ok(())
+}
+
+/// V26（视频代理缓存指纹）：只追加新列，不修改已发布的 V14 表迁移。
+/// 旧 ready 记录保留 NULL 指纹，服务层因此将其判为过期并从源文件重建。
+fn migrate_v26_video_proxy_fingerprints(conn: &Connection) -> AppResult<()> {
+    for (column, sql) in [
+        (
+            "source_fingerprint",
+            "ALTER TABLE video_proxies ADD COLUMN source_fingerprint TEXT",
+        ),
+        (
+            "encoder_version",
+            "ALTER TABLE video_proxies ADD COLUMN encoder_version INTEGER",
+        ),
+        (
+            "tool_fingerprint",
+            "ALTER TABLE video_proxies ADD COLUMN tool_fingerprint TEXT",
+        ),
+        (
+            "source_path",
+            "ALTER TABLE video_proxies ADD COLUMN source_path TEXT",
+        ),
+    ] {
+        if !has_column(conn, "video_proxies", column)? {
+            conn.execute(sql, [])?;
+        }
     }
     Ok(())
 }
@@ -2022,6 +2078,88 @@ mod tests {
         let c = rusqlite::Connection::open_in_memory().unwrap();
         c.pragma_update(None, "journal_mode", "WAL").unwrap();
         c
+    }
+
+    #[test]
+    fn v25_adds_connection_rate_limit_columns_idempotently() {
+        let c = mem();
+        c.execute_batch(
+            "CREATE TABLE ai_connections (
+               id TEXT PRIMARY KEY, name TEXT NOT NULL,
+               deployment TEXT NOT NULL, protocol TEXT NOT NULL,
+               base_url TEXT NOT NULL, model TEXT NOT NULL,
+               api_key_ref TEXT, enabled INTEGER NOT NULL DEFAULT 1,
+               created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+             );",
+        )
+        .unwrap();
+        migrate_v25(&c).unwrap();
+        migrate_v25(&c).unwrap();
+        for column in [
+            "max_concurrency",
+            "requests_per_minute",
+            "requests_per_hour",
+        ] {
+            assert!(has_column(&c, "ai_connections", column).unwrap());
+        }
+        c.execute(
+            "INSERT INTO ai_connections
+             (id, name, deployment, protocol, base_url, model, created_at, updated_at)
+             VALUES ('c', 'C', 'cloud', 'openai_chat', 'u', 'm', 1, 1)",
+            [],
+        )
+        .unwrap();
+        let limits: (i64, i64, i64) = c
+            .query_row(
+                "SELECT max_concurrency, requests_per_minute, requests_per_hour
+                 FROM ai_connections WHERE id='c'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(limits, (0, 0, 0));
+    }
+
+    #[test]
+    fn v26_adds_video_proxy_fingerprints_idempotently_and_leaves_old_rows_stale() -> AppResult<()> {
+        let c = mem();
+        c.execute_batch(
+            "CREATE TABLE assets (id INTEGER PRIMARY KEY, file_path TEXT);
+             CREATE TABLE video_proxies (
+               asset_id INTEGER NOT NULL,
+               variant TEXT NOT NULL DEFAULT 'h264_mp4',
+               status TEXT NOT NULL DEFAULT 'queued',
+               path TEXT,
+               error TEXT,
+               created_at INTEGER NOT NULL,
+               updated_at INTEGER NOT NULL,
+               PRIMARY KEY (asset_id, variant));
+             INSERT INTO assets (id, file_path) VALUES (1, '/v.mp4');
+             INSERT INTO video_proxies
+               (asset_id, variant, status, path, created_at, updated_at)
+               VALUES (1, 'h264_mp4', 'ready', '/proxy/1.mp4', 1, 1);",
+        )?;
+
+        migrate_v26_video_proxy_fingerprints(&c)?;
+        migrate_v26_video_proxy_fingerprints(&c)?;
+
+        for column in [
+            "source_fingerprint",
+            "encoder_version",
+            "tool_fingerprint",
+            "source_path",
+        ] {
+            assert!(has_column(&c, "video_proxies", column)?);
+        }
+        let fingerprints: (Option<String>, Option<i64>, Option<String>, Option<String>) = c
+            .query_row(
+                "SELECT source_fingerprint, encoder_version, tool_fingerprint, source_path
+                 FROM video_proxies WHERE asset_id=1 AND variant='h264_mp4'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )?;
+        assert_eq!(fingerprints, (None, None, None, None));
+        Ok(())
     }
 
     /// 生成一份「已到 v14」的旧库 fixture：直接建必要表 + settings JSON + user_version=14。

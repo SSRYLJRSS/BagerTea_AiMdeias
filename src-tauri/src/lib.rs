@@ -376,6 +376,8 @@ pub fn run() {
             commands::ollama_delete_model,
             commands::ollama_model_dir,
             commands::ollama_open_model_dir,
+            // 平台能力（三端复核 R0）
+            commands::get_platform_capabilities,
             // 设置
             commands::get_settings,
             commands::save_settings,
@@ -383,6 +385,7 @@ pub fn run() {
             commands::open_data_dir,
             // W0-9：设置页「关于」打开日志目录（tracing-appender 滚动文件）
             commands::open_logs_dir,
+            commands::open_help_page,
             // 前端异常与关键事件回传统一 tracing 文件
             commands::log_frontend,
             commands::export_diagnostics,

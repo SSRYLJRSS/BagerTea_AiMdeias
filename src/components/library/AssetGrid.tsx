@@ -56,6 +56,8 @@ export default function AssetGrid({ onPreview, onTag, onExport, onMove, onDelete
         const truncated = ids.length >= 100_000;
         return { ids, total: truncated ? total : ids.length, truncated, warnings: [] };
       }}
+      // 筛选快照变化时丢弃旧筛选下尚未完成的全选/反选结果。
+      selectionRevision={JSON.stringify(filter)}
       onPreview={onPreview}
       onTag={onTag}
       onExport={onExport}

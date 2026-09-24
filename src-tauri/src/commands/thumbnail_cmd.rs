@@ -20,13 +20,12 @@ pub async fn get_thumbnail(
     tauri::async_runtime::spawn_blocking(move || {
         let thumbs = ThumbnailService::new(&data_dir)?;
         match kind.as_str() {
-            "placeholder" => Ok(thumbs
-                .placeholder_path(asset_id)
-                .to_string_lossy()
-                .into_owned()),
+            "placeholder" => {
+                crate::utils::path::encode_native_path(&thumbs.placeholder_path(asset_id))
+            }
             "hd" => {
                 let p = thumbs.get_or_create_hd(&db, asset_id, size)?;
-                Ok(p.to_string_lossy().into_owned())
+                crate::utils::path::encode_native_path(&p)
             }
             _ => Err(AppError::invalid_arg("非法缩略图类型")),
         }
@@ -53,7 +52,7 @@ pub async fn get_preview(state: State<'_, AppState>, path: String) -> AppResult<
     tauri::async_runtime::spawn_blocking(move || {
         let svc = PreviewService::new(&dir)?;
         match svc.get_or_create(std::path::Path::new(&path)) {
-            Ok(p) => Ok(Some(p.to_string_lossy().into_owned())),
+            Ok(p) => crate::utils::path::encode_native_path(&p).map(Some),
             Err(_) => Ok(None),
         }
     })

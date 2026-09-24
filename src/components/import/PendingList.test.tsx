@@ -45,9 +45,9 @@ vi.stubGlobal(
 );
 
 const items: ImportPlanItem[] = [
-  { path: "d:/p/a.jpg", kind: "image", size: 1024 * 512 },
-  { path: "d:/p/b.mp4", kind: "video", size: 1024 * 1024 * 5 },
-  { path: "d:/p/c.mov", kind: "video", size: 1024 * 1024 * 4 },
+  { path: "d:/p/a.jpg", kind: "image", size: 1024 * 512, previewStatus: "ready" },
+  { path: "d:/p/b.mp4", kind: "video", size: 1024 * 1024 * 5, previewStatus: "ready" },
+  { path: "d:/p/c.mov", kind: "video", size: 1024 * 1024 * 4, previewStatus: "ready" },
 ];
 
 function renderGrid(props: { onOpenItem?: (p: string) => void; running?: boolean } = {}) {
@@ -114,6 +114,25 @@ describe("PendingList 固定动作头部", () => {
     expect(screen.getByRole("button", { name: "清空清单" })).toBeInTheDocument();
     expect(screen.queryByText(/3 项/)).toBeNull();
     expect(screen.queryByText("9.5 MB")).toBeNull();
+  });
+
+  it("对可预览但后续能力可能受限的图片显示文字提示", () => {
+    render(
+      <PendingList
+        items={[
+          {
+            path: "d:/p/limited.cr2",
+            kind: "image",
+            size: 1024,
+            previewStatus: "limited",
+            previewMessage: "RAW 格式能力可能受限",
+          },
+        ]}
+        running={false}
+        onRemove={() => {}}
+      />,
+    );
+    expect(screen.getByText("可能受限")).toHaveAttribute("title", "RAW 格式能力可能受限");
   });
 
   it("点击添加文件/文件夹/清空调用对应事件（不直接 invoke）", () => {

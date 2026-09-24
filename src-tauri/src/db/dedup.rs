@@ -8,7 +8,7 @@ use serde::Serialize;
 
 use super::assets::{from_row, Asset, COLUMNS};
 use crate::error::AppResult;
-use crate::services::kinship::kinship_key;
+use crate::services::kinship::{classify_kinship_group, kinship_key, KinshipGroup};
 use crate::services::perceptual::{bucket_by_prefix, hamming};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -63,8 +63,7 @@ pub fn scan_groups(conn: &Connection) -> AppResult<Vec<DupGroup>> {
 /// 扫描感知相似分组。
 ///
 /// `threshold`：汉明距离阈值（0 = 禁用相似检测，直接返回空）。
-/// `exclude_kinship`：同源文件（同目录 + 同主干名 + 一 RAW 一非 RAW，W5h）不算相似 ——
-///   你的库 205 组 RAW+JPG 同画面会被 dHash 识别为「相似」，不开排除会被真实连拍重复淹没。
+/// `exclude_kinship`：只排除全库完整组恰好 1 RAW + 1 非 RAW 的精确配对；歧义组仍参与相似判定。
 /// `need_ids`：只对给定 id 子集做相似检测（空 = 全库）。
 ///
 /// 算法：一次短锁取 (id, file_path, phash) 全表（只三列）→ 过滤 phash 非空 / 哨兵 0 →
@@ -79,28 +78,38 @@ pub fn scan_similar_groups(
     if threshold == 0 {
         return Ok(Vec::new());
     }
-    // 1. 一次短锁取 (id, file_path, phash)
-    let mut stmt = conn.prepare(
-        "SELECT id, file_path, phash FROM assets WHERE deleted_at IS NULL AND phash IS NOT NULL",
-    )?;
+    // 1. 一次短锁读全库成员。无 phash 的素材仍计入同源完整组分类，但不参与相似比较。
+    let mut stmt =
+        conn.prepare("SELECT id, file_path, phash FROM assets WHERE deleted_at IS NULL")?;
     let rows = stmt.query_map([], |r| {
         Ok((
             r.get::<_, i64>(0)?,
             r.get::<_, String>(1)?,
-            r.get::<_, i64>(2)?,
+            r.get::<_, Option<i64>>(2)?,
         ))
     })?;
-    let mut rows_all: Vec<(i64, String, u64)> = Vec::new();
+    let mut library: Vec<(i64, String, Option<u64>)> = Vec::new();
     for row in rows {
         let (id, path, phash) = row?;
-        let ph = phash as u64;
+        library.push((id, path, phash.map(|value| value as u64)));
+    }
+
+    let excluded_pairs = if exclude_kinship {
+        build_kinship_exclusion(&library)
+    } else {
+        std::collections::HashSet::new()
+    };
+
+    let mut rows_all: Vec<(i64, u64)> = Vec::new();
+    for (id, _path, phash) in &library {
+        let Some(ph) = *phash else { continue };
         if ph == 0 {
             continue; // 0 是 set_phash 的哨兵（纯色/无差分图）
         }
-        if !need_ids.is_empty() && !need_ids.contains(&id) {
+        if !need_ids.is_empty() && !need_ids.contains(id) {
             continue;
         }
-        rows_all.push((id, path, ph));
+        rows_all.push((*id, ph));
     }
     if rows_all.len() < 2 {
         return Ok(Vec::new());
@@ -120,18 +129,15 @@ pub fn scan_similar_groups(
     let id_to_idx: std::collections::HashMap<i64, usize> = rows_all
         .iter()
         .enumerate()
-        .map(|(i, (id, _, _))| (*id, i))
+        .map(|(i, (id, _))| (*id, i))
         .collect();
-    let phash_rows: Vec<(i64, u64)> = rows_all.iter().map(|(id, _, ph)| (*id, *ph)).collect();
+    let phash_rows = rows_all.clone();
     for (_prefix, bucket) in bucket_by_prefix(phash_rows) {
         for i in 0..bucket.len() {
             let (ida, pha) = bucket[i];
             let idxa = id_to_idx[&ida];
             for &(idb, phb) in bucket.iter().skip(i + 1) {
-                if exclude_kinship
-                    && kinship_key(&rows_all[id_to_idx[&ida]].1).0
-                        == kinship_key(&rows_all[id_to_idx[&idb]].1).0
-                {
+                if excluded_pairs.contains(&pair_key(ida, idb)) {
                     continue;
                 }
                 if hamming(pha, phb) <= threshold {
@@ -177,6 +183,34 @@ pub fn scan_similar_groups(
     // 组间按代表 phash 排序（稳定输出，方便测试与 UI 复现）
     out.sort_by(|a, b| a.hash.cmp(&b.hash));
     Ok(out)
+}
+
+fn pair_key(a: i64, b: i64) -> (i64, i64) {
+    if a <= b {
+        (a, b)
+    } else {
+        (b, a)
+    }
+}
+
+/// 只把全库完整分组中的精确 RAW/非-RAW 配对加入排除集。`need_ids` 子集不能改变组形状。
+fn build_kinship_exclusion(
+    library: &[(i64, String, Option<u64>)],
+) -> std::collections::HashSet<(i64, i64)> {
+    let mut groups: std::collections::HashMap<String, Vec<(i64, bool)>> =
+        std::collections::HashMap::new();
+    for (id, path, _phash) in library {
+        let (key, is_raw) = kinship_key(path);
+        groups.entry(key).or_default().push((*id, is_raw));
+    }
+
+    groups
+        .values()
+        .filter_map(|members| match classify_kinship_group(members) {
+            KinshipGroup::Paired { raw, non_raw } => Some(pair_key(raw, non_raw)),
+            KinshipGroup::Ambiguous(_) => None,
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -268,6 +302,38 @@ mod tests {
         // 不排除 → 成组
         let included = scan_similar_groups(&conn, 8, false, &[]).unwrap();
         assert_eq!(included.len(), 1);
+    }
+
+    const PH0: i64 = 0xABCD_0000_0000_0001u64 as i64;
+    const PH1: i64 = 0xABCD_0000_0000_0003u64 as i64;
+    const PH2: i64 = 0xABCD_0000_0000_0007u64 as i64;
+
+    #[test]
+    fn ambiguous_kinship_group_is_not_excluded_from_similarity() {
+        let conn = init_memory().unwrap();
+        insert_asset(&conn, "C:/p/X.RW2", "r", Some(PH0));
+        insert_asset(&conn, "C:/p/X.JPG", "j", Some(PH1));
+        insert_asset(&conn, "C:/p/X.PNG", "p", Some(PH2));
+
+        let groups = scan_similar_groups(&conn, 8, true, &[]).unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].assets.len(), 3);
+    }
+
+    #[test]
+    fn need_ids_subset_still_classifies_the_full_kinship_group() {
+        let conn = init_memory().unwrap();
+        let raw = insert_asset(&conn, "C:/p/X.RW2", "r", Some(PH0));
+        let jpg = insert_asset(&conn, "C:/p/X.JPG", "j", Some(PH1));
+        // 即使第三个同源成员没有 phash，也必须计入完整组形状。
+        insert_asset(&conn, "C:/p/X.PNG", "p", None);
+
+        let groups = scan_similar_groups(&conn, 8, true, &[raw, jpg]).unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(
+            groups[0].assets.iter().map(|a| a.id).collect::<Vec<_>>(),
+            vec![raw, jpg]
+        );
     }
 
     #[test]

@@ -19,6 +19,8 @@ import {
   type AiDeployment,
   type AiProtocol,
 } from "@/api/connections";
+import { ollamaListLocalModels } from "@/api/ollama";
+import { usePlatformStore, selectManagedOllama } from "@/stores/platformStore";
 
 interface Props {
   /** 当前部署模式（在线/本地）：新增连接默认按此部署，列表只显示该部署的连接 */
@@ -36,6 +38,9 @@ const EMPTY_FORM = {
   baseUrl: "",
   model: "",
   apiKey: "",
+  maxConcurrency: "",
+  requestsPerMinute: "",
+  requestsPerHour: "",
 };
 
 export default function AiConnectionManager({ deployment, notify, fail, onChanged }: Props) {
@@ -47,19 +52,39 @@ export default function AiConnectionManager({ deployment, notify, fail, onChange
   const [saving, setSaving] = useState(false);
   const [testingId, setTestingId] = useState<string | null>(null);
   const [testResult, setTestResult] = useState<Record<string, string | null>>({});
+  const [localModels, setLocalModels] = useState<string[] | null>(null);
 
-  const visible = conns.filter((c) => c.deployment === deployment);
+  // R1（三端复核 X-05）：非托管平台没有「本机服务」tab，从 Windows 迁移来的旧
+  // deployment=local 档案必须仍能在在线服务列表里看到/编辑，否则会被过滤丢失。
+  const managedOllama = usePlatformStore(selectManagedOllama);
+  const visible = conns.filter((c) =>
+    deployment === "local" && managedOllama
+      ? isManagedOllamaConnection(c, managedOllama)
+      : !isManagedOllamaConnection(c, managedOllama),
+  );
 
   const refresh = useCallback(async () => {
     setError(null);
     try {
-      setConns(await listAiConnections());
+      const connections = await listAiConnections();
+      setConns(connections);
+      if (deployment === "local" && managedOllama) {
+        try {
+          const models = await ollamaListLocalModels("http://localhost:11434/v1");
+          setLocalModels(models.map((model) => model.name));
+        } catch {
+          // 服务未运行时不误标连接；本地服务区会呈现真实运行态。
+          setLocalModels(null);
+        }
+      } else {
+        setLocalModels(null);
+      }
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [deployment, managedOllama]);
 
   useEffect(() => {
     void refresh();
@@ -74,6 +99,9 @@ export default function AiConnectionManager({ deployment, notify, fail, onChange
       baseUrl: c.baseUrl,
       model: c.model,
       apiKey: "", // 不回显完整 key；留空 = 保留
+      maxConcurrency: c.maxConcurrency ? String(c.maxConcurrency) : "",
+      requestsPerMinute: c.requestsPerMinute ? String(c.requestsPerMinute) : "",
+      requestsPerHour: c.requestsPerHour ? String(c.requestsPerHour) : "",
     });
   };
 
@@ -90,6 +118,10 @@ export default function AiConnectionManager({ deployment, notify, fail, onChange
   const save = async () => {
     if (!form.name.trim()) return fail("请填写服务名称");
     if (!form.baseUrl.trim()) return fail("请填写服务地址");
+    const maxConcurrency = parseLimit(form.maxConcurrency, "最大并发数", 128, fail);
+    const requestsPerMinute = parseLimit(form.requestsPerMinute, "每分钟请求数", 1_000_000, fail);
+    const requestsPerHour = parseLimit(form.requestsPerHour, "每小时请求数", 10_000_000, fail);
+    if (maxConcurrency === null || requestsPerMinute === null || requestsPerHour === null) return;
     setSaving(true);
     setError(null);
     try {
@@ -103,6 +135,9 @@ export default function AiConnectionManager({ deployment, notify, fail, onChange
         model: form.model.trim(),
         // 只有用户输入了新 key 才写 keyring；空 = 保留原密钥
         apiKey: form.apiKey.trim() ? form.apiKey.trim() : null,
+        maxConcurrency,
+        requestsPerMinute,
+        requestsPerHour,
       });
       await refresh();
       cancelEdit();
@@ -167,7 +202,7 @@ export default function AiConnectionManager({ deployment, notify, fail, onChange
           {visible.map((c) =>
             editingId === c.id ? (
               <li key={c.id} className="flex flex-col gap-1.5 rounded-md border border-[var(--color-border)] bg-[var(--color-surface)] p-2">
-                <EditFields form={form} setForm={setForm} connectionId={c.id} />
+                    <EditFields form={form} setForm={setForm} connectionId={c.id} managedLocal={deployment === "local" && managedOllama} />
                 <div className="flex items-center gap-2">
                   <Button variant="primary" disabled={saving} onClick={() => void save()}>
                     {saving ? "保存中…" : "保存"}
@@ -187,9 +222,28 @@ export default function AiConnectionManager({ deployment, notify, fail, onChange
                     <span className="shrink-0 rounded bg-[var(--color-surface-hover)] px-1 text-[10px] text-[var(--color-text-secondary)]">
                       {c.protocol === "anthropic_messages" ? "Anthropic" : "OpenAI 兼容"}
                     </span>
+                    {deployment === "local" && localModels && !hasLocalModel(localModels, c.model) && (
+                      <span className="shrink-0 rounded bg-[var(--color-status-soft)] px-1 text-[10px] text-[var(--color-status)]">
+                        模型未安装
+                      </span>
+                    )}
                   </div>
+                  {deployment !== "local" && (
+                    <div className="mt-0.5 text-[10px] text-[var(--color-text-tertiary)]">
+                      请求限制：{formatLimit(c.maxConcurrency)} 并发 · {formatLimit(c.requestsPerMinute)} RPM · {formatLimit(c.requestsPerHour)} 次/小时
+                    </div>
+                  )}
                   <div className="mt-0.5 truncate text-[10px] text-[var(--color-text-secondary)]">
-                    {c.baseUrl || "未填地址"} · {c.model || "未选模型"} · {c.hasKey ? "密钥已配置" : "密钥未配置"}
+                    {c.baseUrl || "未填地址"} · {c.model || "未选模型"} ·{" "}
+                    {c.credentialStatus === "unavailable" ? (
+                      <span className="text-[var(--color-danger)]">
+                        {c.credentialMessage || "系统密钥服务不可用"}
+                      </span>
+                    ) : c.credentialStatus === "configured" || (c.credentialStatus == null && c.hasKey) ? (
+                      "密钥已配置"
+                    ) : (
+                      "密钥未配置"
+                    )}
                   </div>
                   {testResult[c.id] && (
                     <div className={clsx("text-[10px]", testResult[c.id]?.startsWith("连接失败") ? "text-[var(--color-danger)]" : "text-[var(--color-status)]")}>
@@ -230,7 +284,7 @@ export default function AiConnectionManager({ deployment, notify, fail, onChange
           )}
           {editingId === "__new__" && (
             <li className="flex flex-col gap-1.5 rounded-md border border-[var(--color-border)] bg-[var(--color-surface)] p-2">
-              <EditFields form={form} setForm={setForm} connectionId={null} />
+              <EditFields form={form} setForm={setForm} connectionId={null} managedLocal={deployment === "local" && managedOllama} />
               <div className="flex items-center gap-2">
                 <Button variant="primary" disabled={saving} onClick={() => void save()}>
                   {saving ? "保存中…" : "创建"}
@@ -249,11 +303,13 @@ function EditFields({
   form,
   setForm,
   connectionId,
+  managedLocal,
 }: {
   form: typeof EMPTY_FORM;
   setForm: (f: typeof EMPTY_FORM) => void;
   /** FB5-04：编辑中的连接档案 id（__new__ 为 null → legacy 显式字段路径） */
   connectionId: string | null;
+  managedLocal: boolean;
 }) {
   const inputCls = "ui-control rounded-md px-2 py-1.5 text-sm outline-none focus:border-[var(--color-accent)]";
   return (
@@ -277,6 +333,19 @@ function EditFields({
         <label className="w-16 shrink-0 text-xs text-[var(--color-text-secondary)]">服务地址</label>
         <input className={clsx(inputCls, "flex-1")} value={form.baseUrl} onChange={(e) => setForm({ ...form, baseUrl: e.target.value })} placeholder="https://api.example.com/v1" />
       </div>
+      {!managedLocal && (
+        <div className="mt-1 border-t border-[var(--color-border)] pt-2">
+          <div className="mb-1 text-xs text-[var(--color-text-secondary)]">请求限制</div>
+          <div className="mb-1 text-[10px] leading-4 text-[var(--color-text-tertiary)]">
+            用于保护免费或有额度的 API；留空或填 0 表示不限。限制按连接在打标与 AI 搜索间共享。
+          </div>
+          <div className="grid grid-cols-1 gap-1.5 sm:grid-cols-3">
+            <LimitInput label="最大并发数" value={form.maxConcurrency} max={128} onChange={(value) => setForm({ ...form, maxConcurrency: value })} inputCls={inputCls} />
+            <LimitInput label="每分钟请求数" value={form.requestsPerMinute} max={1_000_000} onChange={(value) => setForm({ ...form, requestsPerMinute: value })} inputCls={inputCls} />
+            <LimitInput label="每小时请求数" value={form.requestsPerHour} max={10_000_000} onChange={(value) => setForm({ ...form, requestsPerHour: value })} inputCls={inputCls} />
+          </div>
+        </div>
+      )}
       {/* FB5-04（§3.6）：模型字段 = 可输入 combobox。草稿 key 优先于 keyring（连接已保存时），
           新连接走 legacy 显式字段路径（无 connectionId）。 */}
       <div className="flex items-center gap-2">
@@ -308,5 +377,68 @@ function EditFields({
         />
       </div>
     </div>
+  );
+}
+
+function LimitInput({
+  label,
+  value,
+  max,
+  onChange,
+  inputCls,
+}: {
+  label: string;
+  value: string;
+  max: number;
+  onChange: (value: string) => void;
+  inputCls: string;
+}) {
+  return (
+    <label className="flex items-center gap-1.5 text-[11px] text-[var(--color-text-secondary)]">
+      {label}
+      <input
+        type="number"
+        min={0}
+        max={max}
+        step={1}
+        className={clsx(inputCls, "min-w-0 flex-1")}
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        placeholder="不限"
+        aria-label={label}
+      />
+    </label>
+  );
+}
+
+function parseLimit(value: string, label: string, max: number, fail: (message: string) => void): number | null {
+  const trimmed = value.trim();
+  if (!trimmed) return 0;
+  if (!/^\d+$/.test(trimmed)) {
+    fail(`${label}必须是非负整数；留空或填 0 表示不限`);
+    return null;
+  }
+  const parsed = Number(trimmed);
+  if (!Number.isSafeInteger(parsed) || parsed > max) {
+    fail(`${label}不能超过 ${max}`);
+    return null;
+  }
+  return parsed;
+}
+
+function formatLimit(value: number | undefined): string {
+  return !value ? "不限" : String(value);
+}
+
+function hasLocalModel(models: string[], model: string): boolean {
+  return models.some((name) => name === model || name === `${model}:latest` || name.startsWith(`${model}:`));
+}
+
+function isManagedOllamaConnection(connection: AiConnection, managedOllama: boolean): boolean {
+  if (!managedOllama) return false;
+  return (
+    connection.deployment === "local" &&
+    connection.protocol === "openai_chat" &&
+    connection.baseUrl.replace(/\/+$/, "").replace(/\/v1$/i, "") === "http://localhost:11434"
   );
 }

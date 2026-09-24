@@ -2,6 +2,9 @@
   "name": "bagertea_ai_media_v2",
   "private": true,
   "version": "1.0.1",
+  "engines": {
+    "node": ">=22 <25"
+  },
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -9,8 +12,15 @@
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "test:unit": "vitest run",
+    "test:tooling": "node --test scripts/build-environment.test.mjs scripts/candidate-contract.test.mjs scripts/heif-contract.test.mjs scripts/verify-candidates.test.mjs",
     "tauri": "tauri",
-    "test:ignored": "cd src-tauri && cargo test -- --ignored"
+    "test:ignored": "cd src-tauri && cargo test --test perf_probe -- --ignored",
+    "desktop:dev": "node scripts/desktop.mjs dev",
+    "desktop:build": "node scripts/desktop.mjs build",
+    "desktop:check": "node scripts/desktop.mjs check",
+    "desktop:check:strict": "node scripts/desktop.mjs check --strict-release",
+    "prepare-media-tools": "node scripts/prepare-media-tools.mjs",
+    "prepare-heif-libraries": "node scripts/prepare-heif-libraries.mjs"
   },
   "dependencies": {
     "@tanstack/react-virtual": "^3.10.0",

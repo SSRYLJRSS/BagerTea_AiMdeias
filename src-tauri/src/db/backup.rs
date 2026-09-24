@@ -19,10 +19,12 @@ const REQUIRED_TABLES: [&str; 4] = ["assets", "tags", "tag_facets", "assets_fts"
 
 /// 备份到目标路径。调用方持库锁调用（VACUUM INTO 需要一致的快照点）。
 pub fn backup_to(conn: &Connection, target: &Path) -> AppResult<()> {
+    crate::utils::path::ensure_native_absolute(target)?;
     if target.exists() {
         return Err(AppError::msg("目标文件已存在，请换一个文件名"));
     }
-    conn.execute("VACUUM INTO ?1", [target.to_string_lossy().as_ref()])
+    let target = crate::utils::path::encode_native_path(target)?;
+    conn.execute("VACUUM INTO ?1", [&target])
         .map_err(|e| AppError::msg(format!("备份失败：{e}")))?;
     Ok(())
 }

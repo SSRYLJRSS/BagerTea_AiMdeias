@@ -159,6 +159,84 @@ impl Default for OllamaRuntimeState {
     }
 }
 
+/// 只管理默认 Ollama 地址；LM Studio 等其它本机兼容服务不应被应用擅自启动或停止。
+pub fn is_managed_ollama_base(base_url: &str) -> bool {
+    let root = crate::services::ollama_setup::api_root(base_url).to_ascii_lowercase();
+    matches!(
+        root.as_str(),
+        "http://localhost:11434" | "http://127.0.0.1:11434"
+    )
+}
+
+/// AI 打标进入应用托管的默认 Ollama 前确保服务可用。
+///
+/// 只由 Windows 上已通过 is_managed_ollama_profile 的默认连接调用。若服务已存在，
+/// 标记 External 且不接管/停止；若由本次调用启动，则登记为 AppOwned，沿用退出清理。
+pub fn ensure_ready(
+    runtime: &std::sync::Arc<std::sync::Mutex<OllamaRuntimeState>>,
+    proxy: &str,
+) -> crate::error::AppResult<()> {
+    use crate::error::AppError;
+    use crate::services::{ollama_installer, ollama_setup};
+    use std::time::Duration;
+
+    if !cfg!(target_os = "windows") {
+        return Err(AppError::unsupported(
+            "应用托管 Ollama 仅支持 Windows；请选择 OpenAI 兼容服务",
+        ));
+    }
+
+    let wait_for_ready = {
+        let mut state = runtime
+            .lock()
+            .map_err(|_| AppError::msg("Ollama 运行态锁中毒"))?;
+        if state
+            .ownership()
+            .is_some_and(ServiceOwnership::is_app_owned)
+        {
+            // 已有本应用启动的实例（可能仍在慢启动）；并发批次共用它。
+            true
+        } else if ollama_setup::ping(ollama_installer::LOCAL_BASE_URL).running {
+            state.mark_external();
+            return Ok(());
+        } else {
+            let exe = ollama_installer::detect_installed_executable()
+                .ok_or_else(|| AppError::msg("未检测到已安装的 Ollama，请先一键安装"))?;
+            let child = if proxy.trim().is_empty() {
+                ollama_installer::start_service(&exe)?
+            } else {
+                ollama_installer::start_service_with_proxy(&exe, proxy)?
+            };
+            state.register_app_owned(child);
+            true
+        }
+    };
+
+    if wait_for_ready
+        && (ollama_installer::wait_ready(ollama_installer::LOCAL_BASE_URL, Duration::from_secs(90))
+            .is_some()
+            || ollama_setup::ping(ollama_installer::LOCAL_BASE_URL).running)
+    {
+        if let Ok(mut state) = runtime.lock() {
+            state.touch_activity();
+        }
+        return Ok(());
+    }
+
+    // 仅清理由该 runtime 持有的进程；External 服务从不进入这个分支。
+    if let Ok(mut state) = runtime.lock() {
+        if state
+            .ownership()
+            .is_some_and(ServiceOwnership::is_app_owned)
+        {
+            state.stop_app_owned();
+        }
+    }
+    Err(AppError::timeout(
+        "Ollama 服务启动超时，请检查安装状态和 11434 端口后重试",
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -199,6 +277,14 @@ mod tests {
         let mut s = OllamaRuntimeState::new();
         assert!(s.ownership().is_none());
         assert!(!s.stop_app_owned()); // 空态不产生停止动作
+    }
+
+    #[test]
+    fn managed_base_only_covers_default_ollama_ports() {
+        assert!(is_managed_ollama_base("http://localhost:11434/v1"));
+        assert!(is_managed_ollama_base("http://127.0.0.1:11434"));
+        assert!(!is_managed_ollama_base("http://localhost:1234/v1"));
+        assert!(!is_managed_ollama_base("https://api.example.com/v1"));
     }
 
     #[test]

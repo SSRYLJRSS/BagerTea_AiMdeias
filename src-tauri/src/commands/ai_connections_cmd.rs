@@ -8,6 +8,7 @@ use crate::db::ai_connections;
 use crate::db::settings;
 use crate::error::{AppError, AppResult};
 use crate::services::credentials;
+use crate::services::ollama_runtime;
 use crate::state::AppState;
 
 #[derive(Debug, serde::Serialize)]
@@ -19,40 +20,67 @@ pub struct AiConnectionView {
     pub protocol: String,
     pub base_url: String,
     pub model: String,
-    /// 是否已配置 API 密钥（不回显 plaintext；只暴露已配置/未配置）
+    pub max_concurrency: i64,
+    pub requests_per_minute: i64,
+    pub requests_per_hour: i64,
+    /// 是否已配置 API 密钥（不回显 plaintext；兼容旧 UI，等价 credentialStatus=="configured"）。
     pub has_key: bool,
+    /// 三态凭据状态（B3）：configured|missing|unavailable。UI 三态以此为准。
+    pub credential_status: String,
+    /// 仅 unavailable 时的可执行文案（不含密钥值）。
+    pub credential_message: Option<String>,
     pub enabled: bool,
 }
 
-fn lock_db(state: &AppState) -> AppResult<std::sync::MutexGuard<'_, rusqlite::Connection>> {
-    state.db.lock().map_err(|_| AppError::msg("数据库锁中毒"))
-}
-
-/// 列出全部连接档案（含 key 配置状态）。
-#[tauri::command]
-pub fn list_ai_connections(state: State<AppState>) -> AppResult<Vec<AiConnectionView>> {
-    let conn = lock_db(&state)?;
-    let rows = ai_connections::list(&conn)?;
-    let mut out = Vec::new();
-    for c in rows {
-        let has_key = match &c.api_key_ref {
-            Some(id) => credentials::get_api_key(id)?
-                .map(|k| !k.is_empty())
-                .unwrap_or(false),
-            None => false,
-        };
-        out.push(AiConnectionView {
+impl AiConnectionView {
+    fn from_row(c: ai_connections::AiConnection, status: credentials::CredentialStatus) -> Self {
+        Self {
             id: c.id,
             name: c.name,
             deployment: c.deployment,
             protocol: c.protocol,
             base_url: c.base_url,
             model: c.model,
-            has_key,
+            max_concurrency: c.max_concurrency,
+            requests_per_minute: c.requests_per_minute,
+            requests_per_hour: c.requests_per_hour,
+            has_key: status.has_key(),
+            credential_status: status.tag().to_string(),
+            credential_message: status.message().map(str::to_owned),
             enabled: c.enabled,
-        });
+        }
     }
-    Ok(out)
+}
+
+fn lock_db(state: &AppState) -> AppResult<crate::state::DbConnectionGuard<'_>> {
+    state.db.lock().map_err(|_| AppError::msg("数据库锁中毒"))
+}
+
+/// 列出全部连接档案（含 key 三态状态）。
+///
+/// B3：先短锁读取行、立即释放锁，再在阻塞工作线程逐个探测 keyring；
+/// 一条不可读只标该条 unavailable，其它连接仍可编辑使用（不再让 `?` 中断整个列表）。
+#[tauri::command]
+pub async fn list_ai_connections(state: State<'_, AppState>) -> AppResult<Vec<AiConnectionView>> {
+    // 短锁取行后释放
+    let rows = {
+        let conn = lock_db(&state)?;
+        ai_connections::list(&conn)?
+    };
+    // keyring 访问在阻塞线程（锁外）
+    tauri::async_runtime::spawn_blocking(move || {
+        rows.into_iter()
+            .map(|c| {
+                let status = match &c.api_key_ref {
+                    Some(id) => credentials::probe_status(id),
+                    None => credentials::CredentialStatus::Missing,
+                };
+                AiConnectionView::from_row(c, status)
+            })
+            .collect::<Vec<_>>()
+    })
+    .await
+    .map_err(|e| AppError::msg(format!("凭据状态探测任务失败: {e}")))
 }
 
 /// 保存连接档案。api_key 为 Some(非空) 时写入系统凭据（keyring）并置 api_key_ref；
@@ -60,8 +88,8 @@ pub fn list_ai_connections(state: State<AppState>) -> AppResult<Vec<AiConnection
 // 参数即 IPC 契约（前端 invoke 按字段名传参），收进结构体会破坏前端调用，故平铺并豁免。
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
-pub fn save_ai_connection(
-    state: State<AppState>,
+pub async fn save_ai_connection(
+    state: State<'_, AppState>,
     id: String,
     name: String,
     deployment: String,
@@ -69,6 +97,9 @@ pub fn save_ai_connection(
     base_url: String,
     model: String,
     api_key: Option<String>,
+    max_concurrency: Option<i64>,
+    requests_per_minute: Option<i64>,
+    requests_per_hour: Option<i64>,
 ) -> AppResult<AiConnectionView> {
     if id.trim().is_empty() || name.trim().is_empty() {
         return Err(AppError::msg("连接名称与内部标识不能为空"));
@@ -76,52 +107,113 @@ pub fn save_ai_connection(
     if base_url.trim().is_empty() {
         return Err(AppError::msg("服务地址不能为空"));
     }
-    let conn = lock_db(&state)?;
-    // 新 key 只在 keyring 写成功后才引用
-    let mut api_key_ref: Option<String> = None;
-    if let Some(k) = &api_key {
-        if !k.trim().is_empty() {
-            credentials::save_api_key(&id, k.trim())?;
-            api_key_ref = Some(id.clone());
-        }
-    }
-    ai_connections::upsert(
-        &conn,
-        id.trim(),
-        name.trim(),
-        &deployment,
-        &protocol,
-        base_url.trim(),
-        model.trim(),
-        api_key_ref.as_deref(),
-    )?;
-    let c =
-        ai_connections::get(&conn, id.trim())?.ok_or_else(|| AppError::msg("保存后读取失败"))?;
-    let has_key = match &c.api_key_ref {
-        Some(id) => credentials::get_api_key(id)?
-            .map(|k| !k.is_empty())
-            .unwrap_or(false),
-        None => false,
-    };
-    Ok(AiConnectionView {
-        id: c.id,
-        name: c.name,
-        deployment: c.deployment,
-        protocol: c.protocol,
-        base_url: c.base_url,
-        model: c.model,
-        has_key,
-        enabled: c.enabled,
+    let id_owned = id.trim().to_string();
+    let db = std::sync::Arc::clone(&state.db);
+    let name = name.trim().to_string();
+    let base_url = base_url.trim().to_string();
+    let model = model.trim().to_string();
+    let key_to_write = api_key
+        .filter(|key| !key.trim().is_empty())
+        .map(|key| key.trim().to_string());
+    tauri::async_runtime::spawn_blocking(move || {
+        // Lock order: credential operation -> short DB reads/writes -> keyring IO
+        // only while no DB guard is held. The keyring write is compensated if DB
+        // upsert fails, so an old working key is never silently replaced.
+        let _operations = credentials::lock_operations()?;
+        let existing = {
+            let conn = db.lock()?;
+            ai_connections::get(&conn, &id_owned)?
+        };
+        let max_concurrency = max_concurrency
+            .or_else(|| {
+                existing
+                    .as_ref()
+                    .map(|connection| connection.max_concurrency)
+            })
+            .unwrap_or(0);
+        let requests_per_minute = requests_per_minute
+            .or_else(|| {
+                existing
+                    .as_ref()
+                    .map(|connection| connection.requests_per_minute)
+            })
+            .unwrap_or(0);
+        let requests_per_hour = requests_per_hour
+            .or_else(|| {
+                existing
+                    .as_ref()
+                    .map(|connection| connection.requests_per_hour)
+            })
+            .unwrap_or(0);
+        let write_row = || -> AppResult<ai_connections::AiConnection> {
+            let mut conn = db.lock()?;
+            let tx = conn.transaction()?;
+            ai_connections::upsert_with_limits(
+                &tx,
+                &id_owned,
+                &name,
+                &deployment,
+                &protocol,
+                &base_url,
+                &model,
+                key_to_write.as_ref().map(|_| id_owned.as_str()),
+                max_concurrency,
+                requests_per_minute,
+                requests_per_hour,
+            )?;
+            let row = ai_connections::get(&tx, &id_owned)?
+                .ok_or_else(|| AppError::msg("保存后读取失败"))?;
+            tx.commit()?;
+            Ok(row)
+        };
+        let row = match &key_to_write {
+            Some(key) => credentials::replace_with_commit(
+                &credentials::SystemCredentialBackend,
+                &id_owned,
+                key,
+                write_row,
+            )?,
+            None => write_row()?,
+        };
+        let status = match &row.api_key_ref {
+            Some(_) if key_to_write.is_some() => credentials::CredentialStatus::Configured,
+            Some(reference) => credentials::probe_status(reference),
+            None => credentials::CredentialStatus::Missing,
+        };
+        Ok(AiConnectionView::from_row(row, status))
     })
+    .await
+    .map_err(|e| AppError::msg(format!("连接保存任务失败: {e}")))?
 }
 
 /// 删除连接档案（同时删除用途绑定与系统凭据）。
 #[tauri::command]
-pub fn delete_ai_connection(state: State<AppState>, id: String) -> AppResult<()> {
-    let conn = lock_db(&state)?;
-    ai_connections::delete(&conn, &id)?;
-    let _ = credentials::delete_api_key(&id);
-    Ok(())
+pub async fn delete_ai_connection(state: State<'_, AppState>, id: String) -> AppResult<()> {
+    let db = std::sync::Arc::clone(&state.db);
+    tauri::async_runtime::spawn_blocking(move || {
+        let _operations = credentials::lock_operations()?;
+        let row = {
+            let conn = db.lock()?;
+            ai_connections::get(&conn, &id)?.ok_or_else(|| AppError::not_found("连接档案不存在"))?
+        };
+        let delete_row = || -> AppResult<()> {
+            let mut conn = db.lock()?;
+            let tx = conn.transaction()?;
+            ai_connections::delete(&tx, &id)?;
+            tx.commit()?;
+            Ok(())
+        };
+        match row.api_key_ref.as_deref() {
+            Some(reference) => credentials::delete_with_commit(
+                &credentials::SystemCredentialBackend,
+                reference,
+                delete_row,
+            ),
+            None => delete_row(),
+        }
+    })
+    .await
+    .map_err(|e| AppError::msg(format!("连接删除任务失败: {e}")))?
 }
 
 /// 绑定用途 → 连接（connection_id 为空 = 解绑，回退默认档案）。
@@ -177,31 +269,23 @@ pub async fn test_ai_connection(
     state: State<'_, AppState>,
     connection_id: String,
 ) -> AppResult<crate::services::ai_cloud::AiConnectionTestResult> {
-    // DB 与 keyring 都是阻塞调用：先在当前任务提取需要的数据（短锁），网络测试放 spawn_blocking。
-    // State 不能 move 进 'static 闭包，所以这里克隆 Arc 后释放。
-    let (base_url, protocol, model, api_key, is_local) = {
-        let conn = lock_db(&state)?;
-        let c = ai_connections::get(&conn, &connection_id)?
-            .ok_or_else(|| AppError::msg("连接档案不存在"))?;
+    let db = std::sync::Arc::clone(&state.db);
+    tauri::async_runtime::spawn_blocking(move || {
+        // helper 获取元数据后会先释放 DB guard，再读取系统 keyring；此后才发起网络探测。
+        let (c, key) = credentials::connection_with_system_credential(&db, &connection_id)?;
         if c.base_url.trim().is_empty() {
             return Err(AppError::msg("该服务未填写地址，请先编辑并保存"));
         }
-        // 从 keyring 读取密钥；未配置时按空串处理（本地服务通常无需密钥）
-        let api_key = match &c.api_key_ref {
-            Some(id) => credentials::get_api_key(id)?.unwrap_or_default(),
-            None => String::new(),
-        };
-        (
-            c.base_url,
-            c.protocol,
-            c.model,
-            api_key,
-            c.deployment == "local",
-        )
-    };
-    tauri::async_runtime::spawn_blocking(move || {
+        let managed_ollama = cfg!(target_os = "windows")
+            && c.deployment == "local"
+            && c.protocol == "openai_chat"
+            && ollama_runtime::is_managed_ollama_base(&c.base_url);
         Ok(crate::services::ai_cloud::test_connection(
-            &base_url, &api_key, &protocol, &model, is_local,
+            &c.base_url,
+            key.as_deref().unwrap_or_default(),
+            &c.protocol,
+            &c.model,
+            managed_ollama,
         ))
     })
     .await
@@ -223,25 +307,20 @@ pub async fn discover_ai_models(
     base_url: Option<String>,
     api_key: Option<String>,
 ) -> AppResult<Vec<String>> {
-    let (base_url, protocol, deployment, key) = {
-        let conn = lock_db(&state)?;
-        if let Some(cid) = &connection_id {
-            let c =
-                ai_connections::get(&conn, cid)?.ok_or_else(|| AppError::msg("连接档案不存在"))?;
-            // keyring 读取（阻塞）在短锁内完成；未配置时按空串处理（本地服务通常无需密钥）
-            let saved_key = match &c.api_key_ref {
-                Some(id) => credentials::get_api_key(id)?.unwrap_or_default(),
-                None => String::new(),
-            };
-            // 草稿 key 优先于 saved key（§13.5）
+    let db = std::sync::Arc::clone(&state.db);
+    tauri::async_runtime::spawn_blocking(move || {
+        let (base_url, protocol, deployment, key) = if let Some(cid) = connection_id {
+            // DB guard is released by the credential helper before keyring access.
+            let (connection, saved_key) =
+                credentials::connection_with_system_credential(&db, &cid)?;
             let key = match &api_key {
                 Some(k) if !k.trim().is_empty() => k.trim().to_string(),
-                _ => saved_key,
+                _ => saved_key.unwrap_or_default(),
             };
             (
-                base_url.unwrap_or(c.base_url),
-                protocol.unwrap_or(c.protocol),
-                deployment.unwrap_or(c.deployment),
+                base_url.unwrap_or(connection.base_url),
+                protocol.unwrap_or(connection.protocol),
+                deployment.unwrap_or(connection.deployment),
                 key,
             )
         } else {
@@ -252,15 +331,12 @@ pub async fn discover_ai_models(
                 deployment.unwrap_or_else(|| "cloud".to_string()),
                 api_key.unwrap_or_default(),
             )
-        }
-    };
-    tauri::async_runtime::spawn_blocking(move || {
-        crate::services::ai_cloud::discover_models(
-            &base_url,
-            &key,
-            &protocol,
-            &deployment == "local",
-        )
+        };
+        let managed_ollama = cfg!(target_os = "windows")
+            && deployment == "local"
+            && protocol == "openai_chat"
+            && ollama_runtime::is_managed_ollama_base(&base_url);
+        crate::services::ai_cloud::discover_models(&base_url, &key, &protocol, managed_ollama)
     })
     .await
     .map_err(|e| AppError::msg(format!("模型发现任务失败: {e}")))?

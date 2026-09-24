@@ -27,6 +27,7 @@ use bagertea_ai_media_v2_lib::error::AppResult;
 use bagertea_ai_media_v2_lib::services::ai_cloud;
 use bagertea_ai_media_v2_lib::services::importer;
 use bagertea_ai_media_v2_lib::services::thumbnail::ThumbnailService;
+use bagertea_ai_media_v2_lib::state::Database;
 
 use common::{HttpResponse, MockServer};
 
@@ -87,11 +88,7 @@ fn make_image(dir: &Path, name: &str, salt: u32) {
         .expect("生成测试图失败");
 }
 
-fn import_images(
-    dbm: &Arc<Mutex<rusqlite::Connection>>,
-    thumbs: &ThumbnailService,
-    n: usize,
-) -> AppResult<Vec<i64>> {
+fn import_images(dbm: &Arc<Database>, thumbs: &ThumbnailService, n: usize) -> AppResult<Vec<i64>> {
     let tmp = tempfile::tempdir()?;
     let src = tmp.path().join("src");
     std::fs::create_dir_all(&src)?;
@@ -126,6 +123,9 @@ fn profile(base_url: &str, api_mode: &str, kind: &str) -> ApiProfile {
         base_url: base_url.into(),
         api_key: "test-key".into(),
         model: "qwen-vl-plus".into(),
+        max_concurrency: 0,
+        requests_per_minute: 0,
+        requests_per_hour: 0,
     }
 }
 
@@ -182,7 +182,7 @@ fn ok_content(json: &str) -> HttpResponse {
 
 /// 跑一批云端打标（1 张图，返回建议列表）
 fn run_one(
-    dbm: &Arc<Mutex<rusqlite::Connection>>,
+    dbm: &Arc<Database>,
     thumbs_dir: &Path,
     srv: &MockServer,
 ) -> AppResult<(i64, Vec<ai::AiSuggestion>)> {
@@ -214,7 +214,7 @@ conn_retry_test!(garbled_content_rejected_batch_survives, {
     let _g = common::net_lock_guard();
     let srv =
         MockServer::start(move |_| HttpResponse::ok_json(&openai_ok_body("锟斤拷烫烫烫\x07\x1b")));
-    let dbm = Arc::new(Mutex::new(db::init_memory()?));
+    let dbm = Arc::new(Database::new(db::init_memory()?));
     let tmp = tempfile::tempdir()?;
     let (batch_id, sug) = run_one(&dbm, tmp.path(), &srv)?;
     let b = ai::get_batch(&dbm.lock().unwrap(), batch_id)?;
@@ -232,7 +232,7 @@ conn_retry_test!(degenerate_chat_reply_rejected, {
             "抱歉，我无法分析这张图片，请提供更清晰的照片。",
         ))
     });
-    let dbm = Arc::new(Mutex::new(db::init_memory()?));
+    let dbm = Arc::new(Database::new(db::init_memory()?));
     let tmp = tempfile::tempdir()?;
     let (batch_id, sug) = run_one(&dbm, tmp.path(), &srv)?;
     let b = ai::get_batch(&dbm.lock().unwrap(), batch_id)?;
@@ -250,7 +250,7 @@ conn_retry_test!(out_of_range_confidence_rejected, {
             r#"{"description":"海边风十分开阔明亮","peoplePresence":{"status":"unknown","confidence":0.8},"tags":{"scene":[{"name":"海边","confidence":1.7}]},"numbers":{}}"#,
         )
     });
-    let dbm = Arc::new(Mutex::new(db::init_memory()?));
+    let dbm = Arc::new(Database::new(db::init_memory()?));
     let tmp = tempfile::tempdir()?;
     let (batch_id, sug) = run_one(&dbm, tmp.path(), &srv)?;
     let b = ai::get_batch(&dbm.lock().unwrap(), batch_id)?;
@@ -272,7 +272,7 @@ conn_retry_test!(unknown_facet_key_rejected_with_facet_name, {
             r#"{"description":"傍晚光线柔和温暖","peoplePresence":{"status":"absent","confidence":0.9},"tags":{"mood":[{"name":"治愈","confidence":0.9}]},"numbers":{}}"#,
         )
     });
-    let dbm = Arc::new(Mutex::new(db::init_memory()?));
+    let dbm = Arc::new(Database::new(db::init_memory()?));
     let tmp = tempfile::tempdir()?;
     let (batch_id, sug) = run_one(&dbm, tmp.path(), &srv)?;
     let b = ai::get_batch(&dbm.lock().unwrap(), batch_id)?;
@@ -295,7 +295,7 @@ conn_retry_test!(truncated_json_exhausts_retries_then_rejected, {
             r#"{"description":"海边风十分开阔明亮","peoplePresence":{"status":"unknown","confide"#,
         ))
     });
-    let dbm = Arc::new(Mutex::new(db::init_memory()?));
+    let dbm = Arc::new(Database::new(db::init_memory()?));
     let tmp = tempfile::tempdir()?;
     let (batch_id, sug) = run_one(&dbm, tmp.path(), &srv)?;
     let b = ai::get_batch(&dbm.lock().unwrap(), batch_id)?;
@@ -305,28 +305,26 @@ conn_retry_test!(truncated_json_exhausts_retries_then_rejected, {
     Ok(())
 });
 
-// ⑥ 429 限流持续 → 单条 rejected；后续条目正常 → 批次 done（不熔断）
-conn_retry_test!(http_429_marks_rejected_next_item_recovers, {
+// ⑥ 429 是供应商配额边界 → 不重试、不继续消耗额度，待处理建议保留并中断批次
+conn_retry_test!(http_429_stops_batch_and_preserves_pending, {
     let _g = common::net_lock_guard();
     let calls = Arc::new(AtomicUsize::new(0));
     let calls2 = Arc::clone(&calls);
     let srv = MockServer::start(move |_| {
-        let n = calls2.fetch_add(1, Ordering::SeqCst);
-        if n < 6 {
-            HttpResponse::status_only(429)
-        } else {
-            ok_content(
-                r#"{"description":"海边风景十分开阔明亮","peoplePresence":{"status":"unknown","confidence":0.8},"tags":{"scene":[{"name":"海边","confidence":0.9}]},"numbers":{}}"#,
-            )
+        calls2.fetch_add(1, Ordering::SeqCst);
+        HttpResponse {
+            status: 429,
+            content_type: "application/json",
+            body: r#"{"error":{"type":"rate_limit_exceeded","message":"RPM limit exceeded for free users","api_key":"sk-secret"}}"#.to_string(),
         }
     });
-    let dbm = Arc::new(Mutex::new(db::init_memory()?));
+    let dbm = Arc::new(Database::new(db::init_memory()?));
     let tmp = tempfile::tempdir()?;
     let thumbs = ThumbnailService::new(&tmp.path().join("data"))?;
     let ids = import_images(&dbm, &thumbs, 2)?;
     let batch = ai::create_batch(&dbm.lock().unwrap(), &ids, "cloud")?;
     let (_, progress) = progress_sink();
-    ai_cloud::run_cloud_batch(
+    let error = ai_cloud::run_cloud_batch(
         &dbm,
         batch.id,
         &settings_with(profile(&srv.url(), "openai", "cloud")),
@@ -335,21 +333,22 @@ conn_retry_test!(http_429_marks_rejected_next_item_recovers, {
         None,
         &Arc::new(AtomicBool::new(false)),
         progress,
-    )?;
+    )
+    .expect_err("429 应停止批次并上抛限流错误");
+    assert_eq!(error.code(), "AI_RATE_LIMITED");
+    assert!(error.to_string().contains("RPM limit exceeded"));
+    assert!(!error.to_string().contains("sk-secret"));
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "429 不应触发自动重试");
     let conn = dbm.lock().unwrap();
     let b = ai::get_batch(&conn, batch.id)?;
-    assert_eq!(
-        b.status, "done",
-        "429 单条失败不得中断批次: last_error 见下"
-    );
+    assert_eq!(b.status, "interrupted", "429 应中断批次而不是继续发送");
     let sug = ai::list_suggestions(&conn, batch.id)?;
-    assert_eq!(sug[0].status, "rejected", "限流条目应 rejected");
-    assert!(
-        sug[1].suggested_tags.contains_key("scene"),
-        "后续条目应正常出建议: status={:?} err={:?}",
-        sug[1].status,
-        sug[1].last_error
-    );
+    assert_eq!(sug[0].status, "pending", "限流不是内容失败，应保留待处理");
+    assert!(sug[0]
+        .last_error
+        .as_deref()
+        .is_some_and(|message| message.contains("RPM limit exceeded")));
+    assert_eq!(sug[1].status, "pending", "限流后续素材不得继续发送");
     Ok(())
 });
 
@@ -362,7 +361,7 @@ conn_retry_test!(consecutive_failures_trip_circuit_breaker, {
         calls2.fetch_add(1, Ordering::SeqCst);
         HttpResponse::status_only(500)
     });
-    let dbm = Arc::new(Mutex::new(db::init_memory()?));
+    let dbm = Arc::new(Database::new(db::init_memory()?));
     let tmp = tempfile::tempdir()?;
     let thumbs = ThumbnailService::new(&tmp.path().join("data"))?;
     let ids = import_images(&dbm, &thumbs, 5)?;
@@ -412,7 +411,7 @@ conn_retry_test!(injection_style_tag_name_does_not_pollute_db, {
         hostile
     );
     let srv = MockServer::start(move |_| ok_content(&payload));
-    let dbm = Arc::new(Mutex::new(db::init_memory()?));
+    let dbm = Arc::new(Database::new(db::init_memory()?));
     let tmp = tempfile::tempdir()?;
     let (batch_id, sug) = run_one(&dbm, tmp.path(), &srv)?;
     assert!(
@@ -462,7 +461,7 @@ conn_retry_test!(confirm_then_fts_and_super_search_hit, {
             r#"{"description":"黄昏海边有人散步交谈","peoplePresence":{"status":"present","confidence":0.9},"tags":{"scene":[{"name":"海边","confidence":0.95}]},"numbers":{}}"#,
         )
     });
-    let dbm = Arc::new(Mutex::new(db::init_memory()?));
+    let dbm = Arc::new(Database::new(db::init_memory()?));
     let tmp = tempfile::tempdir()?;
     let (batch_id, sug) = run_one(&dbm, tmp.path(), &srv)?;
     assert_eq!(
@@ -594,7 +593,7 @@ conn_retry_test!(very_long_description_confirm_and_search_ok, {
         long_desc
     );
     let srv = MockServer::start(move |_| ok_content(&payload));
-    let dbm = Arc::new(Mutex::new(db::init_memory()?));
+    let dbm = Arc::new(Database::new(db::init_memory()?));
     let tmp = tempfile::tempdir()?;
     let (batch_id, sug) = run_one(&dbm, tmp.path(), &srv)?;
     assert_eq!(
@@ -632,7 +631,7 @@ conn_retry_test!(empty_and_whitespace_and_duplicate_tag_names, {
             )
         }
     });
-    let dbm = Arc::new(Mutex::new(db::init_memory()?));
+    let dbm = Arc::new(Database::new(db::init_memory()?));
     let tmp = tempfile::tempdir()?;
     let (batch_id, sug) = run_one(&dbm, tmp.path(), &srv)?;
     let b = ai::get_batch(&dbm.lock().unwrap(), batch_id)?;
@@ -661,87 +660,88 @@ conn_retry_test!(empty_and_whitespace_and_duplicate_tag_names, {
 
 const V2_OK: &str = r#"{"description":"海边风景十分开阔明亮安静","peoplePresence":{"status":"unknown","confidence":0.8},"tags":{"scene":[{"name":"海边","confidence":0.9}]},"numbers":{}}"#;
 
-fn ollama_chat_body(content: &str) -> String {
-    let content = serde_json::to_string(content).expect("序列化失败");
-    format!(r#"{{"message":{{"content":{content}}},"done":true}}"#)
-}
-
-// ⑫ 本地档案：结构化优先打原生 /api/chat，成功路径不绕 /v1
-conn_retry_test!(local_ollama_native_api_chat_success, {
+// ⑫ localhost 自定义端口即使标记为 local，也必须作为外部 OpenAI 兼容服务请求。
+conn_retry_test!(localhost_connection_uses_external_openai_path, {
     let _g = common::net_lock_guard();
     let paths = Arc::new(Mutex::new(Vec::<String>::new()));
     let paths2 = Arc::clone(&paths);
-    let success_paths = Arc::new(Mutex::new(Vec::<String>::new()));
-    let success_paths2 = Arc::clone(&success_paths);
     let srv = MockServer::start(move |req| {
         paths2.lock().unwrap().push(req.path.clone());
         match req.path.as_str() {
-            "/api/chat" => {
-                success_paths2.lock().unwrap().push(req.path.clone());
-                HttpResponse::ok_json(&ollama_chat_body(V2_OK))
-            }
+            "/chat/completions" => ok_content(V2_OK),
             _ => HttpResponse::status_only(404),
         }
     });
-    let dbm = Arc::new(Mutex::new(db::init_memory()?));
+    let dbm = Arc::new(Database::new(db::init_memory()?));
     let tmp = tempfile::tempdir()?;
     let (batch_id, sug) = run_one_local(&dbm, tmp.path(), &srv)?;
     assert_eq!(
         sug[0].suggested_tags.get("scene"),
         Some(&vec!["海边".to_string()]),
-        "本地原生 /api/chat 成功应出建议: status={:?} err={:?}",
+        "localhost 外部 API 应出建议: status={:?} err={:?}",
         sug[0].status,
         sug[0].last_error
     );
     let b = ai::get_batch(&dbm.lock().unwrap(), batch_id)?;
     assert_eq!(b.status, "done");
     let paths = paths.lock().unwrap().clone();
-    let success_paths = success_paths.lock().unwrap().clone();
     assert!(
-        !success_paths.is_empty() && success_paths.iter().all(|p| p == "/api/chat"),
-        "本地成功响应应只来自原生端点，实际请求日志: {paths:?}，成功响应: {success_paths:?}"
+        !paths.is_empty() && paths.iter().all(|p| p == "/chat/completions"),
+        "外部成功响应应只来自兼容端点，实际请求日志: {paths:?}"
+    );
+    let request = srv
+        .requests()
+        .into_iter()
+        .find(|request| request.path == "/chat/completions")
+        .expect("应记录 OpenAI 兼容请求");
+    let body: serde_json::Value = serde_json::from_str(&request.body)?;
+    assert!(
+        body["response_format"].is_object(),
+        "应发送结构化 JSON 格式"
+    );
+    assert!(
+        body.get("keep_alive").is_none(),
+        "外部服务不得注入 Ollama 字段"
     );
     Ok(())
 });
 
-// ⑬ 本地档案：原生 /api/chat 5xx → 自动回退 OpenAI 兼容 /v1 端点并成功
-conn_retry_test!(local_ollama_native_failure_falls_back_to_v1, {
-    let _g = common::net_lock_guard();
-    let paths = Arc::new(Mutex::new(Vec::<String>::new()));
-    let paths2 = Arc::clone(&paths);
-    let srv = MockServer::start(move |req| {
-        paths2.lock().unwrap().push(req.path.clone());
-        match req.path.as_str() {
-            "/api/chat" => HttpResponse::status_only(500),
-            "/chat/completions" => ok_content(V2_OK),
-            _ => HttpResponse::status_only(404),
-        }
-    });
-    let dbm = Arc::new(Mutex::new(db::init_memory()?));
-    let tmp = tempfile::tempdir()?;
-    let (batch_id, sug) = run_one_local(&dbm, tmp.path(), &srv)?;
-    assert_eq!(
-        sug[0].suggested_tags.get("scene"),
-        Some(&vec!["海边".to_string()]),
-        "原生失败回退 /v1 后应成功: status={:?} err={:?}",
-        sug[0].status,
-        sug[0].last_error
-    );
-    let paths = paths.lock().unwrap().clone();
-    // Windows 回环噪声容忍：若 mock 侧有 IO 失败，原生请求可能死在传输层未被记录
-    if !paths.iter().any(|p| p == "/api/chat") && srv.io_failures() == 0 {
-        panic!("应先尝试原生端点: {paths:?}");
+// ⑬ 外部兼容服务失败时，只能在其兼容端点重试，不得探测 Ollama 原生 API。
+conn_retry_test!(
+    external_openai_failure_does_not_try_ollama_native_endpoint,
+    {
+        let _g = common::net_lock_guard();
+        let paths = Arc::new(Mutex::new(Vec::<String>::new()));
+        let paths2 = Arc::clone(&paths);
+        let srv = MockServer::start(move |req| {
+            paths2.lock().unwrap().push(req.path.clone());
+            match req.path.as_str() {
+                "/chat/completions" => HttpResponse::status_only(500),
+                _ => HttpResponse::status_only(404),
+            }
+        });
+        let dbm = Arc::new(Database::new(db::init_memory()?));
+        let tmp = tempfile::tempdir()?;
+        let (_batch_id, sug) = run_one_local(&dbm, tmp.path(), &srv)?;
+        assert_eq!(
+            sug[0].status, "rejected",
+            "外部 HTTP 失败应作为失败建议记录"
+        );
+        let paths = paths.lock().unwrap().clone();
+        assert!(
+            paths.iter().any(|p| p == "/chat/completions"),
+            "外部兼容请求应到达 OpenAI 端点: {paths:?}"
+        );
+        assert!(
+            paths.iter().all(|path| path == "/chat/completions"),
+            "失败和重试都不得切换到 Ollama 原生端点: {paths:?}"
+        );
+        Ok(())
     }
-    assert!(
-        paths.iter().any(|p| p == "/chat/completions"),
-        "原生失败应回退 /v1: {paths:?}"
-    );
-    let _ = batch_id;
-    Ok(())
-});
+);
 
-// ⑭ 本地档案：分词器损坏的 mojibake 输出（#8235 症状）→ 检出退化 → 卸载模型 → rejected
-conn_retry_test!(local_mojibake_triggers_unload_and_rejected, {
+// ⑭ 外部服务的 mojibake 仍应 rejected，但不得触发 Ollama 卸载用户服务。
+conn_retry_test!(external_mojibake_does_not_unload_service, {
     let _g = common::net_lock_guard();
     // 有效 V2 JSON（分面齐全不触发修复路径），但 description/标签名都是 Latin-1
     // 误读乱码（占比 > 1/3）→ 触发 is_degenerate → 卸载模型 + 明确报错
@@ -756,7 +756,6 @@ conn_retry_test!(local_mojibake_triggers_unload_and_rejected, {
     let srv = MockServer::start(move |req| {
         paths2.lock().unwrap().push(req.path.clone());
         match req.path.as_str() {
-            "/api/chat" => HttpResponse::ok_json(&ollama_chat_body(&mojibake)),
             "/chat/completions" => ok_content(&mojibake),
             "/api/generate" => {
                 unload_bodies2.lock().unwrap().push(req.body.clone());
@@ -765,7 +764,7 @@ conn_retry_test!(local_mojibake_triggers_unload_and_rejected, {
             _ => HttpResponse::status_only(404),
         }
     });
-    let dbm = Arc::new(Mutex::new(db::init_memory()?));
+    let dbm = Arc::new(Database::new(db::init_memory()?));
     let tmp = tempfile::tempdir()?;
     let (batch_id, sug) = run_one_local(&dbm, tmp.path(), &srv)?;
     let b = ai::get_batch(&dbm.lock().unwrap(), batch_id)?;
@@ -777,18 +776,23 @@ conn_retry_test!(local_mojibake_triggers_unload_and_rejected, {
         "错误应提示模型输出异常/重启服务: {err}"
     );
     let unloads = unload_bodies.lock().unwrap().clone();
-    let unload_hit = unloads
-        .iter()
-        .any(|b| b.contains("keep_alive") && b.contains("\"0\""));
-    if !unload_hit && srv.io_failures() == 0 {
-        panic!("退化检出后应触发模型卸载（keep_alive=0），实际卸载请求: {unloads:?}");
-    }
+    assert!(
+        unloads.is_empty(),
+        "外部服务不得收到模型卸载请求: {unloads:?}"
+    );
+    let requests = srv.requests();
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.path == "/chat/completions"),
+        "外部服务只应收到 OpenAI 兼容请求: {requests:?}"
+    );
     Ok(())
 });
 
 /// 跑一批本地（Ollama）打标
 fn run_one_local(
-    dbm: &Arc<Mutex<rusqlite::Connection>>,
+    dbm: &Arc<Database>,
     thumbs_dir: &Path,
     srv: &MockServer,
 ) -> AppResult<(i64, Vec<ai::AiSuggestion>)> {

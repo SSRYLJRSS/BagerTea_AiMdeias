@@ -11,11 +11,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use image::ImageEncoder;
-use rusqlite::Connection;
 
 use super::{imaging, video};
 use crate::db::assets;
 use crate::error::{AppError, AppResult};
+use crate::state::Database;
 
 pub const PLACEHOLDER_SIZE: u32 = 256;
 pub const HD_SIZE: u32 = 512;
@@ -23,6 +23,7 @@ pub const HD_SIZE: u32 = 512;
 const IMAGE_HD_CACHE_VERSION: &str = "v2";
 
 /// 判断数据库中的图片高清缓存是否属于当前解码代次。
+#[cfg(test)]
 pub(crate) fn is_current_image_hd_cache_path(path: &Path) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
@@ -112,6 +113,9 @@ impl ThumbnailService {
             placeholder_dir: data_dir.join("thumbnails").join("placeholder"),
             hd_dir: data_dir.join("thumbnails").join("hd"),
         };
+        // Cache 路径会写入 SQLite 并通过 asset 协议交给前端，必须保持 UTF-8 无损。
+        crate::utils::path::encode_native_path(&svc.placeholder_dir)?;
+        crate::utils::path::encode_native_path(&svc.hd_dir)?;
         fs::create_dir_all(&svc.placeholder_dir)?;
         fs::create_dir_all(&svc.hd_dir)?;
         Ok(svc)
@@ -193,7 +197,7 @@ impl ThumbnailService {
     /// 解码期间释放（否则排队生成会饿死列表/打标等一切 DB 请求）
     pub fn get_or_create_hd(
         &self,
-        db: &std::sync::Arc<std::sync::Mutex<Connection>>,
+        db: &std::sync::Arc<Database>,
         asset_id: i64,
         size: Option<u32>,
     ) -> AppResult<PathBuf> {
@@ -214,7 +218,7 @@ impl ThumbnailService {
         }
         // 指导书 §9.4.1：single-flight 按 (asset, variant/size) 去重；锁内重新检查文件存在后再生成。
         // 生成期间不持有 DB 锁（decode 在锁外），只短暂读行 + 回写路径。
-        let key = out.to_string_lossy().to_string();
+        let key = crate::utils::path::encode_native_path(&out)?;
         let size = size.unwrap_or(HD_SIZE);
         let asset_for_gen = asset.clone();
         with_single_flight(&key, || {
@@ -234,7 +238,8 @@ impl ThumbnailService {
                 // B05：回写 hd 路径（短锁）+ 节流触发 LRU 清理（先读 settings 短锁，再锁外清理）
                 let cleanup_mb = {
                     let conn = db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
-                    assets::set_hd_thumbnail_path(&conn, asset_id, &out.to_string_lossy())?;
+                    let out_path = crate::utils::path::encode_native_path(&out)?;
+                    assets::set_hd_thumbnail_path(&conn, asset_id, &out_path)?;
                     // B05：每生成 100 张触发一次 LRU 清理
                     let n = HD_GEN_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
                     if n.is_multiple_of(LRU_CHECK_INTERVAL) {

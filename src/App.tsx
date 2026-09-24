@@ -10,6 +10,7 @@ import SettingsPage from "@/pages/SettingsPage";
 import PageErrorBoundary from "@/components/common/PageErrorBoundary";
 import { startGlobalTaskWatch } from "@/stores/taskStore";
 import { useSettingsStore } from "@/stores/settingsStore";
+import { selectNativeWindowControls, usePlatformStore } from "@/stores/platformStore";
 import { useLibraryStore } from "@/stores/libraryStore";
 import { useMetadataStore } from "@/stores/metadataStore";
 import { markStartup } from "@/utils/startupMarks";
@@ -77,10 +78,19 @@ export default function App() {
   // R-24：启动即加载设置并应用主题（load 内部调 applyTheme；single-flight 见 settingsStore §5.3）
   const settingsLoaded = useSettingsStore((s) => s.loaded);
   const loadSettings = useSettingsStore((s) => s.load);
+  const platformStatus = usePlatformStore((s) => s.status);
+  const nativeWindowControls = usePlatformStore(selectNativeWindowControls);
+  const loadPlatform = usePlatformStore((s) => s.load);
   useEffect(() => {
     markStartup("react_first_render"); // §4.1：React 首帧打点（首次挂载即首帧）
     if (!settingsLoaded) void loadSettings();
   }, [settingsLoaded, loadSettings]);
+
+  // 静态平台能力与设置并行加载；状态订阅也让路径显示等纯 UI 选择器在加载后刷新。
+  // 失败时 platformStore 保守禁用平台专属操作，并在界面提供显式重试。
+  useEffect(() => {
+    if (platformStatus === "idle") void loadPlatform();
+  }, [platformStatus, loadPlatform]);
 
   // 骨架超时兜底：设置 IPC 异常挂起时不可无限停留在过渡态（§3.2）
   useEffect(() => {
@@ -104,11 +114,28 @@ export default function App() {
     [],
   );
 
-  const showSkeleton = !settingsLoaded && !startupTimedOut;
+  const platformResolved = platformStatus === "ready" || platformStatus === "error";
+  const showSkeleton = (!settingsLoaded || !platformResolved) && !startupTimedOut;
 
   return (
     <div className="h-full flex flex-col">
-      <TitleBar />
+      {!nativeWindowControls && <TitleBar />}
+
+      {platformStatus === "error" && (
+        <div
+          role="alert"
+          className="flex items-center justify-between gap-3 border-b border-[var(--color-danger)] bg-[var(--color-surface)] px-4 py-2 text-xs text-[var(--color-danger)]"
+        >
+          <span>平台能力加载失败，平台专属功能已安全禁用。请重试或重启应用。</span>
+          <button
+            type="button"
+            className="shrink-0 underline underline-offset-2"
+            onClick={() => void loadPlatform()}
+          >
+            重试
+          </button>
+        </div>
+      )}
 
       <main className={viewerOpen ? "flex-1 min-h-0" : "flex-1 min-h-0 pb-14"}>
         {showSkeleton ? (

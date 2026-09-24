@@ -8,6 +8,7 @@ use bagertea_ai_media_v2_lib::db::assets::AssetFilter;
 use bagertea_ai_media_v2_lib::db::{self, assets, export};
 use bagertea_ai_media_v2_lib::error::AppResult;
 use bagertea_ai_media_v2_lib::services::{export_local, importer, thumbnail::ThumbnailService};
+use bagertea_ai_media_v2_lib::state::Database;
 
 /// 生成 N 张测试 JPEG（image crate 直接出图）
 fn make_jpegs(dir: &std::path::Path, n: usize) {
@@ -32,7 +33,7 @@ fn import_100_images_with_placeholders() -> AppResult<()> {
     std::fs::create_dir_all(&src)?;
     make_jpegs(&src, 100);
 
-    let dbm = std::sync::Arc::new(std::sync::Mutex::new(db::init_memory()?));
+    let dbm = std::sync::Arc::new(Database::new(db::init_memory()?));
     let thumbs = ThumbnailService::new(&tmp.path().join("data"))?;
     let cancel = AtomicBool::new(false);
 
@@ -85,7 +86,7 @@ fn hd_thumbnail_generate_and_cache() -> AppResult<()> {
     std::fs::create_dir_all(&src)?;
     make_jpegs(&src, 1);
 
-    let dbm = std::sync::Arc::new(std::sync::Mutex::new(db::init_memory()?));
+    let dbm = std::sync::Arc::new(Database::new(db::init_memory()?));
     let thumbs = ThumbnailService::new(&tmp.path().join("data"))?;
     let cancel = AtomicBool::new(false);
     importer::import_paths(
@@ -122,7 +123,7 @@ fn export_copy_integrity() -> AppResult<()> {
     std::fs::create_dir_all(&src)?;
     make_jpegs(&src, 5);
 
-    let dbm = std::sync::Arc::new(std::sync::Mutex::new(db::init_memory()?));
+    let dbm = std::sync::Arc::new(Database::new(db::init_memory()?));
     let thumbs = ThumbnailService::new(&tmp.path().join("data"))?;
     let cancel = AtomicBool::new(false);
     importer::import_paths(
@@ -177,7 +178,7 @@ fn delete_cleans_thumbnails() -> AppResult<()> {
     std::fs::create_dir_all(&src)?;
     make_jpegs(&src, 2);
 
-    let dbm = std::sync::Arc::new(std::sync::Mutex::new(db::init_memory()?));
+    let dbm = std::sync::Arc::new(Database::new(db::init_memory()?));
     let data_dir = tmp.path().join("data");
     let thumbs = ThumbnailService::new(&data_dir)?;
     let cancel = AtomicBool::new(false);
@@ -211,7 +212,7 @@ fn managed_library_import() -> AppResult<()> {
     std::fs::create_dir_all(&src)?;
     make_jpegs(&src, 3);
 
-    let dbm = std::sync::Arc::new(std::sync::Mutex::new(db::init_memory()?));
+    let dbm = std::sync::Arc::new(Database::new(db::init_memory()?));
     let thumbs = ThumbnailService::new(&tmp.path().join("data"))?;
     let cancel = AtomicBool::new(false);
     let root = tmp.path().join("library");
@@ -261,7 +262,7 @@ fn b04_export_move_updates_db_file_path() -> AppResult<()> {
     std::fs::create_dir_all(&src)?;
     make_jpegs(&src, 1);
 
-    let dbm = std::sync::Arc::new(std::sync::Mutex::new(db::init_memory()?));
+    let dbm = std::sync::Arc::new(Database::new(db::init_memory()?));
     let thumbs = ThumbnailService::new(&tmp.path().join("data"))?;
     let cancel = AtomicBool::new(false);
     importer::import_paths(
@@ -339,7 +340,7 @@ fn b04_export_move_same_name_suffix_updates_db() -> AppResult<()> {
     std::fs::create_dir_all(&src)?;
     make_jpegs(&src, 1); // photo000.jpg
 
-    let dbm = std::sync::Arc::new(std::sync::Mutex::new(db::init_memory()?));
+    let dbm = std::sync::Arc::new(Database::new(db::init_memory()?));
     let thumbs = ThumbnailService::new(&tmp.path().join("data"))?;
     let cancel = AtomicBool::new(false);
     importer::import_paths(
@@ -412,7 +413,7 @@ fn b01_import_cancel_zero_imported() -> AppResult<()> {
     std::fs::create_dir_all(&src)?;
     make_jpegs(&src, 10);
 
-    let dbm = std::sync::Arc::new(std::sync::Mutex::new(db::init_memory()?));
+    let dbm = std::sync::Arc::new(Database::new(db::init_memory()?));
     let thumbs = ThumbnailService::new(&tmp.path().join("data"))?;
     let cancel = AtomicBool::new(true); // 立即取消
 
@@ -463,7 +464,7 @@ fn b06b_export_same_name_exhaustion_errors() -> AppResult<()> {
     std::fs::create_dir_all(&src)?;
     make_jpegs(&src, 1); // photo000.jpg
 
-    let dbm = std::sync::Arc::new(std::sync::Mutex::new(db::init_memory()?));
+    let dbm = std::sync::Arc::new(Database::new(db::init_memory()?));
     let thumbs = ThumbnailService::new(&tmp.path().join("data"))?;
     let cancel = AtomicBool::new(false);
     importer::import_paths(
@@ -544,7 +545,7 @@ fn import_phase_progress_sequence() -> AppResult<()> {
     std::fs::create_dir_all(&src)?;
     make_jpegs(&src, 3);
 
-    let dbm = std::sync::Arc::new(std::sync::Mutex::new(db::init_memory()?));
+    let dbm = std::sync::Arc::new(Database::new(db::init_memory()?));
     let thumbs = ThumbnailService::new(&tmp.path().join("data"))?;
     let cancel = AtomicBool::new(false);
 

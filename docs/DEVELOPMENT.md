@@ -1,6 +1,6 @@
 # 开发规范
 
-> 更新日期：2026-09-16
+> 更新日期：2026-09-23
 >
 > 本文档定义当前仓库的开发、测试、迁移、提交和 AI 协作规范。根级 [AGENTS.md](../AGENTS.md) 是 AI 的最短强制入口。
 
@@ -9,15 +9,15 @@
 主力环境：
 
 - Windows 10/11。
-- Rust stable MSVC。
+- Rust 1.98.1（由仓库根目录 `rust-toolchain.toml` 固定）；Windows 使用 MSVC。
 - Visual Studio C++ Build Tools，包含 MSVC linker 和 Windows SDK。
-- Node.js 20 或更高版本。
+- Node.js 22、23 或 24（`package.json` 限定 `>=22 <25`）。
 - PowerShell 7 用于本地 smoke；普通 PowerShell 5.1 也可运行基础命令。
 
 辅助依赖：
 
 - `ffmpeg` / `ffprobe`：视频元数据和抽帧，缺失时按降级逻辑运行。
-- LLVM/libclang：HEIC 构建链需要。
+- LLVM/libclang：HEIC 构建链需要；HEIF 原生归档与许可证从固定 manifest 下载并做 SHA256 校验。
 - Ollama：仅本地模型功能需要，不是应用编译前置。
 
 如果 `npm` 或 `cargo` 不在 PATH，先修正当前终端环境，不要把机器专用绝对路径写入仓库配置。
@@ -26,12 +26,15 @@
 
 ```powershell
 npm install
-npm run tauri dev
+npm run desktop:dev
 
 npm run lint
 npm run typecheck
 npm run test:unit
+npm run test:tooling
 npm run build
+npm run desktop:check
+npm run desktop:dev
 ```
 
 Rust：
@@ -43,11 +46,33 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-features
 ```
 
+运行 Rust 编译、clippy、测试前，在目标系统本机准备对应的 HEIF 静态库并设置环境变量（Apple Silicon/macOS 和 Ubuntu/Linux 使用各自 triple）：
+
+```powershell
+npm run prepare-heif-libraries -- --target x86_64-pc-windows-msvc
+$env:HEIF_BINARIES_DIR = (Resolve-Path "src-tauri/native/heif/x86_64-pc-windows-msvc").Path
+```
+
+`desktop:dev` / `desktop:build` 会自动准备 HEIF 库；裸 Cargo 命令不进行下载，未设置已校验目录时会立即失败。
+
 完整冒烟：
 
 ```powershell
 pwsh ./scripts/smoke.ps1
 ```
+
+目标平台构建与媒体 sidecar（每次显式指定交付目标）：
+
+```powershell
+npm run prepare-media-tools -- --target x86_64-pc-windows-msvc
+npm run prepare-heif-libraries -- --target x86_64-pc-windows-msvc
+npm run desktop:check:strict -- --target x86_64-pc-windows-msvc
+npm run desktop:build -- --target x86_64-pc-windows-msvc
+```
+
+Apple Silicon macOS 和 Ubuntu 24.04 x64 的 triple 与支持边界见 [PLATFORM.md](PLATFORM.md)。sidecar
+仅由固定来源和 SHA256 manifest 准备；`desktop:build` 会拒绝缺失或不匹配的 sidecar。平台本机
+构建前置依赖见 [Tauri 官方先决条件](https://v2.tauri.app/start/prerequisites/)。
 
 真实文件性能探针按需执行：
 
@@ -165,6 +190,7 @@ commands -> services -> db
 npm run lint
 npm run typecheck
 npm run test:unit
+npm run test:tooling
 
 cd src-tauri
 cargo fmt --check

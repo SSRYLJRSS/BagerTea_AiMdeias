@@ -342,6 +342,20 @@ describe("W5h-d kinship 合并显示", () => {
     expect(collapseKinship([raw, jpg]).map((a) => a.id)).toEqual([2]);
   });
 
+  it("不折叠大小写不同的 Unix 目录", async () => {
+    const upperDir = mkAsset(4, "/photos/A/X.RW2");
+    const lowerDir = mkAsset(5, "/photos/a/X.JPG");
+    const { collapseKinship } = await import("@/stores/libraryStore");
+    expect(collapseKinship([upperDir, lowerDir]).map((a) => a.id)).toEqual([4, 5]);
+  });
+
+  it("保留 Unix 文件名中的反斜杠，并按扩展名大小写识别 RAW", async () => {
+    const raw = mkAsset(6, "/home/a\\b.RW2");
+    const jpg = mkAsset(7, "/home/a\\b.JPG");
+    const { collapseKinship } = await import("@/stores/libraryStore");
+    expect(collapseKinship([raw, jpg]).map((a) => a.id)).toEqual([7]);
+  });
+
   it("libraryStore_keeps_separate_when_disabled：不折叠由 store 开关控制（viewItems=items）", async () => {
     // mergeInLibrary=false 时 applyKinshipView 返回原数组 —— 通过设置 store 状态验证行为
     const { useSettingsStore } = await import("@/stores/settingsStore");

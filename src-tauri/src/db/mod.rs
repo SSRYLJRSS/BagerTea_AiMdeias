@@ -27,7 +27,7 @@ use std::path::Path;
 
 use rusqlite::Connection;
 
-use crate::error::AppResult;
+use crate::error::{AppError, AppResult};
 use crate::utils::bigram;
 
 fn configure(conn: &Connection) -> AppResult<()> {
@@ -81,6 +81,7 @@ pub fn init(path: &Path) -> AppResult<Connection> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
+    recover_missing_library_from_preserved_old(path)?;
     let conn = Connection::open(path)?;
     configure(&conn)?;
     migrations::migrate(&conn)?;
@@ -109,6 +110,57 @@ pub fn init(path: &Path) -> AppResult<Connection> {
     Ok(conn)
 }
 
+/// If a failed restore left `library.db` absent but preserved `library.db.old`,
+/// restore a validated copy before opening the app DB. Never create a new empty
+/// library over that recovery point.
+fn recover_missing_library_from_preserved_old(path: &Path) -> AppResult<()> {
+    if path.file_name().and_then(|name| name.to_str()) != Some("library.db") || path.exists() {
+        return Ok(());
+    }
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    let old_path = parent.join("library.db.old");
+    if !old_path.exists() {
+        return Ok(());
+    }
+
+    crate::db::backup::validate_backup(&old_path).map_err(|error| {
+        AppError::msg(format!(
+            "library.db 不存在，且保留库 {} 无法验证；为防止创建空库覆盖数据，启动已停止：{error}",
+            old_path.display()
+        ))
+    })?;
+
+    let staged_path = parent.join(format!("library.db.recovery-{}.tmp", uuid::Uuid::new_v4()));
+    if let Err(error) = std::fs::copy(&old_path, &staged_path) {
+        let _ = std::fs::remove_file(&staged_path);
+        return Err(AppError::msg(format!(
+            "保留库复制回 library.db 失败；原文件仍保留在 {}，启动已停止：{error}",
+            old_path.display()
+        )));
+    }
+    if let Err(error) = crate::db::backup::validate_backup(&staged_path) {
+        let _ = std::fs::remove_file(&staged_path);
+        return Err(AppError::msg(format!(
+            "保留库副本校验失败；原文件仍保留在 {}，启动已停止：{error}",
+            old_path.display()
+        )));
+    }
+    if let Err(error) = std::fs::rename(&staged_path, path) {
+        let _ = std::fs::remove_file(&staged_path);
+        return Err(AppError::msg(format!(
+            "保留库已验证但无法恢复到 library.db；原文件仍保留在 {}，启动已停止：{error}",
+            old_path.display()
+        )));
+    }
+    tracing::warn!(
+        preserved_old = %old_path.display(),
+        "library.db 缺失，已从保留副本恢复；原 library.db.old 保持不动"
+    );
+    Ok(())
+}
+
 /// 内存库（单元测试用）
 pub fn init_memory() -> AppResult<Connection> {
     let conn = Connection::open_in_memory()?;
@@ -126,6 +178,7 @@ pub fn ensure_default_taxonomy(conn: &Connection) -> AppResult<()> {
     tag_facets::refresh_system_facet_defaults(conn, now)?;
     tag_facets::seed_system_facets_if_empty(conn)?;
     tags::seed_core_taxonomy_if_empty(conn)?;
+    tags::ensure_core_taxonomy_aliases(conn)?;
     Ok(())
 }
 
@@ -164,6 +217,42 @@ mod tests {
                 "{feature} 在重复初始化后应保持启用"
             );
         }
+    }
+
+    #[test]
+    fn init_recovers_missing_library_from_valid_old_without_removing_old() {
+        let dir = tempfile::tempdir().unwrap();
+        let old_path = dir.path().join("library.db.old");
+        let source = init_memory().unwrap();
+        source
+            .execute(
+                "INSERT INTO assets (file_path, file_name, file_ext, file_size, mime_type, created_at, modified_at, hash)
+                 VALUES ('preserved.jpg', 'preserved.jpg', '.jpg', 1, 'image/jpeg', 1, 1, 'preserved')",
+                [],
+            )
+            .unwrap();
+        crate::db::backup::backup_to(&source, &old_path).unwrap();
+        let library_path = dir.path().join("library.db");
+
+        let recovered = init(&library_path).unwrap();
+        let count: i64 = recovered
+            .query_row("SELECT count(*) FROM assets", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+        assert!(old_path.is_file(), "恢复源 library.db.old 必须保留");
+    }
+
+    #[test]
+    fn init_refuses_to_create_empty_library_when_old_recovery_is_invalid() {
+        let dir = tempfile::tempdir().unwrap();
+        let old_path = dir.path().join("library.db.old");
+        std::fs::write(&old_path, b"not a database").unwrap();
+        let library_path = dir.path().join("library.db");
+
+        let error = init(&library_path).unwrap_err();
+        assert!(error.to_string().contains("防止创建空库覆盖数据"));
+        assert!(!library_path.exists());
+        assert!(old_path.is_file());
     }
 
     #[test]

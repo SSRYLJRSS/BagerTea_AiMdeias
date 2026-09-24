@@ -5,14 +5,17 @@ import clsx from "clsx";
 import { open as pickFiles, open as pickDir } from "@tauri-apps/plugin-dialog";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import Button from "@/components/common/Button";
+import Modal from "@/components/common/Modal";
 import ProgressBar from "@/components/common/ProgressBar";
 import PendingList, { formatSize } from "@/components/import/PendingList";
 import RenameBuilder from "@/components/import/RenameBuilder";
+import { displayBasename } from "@/utils/pathDisplay";
 import { openFileExternal } from "@/api/import";
 import {
   cancelImport,
   importFiles,
   inspectImport,
+  type ImportPlanItem,
   type ImportPlan,
 } from "@/api/import";
 import { useLibraryStore } from "@/stores/libraryStore";
@@ -56,6 +59,9 @@ export default function ImportPage() {
   const [dragOver, setDragOver] = useState(false);
   const [result, setResult] = useState<ImportResult | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [scanReview, setScanReview] = useState<ImportPlan | null>(null);
+  const [scanWarnings, setScanWarnings] = useState<string[]>([]);
+  const [showScanWarnings, setShowScanWarnings] = useState(false);
   const [running, setRunning] = useState(false);
   const importTask = useTaskStore((s) => latestImportTask(s.tasks));
   const activeImportTask = importTask && !importTask.done ? importTask : undefined;
@@ -65,6 +71,17 @@ export default function ImportPage() {
     if (!settingsLoaded) void loadSettings();
   }, [settingsLoaded, loadSettings]);
 
+  const mergePlan = useCallback((scanned: ImportPlan) => {
+    if (scanned.items.length === 0) return;
+    setPlan((prev) => {
+      if (!prev) return scanned;
+      const known = new Set(prev.items.map((item) => item.path));
+      const fresh = scanned.items.filter((item) => !known.has(item.path));
+      const items = [...prev.items, ...fresh];
+      return summarizePlan(items, [...new Set([...prev.warnings, ...scanned.warnings])]);
+    });
+  }, []);
+
   /** 选文件/拖文件 → 只生成清单，不入库（PRD v2.4 手动确认）；追加期间保留旧清单 */
   const stage = useCallback(
     async (paths: string[]) => {
@@ -73,29 +90,40 @@ export default function ImportPage() {
       setResult(null);
       try {
         const scanned = await inspectImport(paths);
+        if (scanned.warnings.length > 0) {
+          setScanWarnings((prev) => [...new Set([...prev, ...scanned.warnings])]);
+        }
         if (scanned.items.length === 0) {
-          setError("未发现可入库的图片/视频文件");
+          if (scanned.warnings.length === 0) setError("未发现可入库的图片/视频文件");
           return;
         }
-        // 追加合并（按规范化路径去重；哈希去重由正式入库兜底）
-        setPlan((prev) => {
-          if (!prev) return scanned;
-          const known = new Set(prev.items.map((i) => i.path));
-          const fresh = scanned.items.filter((i) => !known.has(i.path));
-          const items = [...prev.items, ...fresh];
-          return {
-            items,
-            images: items.filter((i) => i.kind === "image").length,
-            videos: items.filter((i) => i.kind === "video").length,
-            totalSize: items.reduce((s, i) => s + i.size, 0),
-          };
-        });
+        if (scanned.items.some((item) => item.previewStatus === "unsupported")) {
+          // 不把无法生成缩略图的文件静默放入正式队列；用户确认后再合并可用项。
+          setScanReview(scanned);
+          return;
+        }
+        mergePlan(scanned);
       } catch (e) {
         setError(e instanceof Error ? e.message : String(e));
       }
     },
-    [importBusy],
+    [importBusy, mergePlan],
   );
+
+  const confirmScanReview = () => {
+    if (!scanReview) return;
+    const allowed = scanReview.items.filter((item) => item.previewStatus !== "unsupported");
+    mergePlan(summarizePlan(allowed, scanReview.warnings));
+    setScanReview(null);
+    if (allowed.length === 0 && !plan?.items.length) {
+      setError("无法解析的文件已剔除，当前没有可导入项");
+    }
+  };
+
+  const cancelScanReview = () => {
+    setScanReview(null);
+    setError(null);
+  };
 
   // Tauri 原生拖拽（获取真实文件路径）
   useEffect(() => {
@@ -139,22 +167,22 @@ export default function ImportPage() {
     setPlan((prev) => {
       if (!prev) return prev;
       const items = prev.items.filter((i) => i.path !== path);
-      return {
-        items,
-        images: items.filter((i) => i.kind === "image").length,
-        videos: items.filter((i) => i.kind === "video").length,
-        totalSize: items.reduce((s, i) => s + i.size, 0),
-      };
+      return summarizePlan(items, prev.warnings);
     });
 
   const clearPlan = () => {
     if (importBusy) return;
     setPlan(null);
+    setScanWarnings([]);
   };
 
   /** 手动确认入库 */
   const run = async () => {
     if (!plan || plan.items.length === 0 || importBusy) return;
+    if (plan.items.some((item) => item.previewStatus === "unsupported")) {
+      setScanReview(plan);
+      return;
+    }
     setRunning(true);
     setError(null);
     setResult(null);
@@ -165,6 +193,7 @@ export default function ImportPage() {
       );
       setResult(r);
       setPlan(null);
+      setScanWarnings([]);
       void refreshLibrary();
       void useMetadataStore.getState().refresh();
     } catch (e) {
@@ -177,6 +206,27 @@ export default function ImportPage() {
 
   return (
     <div className="flex h-full">
+      <Modal
+        open={Boolean(scanReview)}
+        title="有文件无法生成缩略图"
+        onClose={cancelScanReview}
+        footer={(
+          <>
+            <Button onClick={cancelScanReview}>取消添加</Button>
+            <Button variant="primary" onClick={confirmScanReview}>剔除并保留可导入项</Button>
+          </>
+        )}
+      >
+        <p className="text-sm text-[var(--color-text)]">
+          以下 {scanReview?.items.filter((item) => item.previewStatus === "unsupported").length ?? 0} 个文件无法解析入库缩略图，当前版本禁止导入。
+          是否将它们从本次队列中剔除，并保留其余可导入文件？
+        </p>
+        <ul className="mt-3 max-h-40 space-y-1 overflow-y-auto rounded-md bg-[var(--color-surface)] p-2 text-xs text-[var(--color-text-secondary)]">
+          {scanReview?.items.filter((item) => item.previewStatus === "unsupported").map((item) => (
+            <li key={item.path} className="break-all" title={item.previewMessage}>{item.path}</li>
+          ))}
+        </ul>
+      </Modal>
       {/* 左侧任务栏：统计 + 选项 + 开始/清空（运行中改为取消） */}
       <aside className="flex w-[180px] shrink-0 flex-col border-r border-[var(--color-border)]">
         <div className="border-b border-[var(--color-border)] p-3">
@@ -210,7 +260,11 @@ export default function ImportPage() {
             onChange={setRenamePattern}
             disabled={!libraryRoot}
             collection={collection.trim()}
-            sampleStem={plan?.items[0]?.path.split(/[\\/]/).pop()?.replace(/\.[^.]+$/, "") ?? ""}
+            sampleStem={
+            plan?.items[0]?.path
+              ? displayBasename(plan.items[0].path).replace(/\.[^.]+$/, "")
+              : ""
+          }
             sampleExt={plan?.items[0]?.path.split(".").pop() ?? ""}
           />
         </div>
@@ -268,6 +322,25 @@ export default function ImportPage() {
             )}
           </div>
         )}
+        {scanWarnings.length > 0 && (
+          <div className="mb-3 max-w-lg text-xs text-[var(--color-status)]" role="status">
+            <p>扫描时跳过或遇到 {scanWarnings.length} 项，请在导入前确认。</p>
+            <button
+              type="button"
+              onClick={() => setShowScanWarnings((v) => !v)}
+              className="mt-1 text-left underline"
+            >
+              {showScanWarnings ? "收起扫描提示" : "查看扫描提示"}
+            </button>
+            {showScanWarnings && (
+              <ul className="mt-1 max-h-40 space-y-0.5 overflow-y-auto rounded-md bg-[var(--color-surface)] p-2">
+                {scanWarnings.map((warning, i) => (
+                  <li key={`${i}-${warning}`} className="break-all">{warning}</li>
+                ))}
+              </ul>
+            )}
+          </div>
+        )}
         {result && result.warnings.length > 0 && (
           <div className="mb-3 max-w-lg text-xs text-[var(--color-status)]">
             <button
@@ -287,6 +360,12 @@ export default function ImportPage() {
           </div>
         )}
         {error && !running && <p className="mb-3 text-xs text-[var(--color-danger)]">{error}</p>}
+
+        {plan?.items.some((item) => item.previewStatus === "limited") && (
+          <div className="mb-3 max-w-3xl rounded-md border border-[var(--color-status)] bg-[var(--color-surface)] px-3 py-2 text-xs text-[var(--color-status)]">
+            有 {plan.items.filter((item) => item.previewStatus === "limited").length} 个特殊格式已解析出缩略图，可以导入；但后续高清预览、元数据或 AI 功能可能受限。
+          </div>
+        )}
 
         {plan && plan.items.length > 0 ? (
           <PendingList
@@ -322,6 +401,16 @@ export default function ImportPage() {
       </div>
     </div>
   );
+}
+
+function summarizePlan(items: ImportPlanItem[], warnings: string[] = []): ImportPlan {
+  return {
+    items,
+    images: items.filter((item) => item.kind === "image").length,
+    videos: items.filter((item) => item.kind === "video").length,
+    totalSize: items.reduce((sum, item) => sum + item.size, 0),
+    warnings,
+  };
 }
 
 /** 左侧入库进度：阶段、总体百分比、当前文件与真实结果计数都在同一处展示。 */

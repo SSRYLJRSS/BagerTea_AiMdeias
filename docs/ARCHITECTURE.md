@@ -1,6 +1,6 @@
 # 架构说明
 
-> 更新日期：2026-09-16
+> 更新日期：2026-09-23
 >
 > 本文档描述代码当前实际结构和不可违反的设计约束。数据库、搜索、分面和 AI 协议变化时，必须同步更新本文及相关契约。
 
@@ -52,6 +52,7 @@ Rust commands -> services -> db
 - `superSearchStore`：SearchPlanV3、AI 合并、持久化和诊断。
 - `metadataStore`：元数据筛选项和派生值。
 - `numericDomainStore`：数值分面范围和类型信息。
+- `platformStore`：后端静态平台能力的单一前端消费入口。
 
 跨页核心状态不得放在页面局部 state 中，也不得复制到第二个 store。
 
@@ -63,6 +64,7 @@ Rust commands -> services -> db
 - `assets.ts` / `thumbnail.ts` / `preview.ts`
 - `import.ts` / `export.ts` / `video.ts`
 - `ai.ts` / `connections.ts` / `ollama.ts`
+- `platform.ts`：静态平台能力 IPC。
 - `tags.ts` / `settings.ts` / `superSearch.ts`
 
 约束：
@@ -125,6 +127,8 @@ commands 不允许：
 | `importer.rs` | 扫描、哈希、改名、托管、元数据和落库管线 |
 | `exif_meta.rs` | EXIF 提取与 RAW 元数据兜底 |
 | `video.rs` / `video_proxy.rs` | 视频元数据、抽帧、兼容代理 |
+| `backup_restore.rs` | 备份暂存、验证、主库交换、旧库保底和恢复失败回滚编排 |
+| `platform.rs` | 编译目标静态能力 DTO；不做运行时健康探测 |
 | `export_local.rs` | 复制/移动、目录布局、CSV 和任务状态 |
 | `dedup.rs` / `perceptual.rs` | 文件哈希去重、dHash、相似图和同源关系 |
 | `palette.rs` | 主色提取、色板状态和回填 |
@@ -186,7 +190,7 @@ commands 不允许：
 ### 4.1 版本模型
 
 - `PRAGMA user_version` 当前推进到 V22。
-- V23 色板关系表和 V24 数值分面采用无条件幂等修复，不推进 `user_version`，存量库每次启动可自愈补齐。
+- V23 色板关系表、V24 数值分面、V25 在线连接限额字段和 V26 视频代理指纹采用无条件幂等修复，不推进 `user_version`，存量库每次启动可自愈补齐；V26 只追加列，不修改已发布的 V14 代理表迁移。
 - 已发布迁移禁止修改，只能追加新迁移或幂等修复。
 - 新列只追加到表尾，读取使用列名映射，禁止依赖物理位置。
 
@@ -197,14 +201,21 @@ commands 不允许：
 - `tag_terms` 与 `tag_aliases` 的唯一约束由 `schema_features` 控制，禁止双写。
 - 回收站通过 `assets.deleted_at` 软删实现。
 - 标签操作流水用于批次撤销；手工覆盖应清理批次来源，避免误撤销。
+- RAW/非 RAW 同源组只有在整组恰好包含一个 RAW 和一个非 RAW 时才互相折叠；有缺失、重复或第三个成员的歧义组不自动扩散标签、数值或去重结果。
+- 视频代理只有在源素材指纹、编码器版本、工具指纹与源路径均匹配时才可复用；旧记录的指纹为空时视为陈旧缓存并重建，不影响原始素材。
+- 运行时 keyring IO 由 `services/credentials.rs` 协调：先拿凭据操作锁，再短暂读写 DB 元数据，释放 DB guard 后才触碰系统凭据；不持有该锁跨网络请求。更新/删除与 DB 失败时必须恢复旧凭据或明确报告补偿失败。
+- V15 旧设置凭据迁移只在 `Database`/`AppState` 创建前的启动 bootstrap 执行；凭据写入失败时保留旧 JSON，运行时 commands 不得复用此例外。
 - 外部工具直接改库前必须了解 FTS 触发器和自定义 `cjk_bigram` 依赖。普通 SQLite 客户端只适合 SELECT。
 
 ### 4.3 备份与恢复
 
 - 备份使用 SQLite `VACUUM INTO` 生成单文件快照。
-- 恢复前必须校验快照，并保留旧库为 `library.db.old`。
+- 恢复前校验来源并在数据目录同卷暂存、复验；暂存失败时活动库保持不变。
+- `Database` 普通访问先取得 lifecycle 读门再短暂锁连接；恢复取得独占 lifecycle 写门，阻止其他命令访问半交换状态。连接 mutex 只用于 checkpoint/close、短 SQL 守卫和替换连接，不能跨复制、rename 或迁移文件 IO。
+- 将现库保留为 `library.db.old` 后再安装恢复副本。若该路径已有内容则拒绝恢复，不覆盖、不删除；成功恢复后仍保留 `.old`，需人工确认后才能为下一次恢复腾出该名称。
 - 运行中的导入、导出或打标任务存在时拒绝恢复。
-- 恢复后重新执行迁移和启动自检。
+- 获得独占门后再次检查任务状态，再执行文件交换与 `db::init` 迁移/自检。
+- 替换或重新打开失败时先保留失败副本并从 `.old` 复制回主库；若不能证明活动库有效，封锁后续 DB 命令。若主库缺失，启动时只从校验通过的 `.old` 原样复制恢复，绝不静默创建空库，也不删除 `.old`。
 
 ## 5. 关键机制
 
@@ -218,6 +229,11 @@ commands 不允许：
 4. 使用全局许可限制并发。
 
 占位层优先快速预览，禁止对 RAW 做昂贵全解码。高清层按需生成并缓存。dev 和 release 的图像依赖必须保持合理优化配置，新增图像依赖要核对 `Cargo.toml`。
+
+平台能力由 `services/platform.rs` 单一计算，前端只消费 `platformStore`，不直接探测操作系统。
+FFmpeg/FFprobe 发布构建只从主程序相邻且通过版本探测的 Tauri sidecar 启动，缺失/不可用时失败关闭，不回退任意系统 `PATH`；仅开发构建允许 `PATH` 回退。代理复用必须核对源素材指纹、源路径、编码器策略版本和工具指纹。源素材指纹在数据库锁外基于导入 hash（如有）、文件大小、修改时间及首尾固定大小样本计算；它用于缓存失效判断，不等同于完整内容校验和。代理容器由后端
+能力选择（Windows/macOS H.264/MP4，Linux VP8/WebM）。来源、目标二进制和许可证材料摘要由
+`src-tauri/binaries/manifest.json` 锁定，打包入口统一为 `scripts/desktop.mjs`。
 
 ### 5.2 普通搜索
 
@@ -351,7 +367,7 @@ pending -> processing -> done
 项目使用 MIT 许可证，但以下依赖需要对外分发前复核：
 
 - `rawler` 及其 LGPL/GPL 许可条件。
-- `heif-rs`、libheif、libde265、x265 等静态链接组件。
+- `heif-rs`、libheif、libde265、x265 等静态链接组件。三目标原生归档及源码/许可证 URL、SHA256 见 [`src-tauri/native/heif-manifest.json`](../src-tauri/native/heif-manifest.json)；x265 使用 GPL-2.0-or-later，任何对外交付前必须由负责人独立审查许可义务和再分发条件。
 - 其他图像、视频或模型依赖的再分发条款。
 
 内部自用风险与对外商业分发不同。发布安装包前必须核对许可证，并保留动态链接、替换库或更换依赖的备选方案。

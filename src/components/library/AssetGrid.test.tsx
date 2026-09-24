@@ -4,7 +4,7 @@
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { listAssetIds } from "@/api/assets";
+import { listAssetIds, listAssets } from "@/api/assets";
 import AssetGrid from "@/components/library/AssetGrid";
 import GridToolbar from "@/components/library/GridToolbar";
 import { useLibraryStore } from "@/stores/libraryStore";
@@ -377,6 +377,61 @@ describe("AssetGrid FB2-01 档位缩放（Alt/Ctrl+滚轮）", () => {
 // ═══════════════ §4.6 全选截断安全策略（B2/B8 + Phase 2-16） ═══════════════
 
 describe("AssetGrid §4.6 截断安全", () => {
+  it("筛选变化后丢弃在途的旧全选结果", async () => {
+    const assets = [mkAsset(1), mkAsset(2)];
+    useLibraryStore.setState({ items: assets, viewItems: assets, total: 2 });
+    vi.mocked(listAssets).mockResolvedValue({ items: [], total: 0, hasMore: false });
+
+    let resolveIds!: (ids: number[]) => void;
+    vi.mocked(listAssetIds).mockReturnValueOnce(
+      new Promise((resolve) => {
+        resolveIds = resolve;
+      }),
+    );
+
+    renderGrid();
+    fireEvent.keyDown(window, { key: "a", ctrlKey: true });
+    await waitFor(() => expect(listAssetIds).toHaveBeenCalledTimes(1));
+
+    act(() => useLibraryStore.getState().setFilter({ search: "新条件" }));
+    expect(useSelectionStore.getState().selected.size).toBe(0);
+
+    await act(async () => {
+      resolveIds([1, 2]);
+      await Promise.resolve();
+    });
+
+    expect(useSelectionStore.getState().selected.size).toBe(0);
+  });
+
+  it("筛选变化后丢弃在途的旧反选结果", async () => {
+    const assets = [mkAsset(1), mkAsset(2)];
+    useLibraryStore.setState({ items: assets, viewItems: assets, total: 2 });
+    useSelectionStore.setState({ selected: new Set([1]), anchorIndex: 0 });
+    vi.mocked(listAssets).mockResolvedValue({ items: [], total: 0, hasMore: false });
+
+    let resolveIds!: (ids: number[]) => void;
+    vi.mocked(listAssetIds).mockReturnValueOnce(
+      new Promise((resolve) => {
+        resolveIds = resolve;
+      }),
+    );
+
+    renderGrid();
+    fireEvent.keyDown(window, { key: "i", ctrlKey: true });
+    await waitFor(() => expect(listAssetIds).toHaveBeenCalledTimes(1));
+
+    act(() => useLibraryStore.getState().setFilter({ search: "新条件" }));
+    expect(useSelectionStore.getState().selected.size).toBe(0);
+
+    await act(async () => {
+      resolveIds([1, 2]);
+      await Promise.resolve();
+    });
+
+    expect(useSelectionStore.getState().selected.size).toBe(0);
+  });
+
   it("truncated_ids_block_delete_and_invert：触顶 100000 → 反选/删除菜单项禁用（不可逆 + 集合不完整）", async () => {
     // fetchAllIds 返回触顶的 100000 个 id，total=100010（截断前匹配总数）
     const ids = Array.from({ length: 100_000 }, (_, i) => i + 1);

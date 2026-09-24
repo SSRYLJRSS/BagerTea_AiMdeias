@@ -456,30 +456,52 @@ pub fn delete_model(base_url: &str, model: &str) -> AppResult<()> {
 /// 探测本地模型存储目录：OLLAMA_MODELS 环境变量优先，其次默认 ~/.ollama/models；
 /// 目录不存在（或用户主目录未知）时返回 Err，前端据此隐藏「打开文件夹」入口
 pub fn model_dir() -> AppResult<String> {
-    if let Ok(dir) = std::env::var("OLLAMA_MODELS") {
-        let dir = dir.trim().to_string();
-        if !dir.is_empty() && std::path::Path::new(&dir).exists() {
-            return Ok(dir);
+    if let Some(dir) = std::env::var_os("OLLAMA_MODELS") {
+        let dir = std::path::PathBuf::from(dir);
+        if !dir.as_os_str().is_empty() && dir.is_dir() {
+            return encode_existing_model_dir(&dir);
         }
     }
-    let home = std::env::var("USERPROFILE")
-        .or_else(|_| std::env::var("HOME"))
-        .unwrap_or_default();
-    if home.trim().is_empty() {
-        return Err(AppError::msg("未找到用户主目录"));
+    let home = dirs::home_dir().ok_or_else(|| AppError::msg("未找到用户主目录"))?;
+    let p = home.join(".ollama").join("models");
+    encode_existing_model_dir(&p)
+}
+
+fn encode_existing_model_dir(path: &std::path::Path) -> AppResult<String> {
+    if !path.is_dir() {
+        return Err(AppError::msg(
+            "未找到模型存储目录（OLLAMA_MODELS 或默认 ~/.ollama/models）",
+        ));
     }
-    let p = std::path::Path::new(home.trim())
-        .join(".ollama")
-        .join("models");
-    if p.exists() {
-        return Ok(p.to_string_lossy().into_owned());
-    }
-    Err(AppError::msg("未找到模型存储目录（默认 ~/.ollama/models）"))
+    crate::utils::path::encode_native_path(path)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_dir_conversion_preserves_existing_path_exactly() {
+        let temp = tempfile::tempdir().unwrap();
+        let models = temp.path().join("model store");
+        std::fs::create_dir(&models).unwrap();
+        assert_eq!(
+            encode_existing_model_dir(&models).unwrap(),
+            models.to_str().unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn model_dir_conversion_rejects_non_utf8_path_instead_of_rewriting_it() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let models = temp.path().join(std::ffi::OsStr::from_bytes(b"model-\xff"));
+        std::fs::create_dir(&models).unwrap();
+        let error = encode_existing_model_dir(&models).unwrap_err();
+        assert!(error.to_string().contains("不是有效 UTF-8"));
+    }
 
     #[test]
     fn api_root_strips_v1_and_slashes() {

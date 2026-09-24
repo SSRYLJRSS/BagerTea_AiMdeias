@@ -33,6 +33,11 @@ function Invoke-NetworkTarget([string]$target) {
     if ($LASTEXITCODE -ne 0) { Write-Host "FAIL: $target" -ForegroundColor Red; exit $LASTEXITCODE }
 }
 
+# Cargo/heif-rs must use the SHA256-verified, target-specific local cache; never fall back to implicit downloads.
+node scripts/prepare-heif-libraries.mjs --target x86_64-pc-windows-msvc
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+$env:HEIF_BINARIES_DIR = (Resolve-Path "src-tauri/native/heif/x86_64-pc-windows-msvc").Path
+
 # [1/5] Backend stable group (parallel; network targets excluded to avoid flaky)
 Run-Step "[1/5] cargo test stable group (lib + db_integration + qa_edge + format_matrix + services_integration)" {
     cargo test --manifest-path src-tauri/Cargo.toml `

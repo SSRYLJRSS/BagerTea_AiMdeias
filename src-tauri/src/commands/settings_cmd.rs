@@ -4,6 +4,7 @@ use crate::commands::assets_cmd;
 use crate::db::reset as db_reset;
 use crate::db::settings::{self, Settings};
 use crate::error::{AppError, AppResult};
+use crate::services::backup_restore;
 use crate::state::AppState;
 
 #[tauri::command]
@@ -26,16 +27,17 @@ pub fn save_settings(state: State<AppState>, s: Settings) -> AppResult<()> {
 
 /// 软件数据保存位置（R-33：数据库/缩略图所在目录，便于备份转移）
 #[tauri::command]
-pub fn get_data_dir(state: State<AppState>) -> String {
-    state.data_dir.to_string_lossy().into_owned()
+pub fn get_data_dir(state: State<AppState>) -> AppResult<String> {
+    crate::utils::path::encode_native_path(&state.data_dir)
 }
 
 /// 在系统文件管理器中打开数据目录
 #[tauri::command]
 pub fn open_data_dir(app: tauri::AppHandle, state: State<AppState>) -> AppResult<()> {
     use tauri_plugin_opener::OpenerExt;
+    let data_dir = crate::utils::path::encode_native_path(&state.data_dir)?;
     app.opener()
-        .open_path(state.data_dir.to_string_lossy().as_ref(), None::<&str>)
+        .open_path(&data_dir, None::<&str>)
         .map_err(|e| AppError::msg(format!("打开文件夹失败: {e}")))
 }
 
@@ -44,9 +46,22 @@ pub fn open_data_dir(app: tauri::AppHandle, state: State<AppState>) -> AppResult
 pub fn open_logs_dir(app: tauri::AppHandle, state: State<AppState>) -> AppResult<()> {
     use tauri_plugin_opener::OpenerExt;
     let logs_dir = state.data_dir.join("logs");
+    let logs_dir = crate::utils::path::encode_native_path(&logs_dir)?;
     app.opener()
-        .open_path(logs_dir.to_string_lossy().as_ref(), None::<&str>)
+        .open_path(&logs_dir, None::<&str>)
         .map_err(|e| AppError::msg(format!("打开日志目录失败: {e}")))
+}
+
+/// 打开使用帮助（固定飞书文档；通过系统默认浏览器访问）。
+#[tauri::command]
+pub fn open_help_page(app: tauri::AppHandle) -> AppResult<()> {
+    use tauri_plugin_opener::OpenerExt;
+    app.opener()
+        .open_url(
+            "https://my.feishu.cn/wiki/RGLmw1ExbiNcVvkk240cXJxjnmf?from=from_copylink",
+            None::<&str>,
+        )
+        .map_err(|e| AppError::msg(format!("打开使用帮助失败: {e}")))
 }
 
 /// 分类重置应用数据（设置页「存储与维护 → 重置数据」勾选传入）。
@@ -94,10 +109,33 @@ pub async fn reset_app_data(
     }
     let db = std::sync::Arc::clone(&state.db);
     let data_dir = state.data_dir.clone();
-    // 删大缓存目录是文件 IO 重活，spawn_blocking 防堵主线程
+    // DB 行、keyring 与后置缓存/日志文件清理分别由协调器排序：keyring 不在
+    // Database guard 内，文件清理在事务提交并释放 DB guard 后执行。
     let mut report = tauri::async_runtime::spawn_blocking(move || {
-        let mut conn = db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
-        db_reset::reset(&mut conn, &data_dir, &db_selection)
+        let (report, clear_cache, clear_logs) = if db_selection.ai_connections {
+            let _operations = crate::services::credentials::lock_operations()?;
+            let credential_refs = {
+                let conn = db.lock()?;
+                crate::db::ai_connections::list(&conn)?
+                    .into_iter()
+                    .filter_map(|connection| connection.api_key_ref)
+                    .collect::<Vec<_>>()
+            };
+            crate::services::credentials::delete_many_with_commit(
+                &crate::services::credentials::SystemCredentialBackend,
+                &credential_refs,
+                || {
+                    let mut conn = db.lock()?;
+                    db_reset::reset_db(&mut conn, &db_selection)
+                },
+            )?
+        } else {
+            let mut conn = db.lock()?;
+            db_reset::reset_db(&mut conn, &db_selection)?
+        };
+        // The credential-operation guard from the branch above has been dropped;
+        // neither the DB mutex nor a credential lock spans cache/log filesystem IO.
+        db_reset::finish_reset(&data_dir, report, clear_cache, clear_logs)
     })
     .await
     .map_err(|e| AppError::msg(format!("重置线程异常: {e}")))??;
@@ -136,9 +174,8 @@ pub async fn backup_db(state: State<'_, AppState>, target: String) -> AppResult<
     .map_err(|e| AppError::msg(format!("备份线程异常: {e}")))?
 }
 
-/// W5c：恢复数据库（指导书 §W5c）。
-/// 校验（quick_check + user_version 只拒高版本 + 关键表）→ 运行中任务阻断
-/// → 现库 `.old` 保底 → 覆盖 → 迁移升级 → 热替换连接 → `app.restart()`（不返回）。
+/// W5c：恢复数据库（指导书 §W5c）。备份校验和同目录暂存由 service 完成；
+/// 独占数据库生命周期门期间只短暂持连接 mutex，文件交换/迁移完成后请求应用重启。
 #[tauri::command]
 pub async fn restore_db(
     app: tauri::AppHandle,
@@ -153,50 +190,29 @@ pub async fn restore_db(
         let conn = state.db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
         guard_no_running_tasks(&state, &conn, "恢复备份", false)?;
     }
-    // ③ 换文件 + 换连接（持锁；复制与迁移是文件 IO 重活，spawn_blocking）
+    // ③ 先在当前库仍可用时准备/复验暂存副本，再取得独占 lifecycle 门。
+    // 门内二次检查任务，避免预检后新任务抢先开始；连接 mutex 不跨文件 IO。
     let db = std::sync::Arc::clone(&state.db);
     let data_dir = state.data_dir.clone();
+    let import_running = std::sync::Arc::clone(&state.import_running);
+    let refill_running = std::sync::Arc::clone(&state.refill_running);
+    let export_cancel = std::sync::Arc::clone(&state.export_cancel);
+    let ai_cancel = std::sync::Arc::clone(&state.ai_cancel);
     tauri::async_runtime::spawn_blocking(move || -> AppResult<()> {
-        let db_path = data_dir.join("library.db");
-        let old_path = data_dir.join("library.db.old");
-        let mut guard = db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
-        // 旧连接收尾：checkpoint 截断 WAL → 换入内存占位连接 → 关闭旧连接释放文件句柄
-        //（Windows 上文件被占用时 rename/copy 会失败，必须先关）
-        let old = std::mem::replace(
-            &mut *guard,
-            rusqlite::Connection::open_in_memory()
-                .map_err(|e| AppError::msg(format!("占位连接创建失败: {e}")))?,
-        );
-        let _ = old.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
-        let _ = old.close();
-        // ④ .old 保底：覆盖失败/新库打不开时能回滚回现库
-        if old_path.exists() {
-            let _ = std::fs::remove_file(&old_path);
-        }
-        std::fs::rename(&db_path, &old_path)
-            .map_err(|e| AppError::msg(format!("现库改名保底失败: {e}")))?;
-        if let Err(e) = std::fs::copy(&source, &db_path) {
-            let _ = std::fs::rename(&old_path, &db_path);
-            return Err(AppError::msg(format!("覆盖库文件失败: {e}")));
-        }
-        // ⑤ 打开新库（老版本备份在此自动迁移升级）
-        match crate::db::init(&db_path) {
-            Ok(new_conn) => {
-                *guard = new_conn;
-            }
-            Err(e) => {
-                // 回滚：新库打不开 → 还原 .old（保证应用重启后仍是原库）
-                let _ = std::fs::remove_file(&db_path);
-                let _ = std::fs::rename(&old_path, &db_path);
-                if let Ok(recovered) = crate::db::init(&db_path) {
-                    *guard = recovered;
-                }
-                return Err(AppError::msg(format!(
-                    "恢复后的库无法打开（已还原原库）：{e}"
-                )));
-            }
-        }
-        Ok(())
+        let prepared = backup_restore::prepare_restore(&data_dir, &source)?;
+        let maintenance = db.maintenance()?;
+        maintenance.with_connection(|conn| {
+            guard_no_running_tasks_with(
+                &import_running,
+                &refill_running,
+                &export_cancel,
+                &ai_cancel,
+                conn,
+                "恢复备份",
+                false,
+            )
+        })?;
+        backup_restore::install_prepared_restore(&maintenance, prepared)
     })
     .await
     .map_err(|e| AppError::msg(format!("恢复线程异常: {e}")))??;
@@ -225,24 +241,41 @@ fn guard_no_running_tasks(
     action: &str,
     allow_pending_ai_batches: bool,
 ) -> AppResult<()> {
-    if state
-        .import_running
-        .load(std::sync::atomic::Ordering::Relaxed)
-    {
+    guard_no_running_tasks_with(
+        &state.import_running,
+        &state.refill_running,
+        &state.export_cancel,
+        &state.ai_cancel,
+        conn,
+        action,
+        allow_pending_ai_batches,
+    )
+}
+
+fn guard_no_running_tasks_with(
+    import_running: &std::sync::atomic::AtomicBool,
+    refill_running: &std::sync::atomic::AtomicBool,
+    export_cancel: &std::sync::Mutex<
+        std::collections::HashMap<i64, std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    >,
+    ai_cancel: &std::sync::Mutex<
+        std::collections::HashMap<i64, std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    >,
+    conn: &rusqlite::Connection,
+    action: &str,
+    allow_pending_ai_batches: bool,
+) -> AppResult<()> {
+    if import_running.load(std::sync::atomic::Ordering::Relaxed) {
         return Err(AppError::msg(format!(
             "文件入库进行中，请等它结束或取消后再{action}"
         )));
     }
-    if state
-        .refill_running
-        .load(std::sync::atomic::Ordering::Relaxed)
-    {
+    if refill_running.load(std::sync::atomic::Ordering::Relaxed) {
         return Err(AppError::msg(format!(
             "回填/色板任务进行中，请等它结束或取消后再{action}"
         )));
     }
-    if !state
-        .export_cancel
+    if !export_cancel
         .lock()
         .map_err(|_| AppError::msg("锁中毒"))?
         .is_empty()
@@ -251,8 +284,7 @@ fn guard_no_running_tasks(
             "导出任务进行中，请等它结束或取消后再{action}"
         )));
     }
-    if !state
-        .ai_cancel
+    if !ai_cancel
         .lock()
         .map_err(|_| AppError::msg("锁中毒"))?
         .is_empty()

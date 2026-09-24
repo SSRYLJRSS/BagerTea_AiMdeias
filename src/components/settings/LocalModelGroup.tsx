@@ -33,6 +33,7 @@ import {
 } from "@/api/ollama";
 import { useTauriEvent } from "@/hooks/hooks";
 import { useOllamaPull } from "@/hooks/useOllama";
+import { usePlatformStore, selectManagedOllama } from "@/stores/platformStore";
 import type { ApiProfile, CustomSource, Settings } from "@/types/settings";
 
 const DEFAULT_LOCAL_BASE = "http://localhost:11434/v1";
@@ -66,11 +67,17 @@ interface Props {
     onPatchAi: (patch: Partial<Settings["ai"]>) => void;
     /** 顶层设置补丁（改造方案：自定义源即时落库后回填 draft，防止保存回滚） */
     onPatchSettings: (patch: Partial<Settings>) => void;
+    /** 将向导选中的模型同步到实际 AI 连接；批次执行不读取 settings.ai.profiles。 */
+    onModelSelected?: (model: string) => Promise<void>;
     notify: (msg: string) => void;
     fail: (msg: string) => void;
 }
 
-export default function LocalModelGroup({ draft, onPatchAi, onPatchSettings, notify, fail }: Props) {
+export default function LocalModelGroup({ draft, onPatchAi, onPatchSettings, onModelSelected, notify, fail }: Props) {
+    // R1（三端复核）：组件层防御性 guard。仅 Windows 支持应用管理的 Ollama；
+    // 非托管平台不触发任何安装态/模型目录/运行态探针、轮询与命令（不能只用 CSS 隐藏）。
+    // ServiceManagement 已在非托管平台不挂载本组件，这里是第二重保护，防止未来直接引用绕过。
+    const managedOllama = usePlatformStore(selectManagedOllama);
     const [status, setStatus] = useState<InstallStatus | null>(null);
     const [detectError, setDetectError] = useState(false);
     const [hw, setHw] = useState<HardwareReport | null>(null);
@@ -164,9 +171,11 @@ export default function LocalModelGroup({ draft, onPatchAi, onPatchSettings, not
     }, []);
 
     useEffect(() => {
+        // 非托管平台：不发起任何 Ollama 管理探针。
+        if (!managedOllama) return;
         void refresh();
         void loadSources();
-    }, [refresh, loadSources]);
+    }, [managedOllama, refresh, loadSources]);
 
     // ---- 已装模型管理：服务就绪（且为 Ollama）时加载列表与存储目录 ----
     const loadModels = useCallback(async () => {
@@ -391,14 +400,23 @@ export default function LocalModelGroup({ draft, onPatchAi, onPatchSettings, not
 
     const onPick = async (name: string) => {
         if (modelInstalled(name)) {
-            ensureLocalProfile(name);
-            notify("模型已就绪，点「保存设置」后即可开始打标");
+            setBusy(true);
+            try {
+                await onModelSelected?.(name);
+                ensureLocalProfile(name);
+                notify("模型已就绪并保存到本机服务；如打标当前使用其他服务，请在打标页切换");
+            } catch (e) {
+                fail(errMsg(e));
+            } finally {
+                setBusy(false);
+            }
             return;
         }
         try {
             await pull(DEFAULT_LOCAL_BASE, name);
+            await onModelSelected?.(name);
             ensureLocalProfile(name);
-            notify("配置完成，点「保存设置」后即可开始打标");
+            notify("模型已下载并保存到本机服务；如打标当前使用其他服务，请在打标页切换");
             void refresh();
         } catch (e) {
             fail(errMsg(e));

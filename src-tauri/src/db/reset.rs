@@ -10,7 +10,6 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
 use crate::error::AppResult;
-use crate::services::credentials;
 
 /// 要重置的数据分类（前端勾选传入；false = 保留）
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -26,7 +25,7 @@ pub struct ResetSelection {
     pub tags: bool,
     /// AI 打标任务（批次 + 建议 + 词条级建议）
     pub ai_tasks: bool,
-    /// AI 服务配置（连接档案 + 用途绑定 + 系统凭据中的密钥）
+    /// AI 服务配置（连接档案 + 用途绑定；keyring 清理由 commands 在 DB 锁外协调）
     pub ai_connections: bool,
     /// 偏好设置（settings 表恢复默认）
     pub preferences: bool,
@@ -76,6 +75,16 @@ pub fn reset(
     data_dir: &Path,
     sel: &ResetSelection,
 ) -> AppResult<ResetReport> {
+    let (report, clear_cache_db, clear_logs) = reset_db(conn, sel)?;
+    finish_reset(data_dir, report, clear_cache_db, clear_logs)
+}
+
+/// Perform only transactional database mutations. The caller must drop its
+/// `Database` guard before invoking `finish_reset`, which removes cache/log files.
+pub fn reset_db(
+    conn: &mut Connection,
+    sel: &ResetSelection,
+) -> AppResult<(ResetReport, bool, bool)> {
     let mut report = ResetReport::default();
     let tx = conn.transaction()?;
 
@@ -124,17 +133,9 @@ pub fn reset(
         report.ai_tasks_deleted = tx.changes() as i64;
     }
 
-    // AI 服务配置：先读出连接 id，逐个删除系统凭据里的 API Key（keyring 非事务，先删后清表：
-    // 若中途失败最多留下孤儿凭据，不会出现「表里还有连接但密钥已丢」）
+    // AI 服务配置：keyring 不属于数据库事务，外层 command 已在拿 DB guard 之前
+    // 读取凭据引用并完成可补偿删除；本层只负责事务内删除绑定与档案行。
     if sel.ai_connections {
-        let ids: Vec<String> = {
-            let mut stmt = tx.prepare("SELECT id FROM ai_connections")?;
-            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
-            rows.filter_map(|r| r.ok()).collect()
-        };
-        for id in &ids {
-            let _ = credentials::delete_api_key(id);
-        }
         tx.execute("DELETE FROM ai_usage_bindings", [])?;
         tx.execute("DELETE FROM ai_connections", [])?;
         report.connections_deleted = tx.changes() as i64;
@@ -162,16 +163,22 @@ pub fn reset(
     }
 
     tx.commit()?;
+    Ok((report, clear_cache_db, sel.logs))
+}
 
-    // 缓存文件删除（锁外文件 IO，事务已提交）
-    if clear_cache_db {
+/// Complete post-commit filesystem cleanup without holding the database guard.
+pub fn finish_reset(
+    data_dir: &Path,
+    mut report: ResetReport,
+    clear_cache: bool,
+    clear_logs: bool,
+) -> AppResult<ResetReport> {
+    if clear_cache {
         report.cache_files_deleted = clear_cache_dirs(data_dir)?;
     }
-
-    if sel.logs {
+    if clear_logs {
         report.log_files_deleted = clear_log_files(data_dir)?;
     }
-
     Ok(report)
 }
 

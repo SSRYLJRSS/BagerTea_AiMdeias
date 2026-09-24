@@ -6,7 +6,7 @@ use tauri::State;
 
 use crate::error::{AppError, AppResult};
 use crate::observability;
-use crate::state::AppState;
+use crate::state::{AppState, Database};
 
 const MAX_DIAGNOSTIC_LOG_BYTES: u64 = 20 * 1024 * 1024;
 const MAX_DIAGNOSTIC_FILE_BYTES: u64 = 4 * 1024 * 1024;
@@ -93,7 +93,7 @@ pub async fn export_diagnostics(
 
 fn export_diagnostics_blocking(
     data_dir: &Path,
-    db: &std::sync::Arc<std::sync::Mutex<rusqlite::Connection>>,
+    db: &std::sync::Arc<Database>,
     target: &str,
 ) -> AppResult<DiagnosticsReport> {
     let target_path = PathBuf::from(target);
@@ -308,7 +308,7 @@ fn diagnostics_summary(
 #[cfg(test)]
 mod tests {
     use std::io::Read;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     use super::*;
     use crate::db::settings::{self, ApiProfile, Settings};
@@ -336,6 +336,9 @@ mod tests {
             base_url: "https://example.invalid/v1".into(),
             api_key: "sk-diagnostics-must-not-leak".into(),
             model: "mock-model".into(),
+            max_concurrency: 0,
+            requests_per_minute: 0,
+            requests_per_hour: 0,
         });
         settings::save_settings(&conn, &saved).unwrap();
         conn.execute(
@@ -344,7 +347,7 @@ mod tests {
             [],
         )
         .unwrap();
-        let db = Arc::new(Mutex::new(conn));
+        let db = Arc::new(Database::new(conn));
 
         let target = temp.path().join("diagnostics.zip");
         let report = export_diagnostics_blocking(

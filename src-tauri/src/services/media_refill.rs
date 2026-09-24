@@ -4,14 +4,14 @@
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use rusqlite::Connection;
 use serde::Serialize;
 
 use super::{exif_meta, video};
 use crate::db::assets::{self, Asset, MediaProbeUpdate};
 use crate::error::{AppError, AppResult};
+use crate::state::Database;
 
 /// 回填互斥闸 RAII（FX-12）：Drop 时释放，保证 panic / 提前 return 都不会永久占闸。
 pub(crate) struct RefillGateGuard(pub Arc<AtomicBool>);
@@ -32,7 +32,7 @@ pub(crate) fn try_acquire_gate(gate: &Arc<AtomicBool>) -> Option<RefillGateGuard
 /// 导入后置等场景用：失败被包在返回值里，不 panic、不阻塞调用方。
 pub fn try_rescan_palette_exclusive(
     gate: &Arc<AtomicBool>,
-    db: &Arc<Mutex<Connection>>,
+    db: &Arc<Database>,
     ids: &[i64],
     cancel: &AtomicBool,
     on_progress: impl FnMut(&RefillProgress),
@@ -180,7 +180,7 @@ fn to_probe_update(m: &MediaMetadata) -> MediaProbeUpdate {
 /// 探测在锁外进行：每行只短暂加锁读素材 + 回写结果，ffprobe/图片解码不持 DB 锁。
 /// 单个素材失败不终止整个批次：记录 metadata_error，计入 failed。
 pub fn rescan_assets_with(
-    db: &Arc<Mutex<Connection>>,
+    db: &Arc<Database>,
     asset_ids: &[i64],
     cancel: &AtomicBool,
     probe: impl Fn(&Asset) -> MediaMetadata,
@@ -252,7 +252,7 @@ pub fn rescan_assets_with(
 
 /// 实际回填：用 `probe_asset` 探测（ffprobe / 图片解码，需真实文件）。
 pub fn rescan_assets(
-    db: &Arc<Mutex<Connection>>,
+    db: &Arc<Database>,
     asset_ids: &[i64],
     cancel: &AtomicBool,
     on_progress: impl FnMut(&RefillProgress),
@@ -317,7 +317,7 @@ pub fn probe_geo_taken(asset: &Asset) -> GeoTakenProbe {
 /// 复用 rescan 骨架（短锁读/写 + 取消 + 进度），计数三分：
 /// 已齐全/源素材无对应数据 → skipped（不是错误）；探测/写库失败 → failed；实际补写字段 → success。
 pub fn rescan_assets_geo_taken_with(
-    db: &Arc<Mutex<Connection>>,
+    db: &Arc<Database>,
     asset_ids: &[i64],
     cancel: &AtomicBool,
     probe: impl Fn(&Asset) -> GeoTakenProbe,
@@ -399,7 +399,7 @@ fn emit_progress(
 
 /// 实际定位/拍摄时间回填：用 `probe_geo_taken` 探测。
 pub fn rescan_assets_geo_taken(
-    db: &Arc<Mutex<Connection>>,
+    db: &Arc<Database>,
     asset_ids: &[i64],
     cancel: &AtomicBool,
     on_progress: impl FnMut(&RefillProgress),
@@ -411,7 +411,7 @@ pub fn rescan_assets_geo_taken(
 /// 探测在锁外：image_dimensions 优先，RAW 扩展名失败走 rawler probe_dimensions。
 /// 探测不出宽高（损坏文件等）计 failed；写库失败计 failed；成功计 success。
 pub fn rescan_assets_dimensions(
-    db: &Arc<Mutex<Connection>>,
+    db: &Arc<Database>,
     asset_ids: &[i64],
     cancel: &AtomicBool,
     mut on_progress: impl FnMut(&RefillProgress),
@@ -471,7 +471,7 @@ pub fn rescan_assets_dimensions(
 /// 计数三分（FX-10）：无可信取材/色板为空 → skipped（不是错误）；解码/写库失败 → failed；
 /// 成功写入 palette_json + dominant_* → success。
 pub fn rescan_assets_palette(
-    db: &Arc<Mutex<Connection>>,
+    db: &Arc<Database>,
     asset_ids: &[i64],
     cancel: &AtomicBool,
     mut on_progress: impl FnMut(&RefillProgress),
@@ -617,7 +617,7 @@ pub fn rescan_assets_palette(
 /// 差异点（计划书明确要求）：写库走批量事务，**每 500 条提交一次** —— 解码在锁外，
 /// 只在批量落库瞬间短锁，绝不把解码时长压进 DB 锁。
 pub fn rescan_assets_phash(
-    db: &Arc<Mutex<Connection>>,
+    db: &Arc<Database>,
     asset_ids: &[i64],
     cancel: &AtomicBool,
     mut on_progress: impl FnMut(&RefillProgress),
@@ -715,7 +715,7 @@ pub fn rescan_assets_phash(
 /// decode 阶段已把整批计进 success，这里把写库失败的条目扣回 success 转记 failed；
 /// updated_ids 只收真实写库成功的 id（与 palette 命令语义一致，绝不虚报）。
 fn flush_phash_batch(
-    db: &Arc<Mutex<Connection>>,
+    db: &Arc<Database>,
     summary: &mut RefillSummary,
     pending: &mut Vec<(i64, u64)>,
 ) -> AppResult<()> {
@@ -746,9 +746,10 @@ fn flush_phash_batch(
 mod tests {
     use super::*;
     use crate::db::init_memory;
+    use rusqlite::Connection;
 
-    fn db() -> Arc<Mutex<Connection>> {
-        Arc::new(Mutex::new(init_memory().unwrap()))
+    fn db() -> Arc<Database> {
+        Arc::new(Database::new(init_memory().unwrap()))
     }
 
     fn insert_asset(c: &Connection, id_name: &str, mime: &str, duration: Option<i64>) -> i64 {

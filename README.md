@@ -43,7 +43,7 @@ React pages/components
 
 - 前端：`src/`
 - Rust/Tauri：`src-tauri/`
-- HEIC 预编译库：`heif-bin/`
+- HEIC 原生依赖：从固定的三端 `binaries-heif` release 下载，SHA256、目标 ABI、源码版本与许可证来源见 [`src-tauri/native/heif-manifest.json`](src-tauri/native/heif-manifest.json)；目标缓存不纳入 Git。
 - 文档：`docs/`
 - AI 协作入口：[AGENTS.md](AGENTS.md)
 
@@ -51,20 +51,23 @@ React pages/components
 
 环境要求：
 
-- Windows 10/11 为主力平台。
-- Node.js 20 或更高版本。
-- Rust stable MSVC 工具链和 Visual Studio C++ Build Tools。
-- `ffmpeg`/`ffprobe` 可选，缺失时视频能力按设计降级。
+- Windows 10/11 x64 为首发完整功能目标；Apple Silicon macOS、Ubuntu 24.04 x64 为预览目标，当前验收状态见 [平台文档](docs/PLATFORM.md)。
+- Node.js 22–24。
+- Rust 1.98.1（Windows 另需 MSVC 与 Visual Studio C++ Build Tools）。
+- 开发时系统 `ffmpeg`/`ffprobe` 可选；安装包构建使用按目标校验的 sidecar。
 
 ```powershell
-npm install
-npm run tauri dev
+npm ci
+npm run desktop:dev
 ```
 
 构建安装包：
 
 ```powershell
-npm run tauri build
+npm run prepare-media-tools -- --target x86_64-pc-windows-msvc
+npm run prepare-heif-libraries -- --target x86_64-pc-windows-msvc
+npm run desktop:check:strict -- --target x86_64-pc-windows-msvc
+npm run desktop:build -- --target x86_64-pc-windows-msvc
 ```
 
 ## 开发命令
@@ -80,6 +83,8 @@ cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-features
 ```
+
+直接运行 Cargo 编译/测试前，需要准备当前原生目标的 HEIF 库，并在当前 shell 将 `HEIF_BINARIES_DIR` 指向该目录；缺失或目标不符会由 `build.rs` 明确失败，不再回退到 `heif-rs` 未校验的联网下载。`npm run desktop:dev` 和 `npm run desktop:build` 会自动准备目标库。
 
 完整本地冒烟：
 

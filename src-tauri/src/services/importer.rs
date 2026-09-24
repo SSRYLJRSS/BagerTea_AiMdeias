@@ -6,19 +6,18 @@
 //! B01 重构：阶段②拆为②a（锁外 rayon 并行处理：复制+元数据提取）+ ②b（短锁批量写库）。
 //! 慢 IO（fs::copy / ffprobe / EXIF）不再持库锁，导入期间 list/get 等查询不阻塞。
 
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
-use std::sync::Mutex;
-
 use rayon::prelude::*;
 use rusqlite::Connection;
 use serde::Serialize;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use walkdir::WalkDir;
 
 use super::thumbnail::ThumbnailService;
-use super::{dedup, exif_meta, video};
+use super::{dedup, exif_meta, imaging, thumbnail, video};
 use crate::db::assets::{self, ImportResult};
 use crate::error::{AppError, AppResult};
+use crate::state::Database;
 use crate::utils::{mime, path};
 
 /// 入库阶段（阶段 1 契约，见《入库标签与素材库改造开发指导书》§4.4）：
@@ -102,6 +101,13 @@ fn collect_files(paths: &[String], on_scan: impl Fn(i64) + Sync) -> (Vec<PathBuf
                 match entry {
                     Ok(e) => {
                         if e.file_type().is_file() && is_supported(e.path()) {
+                            if path::encode_native_path(e.path()).is_err() {
+                                warnings.push(format!(
+                                    "{}: 文件名不是有效 UTF-8，首版暂不支持无损入库",
+                                    e.path().display()
+                                ));
+                                continue;
+                            }
                             out.push(e.path().to_path_buf());
                             on_scan(out.len() as i64);
                         }
@@ -227,6 +233,8 @@ fn stage_file(file: &Path, opts: &ImportOptions, seq: usize) -> AppResult<PathBu
     } else {
         PathBuf::from(root).join(collection)
     };
+    // 目标路径将写入 SQLite/回传前端，不接受不可无损表示的路径。
+    path::encode_native_path(&dest_dir)?;
     std::fs::create_dir_all(&dest_dir)?;
 
     let ext = file
@@ -236,9 +244,8 @@ fn stage_file(file: &Path, opts: &ImportOptions, seq: usize) -> AppResult<PathBu
     let base_name = if let Some(tpl) = &opts.rename_pattern {
         let orig_stem = file
             .file_stem()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .into_owned();
+            .and_then(|stem| stem.to_str())
+            .ok_or_else(|| AppError::unsupported("原文件名不是有效 UTF-8，无法安全改名"))?;
         let mtime = file
             .metadata()
             .and_then(|m| m.modified())
@@ -248,13 +255,13 @@ fn stage_file(file: &Path, opts: &ImportOptions, seq: usize) -> AppResult<PathBu
             .unwrap_or(0);
         format!(
             "{}.{ext}",
-            render_name(tpl, collection, &orig_stem, mtime, seq)
+            render_name(tpl, collection, orig_stem, mtime, seq)
         )
     } else {
         file.file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .into_owned()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| AppError::unsupported("原文件名不是有效 UTF-8，无法安全入库"))?
+            .to_owned()
     };
     // 同名冲突加 (n) 后缀：create_new 原子创建，②a 并行 stage 的多个同名文件
     // 各自依次尝试候选名，先创建成功者占用——不再依赖 exists() 检查后复制（有竞态，
@@ -519,7 +526,7 @@ fn emit_done<F: Fn(ImportProgress)>(
 /// ②b 短锁批量写库（单事务，纯 INSERT/UPDATE，毫秒级）
 /// ③ 并行生成占位图（B14：循环内检查 cancel），完成后统一回写路径
 pub fn import_paths<F: Fn(ImportProgress) + Sync>(
-    db: &Mutex<Connection>,
+    db: &Database,
     thumbs: &ThumbnailService,
     paths: &[String],
     opts: &ImportOptions,
@@ -683,6 +690,20 @@ pub fn import_paths<F: Fn(ImportProgress) + Sync>(
             if !is_new {
                 return ProcResult::Duplicate;
             }
+            // 三端复核 X-18：非 UTF-8 源文件名不静默有损入库。首版明确拒绝并保留原文件
+            //（导入只复制不移动，原文件本就不动），后续再做无损 OsString 协议。
+            // 在暂存复制前判定，避免产生无法正确记录路径的孤儿副本。
+            if let Err(e) = path::encode_native_path(file) {
+                tracing::warn!(
+                    operation = "import",
+                    task_id = %task_id,
+                    stage = "encode_name",
+                    file = %file.display(),
+                    error = %e,
+                    "跳过：文件名非 UTF-8，首版暂不支持无损入库"
+                );
+                return ProcResult::Failed(format!("{}: {e}", file.display()));
+            }
             // 锁外：托管复制
             let staged = match stage_file(file, opts, idx + 1) {
                 Ok(p) => p,
@@ -707,12 +728,22 @@ pub fn import_paths<F: Fn(ImportProgress) + Sync>(
             let mime_type = mime::mime_from_ext(&ext).unwrap_or_default();
             // 锁外：元数据提取（image_dimensions / EXIF / ffprobe）
             let meta = extract_meta(&staged, &mime_type);
-            let norm = path::normalize_path(&staged.to_string_lossy());
-            let file_name = staged
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into_owned();
+            let staged_path = match path::encode_native_path(&staged) {
+                Ok(path) => path,
+                Err(e) => {
+                    return ProcResult::Failed(format!("{}: {e}", staged.display()));
+                }
+            };
+            let norm = path::normalize_path(&staged_path);
+            let file_name = match staged.file_name().and_then(|name| name.to_str()) {
+                Some(name) => name.to_owned(),
+                None => {
+                    return ProcResult::Failed(format!(
+                        "{}: 暂存文件名不是有效 UTF-8，无法安全入库",
+                        staged.display()
+                    ));
+                }
+            };
             let file_size = staged.metadata().map(|m| m.len() as i64).unwrap_or(0);
             let modified_at = staged
                 .metadata()
@@ -896,7 +927,8 @@ pub fn import_paths<F: Fn(ImportProgress) + Sync>(
         let tx = conn.unchecked_transaction()?;
         for (id, p, phash) in &paths_out {
             if !p.as_os_str().is_empty() {
-                assets::set_placeholder_path(&tx, *id, &p.to_string_lossy())?;
+                let placeholder_path = path::encode_native_path(p)?;
+                assets::set_placeholder_path(&tx, *id, &placeholder_path)?;
                 if let Some(ph) = phash {
                     assets::set_phash(&tx, *id, *ph)?;
                 }
@@ -949,7 +981,8 @@ pub fn import_paths<F: Fn(ImportProgress) + Sync>(
 
 /// 重复判定（hash 已由并行阶段算好）：true = 新文件
 fn precheck(conn: &Connection, file: &Path, file_hash: &str) -> AppResult<bool> {
-    let norm = path::normalize_path(&file.to_string_lossy());
+    let native_path = path::encode_native_path(file)?;
+    let norm = path::normalize_path(&native_path);
     if assets::find_by_path(conn, &norm)?.is_some() {
         return Ok(false);
     }
@@ -960,12 +993,26 @@ fn precheck(conn: &Connection, file: &Path, file_hash: &str) -> AppResult<bool> 
 }
 
 /// 待入库清单项（两段式入库的左侧统计，PRD v2.4）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImportPreviewStatus {
+    /// 已能生成入库缩略图，普通导入路径。
+    Ready,
+    /// 能生成缩略图，但属于 RAW 等特殊格式，后续高清/元数据/AI 能力可能受限。
+    Limited,
+    /// 连入库缩略图都无法生成，禁止进入正式入库。
+    Unsupported,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ImportPlanItem {
     pub path: String,
     pub kind: String, // image|video
     pub size: i64,
+    pub preview_status: ImportPreviewStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preview_message: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -975,12 +1022,13 @@ pub struct ImportPlan {
     pub images: i64,
     pub videos: i64,
     pub total_size: i64,
+    pub warnings: Vec<String>,
 }
 
 /// 扫描路径展开为待入库清单（不落库，仅统计）
 pub fn inspect_paths(paths: &[String]) -> ImportPlan {
     let (files, warnings) = collect_files(paths, |_| {});
-    for warning in warnings {
+    for warning in &warnings {
         tracing::warn!(
             operation = "inspect_import",
             stage = "scan",
@@ -993,24 +1041,94 @@ pub fn inspect_paths(paths: &[String]) -> ImportPlan {
         images: 0,
         videos: 0,
         total_size: 0,
+        warnings,
     };
     for f in files {
         let ext = f.extension().and_then(|e| e.to_str()).unwrap_or_default();
         let kind = mime::asset_type_from_ext(ext).unwrap_or("image");
         let size = f.metadata().map(|m| m.len() as i64).unwrap_or(0);
+        let path_text = match path::encode_native_path(&f) {
+            Ok(path) => path,
+            Err(err) => {
+                plan.warnings.push(format!("{}: {err}", f.display()));
+                continue;
+            }
+        };
         if kind == "video" {
             plan.videos += 1;
         } else {
             plan.images += 1;
         }
         plan.total_size += size;
+        let (preview_status, preview_message) = if kind == "image" {
+            classify_import_preview(&f, ext)
+        } else {
+            (ImportPreviewStatus::Ready, None)
+        };
         plan.items.push(ImportPlanItem {
-            path: f.to_string_lossy().into_owned(),
+            path: path_text,
             kind: kind.to_string(),
             size,
+            preview_status,
+            preview_message,
         });
     }
     plan
+}
+
+/// 入库前只验证“能否生成快速缩略图”，不进入完整 RAW 显影。
+/// 这样导入页可以在正式入库前明确拦截损坏/当前不支持的图片。
+fn classify_import_preview(file: &Path, ext: &str) -> (ImportPreviewStatus, Option<String>) {
+    let previewable = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        imaging::decode_thumb(file, thumbnail::PLACEHOLDER_SIZE).is_some()
+    }))
+    .unwrap_or(false);
+    if !previewable {
+        return (
+            ImportPreviewStatus::Unsupported,
+            Some("无法解析入库缩略图，当前不支持导入（也可能是文件损坏）".into()),
+        );
+    }
+    if mime::is_raw_ext(ext) {
+        return (
+            ImportPreviewStatus::Limited,
+            Some(
+                "已解析缩略图，可以导入；但该 RAW 格式的高清预览、元数据或 AI 功能可能受限".into(),
+            ),
+        );
+    }
+    (ImportPreviewStatus::Ready, None)
+}
+
+/// 在正式导入前再次验证清单，防止直接调用 IPC 绕过前端的“不支持预览”拦截。
+pub fn require_previewable(plan: &ImportPlan) -> AppResult<()> {
+    let blocked: Vec<&str> = plan
+        .items
+        .iter()
+        .filter(|item| item.preview_status == ImportPreviewStatus::Unsupported)
+        .map(|item| item.path.as_str())
+        .collect();
+    if blocked.is_empty() {
+        return Ok(());
+    }
+
+    let shown = blocked
+        .iter()
+        .take(5)
+        .copied()
+        .collect::<Vec<_>>()
+        .join("、");
+    let suffix = if blocked.len() > 5 {
+        format!(" 等 {} 个文件", blocked.len())
+    } else {
+        String::new()
+    };
+    Err(AppError::unsupported(format!(
+        "有 {} 个文件无法解析入库缩略图，请先从队列剔除：{}{}",
+        blocked.len(),
+        shown,
+        suffix
+    )))
 }
 
 /// 改名模板预览（前端 RenameBuilder 用）：与入库 stage 的 render_name 同源，
@@ -1022,7 +1140,8 @@ pub fn preview_rename(template: &str, collection: &str, orig_stem: &str, seq: us
 
 #[cfg(test)]
 mod tests {
-    use super::{collect_files, precheck, render_name};
+    use super::{collect_files, inspect_paths, precheck, render_name, ImportPreviewStatus};
+    use crate::utils::path;
 
     // 2026-07-27 12:00:00 UTC
     const MTIME: i64 = 1_785_225_600_000;
@@ -1090,6 +1209,27 @@ mod tests {
         assert!(warnings[0].contains("路径不存在或不受支持"));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn collect_files_skips_non_utf8_names_and_reports_warning_before_import() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let bad_name = std::ffi::OsStr::from_bytes(b"bad-\xff.jpg");
+        std::fs::write(dir.path().join(bad_name), b"not really a jpeg").unwrap();
+        let root = path::encode_native_path(dir.path()).unwrap();
+
+        let (files, warnings) = collect_files(&[root.clone()], |_| {});
+        assert!(files.is_empty());
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("不是有效 UTF-8"));
+
+        let plan = super::inspect_paths(&[root]);
+        assert!(plan.items.is_empty());
+        assert_eq!(plan.warnings.len(), 1);
+        assert!(plan.warnings[0].contains("不是有效 UTF-8"));
+    }
+
     #[test]
     fn precheck_database_error_is_not_a_duplicate_result() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
@@ -1098,5 +1238,83 @@ mod tests {
             result.is_err(),
             "数据库结构错误必须向上返回，不能伪装为重复"
         );
+    }
+
+    #[test]
+    fn inspect_classifies_previewable_limited_and_unsupported_images() {
+        let dir = tempfile::tempdir().unwrap();
+        let jpg = dir.path().join("ok.jpg");
+        let raw = dir.path().join("preview.cr2");
+        let bad = dir.path().join("broken.x3f");
+        image::RgbImage::from_fn(256, 192, |x, y| {
+            image::Rgb([x as u8, y as u8, (x.wrapping_add(y) % 255) as u8])
+        })
+        .save(&jpg)
+        .unwrap();
+        std::fs::copy(&jpg, &raw).unwrap();
+        std::fs::write(&bad, b"not an image").unwrap();
+
+        let paths = [
+            path::encode_native_path(&jpg).unwrap(),
+            path::encode_native_path(&raw).unwrap(),
+            path::encode_native_path(&bad).unwrap(),
+        ];
+        let plan = inspect_paths(&paths);
+
+        assert_eq!(plan.images, 3);
+        assert_eq!(
+            plan.items
+                .iter()
+                .find(|item| item.path.ends_with("ok.jpg"))
+                .unwrap()
+                .preview_status,
+            ImportPreviewStatus::Ready
+        );
+        assert_eq!(
+            plan.items
+                .iter()
+                .find(|item| item.path.ends_with("preview.cr2"))
+                .unwrap()
+                .preview_status,
+            ImportPreviewStatus::Limited
+        );
+        assert_eq!(
+            plan.items
+                .iter()
+                .find(|item| item.path.ends_with("broken.x3f"))
+                .unwrap()
+                .preview_status,
+            ImportPreviewStatus::Unsupported
+        );
+    }
+
+    #[test]
+    fn import_preflight_rejects_unsupported_and_accepts_limited_previews() {
+        let item = |path: &str, preview_status| super::ImportPlanItem {
+            path: path.to_string(),
+            kind: "image".to_string(),
+            size: 1,
+            preview_status,
+            preview_message: None,
+        };
+        let blocked = super::ImportPlan {
+            items: vec![item("/data/broken.x3f", ImportPreviewStatus::Unsupported)],
+            images: 1,
+            videos: 0,
+            total_size: 1,
+            warnings: Vec::new(),
+        };
+        let error = super::require_previewable(&blocked).unwrap_err();
+        assert_eq!(error.code(), "UNSUPPORTED");
+        assert!(error.to_string().contains("/data/broken.x3f"));
+
+        let supported = super::ImportPlan {
+            items: vec![item("/data/preview.cr2", ImportPreviewStatus::Limited)],
+            images: 1,
+            videos: 0,
+            total_size: 1,
+            warnings: Vec::new(),
+        };
+        assert!(super::require_previewable(&supported).is_ok());
     }
 }

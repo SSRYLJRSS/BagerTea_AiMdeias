@@ -126,11 +126,12 @@ CR3、RW2 等容器不一定能被通用 EXIF 库完整识别。实现会使用 
 
 检查：
 
-- `heif-bin/` 是否存在。
-- `.cargo/config.toml` 是否指向预编译库。
-- LLVM/libclang 是否可用。
-- MSVC STL 版本与 shim 是否匹配。
-- 网络下载失败时是否使用了完整、未损坏的预编译包。
+- 是否在本机原生受支持的目标上构建，target triple 与 CPU/OS 是否匹配。
+- `src-tauri/native/heif/<target-triple>/` 必须由 `npm run prepare-heif-libraries -- --target <triple>` 创建，且同时含 `include/`、`lib/`、已验证标记和许可证文本；来源、版本、ABI 与 SHA256 以 `src-tauri/native/heif-manifest.json` 为准。
+- `scripts/desktop.mjs` 仅向 `heif-rs` 传递已通过目标与版本校验的缓存。裸 Cargo 命令不联网回退；按错误提示先准备目标库并设置 `HEIF_BINARIES_DIR`。旧 `heif-bin/` 只作为被忽略的本机历史缓存，不再参与当前构建。
+- 网络能否访问固定 `binaries-heif` release 与许可证来源，clang/libclang 是否可用于生成绑定。
+- Windows MSVC STL 版本与 `msvc_stl_shim.cpp` 条件是否匹配。
+- 下载或校验失败时不要复用不完整缓存；删除由本任务产生的 Cargo `OUT_DIR` 构建缓存后重试。
 
 ## 4. 搜索
 
@@ -315,7 +316,7 @@ Windows 上优先在 PowerShell 运行 cargo。若 GNU `link` 抢占 MSVC linker
 
 ### 9.4 后端没有重新编译
 
-确认 cargo watcher 进程存在。不确定时结束旧的 `npm run tauri dev`，然后重新启动。
+确认 cargo watcher 进程存在。不确定时结束旧的 `npm run desktop:dev`，然后重新启动。
 
 ### 9.5 测试/构建产物污染 Git 状态
 
@@ -328,6 +329,9 @@ git diff --check
 npm run lint
 npm run typecheck
 npm run test:unit
+
+npm run prepare-heif-libraries -- --target x86_64-pc-windows-msvc
+$env:HEIF_BINARIES_DIR = (Resolve-Path "src-tauri/native/heif/x86_64-pc-windows-msvc").Path
 
 cd src-tauri
 cargo fmt --check

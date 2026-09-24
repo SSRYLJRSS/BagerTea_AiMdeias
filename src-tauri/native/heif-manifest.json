@@ -1,0 +1,89 @@
+{
+  "schemaVersion": 1,
+  "release": {
+    "version": "26.7.0",
+    "repositoryUrl": "https://github.com/vegidio/binaries-heif",
+    "releaseUrl": "https://github.com/vegidio/binaries-heif/releases/tag/26.7.0"
+  },
+  "libraries": [
+    {
+      "name": "libheif",
+      "version": "1.23.1",
+      "license": "LGPL-3.0-or-later",
+      "repositoryUrl": "https://github.com/strukturag/libheif",
+      "sourceCommit": "2c4bbb54c2738d4a5efbbe3e5fa1d5d76bb88eb0",
+      "sourceUrl": "https://github.com/strukturag/libheif/tree/2c4bbb54c2738d4a5efbbe3e5fa1d5d76bb88eb0",
+      "licenseUrl": "https://raw.githubusercontent.com/strukturag/libheif/2c4bbb54c2738d4a5efbbe3e5fa1d5d76bb88eb0/COPYING",
+      "licenseFileName": "libheif-COPYING",
+      "licenseSha256": "fa81ce652315b013359d6e8e4744335f31a50c7c192907176d3632f78a3b4596"
+    },
+    {
+      "name": "libde265",
+      "version": "1.1.1",
+      "license": "LGPL-3.0-or-later",
+      "repositoryUrl": "https://github.com/strukturag/libde265",
+      "sourceCommit": "4dd701fffac01632ffd5cabc5ef10deb56accba1",
+      "sourceUrl": "https://github.com/strukturag/libde265/tree/4dd701fffac01632ffd5cabc5ef10deb56accba1",
+      "licenseUrl": "https://raw.githubusercontent.com/strukturag/libde265/4dd701fffac01632ffd5cabc5ef10deb56accba1/COPYING",
+      "licenseFileName": "libde265-COPYING",
+      "licenseSha256": "02cc1585a20677992e0ba578fa692635dc193735f2691dc81de924b51c4e8020"
+    },
+    {
+      "name": "x265",
+      "version": "4.1",
+      "license": "GPL-2.0-or-later",
+      "repositoryUrl": "https://github.com/Multicorewareinc/x265",
+      "sourceCommit": "1d117bed4747758b51bd2c124d738527e30392cb",
+      "sourceUrl": "https://github.com/Multicorewareinc/x265/tree/1d117bed4747758b51bd2c124d738527e30392cb",
+      "licenseUrl": "https://raw.githubusercontent.com/Multicorewareinc/x265/1d117bed4747758b51bd2c124d738527e30392cb/COPYING",
+      "licenseFileName": "x265-COPYING",
+      "licenseSha256": "d8afb1bcc7a2cfc603683b168d6987ef0a48e59e0da3693bf55c5d33b67e2b49"
+    }
+  ],
+  "targets": {
+    "x86_64-pc-windows-msvc": {
+      "runner": { "os": "win32", "arch": "x64" },
+      "assetName": "static_windows_x64.zip",
+      "assetUrl": "https://github.com/vegidio/binaries-heif/releases/download/26.7.0/static_windows_x64.zip",
+      "assetSha256": "6021c0643460e525a4ece60b15eecfa4f772d7448cefb178552861c032a8a870",
+      "assetSizeBytes": 9967106,
+      "staticLibraries": ["heif.lib", "x265-static.lib", "libde265.lib"],
+      "staticLibrarySha256s": {
+        "heif.lib": "3172154a8de54edbd8f72a57ceaea3d417e6e433f63a1f29e2c8db758653b0d8",
+        "x265-static.lib": "af2e4d37d7193c152ce4ef69470449df2f94f042890e4ecebe2166881b13a250",
+        "libde265.lib": "575d5f9646b51162f739b572051ef95d281846d034cd1866f0179a079f8d8dee"
+      }
+    },
+    "aarch64-apple-darwin": {
+      "runner": { "os": "darwin", "arch": "arm64" },
+      "assetName": "static_osx_arm64.zip",
+      "assetUrl": "https://github.com/vegidio/binaries-heif/releases/download/26.7.0/static_osx_arm64.zip",
+      "assetSha256": "92be83c8ec3b7039b0721254a3b91b4adbbb16f0be349a37b5d53a5b413cbedf",
+      "assetSizeBytes": 2876516,
+      "staticLibraries": ["libheif.a", "libx265.a", "libde265.a"],
+      "staticLibrarySha256s": {
+        "libheif.a": "e0332de3d1f8f4e02eecb4bed3b42060cacc453333e7b51e9cfdf9da1121a3af",
+        "libx265.a": "4ac4c2e455623d7cd2c5951caaaa8446f9e40ff9eb4a18bfb464d161c0777d03",
+        "libde265.a": "cc245eaaef3556143cc01abb7030c1490511fe256725df3f1c87c91bfb8bef64"
+      }
+    },
+    "x86_64-unknown-linux-gnu": {
+      "runner": { "os": "linux", "arch": "x64" },
+      "assetName": "static_linux_x64.zip",
+      "assetUrl": "https://github.com/vegidio/binaries-heif/releases/download/26.7.0/static_linux_x64.zip",
+      "assetSha256": "0c04f28819bcfe6572aa46c50535c38e3ce69ae5ba687086acd274ef10c1c785",
+      "assetSizeBytes": 3133905,
+      "staticLibraries": ["libheif.a", "libx265.a", "libde265.a"],
+      "staticLibrarySha256s": {
+        "libheif.a": "fb45fb12be934c8b763c4220065096679edaa78837ec28dd332338a335703ff7",
+        "libx265.a": "6d5c80597d0f3fca5377b92b3aa1cc7293ba4ba1522712d021a86ab01a89594d",
+        "libde265.a": "8d7e2bf695c8ab310f502aef4c4b84fed46f9e81a05e342779ed8ca88307752e"
+      }
+    }
+  },
+  "headerChecks": {
+    "include/libheif/heif_version.h": "LIBHEIF_VERSION \"1.23.1\"",
+    "include/libde265/de265-version.h": "LIBDE265_VERSION \"1.1.1\"",
+    "include/x265_config.h": "#define X265_BUILD 216"
+  }
+}

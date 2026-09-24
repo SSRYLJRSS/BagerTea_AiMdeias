@@ -10,8 +10,9 @@ import { render, screen, waitFor, fireEvent } from "@testing-library/react";
 import { StrictMode as ReactStrictMode } from "react";
 import SettingsPage from "@/pages/SettingsPage";
 import { useSettingsStore } from "@/stores/settingsStore";
+import { usePlatformStore } from "@/stores/platformStore";
 import { useTagStore } from "@/stores/tagStore";
-import { exportDiagnostics, getSettings, resetAppData, saveSettings } from "@/api/settings";
+import { exportDiagnostics, getSettings, openHelpPage, resetAppData, saveSettings } from "@/api/settings";
 import { rescanAssetMetadata } from "@/api/assets";
 import type { Settings } from "@/types/settings";
 import type { TagFacet } from "@/types/tag";
@@ -44,6 +45,7 @@ vi.mock("@/api/settings", () => ({
   getDataDir: vi.fn().mockResolvedValue("D:/data"),
   openDataDir: vi.fn().mockResolvedValue(undefined),
   openLogsDir: vi.fn().mockResolvedValue(undefined),
+  openHelpPage: vi.fn().mockResolvedValue(undefined),
   exportDiagnostics: vi.fn().mockResolvedValue({ path: "D:/diag.zip", logFiles: 2, bytes: 2048 }),
   clearThumbnailCache: vi.fn().mockResolvedValue(undefined),
   resetAppData: vi.fn().mockResolvedValue({
@@ -114,7 +116,7 @@ vi.mock("@/api/client", () => ({
 }));
 vi.mock("@/api/connections", () => ({
   listAiConnections: vi.fn().mockResolvedValue([
-    { id: "c1", name: "通义", deployment: "cloud", protocol: "openai_chat", baseUrl: "https://a/v1", model: "qwen-max", hasKey: true, enabled: true },
+    { id: "c1", name: "通义", deployment: "cloud", protocol: "openai_chat", baseUrl: "https://a/v1", model: "qwen-max", hasKey: true, credentialStatus: "configured", enabled: true },
   ]),
   getAiUsageBindings: vi.fn().mockResolvedValue({ super_search: null, tagging: "c1" }),
   setAiUsageBinding: vi.fn().mockResolvedValue(undefined),
@@ -175,6 +177,22 @@ const emptyStore = {
 beforeEach(() => {
   vi.clearAllMocks();
   useSettingsStore.setState(emptyStore);
+  // R1（三端复核）：这些回归编码 Windows（托管 Ollama）契约——本机服务 tab 可见。
+  // 平台能力 store 置为 ready+windows；非托管平台的隐藏行为由 platformStore 单测覆盖。
+  usePlatformStore.setState({
+    status: "ready",
+    error: null,
+    capabilities: {
+      schemaVersion: 1,
+      os: "windows",
+      arch: "x86_64",
+      managedOllama: true,
+      preferredVideoProxy: "h264_mp4",
+      nativeWindowControls: false,
+      primaryModifier: "ctrl",
+      libraryTransferVersion: null,
+    },
+  });
   // 默认：getSettings 成功返回一份完整设置
   vi.mocked(getSettings).mockResolvedValue(mkSettings());
   // 默认 API 行为（色板状态：259 候选全缺；回算成功 259 条并更新前 3 条）
@@ -215,6 +233,15 @@ describe("SettingsPage §6.1 信息架构", () => {
 
     expect(screen.queryByText(/网盘/)).not.toBeInTheDocument();
     expect(screen.queryByText("本地打标")).not.toBeInTheDocument();
+  });
+
+  it("诊断与支持提供使用帮助入口并调用后端默认浏览器命令", async () => {
+    useSettingsStore.setState({ settings: mkSettings(), loaded: true, loading: false, loadError: null });
+    render(<SettingsPage />);
+    await waitFor(() => expect(screen.getByText("保存设置")).toBeInTheDocument());
+    fireEvent.click(screen.getByText("诊断与支持"));
+    fireEvent.click(await screen.findByRole("button", { name: "打开使用帮助" }));
+    await waitFor(() => expect(openHelpPage).toHaveBeenCalledTimes(1));
   });
 
   it("点击「AI 与模型」先进入服务管理，子页顺序为服务管理、超级搜索、自动打标", async () => {

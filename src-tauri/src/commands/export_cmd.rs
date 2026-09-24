@@ -94,7 +94,7 @@ pub fn export_csv_manifest(
     }
     let conn = state.db.lock().map_err(|_| AppError::msg("数据库锁中毒"))?;
     let out = export_local::write_csv_manifest(&conn, &asset_ids, &dest_dir)?;
-    Ok(out.to_string_lossy().into_owned())
+    crate::utils::path::encode_native_path(&out)
 }
 
 #[tauri::command]

@@ -91,6 +91,45 @@ fn facet_impact_reports_number_count() {
     assert_eq!(n, 1, "影响预览应统计到 1 条数值行");
 }
 
+#[test]
+fn numeric_sync_only_applies_to_an_exact_raw_non_raw_pair() {
+    let c = mem();
+    number_facet_setup(&c);
+    let jpg = f4_insert_asset(&c, "d:/photos/X.JPG");
+    let raw = f4_insert_asset(&c, "d:/photos/X.RW2");
+    let png = f4_insert_asset(&c, "d:/photos/X.PNG");
+
+    facet_numbers::set_facet_number(&c, &[jpg], "people_count", 5.0).unwrap();
+    assert!(facet_numbers::get_number(&c, raw, "people_count")
+        .unwrap()
+        .is_none());
+    assert!(facet_numbers::get_number(&c, png, "people_count")
+        .unwrap()
+        .is_none());
+
+    facet_numbers::clear_facet_number(&c, &[jpg], "people_count").unwrap();
+    assert!(facet_numbers::get_number(&c, jpg, "people_count")
+        .unwrap()
+        .is_none());
+    assert!(facet_numbers::get_number(&c, raw, "people_count")
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn numeric_sync_remains_enabled_for_an_exact_raw_non_raw_pair() {
+    let c = mem();
+    number_facet_setup(&c);
+    let jpg = f4_insert_asset(&c, "d:/photos/PAIR.JPG");
+    let raw = f4_insert_asset(&c, "d:/photos/PAIR.RW2");
+
+    facet_numbers::set_facet_number(&c, &[jpg], "people_count", 5.0).unwrap();
+    let value = facet_numbers::get_number(&c, raw, "people_count")
+        .unwrap()
+        .expect("唯一同源兄弟应接收数值");
+    assert_eq!(value.value, 5.0);
+}
+
 /// 带数值行时禁止裸 SQL 删分面（RESTRICT 触发器同时查 asset_facet_numbers）。
 #[test]
 fn restrict_delete_blocks_when_numbers_exist() {

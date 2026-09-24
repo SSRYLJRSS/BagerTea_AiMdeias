@@ -8,6 +8,13 @@ dist/
 src-tauri/target*/
 src-tauri/gen/
 
+# 平台原生构建依赖与候选 sidecar（只跟踪清单，不把 ABI 绑定二进制写入 Git）
+/heif-bin/
+/src-tauri/native/heif/
+/src-tauri/binaries/*
+!/src-tauri/binaries/manifest.json
+/artifacts/
+
 # 系统
 .DS_Store
 Thumbs.db

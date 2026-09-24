@@ -7,6 +7,7 @@ use bagertea_ai_media_v2_lib::db::ai::CategorizedTags;
 use bagertea_ai_media_v2_lib::db::assets::AssetFilter;
 use bagertea_ai_media_v2_lib::db::{self, ai, asset_tags, assets, migrations, tags};
 use bagertea_ai_media_v2_lib::error::AppResult;
+use bagertea_ai_media_v2_lib::state::Database;
 
 fn setup() -> rusqlite::Connection {
     db::init_memory().expect("内存库初始化失败")
@@ -1343,7 +1344,7 @@ fn b27_clear_all_thumbnail_paths_writes_null() -> AppResult<()> {
 #[ignore = "真机验收：写真实库，仅手动跑（cargo test -- --ignored）"]
 fn w1_refill_real_library_rw2_dimensions() {
     use std::sync::atomic::AtomicBool;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
     let db_path = std::path::PathBuf::from(
         std::env::var("APPDATA").unwrap().replace('\\', "/") + "/bagertea_ai_media_v2/library.db",
     );
@@ -1362,7 +1363,7 @@ fn w1_refill_real_library_rw2_dimensions() {
     println!("RW2 宽高缺失（回填前）: {before}");
     drop(conn);
 
-    let db = Arc::new(Mutex::new(rusqlite::Connection::open(&db_path).unwrap()));
+    let db = Arc::new(Database::new(rusqlite::Connection::open(&db_path).unwrap()));
     let cancel = AtomicBool::new(false);
     let ids = {
         let c = db.lock().unwrap();

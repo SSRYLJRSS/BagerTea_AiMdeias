@@ -9,10 +9,10 @@ use crate::db::search_query;
 use crate::db::settings;
 use crate::error::{AppError, AppResult};
 use crate::services::thumbnail::ThumbnailService;
-use crate::state::AppState;
+use crate::state::{AppState, Database};
 
 // 参数取 &AppState（State<T> 经 Deref 自动转换），规避 State 生命周期标注
-fn lock_db(state: &AppState) -> AppResult<std::sync::MutexGuard<'_, rusqlite::Connection>> {
+fn lock_db(state: &AppState) -> AppResult<crate::state::DbConnectionGuard<'_>> {
     state.db.lock().map_err(|_| AppError::msg("数据库锁中毒"))
 }
 
@@ -140,7 +140,7 @@ pub async fn delete_assets(
 /// 设置页的“原始素材文件”重置需要一次性处理在库和回收站中的全部素材，
 /// 复用同一实现可保证磁盘删除失败时保留对应数据库记录（B03），不会出现假删除。
 fn delete_assets_blocking(
-    db: std::sync::Arc<std::sync::Mutex<rusqlite::Connection>>,
+    db: std::sync::Arc<Database>,
     data_dir: PathBuf,
     ids: Vec<i64>,
     strategy: String,
@@ -154,11 +154,9 @@ fn delete_assets_blocking(
             .filter_map(|&id| {
                 // 删除只需要路径；不要为全库重置加载完整 Asset 与标签，
                 // 否则素材量大时会额外占用大量内存和查询时间。
-                conn.query_row(
-                    "SELECT file_path FROM assets WHERE id = ?1",
-                    [id],
-                    |row| row.get::<_, String>(0),
-                )
+                conn.query_row("SELECT file_path FROM assets WHERE id = ?1", [id], |row| {
+                    row.get::<_, String>(0)
+                })
                 .ok()
                 .map(|path| (id, PathBuf::from(path)))
             })
@@ -219,7 +217,7 @@ fn delete_assets_blocking(
 /// 然后复用批量硬删流程。该函数只在 settings_cmd 的 spawn_blocking 中调用，
 /// 不持有数据库锁执行文件 IO。
 pub fn delete_all_asset_files_for_reset(
-    db: std::sync::Arc<std::sync::Mutex<rusqlite::Connection>>,
+    db: std::sync::Arc<Database>,
     data_dir: PathBuf,
 ) -> AppResult<DeleteResult> {
     let ids = {
@@ -255,7 +253,7 @@ pub fn set_user_rotation(state: State<AppState>, ids: Vec<i64>, rotation: i64) -
 /// R-22 超期回收站自动清理（启动时调用，不常驻定时器）：
 /// 短锁取清单 → 锁外删文件（失败保留记录，沿用 B03 语义）→ 短锁硬删 DB + 清缩略图
 pub fn purge_expired_trash(
-    db: &std::sync::Arc<std::sync::Mutex<rusqlite::Connection>>,
+    db: &std::sync::Arc<Database>,
     data_dir: &std::path::Path,
     retention_days: i64,
 ) -> AppResult<()> {
@@ -368,7 +366,7 @@ mod tests {
     #[test]
     fn reset_file_helper_deletes_existing_files_but_keeps_failed_records() {
         let conn = init_memory().unwrap();
-        let db = std::sync::Arc::new(std::sync::Mutex::new(conn));
+        let db = std::sync::Arc::new(Database::new(conn));
         let data_dir = tempfile::tempdir().unwrap();
         let original = data_dir.path().join("keep-me.jpg");
         std::fs::write(&original, b"test").unwrap();

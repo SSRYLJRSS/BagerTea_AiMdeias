@@ -19,6 +19,7 @@
 use rusqlite::types::Value;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 
 use super::query_expr::{compile_expr_with, compile_leaf_with, validate_expr, LeafCond, QueryExpr};
 use super::search_query::ALL_SORT_KEYS;
@@ -406,11 +407,10 @@ pub fn compile_search_plan_with(
     };
 
     // 3) 排序：Field → 额外算 sortv（内层）；Relevance → score DESC, id DESC
-    let order_sql: String;
     let mut sortv_keep = String::new();
     let mut sortv_inner = String::new();
-    match &plan.ranking {
-        Ranking::Relevance => order_sql = "score DESC, id DESC".to_string(),
+    let order_sql = match &plan.ranking {
+        Ranking::Relevance => "score DESC, id DESC".to_string(),
         Ranking::Field { key, dir } => {
             let col = sort_column_sql(key)
                 .ok_or_else(|| AppError::msg(format!("非法排序字段：{key}")))?;
@@ -423,9 +423,9 @@ pub fn compile_search_plan_with(
             };
             // B9（方案 A）：字段排序为主键，score DESC 为次级（同值命中优先项的排前面），
             // 尾缀仍为 id DESC → 分页稳定。
-            order_sql = format!("sortv {dir}, score DESC, id DESC");
+            format!("sortv {dir}, score DESC, id DESC")
         }
-    }
+    };
 
     // 4) 组装（三层：内层算 0/1 标记 → 中层算 score/hits → 外层过滤/排序）。
     //    每个 should 片段只在内层出现一次（别名不能在同一个 SELECT 里复用）。
@@ -480,7 +480,9 @@ pub fn run_search_plan_with(
     let mut params = compiled.params;
     if let Some(l) = limit {
         let li = params.len() + 1;
-        params.push(Value::Integer(l.clamp(0, 1000)));
+        // 列表分页在 run_plan_page 单独限制到 1000；这里不能再次钳制，
+        // 否则全选 ID 路径传入 PLAN_IDS_CAP 时会静默只返回前 1000 条。
+        params.push(Value::Integer(l.max(0)));
         let oi = params.len() + 1;
         params.push(Value::Integer(offset.max(0)));
         sql.push_str(&format!(" LIMIT ?{li} OFFSET ?{oi}"));
@@ -541,11 +543,7 @@ fn run_relevance_fused_with(
         .into_iter()
         .filter(|(id, _)| cand_set.contains(id))
         .skip(offset.max(0) as usize)
-        .take(
-            limit
-                .map(|l| l.clamp(0, 1000) as usize)
-                .unwrap_or(usize::MAX),
-        )
+        .take(limit.map(|l| l.max(0) as usize).unwrap_or(usize::MAX))
         .map(|(id, s)| (id, s, 0.0))
         .collect();
     Ok(page)
@@ -652,9 +650,9 @@ fn probe_leaf(conn: &Connection, cond: &LeafCond) -> AppResult<(Fold, String)> {
     let mut sink: Vec<String> = Vec::new();
     let (sql, _) = compile_leaf_with(conn, cond, &mut sink)?;
     let why = if sink.is_empty() {
-        cond_label(cond)
+        cond_label(cond, None)
     } else {
-        format!("{}（{}）", cond_label(cond), sink.join("；"))
+        format!("{}（{}）", cond_label(cond, None), sink.join("；"))
     };
     let fold = match sql.trim() {
         "1=1" => Fold::AlwaysTrue,
@@ -873,6 +871,7 @@ pub fn diagnose_search_plan(
 ) -> AppResult<PlanDiagnostics> {
     validate_search_plan(plan)?;
     let (pruned, warnings) = prune_invalid(conn, plan)?;
+    let tag_names = load_plan_tag_names(conn, &pruned)?;
     let result_count = count_plan(conn, &pruned)?;
     let mut leaves: Vec<LeafDiagnostic> = Vec::new();
     // filter 树叶子（zone=filter）
@@ -885,6 +884,7 @@ pub fn diagnose_search_plan(
             "filter",
             result_count,
             plan_revision,
+            &tag_names,
             &mut leaves,
         )?;
     }
@@ -898,18 +898,23 @@ pub fn diagnose_search_plan(
             "mustNot",
             result_count,
             plan_revision,
+            &tag_names,
             &mut leaves,
         )?;
     }
     // should 命中/总数（B3：分子 = 当前结果集内命中该加分项的素材数）
+    let should_hits = count_intersections(
+        conn,
+        &pruned,
+        &pruned.should.iter().map(|sc| &sc.cond).collect::<Vec<_>>(),
+    )?;
     let mut should_diag = Vec::new();
-    for (index, sc) in pruned.should.iter().enumerate() {
-        let hit = count_intersection(conn, &pruned, &sc.cond)?;
+    for (index, (sc, hit)) in pruned.should.iter().zip(should_hits).enumerate() {
         should_diag.push(ShouldDiagnostic {
             index,
             plan_revision,
             label: if sc.label.is_empty() {
-                "加分项".to_string()
+                cond_label(&sc.cond, Some(&tag_names))
             } else {
                 sc.label.clone()
             },
@@ -936,26 +941,43 @@ pub fn count_plan(conn: &Connection, plan: &SearchPlanV3) -> AppResult<i64> {
     Ok(n)
 }
 
-/// B3：统计「当前结果集 ∩ 该叶子条件」的命中数 —— 把 plan 的执行 SQL 作为子查询，
-/// 再与 assets 自连接套上叶子条件，天然 ≤ 结果总数（不再出现「命中 500 / 106」）。
-fn count_intersection(conn: &Connection, plan: &SearchPlanV3, cond: &LeafCond) -> AppResult<i64> {
-    let compiled = compile_search_plan(conn, plan)?;
-    let mut sink: Vec<String> = Vec::new();
-    let (leaf_sql, leaf_params) = compile_leaf_with(conn, cond, &mut sink)?;
-    if leaf_sql.trim() == "1=0" {
-        return Ok(0);
+/// B3：批量统计「当前结果集 ∩ 每个加分条件」的命中数。
+/// 将多个 should 条件合并到一次 SQLite 查询，避免每个条件重复编译/扫描完整结果集。
+fn count_intersections(
+    conn: &Connection,
+    plan: &SearchPlanV3,
+    conds: &[&LeafCond],
+) -> AppResult<Vec<i64>> {
+    if conds.is_empty() {
+        return Ok(Vec::new());
     }
-    let shifted = offset_placeholders(&leaf_sql, compiled.params.len());
-    let mut params = compiled.params.clone();
-    params.extend(leaf_params);
+    let compiled = compile_search_plan(conn, plan)?;
+    let mut params = compiled.params;
+    let mut projections = Vec::with_capacity(conds.len());
+    for cond in conds {
+        let mut sink: Vec<String> = Vec::new();
+        let (leaf_sql, leaf_params) = compile_leaf_with(conn, cond, &mut sink)?;
+        let shifted = offset_placeholders(&leaf_sql, params.len());
+        projections.push(format!(
+            "COALESCE(SUM(CASE WHEN ({shifted}) THEN 1 ELSE 0 END), 0)"
+        ));
+        params.extend(leaf_params);
+    }
     let sql = format!(
-        "SELECT COUNT(*) FROM (\n{}\n) _si JOIN assets a ON a.id = _si.id WHERE ({shifted})",
+        "SELECT {} FROM (\n{}\n) _si JOIN assets a ON a.id = _si.id",
+        projections.join(", "),
         compiled.sql
     );
-    let n: i64 = conn.query_row(&sql, rusqlite::params_from_iter(params.iter()), |r| {
-        r.get(0)
-    })?;
-    Ok(n)
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query(rusqlite::params_from_iter(params.iter()))?;
+    let Some(row) = rows.next()? else {
+        return Ok(vec![0; conds.len()]);
+    };
+    let mut counts = Vec::with_capacity(conds.len());
+    for index in 0..conds.len() {
+        counts.push(row.get::<_, i64>(index)?);
+    }
+    Ok(counts)
 }
 
 /// 递归收集叶子。pos = 相对当前树根的路径。
@@ -971,6 +993,7 @@ fn collect_leaves(
     zone: &str,
     result_count: i64,
     plan_revision: i64,
+    tag_names: &HashMap<i64, String>,
     out: &mut Vec<LeafDiagnostic>,
 ) -> AppResult<()> {
     match node {
@@ -991,7 +1014,7 @@ fn collect_leaves(
                 variant.must_not = remove_leaf(variant.must_not.as_ref(), prefix);
             }
             let without = count_plan(conn, &variant)?;
-            let label = cond_label(cond);
+            let label = cond_label(cond, Some(tag_names));
             out.push(LeafDiagnostic {
                 zone: zone.to_string(),
                 path: prefix.to_vec(),
@@ -1008,7 +1031,17 @@ fn collect_leaves(
             for (i, c) in children.iter().enumerate() {
                 let mut p = prefix.to_vec();
                 p.push(i);
-                collect_leaves(conn, plan, c, &p, zone, result_count, plan_revision, out)?;
+                collect_leaves(
+                    conn,
+                    plan,
+                    c,
+                    &p,
+                    zone,
+                    result_count,
+                    plan_revision,
+                    tag_names,
+                    out,
+                )?;
             }
             Ok(())
         }
@@ -1024,6 +1057,7 @@ fn collect_leaves(
                 zone,
                 result_count,
                 plan_revision,
+                tag_names,
                 out,
             )
         }
@@ -1066,7 +1100,7 @@ fn remove_leaf(expr: Option<&QueryExpr>, path: &[usize]) -> Option<QueryExpr> {
         }
         QueryExpr::Not { child } => {
             if path.len() == 1 {
-                return Some(e.clone()); // 不会从 Not 上取叶子
+                return None; // collect_leaves 为 Not 子叶压入 [0]，此时应移除整个 Not
             }
             let sub = remove_leaf(Some(child), &path[1..]);
             sub.map(|n| QueryExpr::Not { child: Box::new(n) })
@@ -1074,7 +1108,25 @@ fn remove_leaf(expr: Option<&QueryExpr>, path: &[usize]) -> Option<QueryExpr> {
     }
 }
 
-fn cond_label(cond: &LeafCond) -> String {
+fn cond_label(cond: &LeafCond, tag_names: Option<&HashMap<i64, String>>) -> String {
+    let format_tags = |ids: &[i64]| {
+        if ids.is_empty() {
+            return "标签×0".to_string();
+        }
+        if let Some(names) = tag_names {
+            return ids
+                .iter()
+                .map(|id| {
+                    names
+                        .get(id)
+                        .cloned()
+                        .unwrap_or_else(|| format!("标签#{id}"))
+                })
+                .collect::<Vec<_>>()
+                .join("、");
+        }
+        format!("标签×{}", ids.len())
+    };
     match cond {
         LeafCond::Tag {
             facet_key,
@@ -1082,14 +1134,25 @@ fn cond_label(cond: &LeafCond) -> String {
             term_query,
             ..
         } => {
-            if let Some(tq) = term_query.as_deref().filter(|s| !s.is_empty()) {
+            if tag_ids.is_empty() {
+                if let Some(tq) = term_query.as_deref().filter(|s| !s.is_empty()) {
+                    return format!("{facet_key}: {tq}");
+                }
+            }
+            if !tag_ids.is_empty() && tag_names.is_some() {
+                format!("{facet_key}: {}", format_tags(tag_ids))
+            } else if let Some(tq) = term_query.as_deref().filter(|s| !s.is_empty()) {
                 format!("{facet_key}: {tq}")
             } else {
-                format!("{facet_key}: 标签×{}", tag_ids.len())
+                format!("{facet_key}: {}", format_tags(tag_ids))
             }
         }
         LeafCond::ExcludeTag { facet_key, tag_ids } => {
-            format!("排除 {facet_key}×{}", tag_ids.len())
+            if tag_names.is_some() {
+                format!("排除 {facet_key}: {}", format_tags(tag_ids))
+            } else {
+                format!("排除 {facet_key}×{}", tag_ids.len())
+            }
         }
         LeafCond::AssetType { value } => format!("类型: {value}"),
         LeafCond::Untagged => "未打标".into(),
@@ -1115,6 +1178,60 @@ fn cond_label(cond: &LeafCond) -> String {
             format!("{facet_key} {op_label}")
         }
     }
+}
+
+fn collect_tag_ids_from_cond(cond: &LeafCond, out: &mut HashSet<i64>) {
+    match cond {
+        LeafCond::Tag { tag_ids, .. } | LeafCond::ExcludeTag { tag_ids, .. } => {
+            out.extend(tag_ids.iter().copied());
+        }
+        _ => {}
+    }
+}
+
+fn collect_tag_ids_from_expr(expr: &QueryExpr, out: &mut HashSet<i64>) {
+    match expr {
+        QueryExpr::Leaf { cond } => collect_tag_ids_from_cond(cond, out),
+        QueryExpr::Not { child } => collect_tag_ids_from_expr(child, out),
+        QueryExpr::And { children } | QueryExpr::Or { children } => {
+            for child in children {
+                collect_tag_ids_from_expr(child, out);
+            }
+        }
+    }
+}
+
+fn load_plan_tag_names(conn: &Connection, plan: &SearchPlanV3) -> AppResult<HashMap<i64, String>> {
+    let mut ids = HashSet::new();
+    if let Some(filter) = &plan.filter {
+        collect_tag_ids_from_expr(filter, &mut ids);
+    }
+    if let Some(must_not) = &plan.must_not {
+        collect_tag_ids_from_expr(must_not, &mut ids);
+    }
+    for clause in &plan.should {
+        collect_tag_ids_from_cond(&clause.cond, &mut ids);
+    }
+    if ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let mut sorted_ids: Vec<i64> = ids.into_iter().collect();
+    sorted_ids.sort_unstable();
+    let placeholders = (0..sorted_ids.len())
+        .map(|_| "?")
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!("SELECT id, name FROM tags WHERE id IN ({placeholders})");
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(sorted_ids.iter()), |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut names = HashMap::new();
+    for row in rows {
+        let (id, name) = row?;
+        names.insert(id, name);
+    }
+    Ok(names)
 }
 
 /// S6：schema 版本迁移（plan_schema_version 3 → 4 时在此加 migrate_plan_v3_to_v4；
@@ -1970,6 +2087,42 @@ mod tests {
         );
     }
 
+    #[test]
+    fn diagnostic_labels_show_tag_names() {
+        let c = init_memory().unwrap();
+        let blue_sky = tag(&c, "scene", "蓝天");
+        let asset = insert_asset(&c, "d:/diagnostic_tag_name.jpg");
+        asset_tags::assign(&c, &[asset], &[blue_sky], "manual").unwrap();
+        let plan = SearchPlanV3 {
+            filter: Some(d_tag("scene", blue_sky)),
+            ranking: Ranking::Relevance,
+            ..Default::default()
+        };
+        let diagnostics = diagnose_search_plan(&c, &plan, 1).unwrap();
+        assert_eq!(diagnostics.leaves[0].label, "scene: 蓝天");
+    }
+
+    #[test]
+    fn diagnostic_can_remove_leaf_nested_under_not() {
+        let c = init_memory().unwrap();
+        let night = tag(&c, "scene", "夜景");
+        let asset = insert_asset(&c, "d:/diagnostic_not.jpg");
+        asset_tags::assign(&c, &[asset], &[night], "manual").unwrap();
+        let plan = SearchPlanV3 {
+            filter: Some(QueryExpr::Not {
+                child: Box::new(d_tag("scene", night)),
+            }),
+            ranking: Ranking::Relevance,
+            ..Default::default()
+        };
+        let diagnostics = diagnose_search_plan(&c, &plan, 1).unwrap();
+        assert_eq!(diagnostics.leaves.len(), 1);
+        assert_eq!(diagnostics.leaves[0].path, vec![0]);
+        assert_eq!(diagnostics.leaves[0].result_count, 0);
+        assert_eq!(diagnostics.leaves[0].count_without_leaf, 1);
+        assert_eq!(diagnostics.leaves[0].delta, 1);
+    }
+
     /// §3.7 不变式 9：叶子诊断带 zone + plan_revision ——
     /// 「必须区第 0 条」与「排除区第 0 条」path 都是 [0]，仅凭 path 无法区分，
     /// zone 必须由后端打标；revision 供前端对在途旧诊断整批丢弃。
@@ -2129,6 +2282,22 @@ mod tests {
         let rest: Vec<i64> = page2.items.iter().map(|x| x.id).collect();
         assert_eq!(rest, ids_res.ids[3..]);
         assert!(!page2.has_more);
+    }
+
+    #[test]
+    fn plan_ids_do_not_use_the_list_page_cap() {
+        let c = init_memory().unwrap();
+        for i in 0..1_001 {
+            insert_asset(&c, &format!("d:/bulk_{i}.jpg"));
+        }
+        let result = run_plan_ids(&c, &SearchPlanV3::default()).unwrap();
+        assert_eq!(result.total, 1_001);
+        assert_eq!(
+            result.ids.len(),
+            1_001,
+            "全选 ID 不得被列表 1000 条限制截断"
+        );
+        assert!(!result.truncated);
     }
 
     /// §4.2：空 plan 三区全空也可执行（返回全库无 filter = 直接列表），这里只验证不 panic。

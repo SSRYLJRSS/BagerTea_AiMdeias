@@ -7,9 +7,38 @@
  *  - 点击 logo 设置入口派发 app:navigate=settings；
  *  - 非 Tauri 环境（jsdom）不抛异常。
  */
-import { describe, expect, it, vi } from "vitest";
-import { render, screen, fireEvent } from "@testing-library/react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import TitleBar from "@/components/layout/TitleBar";
+
+const windowMocks = vi.hoisted(() => ({
+  getCurrentWindow: vi.fn(),
+  minimize: vi.fn(),
+  toggleMaximize: vi.fn(),
+  close: vi.fn(),
+  isMaximized: vi.fn(),
+  onResized: vi.fn(),
+}));
+
+vi.mock("@tauri-apps/api/window", () => ({
+  getCurrentWindow: windowMocks.getCurrentWindow,
+}));
+
+beforeEach(() => {
+  vi.resetAllMocks();
+  windowMocks.minimize.mockResolvedValue(undefined);
+  windowMocks.toggleMaximize.mockResolvedValue(undefined);
+  windowMocks.close.mockResolvedValue(undefined);
+  windowMocks.isMaximized.mockResolvedValue(false);
+  windowMocks.onResized.mockResolvedValue(() => {});
+  windowMocks.getCurrentWindow.mockReturnValue({
+    minimize: windowMocks.minimize,
+    toggleMaximize: windowMocks.toggleMaximize,
+    close: windowMocks.close,
+    isMaximized: windowMocks.isMaximized,
+    onResized: windowMocks.onResized,
+  });
+});
 
 describe("TitleBar（指导书 §3.3）", () => {
   it("软件名不显示，logo 本身作为设置入口并提供悬停提示", () => {
@@ -38,6 +67,20 @@ describe("TitleBar（指导书 §3.3）", () => {
     // 窗口控制顺序为 最小化 → 最大化/还原 → 关闭
     expect(minBtn.compareDocumentPosition(maxBtn) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
     expect(maxBtn.compareDocumentPosition(closeBtn) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
+    expect(screen.getByRole("group", { name: "窗口控制" })).toBeInTheDocument();
+  });
+
+  it("自绘窗口按钮调用 Tauri 当前窗口 API", async () => {
+    render(<TitleBar />);
+    fireEvent.click(screen.getByRole("button", { name: "最小化" }));
+    fireEvent.click(screen.getByRole("button", { name: /最大化|还原/ }));
+    fireEvent.click(screen.getByRole("button", { name: "关闭" }));
+
+    await waitFor(() => {
+      expect(windowMocks.minimize).toHaveBeenCalledTimes(1);
+      expect(windowMocks.toggleMaximize).toHaveBeenCalledTimes(1);
+      expect(windowMocks.close).toHaveBeenCalledTimes(1);
+    });
   });
 
   it("logo 设置入口在左侧（位于窗口控制之前）且无 data-tauri-drag-region", () => {
@@ -65,6 +108,9 @@ describe("TitleBar（指导书 §3.3）", () => {
   });
 
   it("非 Tauri 环境渲染不抛异常（jsdom 无窗口 API）", () => {
+    windowMocks.getCurrentWindow.mockImplementationOnce(() => {
+      throw new Error("not running in Tauri");
+    });
     expect(() => render(<TitleBar />)).not.toThrow();
   });
 });

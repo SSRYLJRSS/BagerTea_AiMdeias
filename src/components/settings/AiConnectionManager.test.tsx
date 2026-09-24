@@ -9,6 +9,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import AiConnectionManager from "@/components/settings/AiConnectionManager";
 import { deleteAiConnection, listAiConnections, saveAiConnection, testAiConnection } from "@/api/connections";
+import { usePlatformStore } from "@/stores/platformStore";
 
 vi.mock("@/api/connections", () => ({
   listAiConnections: vi.fn(),
@@ -23,11 +24,27 @@ import type { AiConnection } from "@/api/connections";
 beforeEach(() => {
   vi.clearAllMocks();
   vi.stubGlobal("crypto", { randomUUID: () => "new-conn-1" });
+  // R1（三端复核）：这些用例编码 Windows（托管）契约——按部署过滤本机/在线。
+  // 平台 store 置 ready+windows；非托管平台「旧 local 档案仍可见」由 X-05 逻辑另测。
+  usePlatformStore.setState({
+    status: "ready",
+    error: null,
+    capabilities: {
+      schemaVersion: 1,
+      os: "windows",
+      arch: "x86_64",
+      managedOllama: true,
+      preferredVideoProxy: "h264_mp4",
+      nativeWindowControls: false,
+      primaryModifier: "ctrl",
+      libraryTransferVersion: null,
+    },
+  });
 });
 
 const fakeConns: AiConnection[] = [
-  { id: "c1", name: "通义", deployment: "cloud", protocol: "openai_chat", baseUrl: "https://a/v1", model: "qwen-max", hasKey: true, enabled: true },
-  { id: "c2", name: "本地 Ollama", deployment: "local", protocol: "openai_chat", baseUrl: "http://localhost:11434/v1", model: "llama3.2-vision", hasKey: false, enabled: true },
+  { id: "c1", name: "通义", deployment: "cloud", protocol: "openai_chat", baseUrl: "https://a/v1", model: "qwen-max", maxConcurrency: 0, requestsPerMinute: 0, requestsPerHour: 0, hasKey: true, credentialStatus: "configured", enabled: true },
+  { id: "c2", name: "本地 Ollama", deployment: "local", protocol: "openai_chat", baseUrl: "http://localhost:11434/v1", model: "llama3.2-vision", maxConcurrency: 0, requestsPerMinute: 0, requestsPerHour: 0, hasKey: false, credentialStatus: "missing", enabled: true },
 ];
 
 describe("AiConnectionManager（§6.3）", () => {
@@ -71,6 +88,48 @@ describe("AiConnectionManager（§6.3）", () => {
           model: "glm-4v",
           apiKey: "sk-secret",
         }),
+      ),
+    );
+  });
+
+  it("在线服务可配置并保存并发、每分钟和每小时请求限制", async () => {
+    vi.mocked(listAiConnections).mockResolvedValue([]);
+    vi.mocked(saveAiConnection).mockResolvedValue({ ...fakeConns[0], id: "new-conn-1" });
+    render(<AiConnectionManager deployment="cloud" notify={vi.fn()} fail={vi.fn()} />);
+    await waitFor(() => expect(screen.getByRole("button", { name: "+ 新增服务" })).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole("button", { name: "+ 新增服务" }));
+    fireEvent.change(screen.getByPlaceholderText(/如「通义官方」/), { target: { value: "限额服务" } });
+    fireEvent.change(screen.getByPlaceholderText(/api.example.com/), { target: { value: "https://limits/v1" } });
+    fireEvent.change(screen.getByLabelText("最大并发数"), { target: { value: "2" } });
+    fireEvent.change(screen.getByLabelText("每分钟请求数"), { target: { value: "10" } });
+    fireEvent.change(screen.getByLabelText("每小时请求数"), { target: { value: "100" } });
+    fireEvent.click(screen.getByRole("button", { name: "创建" }));
+
+    await waitFor(() =>
+      expect(saveAiConnection).toHaveBeenCalledWith(
+        expect.objectContaining({ maxConcurrency: 2, requestsPerMinute: 10, requestsPerHour: 100 }),
+      ),
+    );
+  });
+
+  it("编辑时显示已保存的请求限制并保留到保存结果", async () => {
+    vi.mocked(listAiConnections).mockResolvedValue([
+      { ...fakeConns[0], maxConcurrency: 3, requestsPerMinute: 18, requestsPerHour: 600 },
+    ]);
+    vi.mocked(saveAiConnection).mockResolvedValue(fakeConns[0]);
+    render(<AiConnectionManager deployment="cloud" notify={vi.fn()} fail={vi.fn()} />);
+    await waitFor(() => expect(screen.getByText("通义")).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole("button", { name: "编辑" }));
+    expect(screen.getByLabelText("最大并发数")).toHaveValue(3);
+    expect(screen.getByLabelText("每分钟请求数")).toHaveValue(18);
+    expect(screen.getByLabelText("每小时请求数")).toHaveValue(600);
+    fireEvent.click(screen.getByRole("button", { name: "保存" }));
+
+    await waitFor(() =>
+      expect(saveAiConnection).toHaveBeenCalledWith(
+        expect.objectContaining({ id: "c1", maxConcurrency: 3, requestsPerMinute: 18, requestsPerHour: 600 }),
       ),
     );
   });
@@ -139,5 +198,29 @@ describe("AiConnectionManager（§6.3）", () => {
     await waitFor(() =>
       expect(screen.getByText(/连接失败：服务可达，但密钥无效/)).toBeInTheDocument(),
     );
+  });
+
+  // X-05：非托管平台（macOS）没有本机服务 tab，从 Windows 迁移来的旧 local 档案
+  // 必须仍在在线服务列表可见/可编辑，不被部署过滤丢失。
+  it("非托管平台：旧 deployment=local 档案在在线列表仍可见", async () => {
+    usePlatformStore.setState({
+      status: "ready",
+      error: null,
+      capabilities: {
+        schemaVersion: 1,
+        os: "macos",
+        arch: "aarch64",
+        managedOllama: false,
+        preferredVideoProxy: "h264_mp4",
+        nativeWindowControls: true,
+        primaryModifier: "meta",
+        libraryTransferVersion: null,
+      },
+    });
+    vi.mocked(listAiConnections).mockResolvedValue(fakeConns);
+    render(<AiConnectionManager deployment="cloud" notify={vi.fn()} fail={vi.fn()} />);
+    // 云档案与旧 local 档案都应出现（不因 deployment=cloud 过滤丢失 local）
+    await waitFor(() => expect(screen.getByText("通义")).toBeInTheDocument());
+    expect(screen.getByText("本地 Ollama")).toBeInTheDocument();
   });
 });
