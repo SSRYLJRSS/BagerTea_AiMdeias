@@ -41,7 +41,7 @@
 3. **格式与性能**：在目标机器上复测 RAW/HEIC、视频播放、3 万级搜索和网格滚动。
 4. **工作区交付边界**：所有应发布改动必须完成审查、测试并形成可回退提交。
 5. **发布门禁**：`scripts/smoke.ps1`、严格 Rust 门禁、前端门禁和人工 UAT 必须全部有结果记录。
-6. **三端远端门禁**：尚无当前集成代码的三目标 runner 通过证据；Required checks/ruleset 当前是否生效未核实，不能当作已完成。本机 Windows 通过不能替代它们。
+6. **三端远端门禁**：当前工作分支提交 `b9ac04ff2b07414c7c963440a51aff6b694eb165` 的 code-gate 已由 Linux x64、macOS Apple Silicon、Windows x64 和前端 job 全部通过（[workflow run 35965863783](https://github.com/SSRYLJRSS/BagerTea_AiMdeias/actions/runs/35965863783)）。但 `main` 当前没有有效分支保护/规则集：branch protection API 返回 `Branch not protected`，仓库 rulesets 与 main 的有效规则均为空；Required checks 尚未被设置为合并硬门禁。
 7. **macOS/Linux 真机验收**：当前没有这两类目标设备的验收证据；自动构建成功也不能标记为支持。
 8. **媒体依赖合规**：FFmpeg/HEIF/RAW 相关二进制的来源、对应源码/再分发材料和最终许可义务尚未完成独立复核；HEIF 的三目标归档、解压后静态库 SHA256、源码提交和 LGPL/GPL 许可证摘要已固定并随候选附带，但这不替代法律审查，许可证文本本身不足以解除分发阻塞。
 
@@ -51,32 +51,36 @@
 
 | 范围 | 当前状态 | 完成证据/剩余动作 |
 |---|---|---|
-| 平台契约、AI 协作入口、路径与能力边界 | 本地集成分支已改 | 需复核 diff 后合并到 `main` |
-| Windows/macOS/Linux 平台能力、UTF-8 路径告警、视频代理变体 | 本地集成分支已有实现与定向测试 | 需完整本机门禁及三端 runner 复验 |
-| Rust 1.98.1、统一桌面构建入口、SHA256 sidecar/HEIF manifest | 本地集成分支已配置 | Windows x64 sidecar 与 HEIF 来源/许可证校验通过，MSI 与 NSIS 本机 Release 包已生成；macOS/Linux 原生 runner 构建待验证，Windows 安装/UAT 仍未执行 |
-| 三目标 code-gate 与手动候选包 workflow | workflow 已写入本地分支，尚未推送 | 需首跑全绿；之后在 GitHub 设置 Required checks |
+| 平台契约、AI 协作入口、路径与能力边界 | 已提交并推送到 `codex/platform-integration` | 当前集成提交已完成代码级审查与三端 code-gate；尚未合并，且 Required checks 未设置 |
+| Windows/macOS/Linux 平台能力、UTF-8 路径告警、视频代理变体 | 工作分支已有实现与回归测试 | 最新提交在三端 clippy、全量 Rust 测试及原生 Tauri 构建通过；目标设备人工验收仍未完成 |
+| Rust 1.98.1、统一桌面构建入口、SHA256 sidecar/HEIF manifest | 工作分支已配置 | 三端 HEIF 资源准备及原生应用构建通过；Windows strict media check 通过。MSI/NSIS 曾从旧的未提交源码树生成，不是当前候选包；本轮未安装/UAT |
+| 三目标 code-gate 与手动候选包 workflow | code-gate 已由工作分支 push 触发 | 当前提交三端 code-gate 全绿；GitHub `main` 无有效保护规则，因此 CI 现在还不是合并阻断门禁。候选包 workflow 未运行 |
 | 三端版本/提交/安装包摘要一致性校验 | manifest 包含 runner OS/架构、逐包大小/SHA256、必需包类型、HEIF 来源/许可证材料及逐目标构建日志 SHA256；本地合成三端产物的聚合校验测试通过，真实三端候选尚未生成 | 需在同一提交的三端 runner 生成并验证真实产物 |
-| 固定五步人工验收 | 操作脚本已纳入 QA 手册 | 需 Windows、Apple Silicon、Ubuntu 目标设备逐一执行 |
+| 固定五步人工验收 | 操作脚本已纳入 QA 手册 | 仍需 Windows、Apple Silicon、Ubuntu 目标设备逐一执行 |
 | 候选包交付给熟人测试 | 暂不允许 | 完成媒体许可复核，且目标平台核心五步通过后再发知情测试者 |
 
-这些代码仍在未提交的本地 `codex/platform-integration` 工作区，未合并到 `main`。Windows MSI/NSIS 曾在独立临时输出目录生成，未安装、未分发；之后源码发生变化，旧包不能证明当前源码可交付。此前只创建了本地恢复快照，本轮未提交、推送或运行远端 workflow。
+当前集成改动已整理为可回退提交并推送到 `origin/codex/platform-integration`；最新 HEAD 为 `b9ac04ff2b07414c7c963440a51aff6b694eb165`。远端 `main` 仍为 `683628ae25feb610fdd84aeb37b036e18187a5fe`，本轮没有创建 PR 或合并。之前在独立临时目录生成的 Windows MSI/NSIS 来自未提交工作树，未安装或分发，不能作为当前提交的候选包。
 
 ### 2.4 当前审计结论与证据边界
 
-- 2026-09-24 只读核对：集成 HEAD、本地 `main` 与 `ls-remote` 返回的远端 `main` 都为 `683628ae25feb610fdd84aeb37b036e18187a5fe`。本地 `origin/main` 缓存较旧，不能用其 ahead 数量推断实时远端进度。
-- 集成工作区有 193 条 porcelain 状态记录（不是 193 个源码文件）：72 项暂存、120 项未暂存，其中 25 项同时有两类状态；另有 26 个未跟踪文件。36 项 `heif-bin/` 暂存删除对应的本地原文件仍在磁盘（被忽略，不在 Git 索引中），本轮没有删除或覆盖它们。当前不具备直接整体提交/合并的条件。
+- 2026-09-24 P0 审计起点只读核对：当时集成 HEAD、本地 `main` 与 `ls-remote` 返回的远端 `main` 都为 `683628ae25feb610fdd84aeb37b036e18187a5fe`。本地 `origin/main` 缓存较旧，不能用其 ahead 数量推断实时远端进度。
+- P0 审计起点工作区有 193 条 porcelain 状态记录（不是 193 个源码文件）：72 项暂存、120 项未暂存，其中 25 项同时有两类状态；另有 26 个未跟踪文件。36 项 `heif-bin/` 暂存删除对应的本地原文件仍在磁盘（被忽略，不在 Git 索引中），本轮没有删除或覆盖它们。此为提交前状态，不代表当前工作区。
 - 按 Git clean/filter 后的 blob 对照固定快照：167 个 tracked 变化路径中，61 个与 Windows 快照内容相同、7 个与平台快照内容相同、99 个不同于两个快照；26 个未跟踪文件中，4 个与 Windows 快照相同、6 个是对快照既有路径的集成修改、16 个是新建的文档/构建门禁/候选校验/回归测试文件。这里的“相同”只说明来源，不代表语义已通过审查；`.cargo` 旧配置删除包含在 tracked 变化路径统计中。不同 Git 状态维度不可相加成文件数。
 - **P0 逐路径来源对账于 2026-09-24 完成。** 路径分组结论：快照相同项是既有行为保留；集成差异归为统一平台能力/路径/原生依赖与三端门禁、既有连接/恢复/媒体/SearchPlan 缺陷修复、契约与权威文档同步及其回归测试。逐项检查未发现新增用户入口、AI 能力、搜索语法、数据含义或其他产品功能；SearchIntent V3、AI 图像输入规范化，以及导入阶段“不支持缩略图则拦截、有限预览则提示”的状态与 UI 均可在 Windows 恢复快照中核实，当前 PRD R-02/R-07 是对齐该既有行为而非新增产品能力。高风险核验覆盖 AI 限流、搜索/分面、恢复、凭据、视频缓存、HEIF/媒体构建脚本；无未决产品选择。具体快照哈希和本轮路径/行为分类在任务输出中，不另建第二份长期账本。
 - Windows 恢复快照 `4c2e140` 已含 AI 连接限流字段、V25、帮助页入口和搜索协议调整；当前 `ai_rate_limit.rs` 的 Git blob 与该快照完全相同，两份搜索协议文档也无差异。这些不能仅因未进入 main 就判为本轮新增功能，更不能擅自删除。
 - 当前能力层、非 Windows 托管 Ollama 禁用、发布 sidecar 校验、路径处理及视频代理兼容属于既定平台治理方向。恢复安全和凭据补偿属于已有功能可靠性修复；新文件或追加迁移本身不等于新增产品功能，但必须保留缺陷与测试依据。
 - 先前执行记录中前端 702 项通过、2 项跳过，tooling 15 项通过；完整 Rust 曾通过 788 项、忽略 8 项，Windows smoke 和构建也曾通过。这些均为历史结果，不是当前最终门禁。
-- 恢复已发布 V15 原逻辑后的历史完整 Rust 测试曾出现 `ai_adversarial_sim::http_429_stops_batch_and_preserves_pending` 期望 `pending`、实际 `rejected`。2026-09-24 该单项通过，默认并行 adversarial 目标连续 3 次各 14/14 通过，之后完整 `cargo test --all-features` 退出码 0：708 passed、7 ignored（485 lib、14 adversarial、13 AI、78 DB、12 Ollama、3 perf、54 QA、15 search、10 services、16 V24、8 W7）。失败的历史根因仍未知，不能说已修复；当前复验未发现可稳定复现的 429 缺陷。fmt/clippy 历史通过，但本轮未复验；完整 smoke、前端全门禁和最新安装包未验证。
+- P1 阶段历史记录：恢复已发布 V15 原逻辑后的历史完整 Rust 测试曾出现 `ai_adversarial_sim::http_429_stops_batch_and_preserves_pending` 期望 `pending`、实际 `rejected`。2026-09-24 该单项通过，默认并行 adversarial 目标连续 3 次各 14/14 通过，之后完整 `cargo test --all-features` 退出码 0：708 passed、7 ignored（485 lib、14 adversarial、13 AI、78 DB、12 Ollama、3 perf、54 QA、15 search、10 services、16 V24、8 W7）。失败的历史根因仍未知，不能说已修复；P1 当时未发现可稳定复现的 429 缺陷。该阶段 fmt/clippy、完整 smoke、前端全门禁和最新安装包尚未验证；之后的 P4/最终记录见本节后文。
 - 以上 P0 结论不等于逐行证明所有代码无缺陷，也不替代三端 runner、真机 UAT、许可复核或完整合并审查；它关闭的是范围与来源冻结出口，未发现需要用户裁决的产品选择。
 - 2026-09-24 P4 最终源码复验（包含平台 DTO 注释校正）：tooling 15/15、typecheck、Rust fmt、clippy、build、strict media check 均退出码 0；前端 80/80 文件、702 passed、2 skipped；Rust all-features 为 788 passed、8 ignored。Smoke 命令最终退出码 0，但 AI 集成组首轮 `empty_tags_marks_rejected_and_batch_continues` 曾失败，报第二项建议因 `打标 V2 缺少 description` 被拒；脚本既有重试整组 13/13，通过后独立串行重跑及之后连续 3 次串行重跑均 13/13。根因未定位，保留首轮失败事实，不据重试覆盖；后续未稳定复现，也未改业务逻辑。此前 ViewerPage 异步断言调整仅等待实际卸载，没有改变查看器行为。
 - lint 退出码 0，有 5 条警告：`PendingList.tsx` 的 `hover` effect 依赖、`AssetInfoPanel.tsx` 的 `asset` effect 依赖、`Thumbnail.tsx` 清理函数读取 `gen.current`、`QueryBuilder.test.tsx` 的显式 `any`、`AiTaggingPage.tsx` 的 `currentSuggestion` effect 依赖。逐个核对警告行与相对 main 的 diff：警告行均未被本批改动触及；`PendingList` 与搜索测试文件其他位置虽有改动，但不包含对应警告行。依 P3 单批边界暂不扩成 lint 清债批：测试 `any` 归入类型规范债务；其余 effect/ref 告警须在独立批次证明不重置用户编辑状态、不放过过期请求后再处理。Vite 构建成功，当前主 JS chunk 664.48 kB，高于 500 kB 提示值；本阶段未做全局拆包。
 - P0 后的测试保护补充只增加 `ServiceManagement.test.tsx` 用例，确认选择本机模型不会覆盖仍有效的打标服务绑定；前端定向测试 5/5、`npm run typecheck`、`npm run lint` 和 `npm run test:unit` 均在该改动后退出码 0，unit 为 703 passed/2 skipped。lint 仍有上述 5 条警告。Rust/原生代码未变，Rust、smoke、build 和安装包命令没有因该测试文件改动而重跑；其结果仍按前述历史证据标注。
 - 最终源码 Windows x64 release bundle 在新建独立临时目录 `bagertea-platform-final-9c407c2f8a4741198f4a6bdc96c0ce48` 构建成功：MSI 110,690,304 bytes，SHA256 `211EBAC2298F2A3C16C46437F4C7BE360679BC3103A1311D1E1E6E9A3E164E37`；NSIS 81,124,045 bytes，SHA256 `D48412097CF4E811DBFABE01705483701F7CA3733CD4E982608CC6A40607FA4E`。未安装或分发。包在未提交工作树上生成，**不是候选包**。
-- 工作区 `HEAD` / 本地 `main` 仍为 `683628ae25feb610fdd84aeb37b036e18187a5fe`；只读 `git ls-remote origin refs/heads/main` 确认服务器 `main` 也是该提交。此 worktree 的 `origin/main` 跟踪引用仍滞后在祖先 `c9899125`，本轮未 fetch 更新它。集成改动都仍在未提交工作树中，尚未合并。193 条 Git 状态记录仍在，36 项 HEIF 暂存删除未动。本轮未提交、推送或合并。macOS/Linux runner、Required checks 实际阻断、真机 UAT 和许可复核仍未证明。
+- P0 审计记录的主线/脏工作区状态是当时状态。此后按用户授权将集成改动提交并推送到工作分支；最新状态见下方 2026-09-24 收口记录。macOS/Linux runner 已通过代码级 CI，但真机 UAT、Required checks 阻断和许可复核仍未证明。
+- **2026-09-24 当前源码本机收口（HEAD `b9ac04ff2b07414c7c963440a51aff6b694eb165`）：** `npm run test:tooling` 15/15、`npm run typecheck`、`npm run lint`（0 errors，5 条既有警告）、`npm run test:unit` 705 passed/2 skipped、`npm run build`、`cargo fmt --check`、严格 all-targets/all-features `cargo clippy -D warnings`、`cargo test --all-features`（788 passed/8 ignored）、完整 `pwsh ./scripts/smoke.ps1`、`npm run desktop:check:strict -- --target x86_64-pc-windows-msvc` 均退出码 0。Vite 仍提示 JS 主 chunk 664.48 kB 超过 500 kB 建议值；这不是构建失败，本轮未扩大为全局拆包。此前一次 smoke 运行中的 AI 本地 mock TCP 测试失败且整组重试未恢复；后续增加服务器 IO 失败计数诊断/准确分类后，当前源码完整 smoke 全部通过。该历史失败保留，不宣称网络 mock 已无任何瞬态风险。
+- **2026-09-24 当前源码三端 CI：** [code-gate run 35965863783](https://github.com/SSRYLJRSS/BagerTea_AiMdeias/actions/runs/35965863783)，HEAD `b9ac04ff2b07414c7c963440a51aff6b694eb165`，frontend、Linux x64、macOS Apple Silicon、Windows x64 jobs 全部 success；三端均完成 strict clippy、全量 Rust 测试、原生 Tauri release binary build 与桌面目标/版本检查。较早的两次 push workflow 曾按门禁失败：先后暴露 rfd Linux 互斥后端、Unix 条件导入、macOS 不支持创建非法 UTF-8 文件名的三项文件系统测试。对应提交只修正依赖 feature、平台 cfg/lint 与测试适用平台；没有改产品功能。最新 run 对三端均全绿。
+- **合并保护状态只读检查：** `GET /branches/main/protection` 返回 `Branch not protected`；仓库 rulesets 列表和 `GET /rules/branches/main` 均为空。因此当前 CI 结果真实，但 GitHub 尚未把这些 job 设为 main 的 required checks。没有修改保护规则，也没有创建 PR 或合并。
+- **仍未完成：** 安装包候选（本轮只构建三端 release executable，未运行手动候选包 workflow）、Windows 安装与五步 UAT、macOS/Linux 真机五步 UAT、三端安装包 manifest/摘要一致性实产验证、媒体依赖再分发许可复核。CI 绿不等于发布或平台支持等级已升级。
 
 ## 3. 里程碑
 
@@ -141,13 +145,13 @@
 - App 管理的 Ollama 只在 Windows；macOS/Linux 保留外部兼容 AI 连接，不提供托管安装/启动入口。
 - 第一阶段不承诺跨系统搬迁素材库。
 
-该里程碑的 workflow 文件和本地实现不等于远端门禁已启用；其退出条件还包含首次三端 runner 全绿、GitHub Required checks 生效、媒体依赖再分发复核和真实真机 UAT。
+该里程碑的 workflow 文件和本地实现不等于远端门禁已启用；当前提交的首次三端 runner 已全绿，但 GitHub Required checks 未配置，媒体依赖再分发复核和真实真机 UAT 也未完成。
 
 ## 4. 下一阶段：现有功能冻结与质量收口
 
 ### 4.1 本阶段授权和边界
 
-用户当前要求：**不新增功能，只优化、规范已有代码，修复适配与可靠性问题，达到单 main、三端门禁约束下可审查合并的状态。** 当前 goal 已明确授权按本节逐批实施 P0–P4；P5 的提交、推送、PR、合并与发布仍按独立授权边界处理。文档中的其他未来方向不是开发授权。
+用户当前要求：**不新增功能，只优化、规范已有代码，修复适配与可靠性问题，达到单 main、三端门禁约束下可审查合并的状态。** 用户已明确授权将当前集成改动整理为可回退提交、推送工作分支并运行三端 CI；该授权已用于 `codex/platform-integration`，不包含创建 PR、合并 `main`、改 branch protection、安装/分发或发布。文档中的其他未来方向不是开发授权。
 
 产品基线是 `main` 已有行为加 Windows 恢复快照中既有行为，不是把所有平台分支或旧计划内容无条件搬入。平台差异按 [PLATFORM.md](PLATFORM.md) 收敛；相对 Windows 的行为改变必须能对应既定能力限制或可复现缺陷。
 
@@ -160,7 +164,7 @@
 1. 先读取 AGENTS 与相关权威文档，并核对工作树、分支、HEAD、暂存/未暂存/未跟踪项。只在集成工作树施工，两个恢复快照仅作证据。
 2. 开工列出一个具体问题、预期行为、文件白名单、三端影响、回归测试和不改项。新增文件或迁移须说明其如何服务现有行为，而非扩展产品。
 3. 一次只处理一批；如果发现另一问题，记录后排队，不顺手修复。需要改变产品含义时暂停并请求决策。
-4. 保留用户所有既有改动和暂存区；不用 reset/checkout/clean，不自动 stage/commit/push、建 PR、改保护规则或合并。恢复快照授权不延伸为这些权限。
+4. 保留用户所有既有改动和暂存区；不用 reset/checkout/clean。未经明确任务级授权，不 stage/commit/push；本轮的授权只适用于当前集成分支提交、推送和 CI，不延伸为建 PR、改保护规则、合并或发布。恢复快照授权不延伸为这些权限。
 5. 回改已发布迁移、减少测试断言、跳过失败测试、全局串行化来掩盖失败、放宽三端门禁均不属于可接受修复。
 6. 每批交付：实际 diff、基线来源、验证命令及退出码、未执行项、剩余风险。失败结果不得被之后一次成功覆盖。
 
@@ -249,15 +253,17 @@ Windows 原生安装包按现有 desktop 入口生成到独立输出目录，验
 2026-09-24 P4 首轮最终结果：`npm run test:tooling` 15/15、`npm run typecheck`、`npm run lint`（0 errors/5 个已登记警告）、`npm run test:unit` 702 passed/2 skipped、`npm run build`、`cargo fmt --check`、按 DEVELOPMENT 设置已校验 `HEIF_BINARIES_DIR` 后的 all-targets/all-features clippy、all-features cargo test 788 passed/8 ignored、`scripts/smoke.ps1` 和 Windows strict media check 均最终退出码 0。Smoke 首轮 AI 集成目标失败后按脚本策略重试通过，之后独立串行复跑及连续 3 次串行复跑均 13/13；根因未知，详见 §2，不隐藏首轮结果。Windows x64 MSI/NSIS 在 `%TEMP%/bagertea-platform-final-9c407c2f8a4741198f4a6bdc96c0ce48/cargo-target/.../bundle` 生成并完成 SHA256 校验；它们来自未提交工作树，不得登记为共同提交候选。
 
 后续 2026-09-24 当前工作树复验：在上述门禁之后仅增加普通素材库筛选变更时的过期全选/反选结果保护及两项回归测试。定向与完整前端测试、typecheck、lint、build 均在此代码状态通过，unit 更新为 705 passed/2 skipped；Rust fmt/clippy/all-features test（788 passed/8 ignored）、strict media check 和完整 `scripts/smoke.ps1` 也在当前代码状态通过，smoke 五阶段全部通过。最新 MSI/NSIS 在独立临时 Cargo target 下生成并完成摘要复核：MSI 110,690,304 bytes，SHA256 `2F140DD7C9CDC398C52BC45F2C9D615140E67CB8E5C2DD5C460433172E56BC77`；NSIS 81,134,237 bytes，SHA256 `50633B836BE7EBA69AAE6DCF91F4494B79E57F2EA225B5FF06AB3A468EB40AB3`。输出位于 `%TEMP%/bagertea-platform-current-2b265ccfce774514983af1aa6c8061a3/cargo-target/.../bundle`，未安装或分发，仍来自未提交工作树，**不是候选包**。工作区增加的两个未暂存文件状态使当前 porcelain 记录从 P0 审计时 193 条变为 195 条；P0 来源分类仍是固定审计时点的结论，不把这两项本任务回归测试改动伪装成基线内容。
-- 当前工作树 workflow 复核：本机没有 `actionlint`；用 PyYAML BaseLoader 对 3 个 workflow 文件做 YAML 解析，并断言 code-gate 的 `frontend`/`rust` job 与候选 workflow 的 `bundle -> verify` 依赖存在，检查通过。该静态解析不是 GitHub Actions schema 校验，也不替代远端 runner 或 Required checks 实测。
+- 当前工作树 workflow 复核：本机没有 `actionlint`；用 PyYAML BaseLoader 对 3 个 workflow 文件做 YAML 解析，并断言 code-gate 的 `frontend`/`rust` job 与候选 workflow 的 `bundle -> verify` 依赖存在，检查通过。该静态解析不是 GitHub Actions schema 校验，也不替代 Required checks 实际阻断验证；远端 runner 结果另见本节当前源码记录。
 
-剩余：三端 workflow 未在 GitHub runner 上运行，Required checks 是否实际阻断 main 未验证；macOS/Linux 真机构建/UAT、Windows 安装/UAT、媒体依赖分发许可复核未完成。没有这些证据，不得声称已合并或已达到支持级别。
+2026-09-24 提交/推送后的最终源码状态：集成基线及三项平台 CI/测试修正提交至 `codex/platform-integration`（最新 `b9ac04f`），本地工作树干净；P4 所列全部本机门禁退出码为 0。GitHub run `35965863783` 对该精确 HEAD 的 frontend、Linux x64、macOS Apple Silicon、Windows x64 jobs 全部成功，包括各平台 Rust tests、原生应用构建和桌面目标检查。之前两轮失败均已定位并以最小平台依赖/条件编译/测试条件修正；失败事实及诊断见 §2.4，不将最终绿灯反写成从未失败。GitHub 当前没有对 `main` 生效的保护规则/Required checks；这一项、真机验收、候选安装包与再分发许可仍未完成。
 
-下一步顺序（本轮仅制定，不触发远端写入、安装或分发）：先冻结功能范围并分别复核暂存、未暂存和未跟踪改动，不能对当前混合工作区整体暂存；取得明确推送/PR 授权后，在同一提交运行三个平台 workflow 并验证 Required checks 实际阻断；安排 Windows 安装及五步 UAT，并由知情测试者在 macOS/Linux 设备执行相同闭环，同时完成媒体依赖许可复核；全部证据齐备后再进入 P5 的独立提交、PR、合并授权。CI 不能替代真机 UAT；未能安排设备时保留为未验收，不升级平台承诺。现有 5 条 lint 警告保持独立小批，不与平台收口混改。除被门禁复现并有回归测试的既有缺陷外，不再加改代码，更不增加产品功能。
+剩余：GitHub Required checks 尚未配置为 main 的硬门禁；macOS/Linux 真机五步 UAT、Windows 安装与五步 UAT、同版本/同提交实际安装包 manifest 验证、媒体依赖再分发许可复核未完成。当前代码级三端 CI 通过，不得据此声称已合并、可发布或已达到平台支持级别。
+
+下一步顺序：不再为“凑绿”新增功能或扩展代码优化范围；先由用户决定是否授权把三端 job 配成 `main` Required checks（当前 branch protection 与 rulesets 均为空），再安排 Windows 安装及五步 UAT、macOS/Linux 知情测试者真机五步 UAT，并完成候选安装包同提交 manifest 校验和媒体依赖许可复核。未安排到目标设备时保留为未验收、不升级平台承诺。现有 5 条 lint 警告保持独立小批。用户已要求本轮不合并 `main`；PR、合并、安装/分发与发布仍须另行明确授权。
 
 #### P5：主线合并与候选验收（独立授权边界）
 
-取得相应提交/推送/PR 授权后，按可独立验证的行为组织提交，复核没有漏掉未跟踪文件或夹带用户暂存内容。三端 code-gate 对最终候选提交全绿，Required checks 的实际配置及阻断效果得到核实，完成审查后才可按授权合并。
+当前集成提交/推送及三端 CI 授权已完成，工作分支 `b9ac04f` 的 code-gate 全绿；用户明确要求暂不合并 `main`。下一步若要让三端门禁成为硬阻断，先取得配置 branch protection/ruleset 的明确授权；PR、合并以及候选包安装/分发仍分别要求用户授权。完成平台 UAT、许可与候选包证据前不得进入发布。
 
 三端包须同版本、同提交；Windows 完整回归，macOS/Linux 以固定五步人工脚本验收。没有设备/测试者就如实停在构建证据，不升级支持等级。对外分发还需符合平台文档的许可、签名及知情测试要求。
 
