@@ -53,13 +53,13 @@
 |---|---|---|
 | 平台契约、AI 协作入口、路径与能力边界 | 已提交并推送到 `codex/platform-integration` | 当前集成提交已完成代码级审查与三端 code-gate；尚未合并，且 Required checks 未设置 |
 | Windows/macOS/Linux 平台能力、UTF-8 路径告警、视频代理变体 | 工作分支已有实现与回归测试 | 最新提交在三端 clippy、全量 Rust 测试及原生 Tauri 构建通过；目标设备人工验收仍未完成 |
-| Rust 1.98.1、统一桌面构建入口、SHA256 sidecar/HEIF manifest | 工作分支已配置 | 三端 HEIF 资源准备及原生应用构建通过；Windows strict media check 通过。MSI/NSIS 曾从旧的未提交源码树生成，不是当前候选包；本轮未安装/UAT |
-| 三目标 code-gate 与手动候选包 workflow | code-gate 已由工作分支 push 触发 | 当前提交三端 code-gate 全绿；GitHub `main` 无有效保护规则，因此 CI 现在还不是合并阻断门禁。候选包 workflow 未运行 |
+| Rust 1.98.1、统一桌面构建入口、SHA256 sidecar/HEIF manifest | 工作分支已配置 | 三端 HEIF 资源准备及原生应用构建通过；Windows strict media check 通过。已从提交 `a35cadb64b40714937034580dc638187c99ca8b7` 在本机生成 Windows MSI（110,690,304 bytes，SHA256 `FFB2943DECF107761A1DEC4E84A9D229701E08AB9FC7DF01B5F6A651C3E5DFA0`）和 NSIS（81,115,350 bytes，SHA256 `6B97E30400F72ADC86B0514D5BF5E6D46265281DD4B66DC0F6ADE2D4800F1D0B`），仅用于本地构建验证；未签名、未安装、未启动、未分发，不是发布候选包。三端同提交候选和真实产物 manifest 仍未生成 |
+| 三目标 code-gate 与手动候选包 workflow | code-gate 已由工作分支 push 触发 | 当前 HEAD `a35cadb64b40714937034580dc638187c99ca8b7` 的 [run 36010141984](https://github.com/SSRYLJRSS/BagerTea_AiMdeias/actions/runs/36010141984) 中 frontend、Windows x64、macOS Apple Silicon、Linux x64 全绿；GitHub `main` 无有效保护规则，因此 CI 现在还不是合并阻断门禁。候选包 workflow 未运行 |
 | 三端版本/提交/安装包摘要一致性校验 | manifest 包含 runner OS/架构、逐包大小/SHA256、必需包类型、HEIF 来源/许可证材料及逐目标构建日志 SHA256；本地合成三端产物的聚合校验测试通过，真实三端候选尚未生成 | 需在同一提交的三端 runner 生成并验证真实产物 |
 | 固定五步人工验收 | 操作脚本已纳入 QA 手册 | 仍需 Windows、Apple Silicon、Ubuntu 目标设备逐一执行 |
 | 候选包交付给熟人测试 | 暂不允许 | 完成媒体许可复核，且目标平台核心五步通过后再发知情测试者 |
 
-最新已完成的 source code gate 是源码提交 `fd319ebcfc551b791664fa69eccfc1512faf7be3` 的 [run 36000987683](https://github.com/SSRYLJRSS/BagerTea_AiMdeias/actions/runs/36000987683)：frontend、Linux x64、macOS Apple Silicon、Windows x64 四个 jobs 全部通过。前序源码提交 `36a5d352af85490f8dc37ed02e3b321be573c208` 的 [run 35986278018](https://github.com/SSRYLJRSS/BagerTea_AiMdeias/actions/runs/35986278018) 和文档 HEAD `952e0d5` 的 [run 35996481530](https://github.com/SSRYLJRSS/BagerTea_AiMdeias/actions/runs/35996481530) 也均通过。`fd319eb` 只调整 `SettingsPage.test.tsx` 的异步测试等待，不改产品行为；该 follow-up 的本地门禁结果见 §2.4。远端 `main` 仍为 `683628ae25feb610fdd84aeb37b036e18187a5fe`，未创建 PR 或合并。旧 Windows MSI/NSIS 来自未提交工作树，未安装/分发，不能作为当前候选包。
+最新已完成的 source code gate 是当前集成分支 HEAD `a35cadb64b40714937034580dc638187c99ca8b7` 的 [run 36010141984](https://github.com/SSRYLJRSS/BagerTea_AiMdeias/actions/runs/36010141984)：frontend、Linux x64、macOS Apple Silicon、Windows x64 四个 jobs 全部通过。源码提交 `fd319ebcfc551b791664fa69eccfc1512faf7be3` 的 [run 36000987683](https://github.com/SSRYLJRSS/BagerTea_AiMdeias/actions/runs/36000987683) 也全部通过；该提交只调整 `SettingsPage.test.tsx` 的异步测试等待，不改产品行为，其本地门禁结果见 §2.4。Windows MSI/NSIS 已从当前 HEAD 的同一提交在本机生成用于构建验证（摘要见上表），但没有生成三端候选包 manifest，也未安装、启动或分发。远端 `main` 仍为 `683628ae25feb610fdd84aeb37b036e18187a5fe`，未创建 PR 或合并。
 
 ### 2.4 当前审计结论与证据边界
 
@@ -165,7 +165,7 @@
 | P1 429 批处理状态 | 已修复（故障路径已确认；旧实例未复现） | 基线 `683628a` 虽已将 HTTP 429 映射为 `AI_RATE_LIMITED`，但批处理仍把它和普通请求错误共用退避重试及 rejected 路径；`2e62273` 在首次/重试响应处新增该错误码的提前中断处理，记录错误并保留 pending。`http_429_stops_batch_and_preserves_pending` 覆盖不重试、当前与后续建议均保留 pending；Windows 精确用例 10/10 通过，源码 SHA `fd319eb` 的三端 code-gate 全绿。历史原始运行的随机触发条件未复现，不声称可稳定复现。 |
 | P2 平台与数据安全 | 代码复核完成 | 既有平台差异、安全路径和回归修正已纳入当前集成；目标设备人工验收仍按 §2.2 未关闭。 |
 | P3 规范和文档收口 | 已完成 | 本地 lint 无 warning；权威文档只记录当前行为、证据和开放门禁。 |
-| P4 同一源码验证 | 当前源码提交 `fd319ebcfc551b791664fa69eccfc1512faf7be3` 的本机门禁已通过，且同一 SHA 的 frontend、Windows x64、macOS Apple Silicon、Linux x64 远端 code-gate 全绿 | 已完成代码级验证；CI 不是 `main` 的 Required check，且不替代候选产物、真机 UAT 和许可审查。 |
+| P4 同一源码验证 | 代码变更提交 `fd319ebcfc551b791664fa69eccfc1512faf7be3` 的本机门禁已通过；当前 HEAD `a35cadb64b40714937034580dc638187c99ca8b7` 的 frontend、Windows x64、macOS Apple Silicon、Linux x64 远端 code-gate 全绿。本机从该 HEAD 生成 Windows MSI/NSIS 并记录摘要，仅证明本机打包链路可构建 | 已完成代码级验证和 Windows 本机构建验证；尚无同提交三端候选 manifest、安装/UAT、分发或许可审查证据。CI 不是 `main` 的 Required check。 |
 | P5 主线合并与候选验收 | 暂停在授权边界 | 用户要求暂不合并 `main`。Required checks、候选包、三端真机 UAT、安装包 manifest 实产和媒体许可复核均未完成；需分别满足授权与证据条件后再继续。 |
 
 本阶段结束不代表项目可发布。下一步仅处理 §2.2 中的证据缺口；不得由 AI 自动启动新功能、创建 PR、配置保护规则、合并、安装或分发。
