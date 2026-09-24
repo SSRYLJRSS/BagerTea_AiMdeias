@@ -162,7 +162,7 @@
 | 批次 | 状态 | 证据 / 尚未关闭事项 |
 |---|---|---|
 | P0 范围与来源复核 | 已完成 | 未发现无来源的新功能；结论见 §2.4。 |
-| P1 429 回归调查 | 已完成（未复现） | `ai_adversarial_sim::http_429_stops_batch_and_preserves_pending` 曾出现预期 pending、实际 rejected；随后单项、默认并行 3 次和全量 Rust 测试通过，但根因未知，不宣称已修复。 |
+| P1 429 批处理状态 | 已修复（故障路径已确认；旧实例未复现） | 基线 `683628a` 虽已将 HTTP 429 映射为 `AI_RATE_LIMITED`，但批处理仍把它和普通请求错误共用退避重试及 rejected 路径；`2e62273` 在首次/重试响应处新增该错误码的提前中断处理，记录错误并保留 pending。`http_429_stops_batch_and_preserves_pending` 覆盖不重试、当前与后续建议均保留 pending；Windows 精确用例 10/10 通过，源码 SHA `fd319eb` 的三端 code-gate 全绿。历史原始运行的随机触发条件未复现，不声称可稳定复现。 |
 | P2 平台与数据安全 | 代码复核完成 | 既有平台差异、安全路径和回归修正已纳入当前集成；目标设备人工验收仍按 §2.2 未关闭。 |
 | P3 规范和文档收口 | 已完成 | 本地 lint 无 warning；权威文档只记录当前行为、证据和开放门禁。 |
 | P4 同一源码验证 | 当前源码提交 `fd319ebcfc551b791664fa69eccfc1512faf7be3` 的本机门禁已通过，且同一 SHA 的 frontend、Windows x64、macOS Apple Silicon、Linux x64 远端 code-gate 全绿 | 已完成代码级验证；CI 不是 `main` 的 Required check，且不替代候选产物、真机 UAT 和许可审查。 |
