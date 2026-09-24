@@ -491,7 +491,8 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    // This test creates an invalid-UTF-8 filesystem entry; macOS rejects that path with EILSEQ.
+    #[cfg(target_os = "linux")]
     #[test]
     fn model_dir_conversion_rejects_non_utf8_path_instead_of_rewriting_it() {
         use std::os::unix::ffi::OsStrExt;

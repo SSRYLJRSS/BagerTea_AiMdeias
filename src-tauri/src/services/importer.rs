@@ -1209,7 +1209,8 @@ mod tests {
         assert!(warnings[0].contains("路径不存在或不受支持"));
     }
 
-    #[cfg(unix)]
+    // This test creates an invalid-UTF-8 filesystem entry; macOS rejects that path with EILSEQ.
+    #[cfg(target_os = "linux")]
     #[test]
     fn collect_files_skips_non_utf8_names_and_reports_warning_before_import() {
         use std::os::unix::ffi::OsStrExt;

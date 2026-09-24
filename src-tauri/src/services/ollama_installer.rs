@@ -963,7 +963,8 @@ mod tests {
         assert_eq!(find_ollama_in_path(&path), Some(executable));
     }
 
-    #[cfg(unix)]
+    // This test creates an invalid-UTF-8 filesystem entry; macOS rejects that path with EILSEQ.
+    #[cfg(target_os = "linux")]
     #[test]
     fn ollama_path_lookup_preserves_non_utf8_native_paths() {
         use std::os::unix::ffi::OsStrExt;
