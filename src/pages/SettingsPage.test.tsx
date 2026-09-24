@@ -363,6 +363,7 @@ describe("SettingsPage AI 打标审核流程", () => {
     await waitFor(() => expect(screen.getByText("保存设置")).toBeInTheDocument());
     fireEvent.click(screen.getByText("AI 与模型"));
     fireEvent.click(screen.getAllByText("自动打标")[0]);
+    await screen.findByText("此功能使用的服务");
 
     expect(screen.queryByText("已有标签自动打上")).not.toBeInTheDocument();
     expect(screen.queryByText("新标签自动创建并打上")).not.toBeInTheDocument();
