@@ -92,11 +92,15 @@ static BINARY_CACHE: Mutex<Option<(String, Instant, bool)>> = Mutex::new(None);
 /// Tauri 将 sidecar 放到主可执行文件旁边；这里返回该相邻路径，供同步服务直接管理子进程。
 fn sidecar_path(executable: &Path, name: &str) -> Option<std::path::PathBuf> {
     let directory = executable.parent()?;
-    let mut filename = std::ffi::OsString::from(name);
     #[cfg(target_os = "windows")]
-    filename.push(".exe");
+    let path = {
+        let mut filename = std::ffi::OsString::from(name);
+        filename.push(".exe");
+        directory.join(filename)
+    };
+    #[cfg(not(target_os = "windows"))]
+    let path = directory.join(name);
 
-    let path = directory.join(filename);
     path.is_file().then_some(path)
 }
 

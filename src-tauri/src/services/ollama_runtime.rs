@@ -6,7 +6,9 @@
 //!
 //! 注意：Child 由本模块独占持有（不 Send 复制），Mutex 包裹后由命令层/退出钩子访问。
 
-use std::process::{Child, Command};
+use std::process::Child;
+#[cfg(windows)]
+use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
@@ -114,6 +116,7 @@ impl OllamaRuntimeState {
             ServiceOwnership::External => return false,
         };
         // 优先 Child kill/wait（带短超时的轮询，参考 services/video.rs §4.3 模式）
+        #[cfg(windows)]
         let mut confirmed_exit = false;
         if let Some(mut child) = self.child.take() {
             let deadline = Instant::now() + Duration::from_secs(8);
@@ -121,7 +124,10 @@ impl OllamaRuntimeState {
             loop {
                 match child.try_wait() {
                     Ok(Some(_)) => {
-                        confirmed_exit = true;
+                        #[cfg(windows)]
+                        {
+                            confirmed_exit = true;
+                        }
                         break;
                     }
                     Ok(None) => {

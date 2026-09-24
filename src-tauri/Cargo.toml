@@ -43,8 +43,9 @@ tracing-appender = "0.2"
 # 日志系统 F10：一键诊断包把日志和脱敏环境摘要打成 zip
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 # W0-10：迁移失败需在 tauri app 启动前弹原生 dialog（plugin dialog 需要 AppHandle；
-# 版本与 tauri-plugin-dialog 2.7 传递依赖一致，避免双份 rfd）
-rfd = "0.16"
+# 版本与 tauri-plugin-dialog 2.7 传递依赖一致，避免双份 rfd）。关闭默认 xdg-portal，
+# 使 Linux 与 tauri-plugin-dialog 使用同一 GTK3 后端，避免启用两个互斥后端。
+rfd = { version = "0.16", default-features = false }
 rayon = "1"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "tiff", "bmp", "tga"] }
 # T05a 云端 AI 打标：blocking 与现有同步 command 风格一致（避免跨 await 持 DB 锁）

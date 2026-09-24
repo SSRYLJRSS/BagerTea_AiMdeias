@@ -1219,7 +1219,7 @@ mod tests {
         std::fs::write(dir.path().join(bad_name), b"not really a jpeg").unwrap();
         let root = path::encode_native_path(dir.path()).unwrap();
 
-        let (files, warnings) = collect_files(&[root.clone()], |_| {});
+        let (files, warnings) = collect_files(std::slice::from_ref(&root), |_| {});
         assert!(files.is_empty());
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("不是有效 UTF-8"));
