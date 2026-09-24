@@ -41,7 +41,7 @@
 3. **格式与性能**：在目标机器上复测 RAW/HEIC、视频播放、3 万级搜索和网格滚动。
 4. **工作区交付边界**：所有应发布改动必须完成审查、测试并形成可回退提交。
 5. **发布门禁**：`scripts/smoke.ps1`、严格 Rust 门禁、前端门禁和人工 UAT 必须全部有结果记录。
-6. **三端远端门禁**：当前工作分支提交 `b9ac04ff2b07414c7c963440a51aff6b694eb165` 的 code-gate 已由 Linux x64、macOS Apple Silicon、Windows x64 和前端 job 全部通过（[workflow run 35965863783](https://github.com/SSRYLJRSS/BagerTea_AiMdeias/actions/runs/35965863783)）。但 `main` 当前没有有效分支保护/规则集：branch protection API 返回 `Branch not protected`，仓库 rulesets 与 main 的有效规则均为空；Required checks 尚未被设置为合并硬门禁。
+6. **三端远端门禁**：产品代码提交 `b9ac04ff2b07414c7c963440a51aff6b694eb165` 的 code-gate 首次运行由 Linux x64、macOS Apple Silicon、Windows x64 和前端 job 全部通过（[workflow run 35965863783](https://github.com/SSRYLJRSS/BagerTea_AiMdeias/actions/runs/35965863783)）。其后的仅文档提交 `ca3bd72386f4ad7bbf457210d5f5478720497e48` 在 workflow run `35969019646` 首次尝试的 frontend 单测有一项失败，失败 job 单独复跑后该 run 最终 success；该一次性失败尚未定位根因，不能隐去或视为已修复。但 `main` 当前没有有效分支保护/规则集：branch protection API 返回 `Branch not protected`，仓库 rulesets 与 main 的有效规则均为空；Required checks 尚未被设置为合并硬门禁。
 7. **macOS/Linux 真机验收**：当前没有这两类目标设备的验收证据；自动构建成功也不能标记为支持。
 8. **媒体依赖合规**：FFmpeg/HEIF/RAW 相关二进制的来源、对应源码/再分发材料和最终许可义务尚未完成独立复核；HEIF 的三目标归档、解压后静态库 SHA256、源码提交和 LGPL/GPL 许可证摘要已固定并随候选附带，但这不替代法律审查，许可证文本本身不足以解除分发阻塞。
 
@@ -59,7 +59,7 @@
 | 固定五步人工验收 | 操作脚本已纳入 QA 手册 | 仍需 Windows、Apple Silicon、Ubuntu 目标设备逐一执行 |
 | 候选包交付给熟人测试 | 暂不允许 | 完成媒体许可复核，且目标平台核心五步通过后再发知情测试者 |
 
-当前集成改动已整理为可回退提交并推送到 `origin/codex/platform-integration`；最新 HEAD 为 `b9ac04ff2b07414c7c963440a51aff6b694eb165`。远端 `main` 仍为 `683628ae25feb610fdd84aeb37b036e18187a5fe`，本轮没有创建 PR 或合并。之前在独立临时目录生成的 Windows MSI/NSIS 来自未提交工作树，未安装或分发，不能作为当前提交的候选包。
+当前集成改动已整理为可回退提交并推送到 `origin/codex/platform-integration`；最新 HEAD 为文档提交 `ca3bd72386f4ad7bbf457210d5f5478720497e48`，其产品代码与已通过三端 CI 的 `b9ac04f` 相同。远端 `main` 仍为 `683628ae25feb610fdd84aeb37b036e18187a5fe`，本轮没有创建 PR 或合并。之前在独立临时目录生成的 Windows MSI/NSIS 来自未提交工作树，未安装或分发，不能作为当前提交的候选包。
 
 ### 2.4 当前审计结论与证据边界
 
@@ -79,6 +79,7 @@
 - P0 审计记录的主线/脏工作区状态是当时状态。此后按用户授权将集成改动提交并推送到工作分支；最新状态见下方 2026-09-24 收口记录。macOS/Linux runner 已通过代码级 CI，但真机 UAT、Required checks 阻断和许可复核仍未证明。
 - **2026-09-24 当前源码本机收口（HEAD `b9ac04ff2b07414c7c963440a51aff6b694eb165`）：** `npm run test:tooling` 15/15、`npm run typecheck`、`npm run lint`（0 errors，5 条既有警告）、`npm run test:unit` 705 passed/2 skipped、`npm run build`、`cargo fmt --check`、严格 all-targets/all-features `cargo clippy -D warnings`、`cargo test --all-features`（788 passed/8 ignored）、完整 `pwsh ./scripts/smoke.ps1`、`npm run desktop:check:strict -- --target x86_64-pc-windows-msvc` 均退出码 0。Vite 仍提示 JS 主 chunk 664.48 kB 超过 500 kB 建议值；这不是构建失败，本轮未扩大为全局拆包。此前一次 smoke 运行中的 AI 本地 mock TCP 测试失败且整组重试未恢复；后续增加服务器 IO 失败计数诊断/准确分类后，当前源码完整 smoke 全部通过。该历史失败保留，不宣称网络 mock 已无任何瞬态风险。
 - **2026-09-24 当前源码三端 CI：** [code-gate run 35965863783](https://github.com/SSRYLJRSS/BagerTea_AiMdeias/actions/runs/35965863783)，HEAD `b9ac04ff2b07414c7c963440a51aff6b694eb165`，frontend、Linux x64、macOS Apple Silicon、Windows x64 jobs 全部 success；三端均完成 strict clippy、全量 Rust 测试、原生 Tauri release binary build 与桌面目标/版本检查。较早的两次 push workflow 曾按门禁失败：先后暴露 rfd Linux 互斥后端、Unix 条件导入、macOS 不支持创建非法 UTF-8 文件名的三项文件系统测试。对应提交只修正依赖 feature、平台 cfg/lint 与测试适用平台；没有改产品功能。最新 run 对三端均全绿。
+- **2026-09-24 文档提交后的 CI 复验：** HEAD `ca3bd72386f4ad7bbf457210d5f5478720497e48` 仅变更 `docs/PROJECT_PLAN.md`。 [workflow run 35969019646](https://github.com/SSRYLJRSS/BagerTea_AiMdeias/actions/runs/35969019646) 第一次尝试中，三个平台的 Rust/clippy/native-build/target-check jobs 全部通过；frontend 在 `SettingsPage.test.tsx:478` 的“初始未修改不显示脏状态”断言失败，前端 build 随之跳过。本机该测试文件 37 passed/2 skipped，完整前端单测 705 passed/2 skipped；仅复跑失败的 frontend job 后 run attempt 2 全部 success。未改应用代码，也未定位该单测一次性失败的根因；因此把它记录为未解释的不稳定信号，而非业务缺陷已修复或 CI 从未失败。
 - **合并保护状态只读检查：** `GET /branches/main/protection` 返回 `Branch not protected`；仓库 rulesets 列表和 `GET /rules/branches/main` 均为空。因此当前 CI 结果真实，但 GitHub 尚未把这些 job 设为 main 的 required checks。没有修改保护规则，也没有创建 PR 或合并。
 - **仍未完成：** 安装包候选（本轮只构建三端 release executable，未运行手动候选包 workflow）、Windows 安装与五步 UAT、macOS/Linux 真机五步 UAT、三端安装包 manifest/摘要一致性实产验证、媒体依赖再分发许可复核。CI 绿不等于发布或平台支持等级已升级。
 
@@ -255,7 +256,7 @@ Windows 原生安装包按现有 desktop 入口生成到独立输出目录，验
 后续 2026-09-24 当前工作树复验：在上述门禁之后仅增加普通素材库筛选变更时的过期全选/反选结果保护及两项回归测试。定向与完整前端测试、typecheck、lint、build 均在此代码状态通过，unit 更新为 705 passed/2 skipped；Rust fmt/clippy/all-features test（788 passed/8 ignored）、strict media check 和完整 `scripts/smoke.ps1` 也在当前代码状态通过，smoke 五阶段全部通过。最新 MSI/NSIS 在独立临时 Cargo target 下生成并完成摘要复核：MSI 110,690,304 bytes，SHA256 `2F140DD7C9CDC398C52BC45F2C9D615140E67CB8E5C2DD5C460433172E56BC77`；NSIS 81,134,237 bytes，SHA256 `50633B836BE7EBA69AAE6DCF91F4494B79E57F2EA225B5FF06AB3A468EB40AB3`。输出位于 `%TEMP%/bagertea-platform-current-2b265ccfce774514983af1aa6c8061a3/cargo-target/.../bundle`，未安装或分发，仍来自未提交工作树，**不是候选包**。工作区增加的两个未暂存文件状态使当前 porcelain 记录从 P0 审计时 193 条变为 195 条；P0 来源分类仍是固定审计时点的结论，不把这两项本任务回归测试改动伪装成基线内容。
 - 当前工作树 workflow 复核：本机没有 `actionlint`；用 PyYAML BaseLoader 对 3 个 workflow 文件做 YAML 解析，并断言 code-gate 的 `frontend`/`rust` job 与候选 workflow 的 `bundle -> verify` 依赖存在，检查通过。该静态解析不是 GitHub Actions schema 校验，也不替代 Required checks 实际阻断验证；远端 runner 结果另见本节当前源码记录。
 
-2026-09-24 提交/推送后的最终源码状态：集成基线及三项平台 CI/测试修正提交至 `codex/platform-integration`（最新 `b9ac04f`），本地工作树干净；P4 所列全部本机门禁退出码为 0。GitHub run `35965863783` 对该精确 HEAD 的 frontend、Linux x64、macOS Apple Silicon、Windows x64 jobs 全部成功，包括各平台 Rust tests、原生应用构建和桌面目标检查。之前两轮失败均已定位并以最小平台依赖/条件编译/测试条件修正；失败事实及诊断见 §2.4，不将最终绿灯反写成从未失败。GitHub 当前没有对 `main` 生效的保护规则/Required checks；这一项、真机验收、候选安装包与再分发许可仍未完成。
+2026-09-24 提交/推送后的最终源码状态：集成基线及三项平台 CI/测试修正提交至 `codex/platform-integration`（代码 HEAD `b9ac04f`；之后 `ca3bd72` 仅更新计划文档），本地工作树干净；P4 所列全部本机门禁退出码为 0。GitHub run `35965863783` 对代码 HEAD `b9ac04f` 的 frontend、Linux x64、macOS Apple Silicon、Windows x64 jobs 首次运行全部成功；文档提交后的 run `35969019646` 首次 frontend 单测失败，复跑失败 job 后 attempt 2 全绿。先前平台兼容失败均已定位并以最小依赖/条件编译/测试平台修正；`SettingsPage` 这项间歇失败根因未定位且未改代码。所有失败与复跑事实见 §2.4，不把复跑绿灯反写成从未失败。GitHub 当前没有对 `main` 生效的保护规则/Required checks；这一项、真机验收、候选安装包与再分发许可仍未完成。
 
 剩余：GitHub Required checks 尚未配置为 main 的硬门禁；macOS/Linux 真机五步 UAT、Windows 安装与五步 UAT、同版本/同提交实际安装包 manifest 验证、媒体依赖再分发许可复核未完成。当前代码级三端 CI 通过，不得据此声称已合并、可发布或已达到平台支持级别。
 
@@ -263,7 +264,7 @@ Windows 原生安装包按现有 desktop 入口生成到独立输出目录，验
 
 #### P5：主线合并与候选验收（独立授权边界）
 
-当前集成提交/推送及三端 CI 授权已完成，工作分支 `b9ac04f` 的 code-gate 全绿；用户明确要求暂不合并 `main`。下一步若要让三端门禁成为硬阻断，先取得配置 branch protection/ruleset 的明确授权；PR、合并以及候选包安装/分发仍分别要求用户授权。完成平台 UAT、许可与候选包证据前不得进入发布。
+当前集成提交/推送及三端 CI 授权已完成，工作分支代码提交 `b9ac04f` 的 code-gate 首次全绿，文档提交 `ca3bd72` 的 run 经 frontend 失败 job 复跑后全绿；`SettingsPage.test.tsx:478` 的一次性失败根因尚不明，详见 §2.4。用户明确要求暂不合并 `main`。下一步若要让三端门禁成为硬阻断，先取得配置 branch protection/ruleset 的明确授权；PR、合并以及候选包安装/分发仍分别要求用户授权。完成平台 UAT、许可与候选包证据前不得进入发布。
 
 三端包须同版本、同提交；Windows 完整回归，macOS/Linux 以固定五步人工脚本验收。没有设备/测试者就如实停在构建证据，不升级支持等级。对外分发还需符合平台文档的许可、签名及知情测试要求。
 
