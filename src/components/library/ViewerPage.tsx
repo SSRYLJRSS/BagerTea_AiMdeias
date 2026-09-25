@@ -8,7 +8,7 @@
  *  Escape 优先级：native（浏览器消费 Esc 退出全屏，fullscreenchange 同步回 off）> fallback（退出沉浸）
  *  > 关闭查看器（第二次 Esc）。
  */
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import clsx from "clsx";
 import { convertFileSrc } from "@tauri-apps/api/core";
@@ -233,7 +233,7 @@ export default function ViewerPage({ asset: initial, onClose, listItems, listTot
 
   // 键盘：←→ 过片，Esc 退出。§4.3 忽略输入框/下拉/文本域/contentEditable/播放器根节点与子节点/模态层
   // FB5-01（§4.1）：Esc 优先级 = native（浏览器消费，fullscreenchange 同步）> fallback（退出沉浸）> 关闭查看器。
-  useEffect(() => {
+  useLayoutEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (isEditableTarget(e.target) || isInsidePlayer(e.target)) return;
       if (assignOpen) return; // 模态打开时页面切片不响应
